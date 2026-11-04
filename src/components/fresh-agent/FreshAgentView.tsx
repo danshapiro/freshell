@@ -51,7 +51,12 @@ import { openSessionTab } from '@/store/tabsSlice'
 import { buildReconcileRequestForPanes, foldVerdicts, isFreshAgentReconcileActive } from '@/lib/pane-reconcile'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
-import { detachFreshAgentView, freshAgentViewAttachmentForPane } from '@/lib/fresh-agent-view-attachment'
+import {
+  captureFreshAgentAttachDecision,
+  detachFreshAgentView,
+  freshAgentViewAttachmentForPane,
+  type FreshAgentAttachDecision,
+} from '@/lib/fresh-agent-view-attachment'
 import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
 import { getRebindQueue } from '@/lib/rebind-queue'
 import { getSnapshotScheduler, makeSnapshotKey, type SnapshotTrigger } from '@/lib/fresh-agent-snapshot-scheduler'
@@ -782,11 +787,7 @@ function effectiveSessionRef(content: FreshAgentPaneContent) {
   return undefined
 }
 
-type AttachmentAttempt = {
-  key: string
-  content: FreshAgentPaneContent
-  fence: ObservedOwnerFence | undefined
-}
+type AttachmentAttempt = FreshAgentAttachDecision<FreshAgentPaneContent>
 
 function attachmentAttemptKey(
   state: ReturnType<AppStore['getState']>,
@@ -798,13 +799,9 @@ function attachmentAttemptKey(
     canonical?.provider ?? content.provider,
     content.sessionType,
     canonical?.sessionId ?? content.sessionRef?.sessionId ?? content.sessionId ?? null,
+    content.viewId ?? content.createRequestId,
     content.createRequestId,
     content.reconcileEpoch ?? 0,
-    state.connection.bootId ?? null,
-    // Each successful ready handshake is a distinct attachment opportunity,
-    // including same-server transport reconnects. The boot id alone cannot
-    // distinguish those from a duplicate boot-id effect for the same ready.
-    state.connection.readySequence ?? 0,
     decisionSerial,
   ])
 }
@@ -817,12 +814,22 @@ function captureAttachmentAttempt(
 ): AttachmentAttempt {
   const key = attachmentAttemptKey(state, content, decisionSerial)
   const fence = selectPaneOwnerFence(state, content)
-  if (previous?.key === key && (previous.fence || !fence)) return previous
-  return { key, content, fence }
+  return captureFreshAgentAttachDecision(key, content, fence, previous)
 }
 
-function attachmentSendKey(attempt: AttachmentAttempt): string {
+function attachmentDecisionSendKey(attempt: AttachmentAttempt): string {
   return JSON.stringify([attempt.key, attempt.fence?.epoch ?? null, attempt.fence?.generation ?? null])
+}
+
+function attachmentConnectionSendKey(
+  attempt: AttachmentAttempt,
+  state: ReturnType<AppStore['getState']>,
+): string {
+  return JSON.stringify([
+    attachmentDecisionSendKey(attempt),
+    state.connection.bootId ?? null,
+    state.connection.readySequence ?? 0,
+  ])
 }
 
 function attachmentTargetKey(content: FreshAgentPaneContent): string {
@@ -856,12 +863,14 @@ function currentAttachmentPaneContent(
 function buildFreshAgentAttachMessage(
   content: FreshAgentPaneContent,
   pane: { tabId: string, paneId: string },
-  cwd?: string,
-  observedFence?: ObservedOwnerFence,
+  cwd: string | undefined,
+  observedFence: ObservedOwnerFence | undefined,
+  requestId: string,
 ) {
   const sessionRef = effectiveSessionRef(content)
   return {
     type: 'freshAgent.attach',
+    requestId,
     sessionId: content.sessionId,
     viewId: content.viewId ?? content.createRequestId,
     sessionType: content.sessionType,
@@ -2307,7 +2316,13 @@ export function FreshAgentView({
       return false
     }
     const cwd = getFreshOpenCodeRouteCwd(attempt.content, { sessionCwd: freshOpenCodeRouteCwdRef.current })
-    sendFreshAgentMessage(buildFreshAgentAttachMessage(attempt.content, { tabId, paneId }, cwd, attempt.fence))
+    sendFreshAgentMessage(buildFreshAgentAttachMessage(
+      attempt.content,
+      { tabId, paneId },
+      cwd,
+      attempt.fence,
+      attempt.requestId,
+    ))
     blockedAttachmentAttemptRef.current = null
     return true
   }, [appStore, paneId, sendFreshAgentMessage, tabId])
@@ -2345,7 +2360,7 @@ export function FreshAgentView({
         // consume that one overlap and mark its lifecycle key as handled. A
         // later reconcile has a further epoch and remains a separate decision.
         currentOwnerAttachForPendingReconcileRef.current = null
-        lastConnectionAttachSentKeyRef.current = attachmentSendKey(attempt)
+        lastConnectionAttachSentKeyRef.current = attachmentConnectionSendKey(attempt, state)
         return true
       }
       const stillWaitingForCapturedDecision = pendingSince === currentOwnerAttachForPendingReconcile.pendingSince
@@ -2360,7 +2375,7 @@ export function FreshAgentView({
     // same ready handshake. Collapse those duplicate producers by the exact
     // attachment decision and captured fence, while keeping a new ready,
     // fence, create/reconcile round, or explicit decision distinct.
-    const key = attachmentSendKey(attempt)
+    const key = attachmentConnectionSendKey(attempt, state)
     if (lastConnectionAttachSentKeyRef.current === key) return true
     const sent = sendFencedFreshAgentAttach(attempt)
     if (sent) {
@@ -2383,7 +2398,7 @@ export function FreshAgentView({
     getRebindQueue().enqueue({
       // A newer authorized decision must not be dropped behind an older
       // queued callback that will suppress itself at execution time.
-      key: `freshagent:${paneId}:attach:${attachmentSendKey(attempt)}`,
+      key: `freshagent:${paneId}:attach:${attachmentDecisionSendKey(attempt)}`,
       run: (release) => {
         if (!sendConnectionFreshAgentAttach(attempt)) {
           release()
@@ -3690,6 +3705,32 @@ export function FreshAgentView({
             ...(checkpointOutcomes ? { checkpointOutcomes } : {}),
           },
         }))
+      }
+      if (
+        message.type === 'freshAgent.attach.failed'
+        && message.sessionId === paneContentRef.current.sessionId
+        && message.ownerKind
+        && typeof message.ownerGeneration === 'number'
+      ) {
+        const canonicalSession = resolveCanonicalPaneSession(appStore.getState(), paneContentRef.current)
+        dispatch(applyRefusalFence({
+          provider: canonicalSession?.provider ?? paneContentRef.current.provider,
+          sessionId: canonicalSession?.sessionId ?? message.sessionRef?.sessionId ?? message.sessionId,
+          ownerKind: message.ownerKind,
+          ownerGeneration: message.ownerGeneration,
+        }))
+      }
+      if (
+        message.type === 'freshAgent.attach.failed'
+        && message.sessionId === paneContentRef.current.sessionId
+        && message.ownerKind !== 'terminal'
+        && message.code === 'SESSION_RESERVED'
+      ) {
+        // Task 14 (attach loser): a transient reservation re-drives the attach
+        // after the floor; exhaustion resolves via the single-pane reconcile.
+        // The banner is suppressed via lastErrorCode (never surfaced).
+        redriveAfterSessionReserved()
+        return
       }
       if (
         message.type === 'freshAgent.event'

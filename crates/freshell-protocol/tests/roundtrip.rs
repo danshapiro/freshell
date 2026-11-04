@@ -102,6 +102,30 @@ fn fresh_agent_create_preserves_pane_id() {
     ));
 }
 
+#[test]
+fn fresh_agent_attach_preserves_request_and_view_ids() {
+    let wire = r#"{"type":"freshAgent.attach","requestId":"attach-1","viewId":"view-1","sessionId":"session-1","sessionType":"freshclaude","provider":"claude","sessionRef":{"provider":"claude","sessionId":"session-1"}}"#;
+    assert!(matches!(
+        client_roundtrip(wire, "freshAgent.attach"),
+        ClientMessage::FreshAgentAttach(_)
+    ));
+}
+
+#[test]
+fn fresh_agent_attach_results_roundtrip_and_conform() {
+    let attached = r#"{"type":"freshAgent.attached","requestId":"attach-1","viewId":"view-1","provider":"claude","sessionId":"session-1","sessionType":"freshclaude","sessionRef":{"provider":"claude","sessionId":"session-1"},"status":"running","snapshot":{"type":"freshAgent.session.snapshot","sessionId":"session-1","status":"running"},"operationId":"attach-1","retryable":false,"ownerKind":"fresh-agent","ownerGeneration":7,"ownerEpoch":3}"#;
+    assert!(matches!(
+        server_roundtrip(attached, "freshAgent.attached"),
+        ServerMessage::FreshAgentAttached(_)
+    ));
+
+    let failed = r#"{"type":"freshAgent.attach.failed","requestId":"attach-2","viewId":"view-2","provider":"opencode","sessionId":"session-2","sessionType":"freshopencode","status":"failed","code":"SESSION_RESERVED","message":"session is reserved","retryable":true,"ownerKind":"terminal","ownerGeneration":8,"ownerEpoch":3}"#;
+    assert!(matches!(
+        server_roundtrip(failed, "freshAgent.attach.failed"),
+        ServerMessage::FreshAgentAttachFailed(_)
+    ));
+}
+
 // --------------------------------------------------------------------------
 // 1 + 2. The real handshake transcript.
 // --------------------------------------------------------------------------

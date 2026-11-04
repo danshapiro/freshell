@@ -4,9 +4,33 @@ use freshell_runtime_protocol::{
     HostReply, HostResult, NativeIdentityLaunch, NativeIdentityObservation, NativeIdentitySource,
     OpenCodeAdoptionStatus,
 };
+use freshell_terminal::FrameSink;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const NATIVE: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+fn capturing_attach_sink() -> (
+    FrameSink,
+    std::sync::Arc<std::sync::Mutex<Vec<ServerMessage>>>,
+) {
+    let frames = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let target = std::sync::Arc::clone(&frames);
+    let sink: FrameSink = std::sync::Arc::new(move |frame| {
+        target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(frame);
+    });
+    (sink, frames)
+}
+
+fn attach_request_id(frame: &ServerMessage) -> Option<&str> {
+    match frame {
+        ServerMessage::FreshAgentAttached(attached) => Some(&attached.request_id),
+        ServerMessage::FreshAgentAttachFailed(failed) => Some(&failed.request_id),
+        _ => None,
+    }
+}
 
 // Runtime allocation/Stop are forbidden; a best-effort read-only probe after
 // Started may fail without blocking the independently verified live session.
@@ -427,9 +451,64 @@ async fn hosted_explicit_resume_restores_ended_query_before_created_and_one_orig
         &control_socket,
         HashMap::from([(("claude".into(), NATIVE.into()), soul.clone())]),
     );
-    Arc::clone(&proxy).handle(HostedFreshAgentCommand::Attach(serde_json::from_value(serde_json::json!({
-        "provider":"claude", "sessionId":NATIVE, "sessionType":"freshclaude", "cwd":workspace,
-    })).unwrap())).await;
+    let (reply_a, frames_a) = capturing_attach_sink();
+    Arc::clone(&proxy)
+        .handle_with_requester(
+            HostedFreshAgentCommand::Attach(
+                serde_json::from_value(serde_json::json!({
+                    "provider":"claude", "sessionId":NATIVE, "sessionType":"freshclaude", "cwd":workspace,
+                    "requestId":"attach-a", "viewId":"view-a",
+                }))
+                .unwrap(),
+            ),
+            reply_a,
+        )
+        .await;
+    let (reply_b, frames_b) = capturing_attach_sink();
+    Arc::clone(&proxy)
+        .handle_with_requester(
+            HostedFreshAgentCommand::Attach(
+                serde_json::from_value(serde_json::json!({
+                    "provider":"claude", "sessionId":NATIVE, "sessionType":"freshclaude", "cwd":workspace,
+                    "requestId":"attach-b", "viewId":"view-b",
+                }))
+                .unwrap(),
+            ),
+            reply_b,
+        )
+        .await;
+    let frames_a = frames_a.lock().unwrap().clone();
+    let frames_b = frames_b.lock().unwrap().clone();
+    assert!(frames_a.iter().any(|frame| matches!(frame,
+        ServerMessage::FreshAgentAttached(attached) if attached.request_id == "attach-a"
+    )));
+    assert!(frames_b.iter().any(|frame| matches!(frame,
+        ServerMessage::FreshAgentAttached(attached) if attached.request_id == "attach-b"
+    )));
+    assert!(
+        frames_a
+            .iter()
+            .all(|frame| attach_request_id(frame) != Some("attach-b")),
+        "the second attach result must stay with its requester: {frames_a:?}"
+    );
+    assert!(proxy.pollers.lock().await.contains(&soul));
+    assert_eq!(
+        proxy.pollers.lock().await.len(),
+        1,
+        "two views share one journal poller"
+    );
+    assert!(
+        std::iter::from_fn(|| receiver.try_recv().ok()).all(|raw| {
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            !(frame["type"] == "freshAgent.event"
+                && frame["sessionId"] == NATIVE
+                && matches!(
+                    frame["event"]["type"].as_str(),
+                    Some("freshAgent.status" | "freshAgent.host.backpressure")
+                ))
+        }),
+        "attach replay is delivered through the requester sinks, not the shared bus"
+    );
     let saved = proxy
         .client
         .fresh_agent_snapshot(soul.clone())

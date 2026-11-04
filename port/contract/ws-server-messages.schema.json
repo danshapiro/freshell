@@ -3,7 +3,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `pnpm run contract:generate`. Each entry is a JSON Schema for one server→client message shape, keyed by its `type` discriminant and synthesized from the ServerMessage union via the TypeScript type checker. Opaque values (unknown / index signatures / any) are intentionally permissive — see nondeterministic-fields.md. The wire contract is frozen for the Rust port.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "messageCount": 74,
+  "messageCount": 76,
   "messages": {
     "amplifier.activity.list.response": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1055,6 +1055,168 @@
       ],
       "type": "object"
     },
+    "freshAgent.attach.failed": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "operationId": {
+          "type": "string"
+        },
+        "ownerEpoch": {
+          "type": "number"
+        },
+        "ownerGeneration": {
+          "type": "number"
+        },
+        "ownerKind": {
+          "enum": [
+            "terminal",
+            "fresh-agent"
+          ],
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "sessionRef": {
+          "additionalProperties": false,
+          "properties": {
+            "provider": {
+              "type": "string"
+            },
+            "sessionId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "sessionId"
+          ],
+          "type": "object"
+        },
+        "sessionType": {
+          "type": "string"
+        },
+        "status": {
+          "const": "failed",
+          "type": "string"
+        },
+        "type": {
+          "const": "freshAgent.attach.failed",
+          "type": "string"
+        },
+        "viewId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "provider",
+        "requestId",
+        "sessionId",
+        "sessionType",
+        "status",
+        "type"
+      ],
+      "type": "object"
+    },
+    "freshAgent.attached": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "operationId": {
+          "type": "string"
+        },
+        "ownerEpoch": {
+          "type": "number"
+        },
+        "ownerGeneration": {
+          "type": "number"
+        },
+        "ownerKind": {
+          "enum": [
+            "terminal",
+            "fresh-agent"
+          ],
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "sessionRef": {
+          "additionalProperties": false,
+          "properties": {
+            "provider": {
+              "type": "string"
+            },
+            "sessionId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "sessionId"
+          ],
+          "type": "object"
+        },
+        "sessionType": {
+          "type": "string"
+        },
+        "snapshot": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "status": {
+          "enum": [
+            "unknown",
+            "idle",
+            "running"
+          ],
+          "type": "string"
+        },
+        "type": {
+          "const": "freshAgent.attached",
+          "type": "string"
+        },
+        "viewId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider",
+        "requestId",
+        "sessionId",
+        "sessionType",
+        "status",
+        "type"
+      ],
+      "type": "object"
+    },
     "freshAgent.checkpoint.outcome": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -1175,6 +1337,9 @@
         },
         "type": {
           "const": "freshAgent.create.failed",
+          "type": "string"
+        },
+        "viewId": {
           "type": "string"
         }
       },
@@ -1359,6 +1524,9 @@
         "type": {
           "const": "freshAgent.created",
           "type": "string"
+        },
+        "viewId": {
+          "type": "string"
         }
       },
       "required": [
@@ -1490,6 +1658,9 @@
         },
         "type": {
           "const": "freshAgent.forked",
+          "type": "string"
+        },
+        "viewId": {
           "type": "string"
         }
       },
@@ -3249,6 +3420,9 @@
           "additionalProperties": false,
           "properties": {
             "freshAgentAttentionReplayV1": {
+              "type": "boolean"
+            },
+            "freshAgentReconciliationV1": {
               "type": "boolean"
             },
             "managedRuntimeV1": {

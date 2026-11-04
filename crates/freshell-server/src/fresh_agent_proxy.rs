@@ -3,6 +3,7 @@
 //! Opt-in external gateway from the retained fresh-agent wire to the
 //! supervisor/session-host actor. This module owns no provider process.
 
+use freshell_freshagent::attach::{AttachFailure, AttachOutcome};
 use freshell_freshagent::naming::{admit_pending_projection, session_projection, SessionNaming};
 use freshell_freshagent::rest_lane::{
     FreshAgentRestLane, RestLaneCapture, RestLaneCaptureError, RestLaneCaptureResult,
@@ -11,7 +12,8 @@ use freshell_freshagent::rest_lane::{
 };
 use freshell_protocol::session_names::NamedProvider;
 use freshell_protocol::{
-    AgentProvider, ErrorCode, ErrorMsg, FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent,
+    AgentProvider, ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCreateFailed,
+    FreshAgentCreated, FreshAgentEvent,
     FreshAgentForked, FreshAgentKilled, FreshAgentRecoveryStopped, FreshAgentSend,
     FreshAgentSessionMaterialized, ServerMessage, SessionLocator, SessionType, StringOrNumber,
 };
@@ -22,6 +24,7 @@ use freshell_runtime_protocol::{
     FreshProvider, LaunchRequest, ProviderBootstrapFile, RequestId, RuntimeDiagnosticCode,
     RuntimeErrorCode, RuntimeLimits, RuntimeProfile, SoulId, StopOutcome,
 };
+use freshell_terminal::FrameSink;
 use freshell_ws::hosted_fresh_agent::{HostedFreshAgentCommand, HostedFreshAgentGateway};
 use sha2::{Digest, Sha256};
 use std::{
@@ -300,11 +303,112 @@ impl HostedFreshAgentProxy {
         }));
     }
 
+    async fn attach(self: &Arc<Self>, message: FreshAgentAttach, requester: FrameSink) {
+        let provider = provider_wire(&message.provider);
+        let session_type = session_type_wire(message.session_type);
+        let outcome = if let Some(soul) = self
+            .resolve_soul(&message.provider, message.session_type, &message.session_id)
+            .await
+        {
+            match self.current_event_head(&soul).await {
+                Ok(head) => {
+                    let attention_since = chrono::Utc::now().timestamp_millis();
+                    self.start_poller_from_cursor(
+                        soul.clone(),
+                        provider.clone(),
+                        message.session_id.clone(),
+                        session_type.clone(),
+                        attention_since,
+                        head,
+                    )
+                    .await;
+
+                    let replay_messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+                    let replay_target = Arc::clone(&replay_messages);
+                    let replay_sink: FrameSink = Arc::new(move |frame| {
+                        replay_target
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(frame);
+                    });
+                    self.replay_once(
+                        soul,
+                        &provider,
+                        &message.session_id,
+                        &session_type,
+                        Some(&replay_sink),
+                        Some(head),
+                    )
+                    .await;
+                    let replay_messages = std::mem::take(
+                        &mut *replay_messages
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    );
+                    AttachOutcome::attached_from_replay_for_session(
+                        Some(&message.session_id),
+                        replay_messages,
+                    )
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        event = "fresh_agent.gateway.attach_replay_unavailable",
+                        provider,
+                        session_id = %message.session_id,
+                        error = %error,
+                        "managed Freshagent attach could not read the replay head"
+                    );
+                    AttachOutcome::Failed {
+                        failure: AttachFailure {
+                            code: "MANAGED_FRESH_AGENT_ERROR".into(),
+                            message: "managed fresh-agent replay is temporarily unavailable".into(),
+                            retryable: Some(true),
+                            owner_kind: None,
+                            owner_generation: None,
+                            owner_epoch: None,
+                        },
+                        legacy_messages: Vec::new(),
+                    }
+                }
+            }
+        } else {
+            AttachOutcome::Failed {
+                failure: AttachFailure {
+                    code: "MANAGED_FRESH_AGENT_ERROR".into(),
+                    message: "managed fresh-agent soul was not found".into(),
+                    retryable: None,
+                    owner_kind: None,
+                    owner_generation: None,
+                    owner_epoch: None,
+                },
+                legacy_messages: Vec::new(),
+            }
+        };
+        let outcome = if let Some(ownership) = self.ownership.get() {
+            let canonical = ownership.resolve_canonical(&provider, &message.session_id);
+            outcome.with_current_owner(ownership.observe(&provider, &canonical))
+        } else {
+            outcome
+        };
+
+        for frame in AttachOutcome::requester_messages(&message, outcome) {
+            requester(frame);
+        }
+    }
+
     pub(crate) fn set_session_naming(&self, naming: Arc<dyn SessionNaming>) {
         let _ = self.naming.set(naming);
     }
 
     async fn handle(self: Arc<Self>, command: HostedFreshAgentCommand) {
+        self.handle_with_requester(command, Arc::new(|_| {})).await;
+    }
+
+    async fn handle_with_requester(
+        self: Arc<Self>,
+        command: HostedFreshAgentCommand,
+        requester: FrameSink,
+    ) {
         match command {
             HostedFreshAgentCommand::Create(message) => {
                 let request_id = message.request_id.clone();
@@ -331,34 +435,7 @@ impl HostedFreshAgentProxy {
                 }
             }
             HostedFreshAgentCommand::Attach(message) => {
-                let attention_since = chrono::Utc::now().timestamp_millis();
-                if let Some(soul) = self
-                    .resolve_soul(&message.provider, message.session_type, &message.session_id)
-                    .await
-                {
-                    let provider_name = provider_wire(&message.provider);
-                    let session_type = session_type_wire(message.session_type);
-                    let started = self
-                        .start_poller(
-                            soul.clone(),
-                            provider_name.clone(),
-                            message.session_id.clone(),
-                            session_type.clone(),
-                            attention_since,
-                        )
-                        .await;
-                    if !started {
-                        self.replay_once(soul, &provider_name, &message.session_id, &session_type)
-                            .await;
-                    }
-                } else {
-                    self.error_event(
-                        &message.provider,
-                        &message.session_id,
-                        message.session_type,
-                        "managed fresh-agent soul was not found",
-                    );
-                }
+                self.attach(message, requester).await;
             }
             HostedFreshAgentCommand::Send(message) => {
                 if message.checkpoint_intent.is_some() {
@@ -1258,6 +1335,8 @@ impl HostedFreshAgentProxy {
                 public_provider,
                 &public_session_id,
                 &session_type_wire(message.session_type),
+                None,
+                None,
             )
             .await;
         }
@@ -1401,6 +1480,26 @@ impl HostedFreshAgentProxy {
         session_type: String,
         attention_since: i64,
     ) -> bool {
+        self.start_poller_from_cursor(
+            soul,
+            provider,
+            presentation_session_id,
+            session_type,
+            attention_since,
+            0,
+        )
+        .await
+    }
+
+    async fn start_poller_from_cursor(
+        self: &Arc<Self>,
+        soul: SoulId,
+        provider: String,
+        presentation_session_id: String,
+        session_type: String,
+        attention_since: i64,
+        initial_cursor: u64,
+    ) -> bool {
         self.presentation_routes
             .lock()
             .await
@@ -1411,8 +1510,10 @@ impl HostedFreshAgentProxy {
         }
         let proxy = Arc::clone(self);
         tokio::spawn(async move {
-            let mut cursor = 0;
-            let mut retained_through = 0;
+            // The shared poller starts at the journal head captured by the
+            // caller. Earlier state is replayed to an attaching view only.
+            let mut cursor = initial_cursor;
+            let mut retained_through = initial_cursor;
             let mut replay_through = None;
             let mut source_before = if provider == "codex" {
                 proxy.current_source(&soul).await
@@ -1463,6 +1564,7 @@ impl HostedFreshAgentProxy {
                                     } else {
                                         "freshAgent.host.backpressure"
                                     },
+                                    None,
                                 )
                                 .await;
                             // Projection and controls are covered, but request receipts
@@ -1476,15 +1578,18 @@ impl HostedFreshAgentProxy {
                                 .get(&soul)
                                 .map(|route| route.session_id.clone())
                                 .unwrap_or_else(|| presentation_session_id.clone());
-                            proxy.send(ServerMessage::FreshAgentEvent(FreshAgentEvent {
-                                event: serde_json::json!({
-                                    "type":"freshAgent.host.journal.reset",
-                                    "retainedFrom":batch.retained_from,
+                            proxy.deliver(
+                                None,
+                                ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                                    event: serde_json::json!({
+                                        "type":"freshAgent.host.journal.reset",
+                                        "retainedFrom":batch.retained_from,
+                                    }),
+                                    provider: provider.clone(),
+                                    session_id: current_presentation,
+                                    session_type: session_type.clone(),
                                 }),
-                                provider: provider.clone(),
-                                session_id: current_presentation,
-                                session_type: session_type.clone(),
-                            }));
+                            );
                         }
                         if batch.events.is_empty() {
                             cursor = cursor.max(batch.head);
@@ -1511,6 +1616,7 @@ impl HostedFreshAgentProxy {
                                     &presentation_session_id,
                                     &session_type,
                                     Some(attention_since),
+                                    None,
                                 )
                                 .await;
                         }
@@ -1538,6 +1644,14 @@ impl HostedFreshAgentProxy {
         true
     }
 
+    async fn current_event_head(&self, soul: &SoulId) -> Result<u64, String> {
+        self.client
+            .fresh_agent_events(soul.clone(), 0, 1)
+            .await
+            .map(|batch| batch.head)
+            .map_err(|error| error.to_string())
+    }
+
     async fn current_source(
         &self,
         soul: &SoulId,
@@ -1562,6 +1676,7 @@ impl HostedFreshAgentProxy {
         presentation: &str,
         session_type: &str,
         event_type: &str,
+        requester: Option<&FrameSink>,
     ) {
         let native = retained["snapshot"]["threadId"]
             .as_str()
@@ -1604,12 +1719,15 @@ impl HostedFreshAgentProxy {
         {
             mark["sessionId"] = serde_json::json!(presentation);
         }
-        self.send(ServerMessage::FreshAgentEvent(FreshAgentEvent {
-            provider: provider.into(),
-            session_type: session_type.into(),
-            session_id: presentation.into(),
-            event: serde_json::json!({"type":event_type,"retainedState":retained}),
-        }));
+        self.deliver(
+            requester,
+            ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                provider: provider.into(),
+                session_type: session_type.into(),
+                session_id: presentation.into(),
+                event: serde_json::json!({"type":event_type,"retainedState":retained}),
+            }),
+        );
         for payload in retained["pendingControls"].as_array().into_iter().flatten() {
             self.forward_host_event(
                 AgentEvent::PermissionRequested {
@@ -1619,6 +1737,7 @@ impl HostedFreshAgentProxy {
                 provider,
                 presentation,
                 session_type,
+                requester,
             )
             .await;
         }
@@ -1630,6 +1749,8 @@ impl HostedFreshAgentProxy {
         provider: &str,
         presentation_session_id: &str,
         session_type: &str,
+        requester: Option<&FrameSink>,
+        max_sequence: Option<u64>,
     ) {
         let mut before = if provider == "codex" {
             self.current_source(&soul).await
@@ -1647,7 +1768,8 @@ impl HostedFreshAgentProxy {
             else {
                 return;
             };
-            let replay_through = *replay_through.get_or_insert(batch.head);
+            let through = max_sequence.map_or(batch.head, |maximum| batch.head.min(maximum));
+            let replay_through = *replay_through.get_or_insert(through);
             if batch.retained_state.is_some() || cursor < retained_through {
                 let after = self.current_source(&soul).await;
                 let valid = retained_batch_matches_source(
@@ -1667,9 +1789,10 @@ impl HostedFreshAgentProxy {
                     presentation_session_id,
                     session_type,
                     "freshAgent.host.backpressure",
+                    requester,
                 )
                 .await;
-                retained_through = retained_through.max(batch.head);
+                retained_through = retained_through.max(batch.head.min(replay_through));
             }
             if batch.events.is_empty() {
                 return;
@@ -1692,6 +1815,7 @@ impl HostedFreshAgentProxy {
                         presentation_session_id,
                         session_type,
                         None,
+                        requester,
                     )
                     .await;
                 }
@@ -1710,6 +1834,7 @@ impl HostedFreshAgentProxy {
         fallback_presentation_id: &str,
         session_type: &str,
         attention_since: Option<i64>,
+        requester: Option<&FrameSink>,
     ) {
         let materialized_session = materialized_session(&event);
         let confirmed_clear = self
@@ -1811,7 +1936,7 @@ impl HostedFreshAgentProxy {
             route.materialized = true;
         }
         drop(presentation_routes);
-        self.forward_host_event(event, provider, &presentation_id, session_type)
+        self.forward_host_event(event, provider, &presentation_id, session_type, requester)
             .await;
     }
 
@@ -1892,6 +2017,7 @@ impl HostedFreshAgentProxy {
         provider: &str,
         presentation_session_id: &str,
         session_type: &str,
+        requester: Option<&FrameSink>,
     ) {
         match event {
             AgentEvent::Provider { mut payload } => {
@@ -1920,17 +2046,30 @@ impl HostedFreshAgentProxy {
                     provider,
                     session_type,
                 );
-                if let Ok(frame) = serde_json::to_string(&payload) {
+                if let Some(requester) = requester {
+                    match serde_json::from_value::<ServerMessage>(payload) {
+                        Ok(message) => requester(message),
+                        Err(error) => tracing::warn!(
+                            provider,
+                            session_type,
+                            error = %error,
+                            "freshagent.gateway.requester_replay_frame_invalid"
+                        ),
+                    }
+                } else if let Ok(frame) = serde_json::to_string(&payload) {
                     let _ = self.broadcast.send(frame);
                 }
             }
             AgentEvent::PermissionRequested { payload, .. } => {
-                self.send(ServerMessage::FreshAgentEvent(FreshAgentEvent {
-                    event: payload,
-                    provider: provider.into(),
-                    session_id: presentation_session_id.into(),
-                    session_type: session_type.into(),
-                }));
+                self.deliver(
+                    requester,
+                    ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                        event: payload,
+                        provider: provider.into(),
+                        session_id: presentation_session_id.into(),
+                        session_type: session_type.into(),
+                    }),
+                );
             }
             _ => {}
         }
@@ -2150,6 +2289,14 @@ impl HostedFreshAgentProxy {
             let _ = self.broadcast.send(frame);
         }
     }
+
+    fn deliver(&self, requester: Option<&FrameSink>, message: ServerMessage) {
+        if let Some(requester) = requester {
+            requester(message);
+        } else {
+            self.send(message);
+        }
+    }
 }
 
 enum HostedSendOutcome {
@@ -2305,8 +2452,9 @@ impl HostedFreshAgentGateway for HostedFreshAgentProxy {
     fn dispatch(
         self: Arc<Self>,
         command: HostedFreshAgentCommand,
+        requester: FrameSink,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
-        Box::pin(async move { self.handle(command).await })
+        Box::pin(async move { self.handle_with_requester(command, requester).await })
     }
 }
 

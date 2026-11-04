@@ -1501,6 +1501,8 @@ impl FreshClaudeState {
             }
         };
         let msg = FreshAgentAttach {
+            request_id: None,
+            view_id: None,
             tab_id: tab_id.map(str::to_string),
             pane_id: pane_id.map(str::to_string),
             provider: freshell_protocol::AgentProvider::Claude,
@@ -7582,6 +7584,8 @@ pub(crate) mod tests {
 
     fn attach_msg(session_id: &str) -> FreshAgentAttach {
         FreshAgentAttach {
+            request_id: None,
+            view_id: None,
             tab_id: None,
             pane_id: None,
             observed_epoch: None,
@@ -10890,6 +10894,8 @@ pub(crate) mod tests {
         // A delayed ATTACH: the tracked-and-alive fast path is BLOCKED
         // with the typed error (pre-d3: the silent parity return).
         st.attach_for_test(freshell_protocol::FreshAgentAttach {
+            request_id: None,
+            view_id: None,
             tab_id: None,
             pane_id: None,
             provider: freshell_protocol::AgentProvider::Claude,

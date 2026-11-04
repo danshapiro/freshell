@@ -21,6 +21,7 @@ pub mod claude_rig;
 pub mod claude_sim_environment;
 pub mod ledger_sink;
 pub mod log_capture;
+pub mod multiple_devices;
 pub mod opencode_home;
 /// Whether a process a test started has exited (a zombie has). The same file
 /// `freshell-freshagent`'s tests use, so the rule is defined once.

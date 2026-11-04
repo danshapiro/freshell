@@ -27,12 +27,21 @@ struct PendingFork {
 #[derive(Debug, Default)]
 pub(crate) struct FreshAgentViewRoutes {
     uses_view_ids: bool,
+    fresh_agent_reconciliation_v1: bool,
     pending_creates: HashMap<(String, String), PendingCreate>,
     pending_forks: HashMap<(String, String), PendingFork>,
     views: HashMap<Locator, HashSet<String>>,
 }
 
 impl FreshAgentViewRoutes {
+    pub(crate) fn negotiate_fresh_agent_reconciliation_v1(&mut self) {
+        self.fresh_agent_reconciliation_v1 = true;
+    }
+
+    pub(crate) fn fresh_agent_reconciliation_v1(&self) -> bool {
+        self.fresh_agent_reconciliation_v1
+    }
+
     /// Record modern create/attach/detach traffic before provider dispatch.
     /// Older clients omit `viewId` and retain the pre-routing global fanout.
     pub(crate) fn observe_client_value(&mut self, value: &Value) {

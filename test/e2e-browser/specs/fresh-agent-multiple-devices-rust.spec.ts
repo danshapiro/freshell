@@ -1473,6 +1473,80 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
     }))
   }
 
+  for (const mode of MODES) {
+    test(`stage2 requester ${mode}: mobile joins a desktop turn without resetting its peer`, withTwoDeviceSession(mode, async ({
+      desktop,
+      mobile,
+      native,
+      session,
+      frames,
+      openView,
+    }) => {
+      const prompt = mode === 'freshopencode'
+        ? `stage2 requester held prompt ${mode}`
+        : 'stage1 shared held prompt'
+      const response = mode === 'freshclaude' || mode === 'kilroy'
+        ? 'Stage1 shared response'
+        : mode === 'freshcodex'
+          ? 'Native streaming fragment and final answer'
+          : `Fake OpenCode response: ${prompt}`
+      const before = await fetchFreshAgentSnapshot(native.info, session)
+
+      await native.holdNextTurn()
+      const composer = desktop.page.locator('[data-context="fresh-agent"]').last()
+        .getByRole('textbox', { name: 'Chat message input' })
+      await composer.fill(prompt)
+      await composer.press('Enter')
+      await native.waitForHeldTurn(prompt)
+
+      const desktopSnapshotCount = frames.desktop.filter((frame) => frame.direction === 'received'
+        && frame.type === 'freshAgent.event'
+        && frame.sessionId === session.sessionId
+        && (frame.event as Record<string, unknown> | undefined)?.type === 'freshAgent.session.snapshot').length
+      const mobileView = await openView('mobile', session.sessionId)
+      await waitForPaneStatus(mobileView, /running|busy/i)
+      const mobileAttach = frames.mobile.find((frame) => frame.direction === 'sent'
+        && frame.type === 'freshAgent.attach'
+        && frame.sessionId === session.sessionId)
+      expect(mobileAttach?.requestId).toEqual(expect.any(String))
+      const requestId = mobileAttach?.requestId as string
+      await expect.poll(() => frames.mobile.some((frame) => frame.direction === 'received'
+        && frame.type === 'freshAgent.attached'
+        && frame.requestId === requestId
+        && frame.viewId === mobileAttach?.viewId
+        && frame.sessionId === session.sessionId), {
+        timeout: 30_000,
+        message: 'mobile receives its correlated attach snapshot while desktop is streaming',
+      }).toBe(true)
+      expect(frames.desktop.some((frame) => frame.direction === 'received'
+        && (frame.type === 'freshAgent.attached' || frame.type === 'freshAgent.attach.failed')
+        && frame.requestId === requestId)).toBe(false)
+      expect(frames.desktop.filter((frame) => frame.direction === 'received'
+        && frame.type === 'freshAgent.event'
+        && frame.sessionId === session.sessionId
+        && (frame.event as Record<string, unknown> | undefined)?.type === 'freshAgent.session.snapshot')).toHaveLength(desktopSnapshotCount)
+      expect(frames.desktop.concat(frames.mobile).some((frame) => frame.direction === 'received'
+        && frame.type === 'freshAgent.event'
+        && frame.sessionId === session.sessionId
+        && (frame.event as Record<string, unknown> | undefined)?.type === 'freshAgent.error')).toBe(false)
+
+      await native.releaseTurn()
+      await expect(desktop.page.locator('[data-context="fresh-agent"]').last()).toContainText(response, { timeout: 45_000 })
+      await expect(mobileView.page.locator('[data-context="fresh-agent"]').last()).toContainText(response, { timeout: 45_000 })
+      await expect.poll(async () => {
+        const snapshot = await fetchFreshAgentSnapshot(native.info, session)
+        return {
+          user: countTranscriptRowsWithSummary(snapshot.turns, 'user', prompt)
+            - countTranscriptRowsWithSummary(before.turns, 'user', prompt),
+          assistant: countTranscriptRowsWithSummary(snapshot.turns, 'assistant', response)
+            - countTranscriptRowsWithSummary(before.turns, 'assistant', response),
+        }
+      }, { timeout: 45_000, message: 'the joined turn adds one user row and one assistant row' })
+        .toEqual({ user: 1, assistant: 1 })
+      expect(mode === 'freshopencode' ? native.bootCount() : native.bootCount(session.sessionId)).toBe(1)
+    }))
+  }
+
   test('stage1 live terminal binding: desktop and mobile both refuse recovery without a second writer', withTwoDeviceSession('freshclaude', async ({
     desktop,
     mobile,

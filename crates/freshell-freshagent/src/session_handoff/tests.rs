@@ -7479,18 +7479,23 @@ async fn opencode_handoff_keeps_shared_serve_alive_and_session_id_stable() {
     // Fresh owner: a durable opencode session, registered through the shared
     // serve (the attach-resume lane — get_session on the fake serve answers).
     rig.fresh_opencode
-        .handle_attach(FreshAgentAttach {
-            tab_id: None,
-            pane_id: None,
-            provider: AgentProvider::Opencode,
-            session_id: sid.clone(),
-            session_type: SessionType::Freshopencode,
-            cwd: Some("/tmp".to_string()),
-            observed_epoch: None,
-            observed_generation: None,
-            resume_session_id: None,
-            session_ref: None,
-        })
+        .handle_attach(
+            FreshAgentAttach {
+                request_id: None,
+                view_id: None,
+                tab_id: None,
+                pane_id: None,
+                provider: AgentProvider::Opencode,
+                session_id: sid.clone(),
+                session_type: SessionType::Freshopencode,
+                cwd: Some("/tmp".to_string()),
+                observed_epoch: None,
+                observed_generation: None,
+                resume_session_id: None,
+                session_ref: None,
+            },
+            Arc::new(|_| {}),
+        )
         .await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
@@ -7612,18 +7617,23 @@ async fn an_opencode_placeholder_handoff_resolves_the_durable_owner_and_complete
     // (the materialization's committed owner — the real durable
     // identity the pane resolves to after the first send).
     rig.fresh_opencode
-        .handle_attach(FreshAgentAttach {
-            tab_id: None,
-            pane_id: None,
-            provider: AgentProvider::Opencode,
-            session_id: durable_id.clone(),
-            session_type: SessionType::Freshopencode,
-            cwd: Some("/tmp".to_string()),
-            observed_epoch: None,
-            observed_generation: None,
-            resume_session_id: None,
-            session_ref: None,
-        })
+        .handle_attach(
+            FreshAgentAttach {
+                request_id: None,
+                view_id: None,
+                tab_id: None,
+                pane_id: None,
+                provider: AgentProvider::Opencode,
+                session_id: durable_id.clone(),
+                session_type: SessionType::Freshopencode,
+                cwd: Some("/tmp".to_string()),
+                observed_epoch: None,
+                observed_generation: None,
+                resume_session_id: None,
+                session_ref: None,
+            },
+            Arc::new(|_| {}),
+        )
         .await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
@@ -7737,18 +7747,23 @@ async fn opencode_handoff_stop_aborts_the_active_turn_through_the_manager_before
     // Fresh owner: a durable opencode session, registered through the
     // shared serve (the attach-resume lane — the test-6 pattern).
     rig.fresh_opencode
-        .handle_attach(FreshAgentAttach {
-            tab_id: None,
-            pane_id: None,
-            provider: AgentProvider::Opencode,
-            session_id: sid.clone(),
-            session_type: SessionType::Freshopencode,
-            cwd: Some("/tmp".to_string()),
-            observed_epoch: None,
-            observed_generation: None,
-            resume_session_id: None,
-            session_ref: None,
-        })
+        .handle_attach(
+            FreshAgentAttach {
+                request_id: None,
+                view_id: None,
+                tab_id: None,
+                pane_id: None,
+                provider: AgentProvider::Opencode,
+                session_id: sid.clone(),
+                session_type: SessionType::Freshopencode,
+                cwd: Some("/tmp".to_string()),
+                observed_epoch: None,
+                observed_generation: None,
+                resume_session_id: None,
+                session_ref: None,
+            },
+            Arc::new(|_| {}),
+        )
         .await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
@@ -7882,18 +7897,23 @@ async fn opencode_handoff_stop_aborts_a_daemon_turn_left_running_by_a_finished_l
     // Fresh owner: a durable opencode session, registered through the
     // shared serve (the test-6 pattern).
     rig.fresh_opencode
-        .handle_attach(FreshAgentAttach {
-            tab_id: None,
-            pane_id: None,
-            provider: AgentProvider::Opencode,
-            session_id: sid.clone(),
-            session_type: SessionType::Freshopencode,
-            cwd: Some("/tmp".to_string()),
-            observed_epoch: None,
-            observed_generation: None,
-            resume_session_id: None,
-            session_ref: None,
-        })
+        .handle_attach(
+            FreshAgentAttach {
+                request_id: None,
+                view_id: None,
+                tab_id: None,
+                pane_id: None,
+                provider: AgentProvider::Opencode,
+                session_id: sid.clone(),
+                session_type: SessionType::Freshopencode,
+                cwd: Some("/tmp".to_string()),
+                observed_epoch: None,
+                observed_generation: None,
+                resume_session_id: None,
+                session_ref: None,
+            },
+            Arc::new(|_| {}),
+        )
         .await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
@@ -8028,18 +8048,23 @@ async fn opencode_handoff_during_compaction_aborts_the_daemon_side_summarize() {
     // Fresh owner: a durable opencode session, registered through the
     // shared serve (the test-6 pattern).
     rig.fresh_opencode
-        .handle_attach(FreshAgentAttach {
-            tab_id: None,
-            pane_id: None,
-            provider: AgentProvider::Opencode,
-            session_id: sid.clone(),
-            session_type: SessionType::Freshopencode,
-            cwd: Some("/tmp".to_string()),
-            observed_epoch: None,
-            observed_generation: None,
-            resume_session_id: None,
-            session_ref: None,
-        })
+        .handle_attach(
+            FreshAgentAttach {
+                request_id: None,
+                view_id: None,
+                tab_id: None,
+                pane_id: None,
+                provider: AgentProvider::Opencode,
+                session_id: sid.clone(),
+                session_type: SessionType::Freshopencode,
+                cwd: Some("/tmp".to_string()),
+                observed_epoch: None,
+                observed_generation: None,
+                resume_session_id: None,
+                session_ref: None,
+            },
+            Arc::new(|_| {}),
+        )
         .await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
@@ -9235,18 +9260,23 @@ async fn handoff_route_resolves_absent_session_type_when_unambiguous() {
 
     // Fresh owner: a durable opencode session through the shared serve.
     rig.fresh_opencode
-        .handle_attach(FreshAgentAttach {
-            tab_id: None,
-            pane_id: None,
-            provider: AgentProvider::Opencode,
-            session_id: sid.clone(),
-            session_type: SessionType::Freshopencode,
-            cwd: Some("/tmp".to_string()),
-            observed_epoch: None,
-            observed_generation: None,
-            resume_session_id: None,
-            session_ref: None,
-        })
+        .handle_attach(
+            FreshAgentAttach {
+                request_id: None,
+                view_id: None,
+                tab_id: None,
+                pane_id: None,
+                provider: AgentProvider::Opencode,
+                session_id: sid.clone(),
+                session_type: SessionType::Freshopencode,
+                cwd: Some("/tmp".to_string()),
+                observed_epoch: None,
+                observed_generation: None,
+                resume_session_id: None,
+                session_ref: None,
+            },
+            Arc::new(|_| {}),
+        )
         .await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {

@@ -7835,7 +7835,26 @@ impl FreshOpencodeState {
     /// (`fresh-agent-ws.ts:326-328`); a manager/transport failure degrades to a
     /// `freshAgent.error` frame instead (never panics, never tears down the shared
     /// sidecar, never mis-declares a possibly-live session lost).
-    pub async fn handle_attach(&self, msg: FreshAgentAttach) {
+    pub async fn handle_attach(
+        &self,
+        msg: FreshAgentAttach,
+        reply: FrameSink,
+    ) -> crate::attach::AttachOutcome {
+        let outcome = self.handle_attach_inner(msg.clone()).await;
+        for message in crate::attach::AttachOutcome::requester_messages(&msg, outcome.clone()) {
+            reply(message);
+        }
+        outcome
+    }
+
+    async fn handle_attach_inner(&self, msg: FreshAgentAttach) -> crate::attach::AttachOutcome {
+        let (_, messages) =
+            crate::attach::capture_attach_messages(self.handle_attach_events(msg.clone())).await;
+        crate::attach::AttachOutcome::from_messages(messages)
+            .with_current_owner(self.ownership_snapshot(PROVIDER, &msg.session_id))
+    }
+
+    async fn handle_attach_events(&self, msg: FreshAgentAttach) {
         // b8ke delta review F7: a half-sent observed pair (exactly one of
         // epoch/generation) is the typed invalid-fence refusal — before any
         // state interaction. The attach never proceeds as a silently
@@ -11859,7 +11878,9 @@ mod tests {
         // THE DELAYED ATTACH: the session is still in the lane's map —
         // the terminal-owner gate must answer the TYPED refusal (never
         // the wildcard reuse that restarts the serve bridge).
-        st.handle_attach(FreshAgentAttach {
+        st.handle_attach_events(FreshAgentAttach {
+            request_id: None,
+            view_id: None,
             tab_id: None,
             pane_id: None,
             provider: AgentProvider::Opencode,
@@ -11969,7 +11990,9 @@ mod tests {
 
         // THE DELAYED ATTACH with the STALE pair — the state precheck sees
         // Live (passes); the ADOPT validates the pair and refuses typed.
-        st.handle_attach(FreshAgentAttach {
+        st.handle_attach_events(FreshAgentAttach {
+            request_id: None,
+            view_id: None,
             tab_id: None,
             pane_id: None,
             provider: AgentProvider::Opencode,
@@ -12034,7 +12057,7 @@ mod tests {
         let mut attach = attach_msg(DURABLE_ID);
         attach.observed_epoch = Some(initial.epoch);
         attach.observed_generation = Some(initial.generation);
-        st.handle_attach(attach).await;
+        st.handle_attach_events(attach).await;
         let before = registry.observe(PROVIDER, DURABLE_ID);
         assert!(matches!(
             before.state,
@@ -12919,13 +12942,13 @@ mod tests {
         // reconnect-shaped attach so a reservation error cannot be hidden
         // as a one-time mount race, then repeat once with the placeholder's
         // complete current Vacant fence.
-        st.handle_attach(attach_msg(placeholder)).await;
-        st.handle_attach(attach_msg(placeholder)).await;
+        st.handle_attach_events(attach_msg(placeholder)).await;
+        st.handle_attach_events(attach_msg(placeholder)).await;
         let current = registry.observe(PROVIDER, placeholder);
         let mut fenced_attach = attach_msg(placeholder);
         fenced_attach.observed_epoch = Some(current.epoch);
         fenced_attach.observed_generation = Some(current.generation);
-        st.handle_attach(fenced_attach).await;
+        st.handle_attach_events(fenced_attach).await;
 
         let mut frames = Vec::new();
         while let Ok(raw) = rx.try_recv() {
@@ -13938,7 +13961,7 @@ mod tests {
 
         // The commit's io failure knob (Finding 5's shape).
         fake.set_fail_writes(true);
-        state.handle_attach(attach_msg(DURABLE_ID)).await;
+        state.handle_attach_events(attach_msg(DURABLE_ID)).await;
 
         let mut saw_resume_failed = false;
         while let Ok(raw) = rx.try_recv() {
@@ -14332,7 +14355,7 @@ mod tests {
         let gate = fake.arm_claim_commit_gate("opencode", DURABLE_ID);
         let st2 = state.clone();
         let mut attach =
-            tokio::spawn(async move { st2.handle_attach(attach_msg(DURABLE_ID)).await });
+            tokio::spawn(async move { st2.handle_attach_events(attach_msg(DURABLE_ID)).await });
         gate.entered
             .recv_timeout(std::time::Duration::from_secs(15))
             .expect("the resume reached its commit");
@@ -14907,6 +14930,8 @@ mod tests {
 
     fn attach_msg(session_id: &str) -> FreshAgentAttach {
         FreshAgentAttach {
+            request_id: None,
+            view_id: None,
             tab_id: None,
             pane_id: None,
             observed_epoch: None,
@@ -14995,8 +15020,11 @@ mod tests {
         // daemon's cold start (the defect) — in which case the next steps
         // run inside that window.
         let st_attach = st.clone();
-        let mut attach =
-            tokio::spawn(async move { st_attach.handle_attach(attach_msg(placeholder)).await });
+        let mut attach = tokio::spawn(async move {
+            st_attach
+                .handle_attach_events(attach_msg(placeholder))
+                .await
+        });
         tokio::select! {
             joined = &mut attach => joined.expect("the attach task joins"),
             arrived = health_rx.recv() => {
@@ -15096,7 +15124,7 @@ mod tests {
         fresh_agent.set_manager_for_test(manager).await;
         let st = FreshOpencodeState::new(fresh_agent);
 
-        st.handle_attach(attach_msg("does-not-exist")).await;
+        st.handle_attach_events(attach_msg("does-not-exist")).await;
 
         let frame: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(frame["type"], "freshAgent.event");
@@ -15143,7 +15171,7 @@ mod tests {
             "not tracked locally yet"
         );
 
-        st.handle_attach(attach_msg(&durable_id)).await;
+        st.handle_attach_events(attach_msg(&durable_id)).await;
 
         let frame: serde_json::Value =
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -15206,7 +15234,8 @@ mod tests {
         fresh_agent.set_manager_for_test(manager).await;
         let st = FreshOpencodeState::new(fresh_agent);
 
-        st.handle_attach(attach_msg("ses_some_durable_id")).await;
+        st.handle_attach_events(attach_msg("ses_some_durable_id"))
+            .await;
 
         let frame: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(frame["type"], "error");
@@ -15259,25 +15288,35 @@ mod tests {
         .await
         .expect("the turn task finishes within the budget");
 
-        st.handle_attach(attach_msg(&real_id)).await;
+        while rx.try_recv().is_ok() {}
+        let mut attach = attach_msg(&real_id);
+        attach.request_id = Some("opencode-attach-known-idle".into());
+        attach.view_id = Some("opencode-view-mobile".into());
+        let (reply, captured) = capturing_sink();
+        st.handle_attach(attach, reply).await;
 
-        // Drain frames until the snapshot this attach call broadcasts (turn.complete /
-        // status frames from the send above may already have landed on the bus first).
-        let snapshot: serde_json::Value =
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                loop {
-                    let raw = rx.recv().await.expect("bus stays open");
-                    let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
-                    if frame["event"]["type"] == "freshAgent.session.snapshot"
-                        && frame["sessionId"] == real_id
-                    {
-                        return frame;
-                    }
-                }
-            })
-            .await
-            .unwrap_or_else(|_| panic!("no snapshot frame observed for {real_id}"));
-        assert_eq!(snapshot["event"]["status"], "idle");
+        let replies = captured.lock().expect("capture mutex").clone();
+        assert_eq!(
+            replies.len(),
+            1,
+            "one requester-only attach result is returned"
+        );
+        let ServerMessage::FreshAgentAttached(attached) = &replies[0] else {
+            panic!("expected typed OpenCode attach result, got {replies:?}");
+        };
+        assert_eq!(attached.request_id, "opencode-attach-known-idle");
+        assert_eq!(attached.view_id.as_deref(), Some("opencode-view-mobile"));
+        assert_eq!(attached.status, "idle");
+        assert_eq!(attached.snapshot.as_ref().unwrap()["status"], "idle");
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok()).all(|raw| {
+                let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                !(frame["type"] == "freshAgent.event"
+                    && frame["sessionId"] == real_id
+                    && frame["event"]["type"] == "freshAgent.session.snapshot")
+            }),
+            "the attached snapshot must not fan out through the provider bus"
+        );
     }
 
     /// Task 5 (reconnect-revive): a pane restored from the persisted layout may still be
@@ -15328,7 +15367,7 @@ mod tests {
         // awaited `handle_attach` queues all of its frames before it returns.
         while rx.try_recv().is_ok() {}
 
-        st.handle_attach(attach_msg(placeholder)).await;
+        st.handle_attach_events(attach_msg(placeholder)).await;
         let mut frames: Vec<serde_json::Value> = Vec::new();
         while let Ok(raw) = rx.try_recv() {
             frames.push(serde_json::from_str(&raw).unwrap());
@@ -15360,7 +15399,7 @@ mod tests {
         // Regression guard (identity already matches): an attach addressed by the
         // REAL id must NOT re-emit the materialized frame — only the snapshot.
         while rx.try_recv().is_ok() {}
-        st.handle_attach(attach_msg(&real_id)).await;
+        st.handle_attach_events(attach_msg(&real_id)).await;
         let mut saw_materialized = false;
         let mut saw_snapshot = false;
         while let Ok(raw) = rx.try_recv() {
@@ -16127,7 +16166,7 @@ mod tests {
         // than absence.
         let mut attach = attach_msg(DURABLE_ID);
         attach.cwd = Some("/attach/cwd".to_string());
-        state.handle_attach(attach).await;
+        state.handle_attach_events(attach).await;
 
         let sessions = state.sessions.lock().await;
         let s = sessions.get(DURABLE_ID).expect("resumed").lock().await;
@@ -16201,7 +16240,7 @@ mod tests {
 
         // The explicit late attach-resume (the REAL handle_attach →
         // resume_durable_session lane the fixture drives).
-        state.handle_attach(attach_msg(DURABLE_ID)).await;
+        state.handle_attach_events(attach_msg(DURABLE_ID)).await;
 
         assert!(
             fake.claim_commits
@@ -16284,7 +16323,7 @@ mod tests {
             "a lineage-only row must not count as recorded"
         );
 
-        state.handle_attach(attach_msg(DURABLE_ID)).await;
+        state.handle_attach_events(attach_msg(DURABLE_ID)).await;
 
         let mut saw_settings_reset = false;
         while let Ok(frame) =
@@ -16366,7 +16405,7 @@ mod tests {
 
         // The conn-less attach: the resume rebuilds the live session; the
         // row must follow it back to Bound.
-        state.handle_attach(attach_msg(DURABLE_ID)).await;
+        state.handle_attach_events(attach_msg(DURABLE_ID)).await;
 
         assert_eq!(
             fake.states
@@ -16450,7 +16489,7 @@ mod tests {
         let gate = fake.arm_claim_commit_gate("opencode", DURABLE_ID);
         let st2 = state.clone();
         let attach = tokio::spawn(async move {
-            st2.handle_attach(attach_msg(DURABLE_ID)).await;
+            st2.handle_attach_events(attach_msg(DURABLE_ID)).await;
         });
 
         // The resume reached its commit point (the rebuilt session IS
@@ -16552,7 +16591,7 @@ mod tests {
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         state.set_identity_sink(fake.clone());
 
-        state.handle_attach(attach_msg(DURABLE_ID)).await;
+        state.handle_attach_events(attach_msg(DURABLE_ID)).await;
 
         // RealisticServeHttp's GET /session/:id directory is now used instead of
         // being discarded.
@@ -16601,7 +16640,7 @@ mod tests {
         fake.seed_recorded_only("opencode", DURABLE_ID);
         state.set_identity_sink(fake);
 
-        state.handle_attach(attach_msg(DURABLE_ID)).await;
+        state.handle_attach_events(attach_msg(DURABLE_ID)).await;
 
         let mut found = false;
         while let Ok(frame) =
@@ -17252,7 +17291,7 @@ mod tests {
         attach.observed_epoch = Some(vacant.epoch);
         attach.observed_generation = Some(vacant.generation);
         let st2 = st.clone();
-        let task = tokio::spawn(async move { st2.handle_attach(attach).await });
+        let task = tokio::spawn(async move { st2.handle_attach_events(attach).await });
         stall
             .entered
             .recv_timeout(Duration::from_secs(15))
@@ -17331,7 +17370,7 @@ mod tests {
         let mut attach = attach_msg(durable_id);
         attach.observed_epoch = Some(vacant.epoch);
         attach.observed_generation = Some(vacant.generation);
-        st.handle_attach(attach).await;
+        st.handle_attach_events(attach).await;
 
         assert!(
             matches!(
@@ -17657,7 +17696,7 @@ mod tests {
         attach.observed_epoch = Some(vacant.epoch);
         attach.observed_generation = Some(vacant.generation);
         let st2 = st.clone();
-        let task = tokio::spawn(async move { st2.handle_attach(attach).await });
+        let task = tokio::spawn(async move { st2.handle_attach_events(attach).await });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
@@ -17803,7 +17842,7 @@ mod tests {
         attach.observed_epoch = Some(vacant.epoch);
         attach.observed_generation = Some(vacant.generation);
         let st2 = st.clone();
-        let task = tokio::spawn(async move { st2.handle_attach(attach).await });
+        let task = tokio::spawn(async move { st2.handle_attach_events(attach).await });
         stall
             .entered
             .recv_timeout(Duration::from_secs(15))
@@ -17966,7 +18005,7 @@ mod tests {
         let mut attach = attach_msg(durable_id);
         attach.observed_epoch = Some(registry.boot_epoch());
         attach.observed_generation = Some(stale_generation);
-        st.handle_attach(attach).await;
+        st.handle_attach_events(attach).await;
 
         let frame: serde_json::Value = serde_json::from_str(
             &tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
@@ -18100,7 +18139,7 @@ mod tests {
         );
         state.set_identity_sink(fake.clone());
 
-        state.handle_attach(attach_msg(DURABLE_ID)).await;
+        state.handle_attach_events(attach_msg(DURABLE_ID)).await;
 
         let bindings = fake.bindings.lock().unwrap();
         let b = bindings
@@ -18251,7 +18290,7 @@ mod tests {
     #[tokio::test]
     async fn attach_resume_parks_no_provenance_on_the_reconstructed_session() {
         let (state, _rx) = state_with_durable_serve_session().await;
-        state.handle_attach(attach_msg(DURABLE_ID)).await;
+        state.handle_attach_events(attach_msg(DURABLE_ID)).await;
 
         let sessions = state.sessions.lock().await;
         let s = sessions
@@ -18313,7 +18352,7 @@ mod tests {
         .expect("seed binding write ok");
         state.set_identity_sink(fake.clone());
 
-        state.handle_attach(attach_msg(DURABLE_ID)).await;
+        state.handle_attach_events(attach_msg(DURABLE_ID)).await;
 
         // The reconstructed session parks the ROW's stamps…
         {
@@ -18419,7 +18458,7 @@ mod tests {
         .expect("seed binding write ok");
         state.set_identity_sink(fake.clone());
 
-        state.handle_attach(attach_msg(DURABLE_ID)).await;
+        state.handle_attach_events(attach_msg(DURABLE_ID)).await;
 
         {
             let sessions = state.sessions.lock().await;
@@ -27894,7 +27933,9 @@ mod tests {
 
         // THE MAP-HIT FENCED ATTACH — the incident's three wasted attempts,
         // now the documented recovery verb.
-        st.handle_attach(FreshAgentAttach {
+        st.handle_attach_events(FreshAgentAttach {
+            request_id: None,
+            view_id: None,
             tab_id: None,
             pane_id: None,
             provider: AgentProvider::Opencode,

@@ -2,6 +2,7 @@ mod common;
 use common::*;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tokio_tungstenite::tungstenite::Message;
 static ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 struct Environment(Vec<(&'static str, Option<std::ffi::OsString>)>);
@@ -190,7 +191,7 @@ async fn replay_after_native_exit(mint_new: bool) {
     }
     let before = ready(&url).await;
     std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR",if mint_new {json!({"threadStartThreadId":"replay-new","overrides":{"thread/resume":{"error":{"code":-32600,"message":"no rollout found for thread id replay-old"}}}})} else {json!({})}.to_string());
-    state.fresh_codex.handle_attach(serde_json::from_value(json!({"provider":"codex","sessionType":"freshcodex","sessionId":old,"cwd":dir.path()})).unwrap()).await;
+    state.fresh_codex.handle_attach(serde_json::from_value(json!({"provider":"codex","sessionType":"freshcodex","sessionId":old,"cwd":dir.path()})).unwrap(), Arc::new(|_| {})).await;
     let current = if mint_new {
         materialized_or_attach_error(&mut ws).await["sessionId"]
             .as_str()
@@ -325,7 +326,7 @@ async fn task6_actual_same_session_resume_keeps_unsaved_output_under_a_new_finit
     // Canonical saved history deliberately lacks the event-owned tool/text body.
     // A native refresh may reveal only that finite interrupted representation.
     std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR",json!({"recordTurns":true,"appendNativeNotificationLogPath":notifications,"threadReadResults":{session:{"id":session,"ephemeral":false,"status":{"type":"idle"},"turns":[{"id":native_turn,"status":"interrupted","itemsView":"full","items":[]}]}}}).to_string());
-    state.fresh_codex.handle_attach(serde_json::from_value(json!({"provider":"codex","sessionType":"freshcodex","sessionId":session,"cwd":dir.path()})).unwrap()).await;
+    state.fresh_codex.handle_attach(serde_json::from_value(json!({"provider":"codex","sessionType":"freshcodex","sessionId":session,"cwd":dir.path()})).unwrap(), Arc::new(|_| {})).await;
     let rebound = state.fresh_codex.retained_state(session).await.unwrap();
     let refreshed = state.fresh_codex.get_snapshot(session, None).await.unwrap();
     state.fresh_codex.shutdown().await;

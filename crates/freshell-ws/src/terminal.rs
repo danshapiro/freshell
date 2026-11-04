@@ -62,10 +62,10 @@ use freshell_platform::{
     RealFileProbe, ShellType,
 };
 use freshell_protocol::{
-    AgentProvider, ClientMessage, ErrorCode, ErrorMsg, FreshAgentCreateFailed, FreshAgentDetached,
-    FreshAgentEvent, PaneClosed, PaneClosedResult, PanesClosedResult, Pong, ServerMessage,
-    SessionLocator, SessionType, Shell, TerminalAttach, TerminalAutoResumeCancel, TerminalCreate,
-    TerminalCreated, TerminalDetach, TerminalIdOnly, TerminalInputBlocked,
+    AgentProvider, ClientMessage, ErrorCode, ErrorMsg, FreshAgentAttached, FreshAgentCreateFailed,
+    FreshAgentDetached, FreshAgentEvent, PaneClosed, PaneClosedResult, PanesClosedResult, Pong,
+    ServerMessage, SessionLocator, SessionType, Shell, TerminalAttach, TerminalAutoResumeCancel,
+    TerminalCreate, TerminalCreated, TerminalDetach, TerminalIdOnly, TerminalInputBlocked,
     TerminalInputBlockedReason, TerminalKill, TerminalResize, FRESH_AGENT_DISABLED_REFUSAL,
     LEGACY_RESUME_IDENTITY_REFUSAL,
 };
@@ -81,6 +81,64 @@ mod host_opencode_restore_tests;
 
 use crate::fresh_agent_view_routes::FreshAgentViewRoutes;
 use crate::WsState;
+
+fn attach_request_reply_sink(reply: FrameSink, negotiated: bool) -> FrameSink {
+    Arc::new(move |message| match message {
+        ServerMessage::FreshAgentAttached(attached) if !negotiated => {
+            let FreshAgentAttached {
+                provider,
+                session_id,
+                session_type,
+                status,
+                snapshot,
+                ..
+            } = attached;
+            let has_snapshot = snapshot.is_some();
+            let event = snapshot.unwrap_or_else(|| {
+                serde_json::json!({
+                    "type": "freshAgent.session.snapshot",
+                    "sessionId": session_id.clone(),
+                    "status": status.clone(),
+                })
+            });
+            if has_snapshot || status != "unknown" {
+                reply(ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                    event,
+                    provider,
+                    session_id,
+                    session_type,
+                }));
+            }
+        }
+        ServerMessage::FreshAgentAttachFailed(failed) if !negotiated => {
+            let mut event = serde_json::json!({
+                "type": "freshAgent.error",
+                "sessionId": failed.session_id,
+                "code": failed.code,
+                "message": failed.message,
+            });
+            if let Some(retryable) = failed.retryable {
+                event["retryable"] = serde_json::json!(retryable);
+            }
+            if let Some(owner_kind) = failed.owner_kind {
+                event["ownerKind"] = serde_json::json!(owner_kind);
+            }
+            if let Some(owner_generation) = failed.owner_generation {
+                event["ownerGeneration"] = serde_json::json!(owner_generation);
+            }
+            if let Some(owner_epoch) = failed.owner_epoch {
+                event["ownerEpoch"] = serde_json::json!(owner_epoch);
+            }
+            reply(ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                event,
+                provider: failed.provider,
+                session_id: failed.session_id,
+                session_type: failed.session_type,
+            }));
+        }
+        message => reply(message),
+    })
+}
 
 #[cfg(test)]
 #[path = "terminal_create_ordering_tests.rs"]
@@ -167,6 +225,7 @@ async fn dispatch_hosted_fresh_agent(
     ws_tx: &mut WsSink,
     admission: &freshell_freshagent::host_agent_admission::HostAgentAdmissionGate,
     gateway: Arc<dyn crate::hosted_fresh_agent::HostedFreshAgentGateway>,
+    requester: FrameSink,
 ) -> Option<bool> {
     let crate::hosted_fresh_agent::HostedRoute::Gateway(command) =
         crate::hosted_fresh_agent::hosted_route(message)
@@ -191,7 +250,7 @@ async fn dispatch_hosted_fresh_agent(
         }
         _ => None,
     };
-    let task = gateway.dispatch(*command);
+    let task = gateway.dispatch(*command, requester);
     tokio::spawn(async move {
         // Keep maintenance admission active through the hosted provider's
         // create future, so quiesce cannot report drained while it is running.
@@ -380,6 +439,7 @@ pub async fn run(
     ui_screenshot_v1: bool,
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
+    fresh_agent_reconciliation_v1: bool,
     origin_kind: &'static str,
     conn_identity: ConnectionIdentity,
     terminal_interest_v1: bool,
@@ -427,6 +487,7 @@ pub async fn run(
         ui_screenshot_v1,
         pane_reconcile_v1,
         pane_reconcile_fresh_agent_v1,
+        fresh_agent_reconciliation_v1,
         conn_id,
         origin_kind,
         conn_identity,
@@ -452,6 +513,7 @@ async fn run_loop(
     ui_screenshot_v1: bool,
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
+    fresh_agent_reconciliation_v1: bool,
     conn_id: u64,
     origin_kind: &'static str,
     mut conn_identity: ConnectionIdentity,
@@ -509,6 +571,9 @@ async fn run_loop(
     // Fresh Agent event subscriptions belong to this socket and disappear
     // with it. They never own or stop a provider runtime.
     let mut fresh_agent_views = FreshAgentViewRoutes::default();
+    if fresh_agent_reconciliation_v1 {
+        fresh_agent_views.negotiate_fresh_agent_reconciliation_v1();
+    }
     // Round-2 finding F1 + E2R1 finding 1 + E2R2 finding: the
     // connection's staged-exit routing. A natural exit while a paced
     // session's deferral is armed STAGES the exit registry-side (final
@@ -1256,12 +1321,17 @@ async fn handle_client_text_with_view_routes(
     // Explicit managed fresh-agent rollout: every fresh-agent operation is
     // consumed by the external gateway when installed. It is never allowed
     // to fall through and mint a competing web-owned provider writer.
+    let attach_reply = attach_request_reply_sink(
+        conn_sink.clone(),
+        fresh_agent_views.fresh_agent_reconciliation_v1(),
+    );
     if let Some(gateway) = crate::hosted_fresh_agent::installed_gateway() {
         if let Some(handled) = dispatch_hosted_fresh_agent(
             &message,
             ws_tx,
             &state.fresh_opencode.host_agent_admission(),
             gateway,
+            attach_reply.clone(),
         )
         .await
         {
@@ -2223,20 +2293,20 @@ async fn handle_client_text_with_view_routes(
                         }
                     }
                 };
+            let reply = attach_reply;
             match attach.provider {
                 freshell_protocol::AgentProvider::Codex => {
                     let fresh_codex = state.fresh_codex.clone();
                     tokio::spawn(
                         async move {
                             let _host_agent_permit = host_agent_permit;
-                            fresh_codex.handle_attach(attach).await
+                            fresh_codex.handle_attach(attach, reply).await
                         }
                         .instrument(tracing::Span::current()),
                     );
                 }
                 freshell_protocol::AgentProvider::Claude => {
                     let fresh_claude = state.fresh_claude.clone();
-                    let reply = conn_sink.clone();
                     tokio::spawn(
                         async move {
                             let _host_agent_permit = host_agent_permit;
@@ -2250,7 +2320,7 @@ async fn handle_client_text_with_view_routes(
                     tokio::spawn(
                         async move {
                             let _host_agent_permit = host_agent_permit;
-                            fresh_opencode.handle_attach(attach).await
+                            fresh_opencode.handle_attach(attach, reply).await
                         }
                         .instrument(tracing::Span::current()),
                     );
@@ -14436,6 +14506,7 @@ mod host_agent_admission_tests {
         fn dispatch(
             self: Arc<Self>,
             command: crate::hosted_fresh_agent::HostedFreshAgentCommand,
+            _requester: FrameSink,
         ) -> BoxFuture<'static, ()> {
             if let crate::hosted_fresh_agent::HostedFreshAgentCommand::Create(create) = &command {
                 let _ = self.broadcast_tx.send(
@@ -14603,6 +14674,7 @@ mod host_agent_admission_tests {
             &mut ws_tx,
             &gate,
             Arc::clone(&gateway) as Arc<dyn crate::hosted_fresh_agent::HostedFreshAgentGateway>,
+            Arc::new(|_| {}),
         )
         .await;
         assert_eq!(handled, Some(true));
@@ -14635,6 +14707,7 @@ mod host_agent_admission_tests {
             &mut ws_tx,
             &gate,
             Arc::clone(&gateway) as Arc<dyn crate::hosted_fresh_agent::HostedFreshAgentGateway>,
+            Arc::new(|_| {}),
         )
         .await;
         assert_eq!(handled, Some(true));

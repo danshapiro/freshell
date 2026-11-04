@@ -632,6 +632,7 @@ pub async fn build_handshake(state: &WsState) -> Vec<ServerMessage> {
 pub struct HandshakeCapabilities {
     pub pane_reconcile_v1: bool,
     pub pane_reconcile_fresh_agent_v1: bool,
+    pub fresh_agent_reconciliation_v1: bool,
     pub terminal_interest_v1: bool,
     pub paced_terminal_replay_v1: bool,
     pub terminal_lifetime_claim_v1: bool,
@@ -662,6 +663,7 @@ pub async fn build_handshake_with_capabilities(
     let HandshakeCapabilities {
         pane_reconcile_v1,
         pane_reconcile_fresh_agent_v1,
+        fresh_agent_reconciliation_v1,
         terminal_interest_v1,
         paced_terminal_replay_v1,
         terminal_lifetime_claim_v1,
@@ -733,6 +735,7 @@ pub async fn build_handshake_with_capabilities(
             build_id: ready_build_id(),
             capabilities: (pane_reconcile_v1
                 || pane_reconcile_fresh_agent_v1
+                || fresh_agent_reconciliation_v1
                 || terminal_interest_v1
                 || paced_terminal_replay_v1
                 || terminal_lifetime_claim_v1
@@ -744,6 +747,7 @@ pub async fn build_handshake_with_capabilities(
                         .then_some(true),
                     pane_reconcile_v1: pane_reconcile_v1.then_some(true),
                     pane_reconcile_fresh_agent_v1: pane_reconcile_fresh_agent_v1.then_some(true),
+                    fresh_agent_reconciliation_v1: fresh_agent_reconciliation_v1.then_some(true),
                     terminal_interest_v1: terminal_interest_v1.then_some(true),
                     paced_terminal_replay_v1: paced_terminal_replay_v1.then_some(true),
                     terminal_lifetime_claim_v1: terminal_lifetime_claim_v1.then_some(true),
@@ -974,6 +978,12 @@ async fn handle_socket(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    let fresh_agent_reconciliation_v1 = value
+        .get("capabilities")
+        .and_then(|caps| caps.get("freshAgentReconciliationV1"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
     let terminal_interest_v1 = value
         .get("capabilities")
         .and_then(|caps| caps.get("terminalInterestV1"))
@@ -1035,6 +1045,7 @@ async fn handle_socket(
         HandshakeCapabilities {
             pane_reconcile_v1,
             pane_reconcile_fresh_agent_v1,
+            fresh_agent_reconciliation_v1,
             terminal_interest_v1,
             paced_terminal_replay_v1,
             terminal_lifetime_claim_v1,
@@ -1101,6 +1112,7 @@ async fn handle_socket(
         ui_screenshot_v1,
         pane_reconcile_v1,
         pane_reconcile_fresh_agent_v1,
+        fresh_agent_reconciliation_v1,
         origin_kind,
         conn_identity,
         terminal_interest_v1,
@@ -1318,6 +1330,31 @@ mod tests {
             build_handshake_with_capabilities(&s, HandshakeCapabilities::default()).await;
         let ready2 = serde_json::to_value(&unnegotiated[0]).unwrap();
         assert!(ready2.get("capabilities").is_none());
+    }
+
+    #[tokio::test]
+    async fn handshake_advertises_fresh_agent_reconciliation_only_when_negotiated() {
+        let s = state();
+        let negotiated = build_handshake_with_capabilities(
+            &s,
+            HandshakeCapabilities {
+                fresh_agent_reconciliation_v1: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let ready = serde_json::to_value(&negotiated[0]).unwrap();
+        assert_eq!(
+            ready["capabilities"],
+            serde_json::json!({ "freshAgentReconciliationV1": true })
+        );
+
+        let default = build_handshake(&s).await;
+        let ready = serde_json::to_value(&default[0]).unwrap();
+        assert!(
+            ready.get("capabilities").is_none(),
+            "a legacy hello must not receive the attach capability: {ready}"
+        );
     }
 
     /// Responsive-terminal-restore Workstream 1 (paced replay negotiation):

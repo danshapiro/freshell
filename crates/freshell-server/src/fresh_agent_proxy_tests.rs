@@ -1782,6 +1782,7 @@ async fn hosted_created_frame_uses_the_public_request_identity() {
             "claude",
             "public",
             "freshclaude",
+            None,
         )
         .await;
     assert!(
@@ -1859,16 +1860,17 @@ async fn managed_ordinary_stop_eof_broadcasts_one_failed_ack_to_both_receivers()
     });
     tokio::time::timeout(
         Duration::from_secs(5),
-        proxy.dispatch(HostedFreshAgentCommand::Kill(
-            freshell_protocol::FreshAgentKill {
+        proxy.dispatch(
+            HostedFreshAgentCommand::Kill(freshell_protocol::FreshAgentKill {
                 provider: AgentProvider::Codex,
                 session_id: "presentation-stop-session".into(),
                 session_type: SessionType::Freshcodex,
                 cwd: None,
                 observed_epoch: Some(77),
                 observed_generation: Some(9),
-            },
-        )),
+            }),
+            Arc::new(|_| {}),
+        ),
     )
     .await
     .expect("UDS EOF must settle the actual gateway dispatch");
@@ -2681,6 +2683,7 @@ async fn materialization_keeps_following_transcript_invalidations_on_the_native_
                 "managed-public",
                 "freshopencode",
                 Some(0),
+                None,
             )
             .await;
     }
@@ -2768,6 +2771,7 @@ async fn replayed_materialization_does_not_rekey_a_forked_pane_to_its_retired_pa
                 "managed-public",
                 "freshopencode",
                 Some(current_at),
+                None,
             )
             .await;
     }
@@ -2851,6 +2855,7 @@ async fn historical_attention_is_silent_while_status_transcript_and_permissions_
                 "native-current",
                 "freshcodex",
                 Some(current_at),
+                None,
             )
             .await;
     }
@@ -2899,6 +2904,7 @@ async fn claude_live_attention_keeps_public_sidecar_ids_after_native_materializa
             "native-claude-root",
             "freshclaude",
             Some(42),
+            None,
         )
         .await;
     let frame: serde_json::Value = serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
@@ -2983,7 +2989,7 @@ async fn replay_once_rebuilds_pending_state_without_repeating_even_recent_attent
     let mut receiver = proxy.broadcast.subscribe();
     tokio::time::timeout(
         Duration::from_secs(5),
-        proxy.replay_once(soul, "codex", "native-current", "freshcodex"),
+        proxy.replay_once(soul, "codex", "native-current", "freshcodex", None, None),
     )
     .await
     .unwrap();
@@ -5958,7 +5964,7 @@ async fn task6_gateway_recovery_receipts(
     let soul = SoulId::parse("retained-soul").unwrap();
     if replay {
         proxy
-            .replay_once(soul, "codex", "public-owned", "freshcodex")
+            .replay_once(soul, "codex", "public-owned", "freshcodex", None, None)
             .await;
     } else {
         proxy

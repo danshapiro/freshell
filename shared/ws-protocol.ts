@@ -462,6 +462,7 @@ export const HelloSchema = z.object({
     // STRIP unknown keys, so without this the capability would silently no-op.
     paneReconcileV1: z.literal(true).optional(),
     paneReconcileFreshAgentV1: z.literal(true).optional(),
+    freshAgentReconciliationV1: z.literal(true).optional(),
     freshAgentAttentionReplayV1: z.literal(true).optional(),
     // Paced terminal restore (responsive-terminal-restore Workstream 1): the
     // client understands bounded, ascending paced replay batches with
@@ -927,6 +928,8 @@ export const FreshAgentCreateSchema = z.object({
 
 export const FreshAgentAttachSchema = z.object({
   type: z.literal('freshAgent.attach'),
+  /** Stable identity for this immutable attachment decision; omitted by legacy clients. */
+  requestId: z.string().min(1).optional(),
   sessionId: z.string().min(1),
   /** Connection-scoped delivery identity for this pane; older clients omit it. */
   viewId: z.string().min(1).optional(),
@@ -1299,6 +1302,7 @@ export const ReadyCapabilitiesSchema = z
     terminalInterestV1: z.literal(true).optional(),
     paneReconcileV1: z.literal(true).optional(),
     paneReconcileFreshAgentV1: z.literal(true).optional(),
+    freshAgentReconciliationV1: z.literal(true).optional(),
     // Paced terminal restore (Workstream 1): echoed only for a hello that
     // opted in via capabilities.pacedTerminalReplayV1.
     pacedTerminalReplayV1: z.literal(true).optional(),
@@ -2073,6 +2077,8 @@ export type FreshAgentCheckpointOutcome = z.infer<typeof FreshAgentCheckpointOut
 
 export type FreshAgentServerMessage =
   | { type: 'freshAgent.created'; requestId: string; viewId?: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string }; sessionName?: SessionNameRecord; nameRef?: SessionNameRef }
+  | { type: 'freshAgent.attached'; requestId: string; viewId?: string; sessionId: string; sessionType: string; provider: string; sessionRef?: { provider: string; sessionId: string }; status: 'running' | 'idle' | 'unknown'; snapshot?: Record<string, unknown>; operationId?: string; retryable?: boolean; ownerKind?: 'terminal' | 'fresh-agent'; ownerGeneration?: number; ownerEpoch?: number }
+  | { type: 'freshAgent.attach.failed'; requestId: string; viewId?: string; sessionId: string; sessionType: string; provider: string; sessionRef?: { provider: string; sessionId: string }; status: 'failed'; code: string; message: string; operationId?: string; retryable?: boolean; ownerKind?: 'terminal' | 'fresh-agent'; ownerGeneration?: number; ownerEpoch?: number }
   | { type: 'freshAgent.detached'; requestId: string; viewId: string; sessionRef?: { provider: string; sessionId: string }; success: boolean; code?: string; message?: string }
   | { type: 'freshAgent.create.failed'; requestId: string; viewId?: string; code: string; message: string; retryable?: boolean
       /** kata b8ke: ownership-conflict refusals only — the owning kind, its

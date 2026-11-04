@@ -35,6 +35,31 @@ export class FreshAgentViewDetachError extends Error {
 type FreshAgentViewWs = Pick<WsClient, 'send' | 'onMessage' | 'onDisconnect'>
 export type LocatedFreshAgentViewAttachment = FreshAgentViewAttachment & { sessionId: string }
 
+export type FreshAgentAttachDecisionFence = { epoch: number; generation: number }
+export type FreshAgentAttachDecision<T> = {
+  key: string
+  content: T
+  fence: FreshAgentAttachDecisionFence | undefined
+  requestId: string
+}
+
+/** Keep a request id for retries of the same attach decision. A new target,
+ * explicit decision, or observed owner fence gets a new id. The connection's
+ * ready handshake is intentionally not part of this identity. */
+export function captureFreshAgentAttachDecision<T>(
+  key: string,
+  content: T,
+  fence: FreshAgentAttachDecisionFence | undefined,
+  previous: FreshAgentAttachDecision<T> | null,
+): FreshAgentAttachDecision<T> {
+  if (
+    previous?.key === key
+    && previous.fence?.epoch === fence?.epoch
+    && previous.fence?.generation === fence?.generation
+  ) return previous
+  return { key, content, fence, requestId: nanoid() }
+}
+
 /** Resolve the connection-scoped attachment represented by one pane. */
 export function freshAgentViewAttachmentForPane(
   content: Pick<FreshAgentPaneContent, 'provider' | 'sessionType' | 'createRequestId' | 'viewId' | 'sessionId' | 'sessionRef'>,

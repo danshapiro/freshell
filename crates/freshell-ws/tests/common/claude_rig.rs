@@ -307,19 +307,27 @@ impl ClaudeRig {
 
     /// A WS connection that has completed the handshake (`ready` seen).
     pub async fn connect(&self) -> RigConnection {
+        self.connect_with_capabilities(Value::Null).await
+    }
+
+    /// Connect with an explicit capability set. Multi-device protocol tests
+    /// use this to distinguish the negotiated attach result from legacy
+    /// event-shaped replies.
+    pub async fn connect_with_capabilities(&self, capabilities: Value) -> RigConnection {
         let (mut ws, _) = tokio_tungstenite::connect_async(&self.url)
             .await
             .expect("connect to the rig's server");
-        ws.send(WsMessage::Text(
-            json!({
-                "type": "hello",
-                "token": AUTH_TOKEN,
-                "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
-            })
-            .to_string(),
-        ))
-        .await
-        .expect("send hello");
+        let mut hello = json!({
+            "type": "hello",
+            "token": AUTH_TOKEN,
+            "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
+        });
+        if let Value::Object(capabilities) = capabilities {
+            hello["capabilities"] = Value::Object(capabilities);
+        }
+        ws.send(WsMessage::Text(hello.to_string()))
+            .await
+            .expect("send hello");
         let mut connection = RigConnection {
             ws,
             workspace: self.workspace.clone(),

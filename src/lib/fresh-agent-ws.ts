@@ -23,6 +23,7 @@ import { streamBatcherFor } from '@/lib/fresh-agent-stream-batcher'
 import type { LiveBlockKind, LiveNotice, LiveNoticeLevel, LiveRateLimit, LiveRetry, LiveStreamOp } from '@/store/freshAgentLiveTypes'
 import { assistantBlockBound, liveNoticeReceived, liveRetrySet, transcriptAnnounced, transcriptProjectionBound, transcriptPatchApplied, codexMetadataReceived, transcriptProjectionSnapshotReceived } from '@/store/freshAgentLiveSlice'
 import { FreshAgentSnapshotSchema, FreshAgentTranscriptPatchSchema } from '@shared/fresh-agent-contract'
+import type { FreshAgentAttachFailed, FreshAgentAttached } from '@shared/fresh-agent-contract'
 import {
   addPermissionRequest,
   addQuestionRequest,
@@ -322,6 +323,75 @@ export function handleFreshAgentMessage(
           provider: stopped.provider,
         }))
       }
+      return true
+    }
+    case 'freshAgent.attached': {
+      const attached = msg as FreshAgentAttached
+      const locator = {
+        sessionId: attached.sessionId,
+        sessionType: attached.sessionType,
+        provider: attached.provider,
+      }
+      if (attached.ownerKind && typeof attached.ownerGeneration === 'number' && typeof attached.ownerEpoch === 'number') {
+        dispatch(applyRuntimeOwner({
+          type: 'session.runtimeOwner',
+          provider: attached.provider,
+          sessionId: attached.sessionRef?.sessionId ?? attached.sessionId,
+          epoch: attached.ownerEpoch,
+          generation: attached.ownerGeneration,
+          ownerKind: attached.ownerKind,
+          operationId: attached.operationId ?? attached.requestId,
+          transition: 'handoff-committed',
+        }))
+      }
+      if (attached.snapshot && typeof attached.snapshot.type === 'string') {
+        handleFreshAgentTransportEvent(dispatch, {
+          type: 'freshAgent.event',
+          ...locator,
+          event: attached.snapshot,
+        })
+      } else if (attached.status === 'running' || attached.status === 'idle') {
+        dispatch(observeFreshAgentSession(locator))
+        dispatch(sessionSnapshotReceived({ ...locator, status: attached.status, latestTurnId: null }))
+      } else {
+        dispatch(observeFreshAgentSession(locator))
+      }
+      return true
+    }
+    case 'freshAgent.attach.failed': {
+      const failed = msg as FreshAgentAttachFailed
+      const locator = {
+        sessionId: failed.sessionId,
+        sessionType: failed.sessionType,
+        provider: failed.provider,
+      }
+      if (failed.ownerKind && typeof failed.ownerGeneration === 'number' && typeof failed.ownerEpoch === 'number') {
+        dispatch(applyRuntimeOwner({
+          type: 'session.runtimeOwner',
+          provider: failed.provider,
+          sessionId: failed.sessionRef?.sessionId ?? failed.sessionId,
+          epoch: failed.ownerEpoch,
+          generation: failed.ownerGeneration,
+          ownerKind: failed.ownerKind,
+          operationId: failed.operationId ?? failed.requestId,
+          transition: 'handoff-committed',
+        }))
+      }
+      handleFreshAgentTransportEvent(dispatch, {
+        type: 'freshAgent.event',
+        ...locator,
+        event: {
+          type: 'freshAgent.error',
+          sessionId: failed.sessionId,
+          code: failed.code,
+          message: failed.message,
+          retryable: failed.retryable,
+          ownerKind: failed.ownerKind,
+          ownerGeneration: failed.ownerGeneration,
+          ownerEpoch: failed.ownerEpoch,
+          requestId: failed.requestId,
+        },
+      })
       return true
     }
     case 'freshAgent.event':

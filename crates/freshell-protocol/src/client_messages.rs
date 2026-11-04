@@ -220,6 +220,9 @@ pub struct HelloCapabilities {
     /// advertises the capability back (§4.2). Absent for the frozen client.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_reconcile_v1: Option<bool>,
+    /// Freshagent requester-scoped attach outcomes; echoed only when opted in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fresh_agent_reconciliation_v1: Option<bool>,
     /// Paced terminal restore opt-in (responsive-terminal-restore Workstream
     /// 1): the client understands bounded, ascending paced replay batches with
     /// continuation credit. Additive optional — absent on the frozen client
@@ -981,6 +984,13 @@ pub struct FreshAgentAttach {
     pub provider: AgentProvider,
     pub session_id: String,
     pub session_type: SessionType,
+    /// Stable identity for this immutable attachment decision. Legacy clients
+    /// omit it and keep the event-shaped attach result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Connection-scoped delivery identity for the attaching pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     /// kata b8ke delayed-request fence: attach can cold-resume an untracked

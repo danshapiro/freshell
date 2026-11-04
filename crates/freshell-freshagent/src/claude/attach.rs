@@ -4,9 +4,42 @@ use super::*;
 use freshell_terminal::FrameSink;
 
 impl FreshClaudeState {
+    /// Produce one typed attach result, then adapt it for this requester. The
+    /// legacy attach implementation still owns lifecycle recovery and its
+    /// provider-specific event details; its attach-only frames are captured
+    /// instead of entering the shared event bus.
+    pub async fn handle_attach(&self, msg: FreshAgentAttach, reply: FrameSink) {
+        let attach = msg.clone();
+        let (mut messages, captured_messages) = crate::attach::capture_attach_messages(async {
+            let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let target = Arc::clone(&captured);
+            let capture_sink: FrameSink = Arc::new(move |message| {
+                target
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(message);
+            });
+            self.handle_attach_events(msg, capture_sink).await;
+            let messages = {
+                let mut captured = captured
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                std::mem::take(&mut *captured)
+            };
+            messages
+        })
+        .await;
+        messages.extend(captured_messages);
+        let outcome = crate::attach::AttachOutcome::from_messages(messages)
+            .with_current_owner(self.ownership_snapshot(PROVIDER, &attach.session_id));
+        for message in crate::attach::AttachOutcome::requester_messages(&attach, outcome) {
+            reply(message);
+        }
+    }
+
     /// Reply to this page only. Status, content, and attention keep their
     /// ordinary broadcast path and canonical session identity.
-    pub async fn handle_attach(&self, mut msg: FreshAgentAttach, reply: FrameSink) {
+    async fn handle_attach_events(&self, mut msg: FreshAgentAttach, reply: FrameSink) {
         let session_type = session_type_str(msg.session_type);
         let fence =
             match crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation) {

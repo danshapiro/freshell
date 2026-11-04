@@ -75,6 +75,10 @@ pub enum ServerMessage {
     ExtensionsRegistry(ExtensionsRegistry),
     #[serde(rename = "freshAgent.create.failed")]
     FreshAgentCreateFailed(FreshAgentCreateFailed),
+    #[serde(rename = "freshAgent.attached")]
+    FreshAgentAttached(FreshAgentAttached),
+    #[serde(rename = "freshAgent.attach.failed")]
+    FreshAgentAttachFailed(FreshAgentAttachFailed),
     #[serde(rename = "freshAgent.detached")]
     FreshAgentDetached(FreshAgentDetached),
     #[serde(rename = "freshAgent.checkpoint.outcome")]
@@ -231,7 +235,7 @@ pub enum ServerMessage {
 
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const SERVER_MESSAGE_TYPES: [&str; 74] = [
+pub const SERVER_MESSAGE_TYPES: [&str; 76] = [
     "amplifier.activity.list.response",
     "amplifier.activity.updated",
     "antigravity.activity.list.response",
@@ -252,6 +256,8 @@ pub const SERVER_MESSAGE_TYPES: [&str; 74] = [
     "extension.server.starting",
     "extension.server.stopped",
     "extensions.registry",
+    "freshAgent.attach.failed",
+    "freshAgent.attached",
     "freshAgent.checkpoint.outcome",
     "freshAgent.create.failed",
     "freshAgent.created",
@@ -1085,6 +1091,64 @@ pub struct FreshAgentCreateFailed {
     pub owner_epoch: Option<u64>,
 }
 
+/// Requester-only acknowledgement that one view has attached to the current
+/// shared provider runtime. The captured snapshot is applied by the existing
+/// Freshagent event reducer on the client.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentAttached {
+    pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_id: Option<String>,
+    pub provider: String,
+    pub session_id: String,
+    pub session_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_ref: Option<SessionLocator>,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_epoch: Option<u64>,
+}
+
+/// Requester-only typed failure for one attachment attempt. Ownership fields
+/// let an outdated owner decision refresh from this result without a shared
+/// session error broadcast.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentAttachFailed {
+    pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_id: Option<String>,
+    pub provider: String,
+    pub session_id: String,
+    pub session_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_ref: Option<SessionLocator>,
+    pub status: String,
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_epoch: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentCreated {
@@ -1341,6 +1405,10 @@ pub struct ReadyCapabilities {
     /// omitted from the wire entirely otherwise (frozen-client inertness).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_reconcile_fresh_agent_v1: Option<bool>,
+    /// Requester-scoped attach outcomes negotiated by
+    /// `hello.capabilities.freshAgentReconciliationV1`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fresh_agent_reconciliation_v1: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_interest_v1: Option<bool>,
     /// Paced terminal restore (responsive-terminal-restore Workstream 1):
