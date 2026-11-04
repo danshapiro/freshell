@@ -99,8 +99,9 @@ verify authenticated readiness against the intended supervisor before
 describing the agents as protected.
 
 For a deliberate upgrade from older protocol-1 hosts, qualify retained
-terminal processes, Codex sidecar adoption, original-host Claude restoration,
-and any OpenCode history transfers with the candidate first. See
+terminal processes, Codex sidecar adoption, and original-host Claude and
+OpenCode restoration with the candidate first. Qualify any separately selected
+history transfers for their intended route. See
 [Retaining processes from a legacy installation](managed-runtime-rollout.md#retaining-processes-from-a-legacy-installation).
 This does not bypass the updater's refusal or authorize a service restart.
 Record the specific interruption and recovery plan for other host-owned

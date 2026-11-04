@@ -363,12 +363,21 @@ This preserves the conversation, not the old Claude process, and the resumed
 terminal remains host-managed. Qualify the actual source and interruption
 plan before bootstrap.
 
-Host OpenCode terminal resumes use the exact-session transfer path. Qualify
-the actual native identities, source and pinned target schema, required
-descendants and assets, and imported native history. Native history readback
-alone does not establish live PTY adoption; verify that separately after the
-approved startup. Other host-managed providers need a separately verified
-recovery procedure.
+Existing host OpenCode terminal conversations resume through their original
+host CLI, HOME, default database, working directory, and exact native session
+ID. Existing managed ownership is checked first; a managed owner under any
+create key or state, an unavailable inventory, or missing or ambiguous native
+history prevents a new host writer. Recheck the selected database file,
+conversation identity, and child environment immediately before spawning.
+REST refuses a verified host-history resume and directs the caller to its
+terminal tab. Fresh managed creation keeps its existing route.
+
+Qualify the installed host CLI and selected source before bootstrap. The old
+host PTY process is interrupted; verify the same conversation after startup.
+This route creates no managed soul or provider volume and requires no history
+transfer, provider downgrade, or imported-store qualification. Generic managed
+imports remain separate operations. Other host-managed providers need a
+separately verified recovery procedure.
 
 An installation without the authenticated readiness or maintenance APIs
 cannot use the current updater for its initial upgrade. Its deliberate
