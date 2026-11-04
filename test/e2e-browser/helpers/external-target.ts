@@ -183,11 +183,8 @@ export async function createE2eServerHandle(
 
   const construct = options.construct ?? {}
   const { RustServer } = await import('./rust-server.js')
-  const explicitlyConfiguredManagedRuntime = Object.hasOwn(
-    construct.env ?? {},
-    'FRESHELL_MANAGED_RUNTIME_V1',
-  )
-  const stripEnvPrefixes = new Set(construct.stripEnvPrefixes ?? [])
-  if (!explicitlyConfiguredManagedRuntime) stripEnvPrefixes.add('FRESHELL_MANAGED_RUNTIME_V1')
-  return new RustServer({ ...construct, stripEnvPrefixes: [...stripEnvPrefixes] })
+  // The owned RustServer strips the ambient managed-runtime opt-in itself
+  // (shared runtimeWebStripPrefixes rule in scripts/testing/runtime-sandbox.ts)
+  // unless the construct explicitly configures it in `env`.
+  return new RustServer(construct)
 }

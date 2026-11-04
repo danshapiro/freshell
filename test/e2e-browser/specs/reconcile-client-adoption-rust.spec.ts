@@ -311,12 +311,6 @@ async function bootAdoption(
   const server = new RustServer({
     env: options.env,
     setupHome: options.setupHome,
-    // Direct RustServer import (restart()/restartAbrupt()) bypasses the
-    // external-target factory's default strip: strip the ambient
-    // managed-runtime opt-in the same way the factory does, so a developer
-    // shell exporting FRESHELL_MANAGED_RUNTIME_V1=1 cannot fail server boot
-    // against a non-managed-runtime feature build.
-    stripEnvPrefixes: ['FRESHELL_MANAGED_RUNTIME_V1'],
   })
   const info = await server.start()
   await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
