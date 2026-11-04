@@ -1387,6 +1387,32 @@ async fn spawn_terminal_pane_with_handoff_and_admission(
     let (mut resume_session_id, accepted_session_ref, session_ref_locator_present) =
         derive_resume_identity(body, &mode)?;
 
+    if let Some(session_id) = resume_session_id
+        .clone()
+        .filter(|_| use_managed_runtime && mode == "claude")
+    {
+        let original_cwd = cwd.as_deref().map(std::path::PathBuf::from);
+        let verified_host_source = tokio::task::spawn_blocking(move || {
+            crate::locate_host_claude_restore(&session_id, original_cwd.as_deref()).is_ok()
+        })
+        .await
+        .unwrap_or(false);
+        if verified_host_source {
+            tracing::info!(
+                event = "terminal.rest.host_claude_restore_refused",
+                provider = "claude",
+                transport = "rest",
+                reason = "verified_original_host_history",
+                "Original host Claude history requires its terminal-tab resume route"
+            );
+            return Err(fail_json_code(
+                    StatusCode::CONFLICT,
+                    "RESTORE_UNAVAILABLE",
+                    "This saved Claude conversation uses its original host history. Restore it through its terminal tab.".into(),
+                ).into());
+        }
+    }
+
     if let Some(session_id) = resume_session_id.as_deref().filter(|_| mode == "codex") {
         if freshell_codex::sidecar_reconcile::codex_sidecar_reconciler()
             .is_some_and(|reconciler| reconciler.has_verified_terminal_session(session_id))
@@ -7656,6 +7682,87 @@ if (args.includes('app-server')) {{
         > {
             Box::pin(async { Err("unexpected managed output read".into()) })
         }
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn rest_verified_host_claude_resume_refuses_before_launch_or_new_tab() {
+        const CHILD: &str = "FRESHELL_REST_HOST_CLAUDE_REFUSAL_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "terminal_tabs::tests::rest_verified_host_claude_resume_refuses_before_launch_or_new_tab", "--nocapture"])
+                .env(CHILD, "1").kill_on_drop(true);
+            let output = tokio::time::timeout(std::time::Duration::from_secs(45), command.output())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let owned = tempfile::tempdir().unwrap();
+        let session_id = "11111111-2222-4333-8444-555566667777";
+        let config = owned.path().join(".claude");
+        let project = config.join("projects/native-project");
+        std::fs::create_dir_all(&project).unwrap();
+        let transcript = project.join(format!("{session_id}.jsonl"));
+        let bytes = format!(
+            "{}\n",
+            json!({"type":"user","sessionId":session_id,"cwd":owned.path(),"message":{"content":"owned original history"}})
+        );
+        std::fs::write(&transcript, &bytes).unwrap();
+        std::env::set_var("HOME", owned.path());
+        std::env::set_var("CLAUDE_CONFIG_DIR", &config);
+        std::env::remove_var("CLAUDE_HOME");
+        let before = std::fs::metadata(&transcript).unwrap();
+        let hooks = Arc::new(AtomicUsize::new(0));
+        let hook_count = hooks.clone();
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec(
+                "claude",
+                &owned.path().join("argv"),
+            )]))
+            .with_resume_probe(probe_answering(
+                freshell_platform::resume_gate::ResumeExistence::Present,
+                true,
+            ))
+            .with_terminal_created_hook(Arc::new(move |_| {
+                hook_count.fetch_add(1, Ordering::SeqCst);
+            }));
+        let registry = state.terminal_registry.clone().unwrap();
+        let controller = Arc::new(CapturingManagedController(std::sync::Mutex::new(None)));
+        registry.set_managed_controller(Some(controller.clone()));
+        let mut events = state.broadcast_tx.subscribe();
+        let (status, body) = post(app(state.clone()), "/api/tabs", json!({"mode":"claude","cwd":owned.path(),"sessionRef":{"provider":"claude","sessionId":session_id}}), true).await;
+        let attempted_launch = controller.0.lock().unwrap().is_some();
+        let no_tabs = state.tabs.lock().unwrap().is_empty();
+        let no_panes = state.terminal_panes.lock().unwrap().is_empty();
+        let no_terminals = registry.directory().is_empty();
+        let no_events = matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        );
+        let after = std::fs::metadata(&transcript).unwrap();
+        registry.kill_all();
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
+        assert!(
+            !attempted_launch,
+            "original host history must not be sent to an empty managed store"
+        );
+        assert!(
+            no_tabs && no_panes && no_terminals && no_events,
+            "refusal must precede tab/process/event side effects"
+        );
+        assert_eq!(hooks.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read_to_string(&transcript).unwrap(), bytes);
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
     }
 
     #[tokio::test]
