@@ -150,6 +150,83 @@ async fn a_fenced_claude_send_returns_retry_and_owner_details_from_its_refusal()
     state.shutdown().await;
 }
 
+#[tokio::test]
+async fn attach_result_keeps_lifecycle_guard_until_correlated_ack_is_sent() {
+    let (mut state, _rx) = state_with_bus();
+    let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::with_epoch(41));
+    let id = uuid::Uuid::new_v4().to_string();
+    let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
+        PROVIDER,
+        &id,
+        freshell_ownership::RuntimeOwnerKind::FreshAgent,
+        "test-fresh-agent-owner",
+        None,
+        "test",
+        0,
+    ) else {
+        panic!("fresh-agent ownership begins")
+    };
+    assert!(matches!(
+        registry.commit_live(
+            PROVIDER,
+            &id,
+            "test-fresh-agent-owner",
+            generation,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                terminal_id: None,
+                live_session_key: Some(id.clone()),
+                pid: None,
+                ownership_id: None,
+            }
+        ),
+        freshell_ownership::CommitOutcome::Committed
+    ));
+    state.set_ownership(Arc::clone(&registry));
+    insert_fake_claude_session(&state, &id).await;
+
+    let handoff_at_ack = Arc::new(std::sync::Mutex::new(None));
+    let observed_handoff = Arc::clone(&handoff_at_ack);
+    let registry_for_reply = Arc::clone(&registry);
+    let session_for_reply = id.clone();
+    let reply: freshell_terminal::FrameSink = Arc::new(move |message| {
+        if matches!(
+            message,
+            freshell_protocol::ServerMessage::FreshAgentAttached(_)
+        ) {
+            let outcome = registry_for_reply.begin_handoff(
+                PROVIDER,
+                &session_for_reply,
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "competing-terminal-handoff",
+                None,
+                "attach-ack-race-test",
+                0,
+            );
+            *observed_handoff.lock().expect("handoff result mutex") = Some(outcome);
+        }
+    });
+    let mut request = attach_msg(&id);
+    request.request_id = Some("attach-guard-ack-race".into());
+    request.view_id = Some("attach-guard-view".into());
+    request.observed_epoch = Some(41);
+    request.observed_generation = Some(generation);
+
+    state.handle_attach(request, reply).await;
+
+    assert!(
+        matches!(
+            handoff_at_ack
+                .lock()
+                .expect("handoff result mutex")
+                .as_ref(),
+            Some(freshell_ownership::BeginOutcome::Blocked { .. })
+        ),
+        "a competing ownership handoff must stay blocked until the requester ack is sent"
+    );
+    state.shutdown().await;
+}
+
 #[test]
 fn a_fresh_lane_blocked_outcome_preserves_its_captured_fresh_agent_kind() {
     let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::with_epoch(41));

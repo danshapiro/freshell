@@ -17,9 +17,10 @@
 // bookkeeping) -> program-rule events (approval -> `permission.asked`,
 // question -> `question.asked`) -> completion default: session.idle +
 // session.status idle.
+import fs from 'node:fs'
 import http from 'node:http'
 import { randomUUID } from 'node:crypto'
-import { appendLaunchLedger, FixtureEngine, keepAlive, loadProgram } from './fixture-core.mjs'
+import { appendJsonl, appendLaunchLedger, FixtureEngine, keepAlive, loadProgram } from './fixture-core.mjs'
 
 const provider = process.env.FRESHELL_FAKE_PROVIDER ?? 'opencode-server'
 const argv = process.argv.slice(2)
@@ -44,6 +45,12 @@ const program = loadProgram(env)
 
 const sseClients = new Set()
 let activeSessionId = null
+
+function logHttp(method, pathname, extra = {}) {
+  appendJsonl(env.FRESHELL_FAKE_OPENCODE_HTTP_AUDIT, {
+    t: Date.now(), pid: process.pid, event: 'http', method, path: pathname, ...extra,
+  })
+}
 
 function broadcast(type, properties) {
   const frame = `data: ${JSON.stringify({ type, properties })}\n\n`
@@ -114,6 +121,14 @@ const server = http.createServer((req, res) => {
 async function route(req, res) {
   const url = new URL(req.url ?? '/', `http://${hostname}:${port}`)
   const method = req.method ?? 'GET'
+  logHttp(method, url.pathname, url.pathname === '/session/status'
+    ? { busy: activeSessionId !== null && !releaseReached() }
+    : {})
+
+  if (method === 'GET' && url.pathname === '/global/health') {
+    json(res, 200, { status: 'ok' })
+    return
+  }
 
   if (method === 'GET' && (url.pathname === '/event' || url.pathname === '/global/event')) {
     res.writeHead(200, {
@@ -129,7 +144,7 @@ async function route(req, res) {
 
   if (method === 'POST' && url.pathname === '/session') {
     const body = await readBody(req)
-    const id = `sess-${randomUUID()}`
+    const id = program.sessionId ?? `sess-${randomUUID()}`
     const now = Date.now()
     sessions.set(id, {
       id,
@@ -148,10 +163,14 @@ async function route(req, res) {
     return
   }
 
-  const sessionMatch = url.pathname.match(/^\/session\/([^/]+)(\/message)?$/)
+  const sessionMatch = url.pathname.match(/^\/session\/([^/]+)(\/message|\/prompt_async)?$/)
   if (sessionMatch) {
     const [, sessionId, tail] = sessionMatch
     if (method === 'GET' && !tail) {
+      if (sessionId === env.FRESHELL_FAKE_OPENCODE_TRANSIENT_FAILURE_SESSION_ID) {
+        json(res, 503, { error: 'temporary manager failure' })
+        return
+      }
       const row = sessions.get(sessionId)
       if (!row) {
         json(res, 404, { error: 'session not found' })
@@ -160,6 +179,24 @@ async function route(req, res) {
       // The durable-resume probe (opencode_ws.rs resume_durable_session).
       await engine.emitResume(sessionId, 'http:GET /session/:id')
       json(res, 200, row)
+      return
+    }
+    if (method === 'POST' && url.pathname === `/session/${sessionId}/prompt_async`) {
+      await readBody(req)
+      if (!sessions.has(sessionId)) {
+        json(res, 404, { error: 'session not found' })
+        return
+      }
+      activeSessionId = sessionId
+      json(res, 200, {})
+      await engine.emitEvent('activity', { sessionId, status: 'busy' }, `http:POST ${url.pathname}`)
+      void (async () => {
+        while (!releaseReached()) await new Promise((resolve) => setTimeout(resolve, 20))
+        await engine.emitEvent('completion', { sessionId, subtype: 'success' }, `http:POST ${url.pathname}`)
+        if (activeSessionId === sessionId) activeSessionId = null
+      })().catch((error) => {
+        process.stderr.write(`fake opencode prompt failure: ${String(error)}\n`)
+      })
       return
     }
     if (method === 'POST' && tail === '/message') {
@@ -183,11 +220,18 @@ async function route(req, res) {
   }
 
   if (method === 'GET' && url.pathname === '/session/status') {
-    json(res, 200, {})
+    json(res, 200, activeSessionId && !releaseReached()
+      ? { [activeSessionId]: { type: 'busy' } }
+      : {})
     return
   }
 
   json(res, 404, { error: `fake opencode: no route ${method} ${url.pathname}` })
+}
+
+function releaseReached() {
+  return !env.FRESHELL_FAKE_OPENCODE_PROMPT_RELEASE_PATH
+    || fs.existsSync(env.FRESHELL_FAKE_OPENCODE_PROMPT_RELEASE_PATH)
 }
 
 function readBody(req) {

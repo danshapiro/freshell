@@ -9043,9 +9043,11 @@ impl FreshCodexState {
                 })
                 .unwrap_or("unknown")
         };
-        crate::attach::AttachOutcome::from_messages(messages)
-            .with_status_snapshot(&msg.session_id, current_status)
-            .with_current_owner(self.ownership_snapshot(PROVIDER, &msg.session_id))
+        let outcome = crate::attach::AttachOutcome::from_messages(messages)
+            .with_status_snapshot(&msg.session_id, current_status);
+        let resolved_session_id = outcome.resolved_session_id(&msg);
+        let owner_session_id = self.resolve_ownership_key(&resolved_session_id);
+        outcome.with_current_owner(self.ownership_snapshot(PROVIDER, &owner_session_id))
     }
 
     async fn handle_attach_events(&self, msg: FreshAgentAttach) {
@@ -9187,7 +9189,8 @@ impl FreshCodexState {
             }
         }
 
-        let (session_id, active_turn_present, should_emit_snapshot) = if tracked {
+        let (session_id, active_turn_present, should_emit_snapshot, recovered_runtime) = if tracked
+        {
             let (resolved_id, should_emit_snapshot) = match self
                 .ensure_session_alive(
                     &msg.session_id,
@@ -9226,6 +9229,7 @@ impl FreshCodexState {
                     return;
                 }
             };
+            let recovered_runtime = should_emit_snapshot;
             let active_turn_present = {
                 let guard = self.sessions.lock().await;
                 guard
@@ -9233,7 +9237,12 @@ impl FreshCodexState {
                     .map(|s| s.active_turn.lock().expect("active_turn mutex").is_some())
                     .unwrap_or(false)
             };
-            (resolved_id, active_turn_present, should_emit_snapshot)
+            (
+                resolved_id,
+                active_turn_present,
+                should_emit_snapshot,
+                recovered_runtime,
+            )
         } else {
             match self
                 .ensure_session_resumable(
@@ -9253,7 +9262,7 @@ impl FreshCodexState {
                         .lock()
                         .expect("active_turn mutex")
                         .is_some();
-                    (msg.session_id.clone(), active_turn_present, true)
+                    (msg.session_id.clone(), active_turn_present, true, false)
                 }
                 Err(ResumeSessionError::NotFound) => {
                     self.broadcast(&lost_session_frame(&msg.session_id));
@@ -9296,15 +9305,26 @@ impl FreshCodexState {
             ));
         }
 
-        if !should_emit_snapshot {
-            return;
-        }
-
         let status = if active_turn_present {
             CodexStatus::Running
         } else {
             CodexStatus::Idle
         };
+        if recovered_runtime {
+            let event = CodexAdapterEvent::Status {
+                session_id: session_id.clone(),
+                status: status.clone(),
+            };
+            if let Some(frame) = adapter_event_to_frame(&event, &session_id) {
+                let message: ServerMessage = serde_json::from_str(&frame)
+                    .expect("Codex adapter status matches the server frame schema");
+                self.broadcast(&message);
+            }
+        }
+        if !should_emit_snapshot {
+            return;
+        }
+
         let event = CodexAdapterEvent::StatusSnapshot {
             session_id: session_id.clone(),
             status,
@@ -34869,11 +34889,42 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn attach_crash_recovery_uses_the_replacement_id_snapshot_for_its_requester() {
         let _guard = ENV_LOCK.lock().await;
-        let (st, mut peer_bus) = state_with_bus();
+        let (mut st, mut peer_bus) = state_with_bus();
+        let capture = tracing_capture::capture_by_session("attach-owner-status-marker-unused");
+        let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&ownership));
         configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-original"}"#);
         let thread_id = create_real_fake_session(&st, &mut peer_bus).await;
         simulate_unrequested_crash(&st, &thread_id).await;
         drain_create_time_snapshot(&mut peer_bus, &thread_id).await;
+        let crashed_owner = ownership.observe(PROVIDER, &thread_id);
+        let freshell_ownership::OwnershipState::Live {
+            owner, generation, ..
+        } = crashed_owner.state
+        else {
+            panic!("the crashed runtime was live before its exit release: {crashed_owner:?}");
+        };
+        assert!(ownership.release(
+            PROVIDER,
+            &thread_id,
+            &freshell_ownership::ReleaseClaim {
+                operation_id: owner.ownership_id.clone().expect("owner operation id"),
+                generation,
+                runtime: Some(owner),
+            },
+            "test-codex-crash",
+        ));
+        while peer_bus.try_recv().is_ok() {}
+        st.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            provider: PROVIDER.into(),
+            session_type: SESSION_TYPE.into(),
+            session_id: thread_id.clone(),
+            event: json!({
+                "type":"freshAgent.status", "sessionId":thread_id, "status":"exited"
+            }),
+        }));
+        let exited: Value = serde_json::from_str(&peer_bus.try_recv().unwrap()).unwrap();
+        assert_eq!(exited["event"]["status"], "exited");
 
         configure_fake_codex_cmd(
             &json!({
@@ -34889,6 +34940,9 @@ pub(crate) mod tests {
         let mut attach = attach_msg(&thread_id);
         attach.request_id = Some("codex-replacement-recovery".into());
         attach.view_id = Some("codex-replacement-view".into());
+        let observed = ownership.observe(PROVIDER, &thread_id);
+        attach.observed_epoch = Some(observed.epoch);
+        attach.observed_generation = Some(observed.generation);
         let (reply, requester) = capturing_sink();
         st.handle_attach(attach, reply).await;
 
@@ -34898,6 +34952,35 @@ pub(crate) mod tests {
         };
         assert_eq!(attached.request_id, "codex-replacement-recovery");
         assert_eq!(attached.session_id, "thread-respawned");
+        let canonical_owner = ownership.observe(PROVIDER, &attached.session_id);
+        assert!(matches!(
+            canonical_owner.state,
+            freshell_ownership::OwnershipState::Live { ref owner, .. }
+                if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+        ));
+        assert_eq!(attached.owner_kind.as_deref(), Some("fresh-agent"));
+        assert_eq!(attached.owner_epoch, Some(canonical_owner.epoch));
+        assert_eq!(attached.owner_generation, Some(canonical_owner.generation));
+        let shared_status = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let frame: Value = serde_json::from_str(&peer_bus.recv().await.unwrap()).unwrap();
+                if frame["type"] == "freshAgent.event"
+                    && frame["event"]["type"] == "freshAgent.status"
+                    && frame["sessionId"] == "thread-respawned"
+                    && matches!(frame["event"]["status"].as_str(), Some("idle" | "running"))
+                {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("the peer receives the canonical recovered status");
+        assert_eq!(shared_status["event"]["status"], "idle");
+        assert_eq!(
+            spawn_count(&capture),
+            3,
+            "the create, failed resume probe, and one replacement sidecar are the only native boots"
+        );
         assert_eq!(
             attached
                 .snapshot

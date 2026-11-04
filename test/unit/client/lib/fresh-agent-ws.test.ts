@@ -153,6 +153,94 @@ describe('fresh-agent-ws', () => {
     })
   })
 
+  it('marks only a lost attach identity for recovery without failing the shared session', () => {
+    const store = createFreshAgentStore()
+    const locator = { provider: 'codex', sessionType: 'freshcodex', sessionId: 'thread-lost-attach' }
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      ...locator,
+      event: { type: 'freshAgent.session.snapshot', sessionId: locator.sessionId, status: 'running' },
+    })
+
+    expect(handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.attach.failed',
+      requestId: 'attach-lost-thread',
+      viewId: 'requesting-view',
+      ...locator,
+      status: 'failed',
+      code: 'INVALID_SESSION_ID',
+      message: 'Session no longer exists',
+    })).toBe(true)
+
+    const session = store.getState().freshAgent.sessions['freshcodex:codex:thread-lost-attach']
+    expect(session).toMatchObject({ status: 'running', lost: true })
+    expect(session).not.toHaveProperty('lastErrorCode')
+    expect(session).not.toHaveProperty('lastError')
+  })
+
+  it.each(['SESSION_RESERVED', 'PROVIDER_FAILURE'])(
+    'does not mark a %s attach failure as a lost session', (code) => {
+      const store = createFreshAgentStore()
+      const locator = { provider: 'codex', sessionType: 'freshcodex', sessionId: `thread-${code}` }
+      handleFreshAgentMessage(store.dispatch, {
+        type: 'freshAgent.event',
+        ...locator,
+        event: { type: 'freshAgent.session.snapshot', sessionId: locator.sessionId, status: 'running' },
+      })
+
+      handleFreshAgentMessage(store.dispatch, {
+        type: 'freshAgent.attach.failed',
+        requestId: `attach-${code}`,
+        viewId: 'requesting-view',
+        ...locator,
+        status: 'failed',
+        code,
+        message: 'Attach did not complete',
+      })
+
+      const session = store.getState().freshAgent.sessions[`freshcodex:codex:thread-${code}`]
+      expect(session).toMatchObject({ status: 'running' })
+      expect(session?.lost ?? false).toBe(false)
+    },
+  )
+
+  it('preserves terminal identity when a same-fence attach result refreshes owner facts', () => {
+    const store = createFreshAgentStore()
+    const locator = { provider: 'codex', sessionType: 'freshcodex', sessionId: 'thread-terminal-owner' }
+    foldSessionRuntimeOwnerFrame(store.dispatch, {
+      type: 'session.runtimeOwner',
+      provider: 'codex',
+      sessionId: locator.sessionId,
+      epoch: 4,
+      generation: 9,
+      ownerKind: 'terminal',
+      terminalId: 'terminal-codex-9',
+      aliasOf: 'thread-native-owner',
+      operationId: 'handoff-9',
+      transition: 'handoff-committed',
+    })
+
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.attached',
+      requestId: 'attach-same-fence',
+      viewId: 'fresh-view',
+      ...locator,
+      status: 'idle',
+      ownerKind: 'terminal',
+      ownerEpoch: 4,
+      ownerGeneration: 9,
+    })
+
+    expect(store.getState().freshAgent.runtimeOwners?.['codex:thread-terminal-owner']).toMatchObject({
+      epoch: 4,
+      generation: 9,
+      ownerKind: 'terminal',
+      terminalId: 'terminal-codex-9',
+      aliasOf: 'thread-native-owner',
+      transition: 'handoff-committed',
+    })
+  })
+
   it('routes native patches outside the session slice and fences complete items and stale init incarnations', () => {
     const store = createFreshAgentStore()
     const outer = { type: 'freshAgent.event' as const, sessionId: 'native-live', sessionType: 'freshcodex' as const, provider: 'codex' as const }

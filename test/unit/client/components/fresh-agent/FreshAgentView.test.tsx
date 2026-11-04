@@ -17163,7 +17163,7 @@ describe('FreshAgentView', () => {
     }))
   })
 
-  it('recreates a lost freshclaude session through fresh-agent transport events with the durable resume id', async () => {
+  it('recovers a freshclaude session after a modern typed lost-attach failure', async () => {
     const store = createStore()
     const durableSessionId = '00000000-0000-4000-8000-000000000441'
     apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new TypeError('Failed to parse URL from /api/fresh-agent/threads/claude/dead-session-id'))
@@ -17186,6 +17186,9 @@ describe('FreshAgentView', () => {
         <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
       </Provider>,
     )
+
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).not.toHaveLength(0))
+    const attach = sentFreshAgentMessages('freshAgent.attach')[0]
 
     const onMessage = wsMock.onMessage.mock.calls[0]?.[0]
     expect(onMessage).toBeTypeOf('function')
@@ -17218,16 +17221,15 @@ describe('FreshAgentView', () => {
     expect(screen.queryByText(/failed to parse url/i)).not.toBeInTheDocument()
 
     const lostMessage = {
-      type: 'freshAgent.event',
+      type: 'freshAgent.attach.failed',
+      requestId: attach.requestId,
+      viewId: attach.viewId,
       sessionId: 'dead-session-id',
       sessionType: 'freshclaude',
       provider: 'claude',
-      event: {
-        type: 'freshAgent.error',
-        sessionId: 'dead-session-id',
-        code: 'INVALID_SESSION_ID',
-        message: 'Session no longer exists',
-      },
+      status: 'failed',
+      code: 'INVALID_SESSION_ID',
+      message: 'Session no longer exists',
     }
     act(() => {
       handleFreshAgentMessage(store.dispatch, lostMessage)
@@ -20464,7 +20466,21 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
     // closure captures `dispatch` at render time (react-redux).
     const dispatchSpy = vi.spyOn(store, 'dispatch')
 
-    act(() => store.dispatch(applyRuntimeOwner(terminalOwnerFrame())))
+    act(() => {
+      store.dispatch(applyRuntimeOwner(terminalOwnerFrame()))
+      expect(handleFreshAgentMessage(store.dispatch, {
+        type: 'freshAgent.attached',
+        requestId: 'attach-same-terminal-fence',
+        viewId: 'req-divergence',
+        provider: 'codex',
+        sessionType: 'freshcodex',
+        sessionId: DIV_SESSION_ID,
+        status: 'idle',
+        ownerKind: 'terminal',
+        ownerEpoch: 1,
+        ownerGeneration: 2,
+      })).toBe(true)
+    })
 
     const alert = (await screen.findByText('Session opened elsewhere', { exact: true })).closest('details') as HTMLElement
     fireEvent.click(within(alert).getByText('Session opened elsewhere', { exact: true }))

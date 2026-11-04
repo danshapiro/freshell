@@ -1065,6 +1065,11 @@ impl FreshOpencodeState {
         self.fresh_agent.host_agent_admission()
     }
 
+    /// Reap the shared OpenCode serve manager when its owning server shuts down.
+    pub async fn shutdown(&self) {
+        self.fresh_agent.shutdown().await;
+    }
+
     /// b8ke e3 post-cap F2: test seam — retain a condemned-session
     /// witness (the kill path's retained accepted-daemon-turn evidence).
     /// Test-only seeding route for cross-crate consumers; production code
@@ -7850,8 +7855,12 @@ impl FreshOpencodeState {
     async fn handle_attach_inner(&self, msg: FreshAgentAttach) -> crate::attach::AttachOutcome {
         let (_, messages) =
             crate::attach::capture_attach_messages(self.handle_attach_events(msg.clone())).await;
-        crate::attach::AttachOutcome::from_messages(messages)
-            .with_current_owner(self.ownership_snapshot(PROVIDER, &msg.session_id))
+        let outcome = crate::attach::AttachOutcome::from_messages(messages);
+        let resolved_session_id = outcome.resolved_session_id(&msg);
+        outcome.with_current_owner(
+            self.fresh_agent
+                .canonical_ownership_snapshot(PROVIDER, &resolved_session_id),
+        )
     }
 
     async fn handle_attach_events(&self, msg: FreshAgentAttach) {
@@ -7878,6 +7887,7 @@ impl FreshOpencodeState {
             let guard = self.sessions.lock().await;
             guard.get(&msg.session_id).cloned()
         };
+        let ownership_session_id = self.resolve_ownership_key(&msg.session_id);
         // b8ke gate C fix: the coordinator consult (the map-hit
         // registration + the r12/r38 arm) applies ONLY to MATERIALIZED
         // sessions — a real durable `ses_*` whose serve-SSE bridge the
@@ -7923,7 +7933,7 @@ impl FreshOpencodeState {
         if session_arc.is_some() && attach_row_materialized {
             let snap = self
                 .fresh_agent
-                .ownership_snapshot(PROVIDER, &msg.session_id);
+                .ownership_snapshot(PROVIDER, &ownership_session_id);
             match snap.state {
                 freshell_ownership::OwnershipState::Handoff { .. }
                 | freshell_ownership::OwnershipState::Starting { .. }
@@ -8128,7 +8138,7 @@ impl FreshOpencodeState {
                     existing_session_attach_guard = match crate::ownership_lane::arm_adopt_guard(
                         &self.fresh_agent.ownership,
                         PROVIDER,
-                        &msg.session_id,
+                        &ownership_session_id,
                         &format!("attach-{}", uuid::Uuid::new_v4()),
                         &expected_fresh_owner,
                         adopt_fence,
@@ -28004,7 +28014,7 @@ mod tests {
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         st.set_ownership(Arc::clone(&registry));
 
-        let (_placeholder, durable) =
+        let (placeholder, durable) =
             materialized_selfheal_session(&st, &mut rx, "req-attach-recover").await;
         await_freshagent_live(&registry, &durable).await;
         // The observed runtime-owner pair the fenced attach carries.
@@ -28038,13 +28048,16 @@ mod tests {
             tab_id: None,
             pane_id: None,
             provider: AgentProvider::Opencode,
-            session_id: durable.clone(),
+            session_id: placeholder.clone(),
             session_type: SessionType::Freshopencode,
             cwd: None,
             observed_epoch: Some(before.epoch),
             observed_generation: Some(before.generation),
             resume_session_id: None,
-            session_ref: None,
+            session_ref: Some(freshell_protocol::SessionLocator {
+                provider: "opencode".into(),
+                session_id: durable.clone(),
+            }),
         };
         attach.request_id = Some("opencode-map-hit-recovery-attach".into());
         attach.view_id = Some("opencode-map-hit-recovery-view".into());
@@ -28069,6 +28082,20 @@ mod tests {
                     && attached.status == "idle"
                     && attached.snapshot.as_ref().is_some_and(|snapshot| snapshot["status"] == "idle")
         ));
+        let canonical = registry.resolve_canonical("opencode", &placeholder);
+        assert_eq!(canonical, durable);
+        let canonical_owner = registry.observe("opencode", &canonical);
+        assert!(matches!(
+            canonical_owner.state,
+            freshell_ownership::OwnershipState::Live { ref owner, .. }
+                if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+        ));
+        assert_eq!(attached[0].owner_kind.as_deref(), Some("fresh-agent"));
+        assert_eq!(attached[0].owner_epoch, Some(canonical_owner.epoch));
+        assert_eq!(
+            attached[0].owner_generation,
+            Some(canonical_owner.generation)
+        );
 
         assert!(
             spawns.load(Ordering::SeqCst) > spawns_before,

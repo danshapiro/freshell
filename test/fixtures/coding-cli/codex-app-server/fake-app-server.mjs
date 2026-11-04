@@ -899,12 +899,10 @@ function socketSafeBroadcast(notification) {
 
 function appendThreadOperation(method, params, result) {
   const logPath = behavior.appendThreadOperationLogPath
-  if (!logPath || !method.startsWith('thread/')) {
-    return
-  }
+  const turnLogPath = behavior.appendTurnOperationLogPath
+  if ((!logPath || !method.startsWith('thread/')) && !(turnLogPath && method === 'turn/start')) return
   const threadId = result?.thread?.id || params?.threadId || null
-  fs.mkdirSync(path.dirname(logPath), { recursive: true })
-  fs.appendFileSync(logPath, JSON.stringify({
+  const row = JSON.stringify({
     method,
     threadId,
     params,
@@ -912,7 +910,15 @@ function appendThreadOperation(method, params, result) {
     sidecarOwnershipId: process.env.FRESHELL_CODEX_SIDECAR_ID ?? null,
     pid: process.pid,
     at: new Date().toISOString(),
-  }) + '\n', 'utf8')
+  }) + '\n'
+  if (logPath && method.startsWith('thread/')) {
+    fs.mkdirSync(path.dirname(logPath), { recursive: true })
+    fs.appendFileSync(logPath, row, 'utf8')
+  }
+  if (turnLogPath && method === 'turn/start') {
+    fs.mkdirSync(path.dirname(turnLogPath), { recursive: true })
+    fs.appendFileSync(turnLogPath, row, 'utf8')
+  }
 }
 
 function claimCrossProcessOnce(markerPath, key) {
@@ -1161,10 +1167,14 @@ wss.on('connection', (socket, request) => {
       return
     }
     const override = behavior.overrides?.[method]
+    const threadResumeError = method === 'thread/resume'
+      ? behavior.threadResumeErrorsById?.[message.params?.threadId]
+      : undefined
+    const resumeError = threadResumeError ?? override?.error
     const delayMs = Number(behavior.delayMethodsMs?.[method] || 0)
     const floodStdoutBytes = Number(behavior.floodStdoutBeforeMethodsBytes?.[method] || 0)
     const floodStderrBytes = Number(behavior.floodStderrBeforeMethodsBytes?.[method] || 0)
-    if (override?.error) {
+    if (resumeError) {
       setTimeout(async () => {
         if (method === 'thread/resume' && behavior.waitForResumeReleasePath) {
           if (behavior.resumeWaitingPath) {
@@ -1178,7 +1188,7 @@ wss.on('connection', (socket, request) => {
         }
         socket.send(JSON.stringify({
           id: message.id,
-          error: override.error,
+          error: resumeError,
         }))
       }, delayMs)
       return

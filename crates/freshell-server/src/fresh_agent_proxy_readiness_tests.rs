@@ -55,6 +55,66 @@ async fn attach_with_requester(
     captured
 }
 
+async fn attach_with_requester_and_ack_signal(
+    proxy: &Arc<HostedFreshAgentProxy>,
+    soul: SoulId,
+    request_id: &str,
+    ack_sent: Arc<AtomicBool>,
+) -> Vec<ServerMessage> {
+    let frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let target = Arc::clone(&frames);
+    let reply: FrameSink = Arc::new(move |frame| {
+        if matches!(frame, ServerMessage::FreshAgentAttached(_)) {
+            ack_sent.store(true, Ordering::SeqCst);
+        }
+        target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(frame);
+    });
+    Arc::clone(proxy)
+        .handle_with_requester(
+            HostedFreshAgentCommand::Attach(
+                serde_json::from_value(serde_json::json!({
+                    "provider":"claude", "sessionId":NATIVE, "sessionType":"freshclaude",
+                    "requestId":request_id, "viewId":"requesting-view",
+                }))
+                .unwrap(),
+            ),
+            reply,
+        )
+        .await;
+    assert!(proxy.pollers.lock().await.contains(&soul));
+    let captured = std::mem::take(
+        &mut *frames
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    captured
+}
+
+async fn legacy_attach_with_requester(
+    proxy: &Arc<HostedFreshAgentProxy>,
+    soul: SoulId,
+) -> Vec<ServerMessage> {
+    let (reply, frames) = capturing_attach_sink();
+    Arc::clone(proxy)
+        .handle_with_requester(
+            HostedFreshAgentCommand::Attach(
+                serde_json::from_value(serde_json::json!({
+                    "provider":"claude", "sessionId":NATIVE, "sessionType":"freshclaude",
+                    "viewId":"legacy-requesting-view",
+                }))
+                .unwrap(),
+            ),
+            reply,
+        )
+        .await;
+    assert!(proxy.pollers.lock().await.contains(&soul));
+    let captured = frames.lock().unwrap().clone();
+    captured
+}
+
 // Runtime allocation/Stop are forbidden; a best-effort read-only probe after
 // Started may fail without blocking the independently verified live session.
 struct ReadinessBackend;
@@ -864,6 +924,217 @@ async fn hosted_attaches_keep_replay_requester_scoped_and_later_events_shared() 
         .unwrap_or_else(|_| panic!("{name} did not receive the later shared event"));
         assert_eq!(shared["provider"], "claude");
     }
+}
+
+#[tokio::test]
+async fn hosted_legacy_attach_keeps_event_shape_on_requester_and_later_events_shared() {
+    let fixture = readiness_fixture().await;
+    fixture.ready.store(true, Ordering::SeqCst);
+    let (proxy, mut peer) = configure_proxy(
+        &fixture.control_socket,
+        HashMap::from([(("claude".into(), NATIVE.into()), fixture.soul.clone())]),
+    );
+    while peer.try_recv().is_ok() {}
+
+    let requester_frames = legacy_attach_with_requester(&proxy, fixture.soul.clone()).await;
+    let replay_events: Vec<_> = requester_frames
+        .iter()
+        .filter_map(|frame| match frame {
+            ServerMessage::FreshAgentEvent(event) => Some(event.event.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        replay_events,
+        vec![
+            serde_json::json!({
+                "type":"freshAgent.status", "sessionId":NATIVE, "status":"closed",
+            }),
+            serde_json::json!({
+                "type":"freshAgent.status", "sessionId":NATIVE, "status":"idle",
+            }),
+        ],
+        "the request-ID-free view keeps the previous event-shaped replay: {requester_frames:?}"
+    );
+    assert!(
+        requester_frames.iter().all(|frame| !matches!(
+            frame,
+            ServerMessage::FreshAgentAttached(_) | ServerMessage::FreshAgentAttachFailed(_)
+        )),
+        "legacy attachment must not introduce the typed request-ID envelope: {requester_frames:?}"
+    );
+    assert!(
+        peer.try_recv().is_err(),
+        "attach-only replay must not be published to the sibling view"
+    );
+    assert_eq!(proxy.pollers.lock().await.len(), 1);
+
+    fixture.events.lock().unwrap().push(AgentJournalEvent {
+        sequence: 4,
+        event: AgentEvent::Provider {
+            payload: serde_json::json!({
+                "type":"freshAgent.event", "provider":"claude",
+                "sessionType":"freshclaude", "sessionId":NATIVE,
+                "event":{"type":"freshAgent.status", "sessionId":NATIVE, "status":"running"},
+            }),
+        },
+    });
+    let shared = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let raw = peer.recv().await.expect("shared bus remains open");
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event"
+                && frame["sessionId"] == NATIVE
+                && frame["event"]["type"] == "freshAgent.status"
+                && frame["event"]["status"] == "running"
+            {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("later canonical events remain shared after a legacy attach");
+    assert_eq!(shared["provider"], "claude");
+}
+
+#[tokio::test]
+async fn concurrent_hosted_attaches_keep_the_earliest_poller_head_and_share_later_events() {
+    let fixture = readiness_fixture().await;
+    fixture.ready.store(true, Ordering::SeqCst);
+    let (proxy, mut peer) = configure_proxy(
+        &fixture.control_socket,
+        HashMap::from([(("claude".into(), NATIVE.into()), fixture.soul.clone())]),
+    );
+    while peer.try_recv().is_ok() {}
+
+    let pause = Arc::new(AttachHeadPause::new("attach-head-early"));
+    proxy.set_attach_head_pause_for_test(Arc::clone(&pause));
+    let first_ack_sent = Arc::new(AtomicBool::new(false));
+    let first_ack_signal = Arc::clone(&first_ack_sent);
+    let first_proxy = Arc::clone(&proxy);
+    let first_soul = fixture.soul.clone();
+    let first = tokio::spawn(async move {
+        attach_with_requester_and_ack_signal(
+            &first_proxy,
+            first_soul,
+            "attach-head-early",
+            first_ack_signal,
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), pause.wait_until_entered())
+        .await
+        .expect("the first attach captures its earlier head before pausing");
+
+    fixture.events.lock().unwrap().push(AgentJournalEvent {
+        sequence: 4,
+        event: AgentEvent::Provider {
+            payload: serde_json::json!({
+                "type":"freshAgent.event", "provider":"claude",
+                "sessionType":"freshclaude", "sessionId":NATIVE,
+                "event":{"type":"freshAgent.status", "sessionId":NATIVE, "status":"running"},
+            }),
+        },
+    });
+    let second_proxy = Arc::clone(&proxy);
+    let second_soul = fixture.soul.clone();
+    let second = tokio::spawn(async move {
+        attach_with_requester(&second_proxy, second_soul, "attach-head-late").await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !second.is_finished(),
+        "a later attach cannot capture a later head and establish the poller first"
+    );
+    pause.resume();
+
+    tokio::time::timeout(Duration::from_secs(3), pause.wait_until_reply_entered())
+        .await
+        .expect("the earlier attach has replayed through its captured watermark");
+    fixture.events.lock().unwrap().push(AgentJournalEvent {
+        sequence: 5,
+        event: AgentEvent::Provider {
+            payload: serde_json::json!({
+                "type":"freshAgent.event", "provider":"claude",
+                "sessionType":"freshclaude", "sessionId":NATIVE,
+                "event":{"type":"freshAgent.status", "sessionId":NATIVE, "status":"idle"},
+            }),
+        },
+    });
+    assert!(
+        !first_ack_sent.load(Ordering::SeqCst),
+        "the requester result remains pending while the final ordering window is held"
+    );
+    pause.resume_reply();
+
+    let first_frames = tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("first attach settles")
+        .expect("first attach task joins");
+    let second_frames = tokio::time::timeout(Duration::from_secs(5), second)
+        .await
+        .expect("second attach settles")
+        .expect("second attach task joins");
+    assert!(
+        first_frames.iter().any(|frame| matches!(frame,
+            ServerMessage::FreshAgentAttached(attached)
+                if attached.request_id == "attach-head-early" && attached.status == "idle"
+        )),
+        "the first view settles at its captured watermark: {first_frames:?}"
+    );
+    assert!(
+        second_frames.iter().any(|frame| matches!(frame,
+            ServerMessage::FreshAgentAttached(attached)
+                if attached.request_id == "attach-head-late" && attached.status == "idle"
+        )),
+        "the later view replays through its newer watermark: {second_frames:?}"
+    );
+    let mut shared_statuses = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while shared_statuses.len() < 2 {
+            let raw = peer.recv().await.expect("shared bus remains open");
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event"
+                && frame["sessionId"] == NATIVE
+                && frame["event"]["type"] == "freshAgent.status"
+                && matches!(frame["event"]["status"].as_str(), Some("running" | "idle"))
+            {
+                assert!(
+                    first_ack_sent.load(Ordering::SeqCst),
+                    "live events cannot overtake the replay and correlated result: {frame}"
+                );
+                shared_statuses.push(frame);
+            }
+        }
+    })
+    .await
+    .expect("both events after the captured head remain shared and ordered");
+    assert_eq!(shared_statuses[0]["event"]["status"], "running");
+    assert_eq!(shared_statuses[1]["event"]["status"], "idle");
+    assert_eq!(
+        proxy.pollers.lock().await.len(),
+        1,
+        "one poller serves the soul"
+    );
+    let native_actions = fixture
+        .commands
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|command| {
+            matches!(
+                command,
+                HostCommand::FreshAgentPrepareNative { .. }
+                    | HostCommand::FreshAgentResumePending { .. }
+                    | HostCommand::FreshAgentSend { .. }
+                    | HostCommand::FreshAgentResolve { .. }
+            )
+        })
+        .count();
+    assert_eq!(
+        native_actions, 0,
+        "attach and replay perform no native actions"
+    );
 }
 
 #[tokio::test]
