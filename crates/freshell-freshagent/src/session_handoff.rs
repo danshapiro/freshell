@@ -35,6 +35,11 @@ pub(crate) const HANDOFF_ROUTE: &str = "/api/sessions/handoff";
 pub struct HandoffTestHooks {
     /// Park the runner right after the coordinator enter (before the stop).
     pub pause_after_enter: Option<tokio::sync::Notify>,
+    /// Park the detached abort cleanup before it starts reaping a canceled
+    /// under-ticket target. This lets registration cleanup win the race
+    /// deterministically in the Codex condemned-writer regression.
+    pub pause_abort_cleanup_target_reap: Option<std::sync::Arc<tokio::sync::Notify>>,
+    pub abort_cleanup_target_reap_entered: Option<std::sync::Arc<tokio::sync::Notify>>,
     /// Park the runner after the TERMINAL prior's registry kill is ISSUED but
     /// before the dead-poll confirms it (round-3 review I-1: the prior-reap
     /// window's abort-test hold; terminal arm only — the fresh arm's hold is
@@ -86,6 +91,20 @@ pub struct HandoffTestHooks {
     /// the no-prior abort path's replacement confirmation watcher. Atomic
     /// so a test can arm it once; never armed in production.
     pub drop_abort_target_confirmation_once: std::sync::atomic::AtomicBool,
+    /// Park the abort-cleanup target confirmation after the lane has
+    /// positively confirmed target death but before the generic reap watcher
+    /// consumes that answer. This keeps tests inside the real
+    /// abort_cleanup -> reconfirmation path while they inspect the durable
+    /// repair fence.
+    pub pause_abort_target_reconfirmation_after_confirm:
+        Option<std::sync::Arc<tokio::sync::Notify>>,
+    pub release_abort_target_reconfirmation_after_confirm:
+        Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    /// Park an OpenCode handoff stop after the lane has confirmed per-session
+    /// quiescence but before stop_runtime delivers that result to its timeout
+    /// watcher. This makes the detached-watcher / repair race deterministic.
+    pub pause_opencode_stop_after_confirm: Option<std::sync::Arc<tokio::sync::Notify>>,
+    pub release_opencode_stop_after_confirm: Option<std::sync::Arc<tokio::sync::Semaphore>>,
     /// Make the NEXT `start_target` fail before spawning anything.
     pub fail_target_spawn_once: std::sync::atomic::AtomicBool,
     /// b8ke e4r2 F3: park `broadcast_failure_truth` BETWEEN its snapshot
@@ -117,6 +136,8 @@ impl Default for HandoffTestHooks {
     fn default() -> Self {
         Self {
             pause_after_enter: None,
+            pause_abort_cleanup_target_reap: None,
+            abort_cleanup_target_reap_entered: None,
             pause_after_terminal_prior_kill: None,
             pause_in_target_spawn: None,
             pause_in_target_spawn_before_publish: None,
@@ -129,6 +150,10 @@ impl Default for HandoffTestHooks {
             force_unsupported_preflight: std::sync::atomic::AtomicBool::new(false),
             abort_reap_confirmation_once: std::sync::atomic::AtomicBool::new(false),
             drop_abort_target_confirmation_once: std::sync::atomic::AtomicBool::new(false),
+            pause_abort_target_reconfirmation_after_confirm: None,
+            release_abort_target_reconfirmation_after_confirm: None,
+            pause_opencode_stop_after_confirm: None,
+            release_opencode_stop_after_confirm: None,
             fail_target_spawn_once: std::sync::atomic::AtomicBool::new(false),
             pause_in_failure_truth_broadcast: None,
             pause_in_failure_truth_once: std::sync::atomic::AtomicBool::new(false),
@@ -1184,7 +1209,7 @@ impl SessionHandoffRunner {
         if let Some((owner, _)) = prior.as_ref() {
             guard.prior_stop = PriorStopPhase::KillInFlight;
             match self
-                .stop_runtime(&req, owner, &initiator, &operation_id, generation)
+                .stop_runtime(&req, owner, &initiator, &operation_id, generation, false)
                 .await
             {
                 StopOutcomePriv::Reaped => {
@@ -2157,12 +2182,14 @@ impl SessionHandoffRunner {
             .repair_failed_transition(provider, session_id, operation_id, epoch, generation)
             .await
         {
+            let ownership_state = self.ownership.observe(provider, session_id).state;
             tracing::error!(target: "invariant",
                 provider = %provider, session_id = %session_id,
                 operation_id = %operation_id, epoch, generation, error = %err,
+                ownership_state = ?ownership_state,
                 event = "ownership.handoff.failed_transition_repair_write_failed",
-                "the failed transition's durable ledger repair could not land; \
-                 the coordinator key remains fenced and cannot be released (Task 3)"
+                "the failed transition's durable ledger repair did not land; \
+                 the ownership claim must stay held"
             );
             return false;
         }
@@ -2293,6 +2320,7 @@ impl SessionHandoffRunner {
                         "handoff-runner-stale-commit",
                         operation_id,
                         generation,
+                        true,
                     )
                     .await;
                 // b8ke focused ep5 r4 F1: the FAILED-TRANSITION REPAIR —
@@ -2471,6 +2499,14 @@ impl SessionHandoffRunner {
             pid: None,
             ownership_id: None,
         });
+        if let Some(hooks) = self.test_hooks.as_ref() {
+            if let Some(pause) = hooks.pause_abort_cleanup_target_reap.as_ref() {
+                if let Some(entered) = hooks.abort_cleanup_target_reap_entered.as_ref() {
+                    entered.notify_one();
+                }
+                let _ = pause.notified().await;
+            }
+        }
         let target_outcome = self.abort_reap_uncommitted_target(&payload).await;
         let confirmed_live = match prior.as_ref() {
             Some((owner, _)) => {
@@ -2824,13 +2860,42 @@ impl SessionHandoffRunner {
             } else {
                 Box::pin(self.prior_death_reconfirmation(provider, session_id, &probe_target))
             };
-        self.spawn_reap_confirmation_watcher(
+        // Test-only parking point, deliberately after the real lane/terminal
+        // probe has confirmed the exact target and before the shared watcher
+        // is allowed to release ownership. The gate is inert in production.
+        let confirmation = if let Some(hooks) = self.test_hooks.as_ref() {
+            match (
+                hooks
+                    .pause_abort_target_reconfirmation_after_confirm
+                    .clone(),
+                hooks
+                    .release_abort_target_reconfirmation_after_confirm
+                    .clone(),
+            ) {
+                (Some(entered), Some(release)) => Box::pin(async move {
+                    let answer = confirmation.await;
+                    if matches!(&answer, ReapAnswer::Confirmed) {
+                        entered.notify_one();
+                        if let Ok(permit) = release.acquire().await {
+                            permit.forget();
+                        }
+                    }
+                    answer
+                })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = ReapAnswer> + Send>>,
+                _ => confirmation,
+            }
+        } else {
+            confirmation
+        };
+        self.spawn_reap_confirmation_watcher_with_repair(
             &cleanup_req,
             operation_id,
             *generation,
             "handoff-guard-cleanup",
             &probe_target,
             "RUNNER_ABORTED",
+            true,
             confirmation,
         );
     }
@@ -3300,6 +3365,7 @@ impl SessionHandoffRunner {
         initiator: &str,
         operation_id: &str,
         generation: u64,
+        repair_failed_target: bool,
     ) -> StopOutcomePriv {
         if let Some(outcome) = self.forced_stop_outcome(req, owner, operation_id, generation) {
             return outcome;
@@ -3441,9 +3507,23 @@ impl SessionHandoffRunner {
                     "opencode" => {
                         let lane = self.fresh_opencode.clone();
                         let initiator = initiator.clone();
+                        let pause_after_confirm = self.test_hooks.as_ref().and_then(|hooks| {
+                            Some((
+                                hooks.pause_opencode_stop_after_confirm.clone()?,
+                                hooks.release_opencode_stop_after_confirm.clone()?,
+                            ))
+                        });
                         Box::pin(async move {
-                            lane.opencode_kill_for_handoff(&session_id, &initiator)
-                                .await
+                            let result = lane
+                                .opencode_kill_for_handoff(&session_id, &initiator)
+                                .await;
+                            if let Some((entered, release)) = pause_after_confirm {
+                                entered.notify_one();
+                                if let Ok(permit) = release.acquire().await {
+                                    permit.forget();
+                                }
+                            }
+                            result
                         })
                     }
                     _ => return StopOutcomePriv::Reaped,
@@ -3479,13 +3559,14 @@ impl SessionHandoffRunner {
                         }
                         StopResult::NotConfirmed { confirmation } => {
                             self.broadcast_fenced_reap_timeout(req, owner, operation_id, generation);
-                            self.spawn_reap_confirmation_watcher(
+                            self.spawn_reap_confirmation_watcher_with_repair(
                                 req,
                                 operation_id,
                                 generation,
                                 &initiator,
                                 owner,
                                 "REAP_TIMEOUT",
+                                repair_failed_target,
                                 async move {
                                     if confirmation.await {
                                         ReapAnswer::Confirmed
@@ -3501,13 +3582,14 @@ impl SessionHandoffRunner {
                         self.broadcast_fenced_reap_timeout(req, owner, operation_id, generation);
                         let confirmation = tokio::spawn(kill);
                         let hooks = self.test_hooks.clone();
-                        self.spawn_reap_confirmation_watcher(
+                        self.spawn_reap_confirmation_watcher_with_repair(
                             req,
                             operation_id,
                             generation,
                             &initiator,
                             owner,
                             "REAP_TIMEOUT",
+                            repair_failed_target,
                             async move {
                                 // b8ke focused FR6's test seam: the armed hook
                                 // aborts the spawned teardown task — a REAL
@@ -3655,6 +3737,33 @@ impl SessionHandoffRunner {
         release_reason: &'static str,
         confirmation: impl std::future::Future<Output = ReapAnswer> + Send + 'static,
     ) {
+        self.spawn_reap_confirmation_watcher_with_repair(
+            req,
+            operation_id,
+            generation,
+            initiator,
+            prior,
+            release_reason,
+            false,
+            confirmation,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Reap watcher shared by prior-owner and failed-target cleanup. For an
+    /// uncommitted fresh-agent target, exact durable repair joins confirmed
+    /// death as a condition for releasing its operation fence.
+    fn spawn_reap_confirmation_watcher_with_repair(
+        self: &Arc<Self>,
+        req: &HandoffRequest,
+        operation_id: &str,
+        generation: u64,
+        initiator: &str,
+        prior: &OwnerIdentity,
+        release_reason: &'static str,
+        repair_failed_target: bool,
+        confirmation: impl std::future::Future<Output = ReapAnswer> + Send + 'static,
+    ) {
         let runner = Arc::clone(self);
         let provider = req.provider.clone();
         let session_id = req.session_id.clone();
@@ -3665,7 +3774,30 @@ impl SessionHandoffRunner {
         let broadcast_req = self.cleanup_request(&provider, &session_id, req.target_kind);
         let settled = std::time::Instant::now();
         tokio::spawn(async move {
-            match confirmation.await {
+            let answer = confirmation.await;
+            if repair_failed_target
+                && matches!(&answer, ReapAnswer::Confirmed)
+                && !runner
+                    .repair_failed_transition_binding_row(
+                        &provider,
+                        &session_id,
+                        &operation_id,
+                        generation,
+                    )
+                    .await
+            {
+                let ownership_state = runner.ownership.observe(&provider, &session_id).state;
+                tracing::error!(target: "freshell_ownership",
+                    event = "ownership.handoff.reap_watcher_repair_failed_held",
+                    operation_id = %operation_id, provider = %provider, session_id = %session_id,
+                    epoch = runner.ownership.boot_epoch(), generation,
+                    ownership_state = ?ownership_state,
+                    "the target's death was confirmed but its exact durable repair failed; \
+                     the ownership claim remains held"
+                );
+                return;
+            }
+            match answer {
                 ReapAnswer::Lost => {
                     // R2-1: the confirmation future was lost — FENCE with
                     // the typed WatcherFailed reason (never a fail-open to
@@ -3723,13 +3855,14 @@ impl SessionHandoffRunner {
                     // resolve Lost or PlatformLimited).
                     let replacement =
                         runner.prior_death_reconfirmation(&provider, &session_id, &prior);
-                    runner.spawn_reap_confirmation_watcher(
+                    runner.spawn_reap_confirmation_watcher_with_repair(
                         &broadcast_req,
                         &operation_id,
                         generation,
                         &initiator,
                         &prior,
                         "WATCHER_FAILED",
+                        repair_failed_target,
                         replacement,
                     );
                     // The replacement watcher owns the release from here —

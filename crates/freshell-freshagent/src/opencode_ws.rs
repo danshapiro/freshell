@@ -1646,6 +1646,21 @@ impl FreshOpencodeState {
         Ok(())
     }
 
+    /// Capture the exact current settled owner for an ordinary durable-row
+    /// refresh. The identity sink revalidates this immutable claim at the
+    /// write boundary; a handler must never infer authority from the ledger
+    /// row or let a delayed writer borrow a later owner's identity.
+    fn current_live_binding_claim(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::identity_sink::BindingClaim> {
+        self.fresh_agent.ownership.as_ref().and_then(|registry| {
+            crate::identity_sink::BindingClaim::current_live_fresh_agent(
+                registry, PROVIDER, session_id,
+            )
+        })
+    }
+
     /// Retire-on-kill round 2/3 (focused-ep5-r1 Finding 2, -r2 Finding 4),
     /// the claim lifecycle's COMMIT: an explicit resume/attach of a durable
     /// `ses_*` id is a NEW pane GENUINELY CLAIMING that identity — invoked
@@ -3317,38 +3332,48 @@ impl FreshOpencodeState {
         // model/effort re-snapshot the binding row (AWAITED BEFORE send.accepted --
         // durable-before-answer). No pending resolution or supersession here.
         if acked_session_id.starts_with("ses_") {
-            // D8: same session-carried stamps (a per-send refresh re-asserts
-            // them via `Replace`; a conn-less refresh lane carries `None` →
-            // `Inherit` and the ledger merge preserves them).
-            let _ = self
-                .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
-                    genesis: crate::identity_sink::GenesisUpdate::Keep,
-                    provider: PROVIDER.into(),
-                    session_id: acked_session_id.clone(),
-                    mode: SESSION_TYPE.into(),
-                    create_request_id: None,
-                    resolves_pending: None,
-                    supersedes: None,
-                    // Unified agent names: no naming fact on this ledger edge.
-                    name_transition: None,
-                    provenance: session.provenance.clone().into(),
-                    observed_epoch: None,
-                    observed_generation: None,
-                    // b8ke focused ep5 r2 F1: a lane write.
-                    claim: None,
-                    settings: crate::identity_sink::SettingsUpdate::Replace(
-                        crate::identity_sink::FreshAgentSettings {
-                            collaboration_mode: None,
-                            model: session.model.clone(),
-                            sandbox: None,
-                            permission_mode: None,
-                            effort: session.effort.clone(),
-                            cwd: session.cwd.clone(),
-                            plugins: None,
-                        },
-                    ),
-                })
-                .await;
+            // A per-send refresh carries the exact settled owner claim and
+            // pair captured from the coordinator. A claimless write here
+            // could be mistaken for the failed operation's delayed write at
+            // the same generation, so a configured coordinator with no Live
+            // fresh-agent owner skips this persistence edge.
+            let binding_claim = self.current_live_binding_claim(&acked_session_id);
+            if self.fresh_agent.ownership.is_some() && binding_claim.is_none() {
+                tracing::warn!(target: "freshell_freshagent::opencode",
+                    session_id = %acked_session_id,
+                    request_id = ?request_id,
+                    "freshagent.opencode.send_settings_refresh_skipped: no exact current +                     live owner is available to authorize the durable refresh"
+                );
+            } else {
+                let _ = self
+                    .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                        genesis: crate::identity_sink::GenesisUpdate::Keep,
+                        provider: PROVIDER.into(),
+                        session_id: acked_session_id.clone(),
+                        mode: SESSION_TYPE.into(),
+                        create_request_id: None,
+                        resolves_pending: None,
+                        supersedes: None,
+                        // Unified agent names: no naming fact on this ledger edge.
+                        name_transition: None,
+                        provenance: session.provenance.clone().into(),
+                        observed_epoch: binding_claim.as_ref().map(|claim| claim.epoch),
+                        observed_generation: binding_claim.as_ref().map(|claim| claim.generation),
+                        claim: binding_claim,
+                        settings: crate::identity_sink::SettingsUpdate::Replace(
+                            crate::identity_sink::FreshAgentSettings {
+                                collaboration_mode: None,
+                                model: session.model.clone(),
+                                sandbox: None,
+                                permission_mode: None,
+                                effort: session.effort.clone(),
+                                cwd: session.cwd.clone(),
+                                plugins: None,
+                            },
+                        ),
+                    })
+                    .await;
+            }
         }
 
         // A send whose settings CHANGED the session record converges every
@@ -3809,6 +3834,26 @@ impl FreshOpencodeState {
             // Idempotent configure: nothing to converge.
             return;
         }
+        let durable_id = session.real_session_id.clone();
+        let binding_claim = if let Some(durable_id) = durable_id.as_deref() {
+            let claim = self.current_live_binding_claim(durable_id);
+            if self.fresh_agent.ownership.is_some() && claim.is_none() {
+                tracing::warn!(target: "freshell_freshagent::opencode",
+                    session_id = %durable_id,
+                    "freshagent.opencode.configure_refused: no exact current live owner +                     is available to authorize the durable settings refresh"
+                );
+                drop(session);
+                self.emit_fresh_agent_error(
+                    &session_id,
+                    "SESSION_RESERVED",
+                    "A lifecycle operation owns this session; retry after it settles",
+                );
+                return;
+            }
+            claim
+        } else {
+            None
+        };
         session.model = model.clone();
         session.effort = effort.clone();
 
@@ -3816,7 +3861,6 @@ impl FreshOpencodeState {
         // same per-send refresh `handle_send` performs — durable before the
         // broadcast). A configure for a placeholder has no row yet; the
         // materialization write will carry the staged pair.
-        let durable_id = session.real_session_id.clone();
         let provenance = session.provenance.clone();
         let cwd = session.cwd.clone();
         drop(session);
@@ -3833,9 +3877,9 @@ impl FreshOpencodeState {
                     // Unified agent names: no naming fact on this ledger edge.
                     name_transition: None,
                     provenance: provenance.into(),
-                    observed_epoch: None,
-                    observed_generation: None,
-                    claim: None,
+                    observed_epoch: binding_claim.as_ref().map(|claim| claim.epoch),
+                    observed_generation: binding_claim.as_ref().map(|claim| claim.generation),
+                    claim: binding_claim,
                     settings: crate::identity_sink::SettingsUpdate::Replace(
                         crate::identity_sink::FreshAgentSettings {
                             collaboration_mode: None,

@@ -365,6 +365,7 @@ struct Rig {
     ownership: Arc<RuntimeOwnershipRegistry>,
     registry: freshell_terminal::TerminalRegistry,
     fresh_claude: crate::FreshClaudeState,
+    fresh_codex: crate::FreshCodexState,
     fresh_opencode: crate::FreshOpencodeState,
     fresh_agent: crate::FreshAgentState,
     rx: tokio::sync::broadcast::Receiver<String>,
@@ -560,7 +561,7 @@ fn build_rig_inner(
         broadcast_tx,
         Arc::clone(&ownership),
         registry.clone(),
-        fresh_codex,
+        fresh_codex.clone(),
         fresh_claude.clone(),
         fresh_opencode.clone(),
         fresh_agent.clone(),
@@ -576,6 +577,7 @@ fn build_rig_inner(
         ownership,
         registry,
         fresh_claude,
+        fresh_codex,
         fresh_opencode,
         fresh_agent,
         rx,
@@ -4537,6 +4539,261 @@ async fn a_codex_handoff_on_an_old_rebound_reference_resolves_the_permanent_alia
         OwnershipState::Aliased { to, .. } if to == new_tid
     ));
     rig.registry.kill(&terminal_id);
+}
+
+/// A canceled under-ticket Codex resume can be removed by its own registered
+/// startup guard before the handoff abort cleanup reaches the session map.
+/// While exact tree death is still being checked, neither the Handoff fence
+/// nor the failed-transition repair may release the key to another writer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn canceled_codex_under_ticket_handoff_joins_registered_startup_cleanup() {
+    let _guard = ENV_LOCK.lock().await;
+    let _codex_env = crate::codex::tests::ENV_LOCK.lock().await;
+    crate::codex::tests::configure_fake_codex_cmd("{}");
+
+    let session_id = format!("c1-under-ticket-{}", uuid::Uuid::new_v4());
+    let abort_cleanup_entered = Arc::new(tokio::sync::Notify::new());
+    let abort_cleanup_release = Arc::new(tokio::sync::Notify::new());
+    let hooks = Arc::new(HandoffTestHooks {
+        pause_abort_cleanup_target_reap: Some(Arc::clone(&abort_cleanup_release)),
+        abort_cleanup_target_reap_entered: Some(Arc::clone(&abort_cleanup_entered)),
+        ..HandoffTestHooks::default()
+    });
+    let rig = build_rig(Some(hooks));
+    let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+    rig.fresh_codex.set_identity_sink(sink.clone());
+
+    let binding_stall = sink.arm_binding_stall("codex", &session_id);
+    let binding_stall_entered = binding_stall.entered;
+    let _binding_stall_release = binding_stall.release;
+    let mut repair_barrier = sink.arm_repair_barrier("codex", &session_id);
+    let (probe_entered_tx, mut probe_entered_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::session_lease::CondemnedRuntimeIdentity>();
+    let (probe_release_tx, probe_release_rx) = tokio::sync::watch::channel(false);
+    rig.fresh_codex
+        .set_sidecar_cleanup_probe(Arc::new(move |recorded| {
+            let entered = probe_entered_tx.clone();
+            let mut release = probe_release_rx.clone();
+            Box::pin(async move {
+                let _ = entered.send(recorded.clone());
+                while !*release.borrow() {
+                    if release.changed().await.is_err() {
+                        return Ok(false);
+                    }
+                }
+                Ok(crate::session_lease::kill_and_confirm_recorded_tree_dead(
+                    &recorded,
+                    "FRESHELL_CODEX_SIDECAR_ID",
+                )
+                .await)
+            })
+        }));
+
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_fresh("codex", &session_id, "freshcodex"));
+    tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::task::spawn_blocking(move || {
+            binding_stall_entered.recv_timeout(Duration::from_secs(15))
+        })
+        .await
+        .expect("binding stall waiter joined")
+        .expect("the binding write reached the fake sink")
+    })
+    .await
+    .expect("the target reaches its durable binding write");
+
+    let snapshot = rig.ownership.observe("codex", &session_id);
+    let (operation_id, generation) = match snapshot.state {
+        OwnershipState::Handoff {
+            operation_id,
+            generation,
+            to_kind: RuntimeOwnerKind::FreshAgent,
+            prior: None,
+            ..
+        } => (operation_id, generation),
+        other => panic!("the from-vacant target is under its own Handoff ticket: {other:?}"),
+    };
+    let binding_key = ("codex".to_string(), session_id.clone());
+    assert_eq!(
+        sink.binding_pairs.lock().unwrap().get(&binding_key),
+        Some(&(Some(snapshot.epoch), Some(generation))),
+        "the under-ticket binding carries the exact handoff fence pair"
+    );
+
+    // Cancel the real runner while its target resume is parked after session
+    // registration. Hold abort cleanup so the provider-owned registered
+    // startup guard deterministically removes the target first.
+    handle.abort();
+    assert!(handle.task.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(Duration::from_secs(10), abort_cleanup_entered.notified())
+        .await
+        .expect("the detached abort cleanup reached its test pause");
+
+    // The canceled provider operation has now removed the registered map
+    // entry and is waiting inside its exact native-tree confirmation probe.
+    let recorded = tokio::time::timeout(Duration::from_secs(10), probe_entered_rx.recv())
+        .await
+        .expect("registered startup cleanup enters exact death confirmation")
+        .expect("the probe reports the condemned Codex runtime");
+    assert!(
+        !crate::ownership_lane::partial_pid_confirmed_dead(recorded.pid),
+        "the fixture keeps the exact Codex writer alive while confirmation is held"
+    );
+    assert!(
+        !rig.fresh_codex.has_live_session(&session_id).await,
+        "the registered startup cleanup removed its exact session-map entry"
+    );
+    assert!(sink.repairs.lock().unwrap().is_empty());
+    assert!(matches!(
+        rig.ownership.observe("codex", &session_id).state,
+        OwnershipState::Handoff { .. }
+    ));
+
+    // Let the actual handoff abort cleanup query the now-absent session. The
+    // exact repair is held so we can prove that its result alone cannot
+    // release the ownership record while native death is still unconfirmed.
+    abort_cleanup_release.notify_one();
+    let mut repair_started_before_native_death = false;
+    let state_before_repair = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let state = rig.ownership.observe("codex", &session_id).state;
+            match repair_barrier.entered.try_recv() {
+                Ok(()) => {
+                    repair_started_before_native_death = true;
+                    break state;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("the exact repair barrier disconnected")
+                }
+            }
+            if matches!(
+                state,
+                OwnershipState::Fenced { .. } | OwnershipState::Vacant
+            ) {
+                break state;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("abort cleanup either begins repair or fences");
+    let competing_start_before_repair = rig.ownership.begin_start(
+        "codex",
+        &session_id,
+        RuntimeOwnerKind::FreshAgent,
+        "c1-competing-start-before-repair",
+        None,
+        "test",
+        0,
+    );
+    if let BeginOutcome::Granted { generation } = &competing_start_before_repair {
+        let _ = rig.ownership.fail(
+            "codex",
+            &session_id,
+            "c1-competing-start-before-repair",
+            *generation,
+            false,
+        );
+    }
+
+    // Finish repair while the death probe is still held. The fixed path
+    // keeps a typed fence naming this exact target; the old AlreadyGone
+    // result instead released to Vacant and admitted a competing start.
+    repair_barrier.release.send(true).unwrap();
+    let state_after_repair_before_death = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let state = rig.ownership.observe("codex", &session_id).state;
+            if matches!(
+                state,
+                OwnershipState::Fenced { .. } | OwnershipState::Vacant
+            ) {
+                break state;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("repair settles to a fence or premature vacancy");
+    let competing_start_before_death = rig.ownership.begin_start(
+        "codex",
+        &session_id,
+        RuntimeOwnerKind::FreshAgent,
+        "c1-competing-start-before-death",
+        None,
+        "test",
+        0,
+    );
+    if let BeginOutcome::Granted { generation } = &competing_start_before_death {
+        let _ = rig.ownership.fail(
+            "codex",
+            &session_id,
+            "c1-competing-start-before-death",
+            *generation,
+            false,
+        );
+    }
+    if matches!(
+        &state_after_repair_before_death,
+        OwnershipState::Fenced { .. }
+    ) {
+        let joined = tokio::time::timeout(Duration::from_secs(10), probe_entered_rx.recv())
+            .await
+            .expect("the replacement watcher re-probes the recorded Codex identity")
+            .expect("the replacement watcher reports the exact runtime");
+        assert_eq!(joined.pid, recorded.pid);
+        assert_eq!(joined.ownership_id, recorded.ownership_id);
+    }
+
+    // Death confirmation is the final release condition after repair.
+    probe_release_tx.send(true).unwrap();
+    await_cond("the exact Codex writer must die", || {
+        crate::ownership_lane::partial_pid_confirmed_dead(recorded.pid)
+    })
+    .await;
+    await_cond(
+        "confirmed death and repair release the failed handoff",
+        || rig.ownership.observe("codex", &session_id).state == OwnershipState::Vacant,
+    )
+    .await;
+    assert!(!rig.fresh_codex.has_live_session(&session_id).await);
+    let expected_repair = (
+        "codex".to_string(),
+        session_id.clone(),
+        operation_id,
+        snapshot.epoch,
+        generation,
+    );
+    assert!(
+        sink.repairs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|repair| repair == &expected_repair),
+        "the exact canceled handoff's durable binding repair must finish"
+    );
+    assert!(
+        matches!(&state_before_repair, OwnershipState::Handoff { .. })
+            && matches!(&competing_start_before_repair, BeginOutcome::Blocked { .. }),
+        "the handoff retains its fence while exact durable repair is pending"
+    );
+    assert!(
+        matches!(
+            &state_after_repair_before_death,
+            OwnershipState::Fenced {
+                reason: FenceReason::WatcherFailed,
+                prior: Some((owner, _)),
+                ..
+            } if owner.kind == RuntimeOwnerKind::FreshAgent
+                && owner.live_session_key.as_deref() == Some(session_id.as_str())
+        ) && matches!(
+            &competing_start_before_death,
+            BeginOutcome::Blocked { .. }
+        ),
+        "repair alone cannot release the exact Codex target's fence while its writer is alive: state={state_after_repair_before_death:?}, competing={competing_start_before_death:?}, early_repair={repair_started_before_native_death}"
+    );
+    rig.fresh_codex.shutdown().await;
 }
 
 /// b8ke ext r34 F1: the SERVER-side per-code pin — every real
@@ -8898,6 +9155,7 @@ async fn the_prior_stop_never_confirms_on_a_missing_row() {
             "test",
             "op-r6-f2",
             1,
+            false,
         )
         .await;
     assert!(
@@ -8930,6 +9188,7 @@ async fn the_prior_stop_never_confirms_on_a_missing_row() {
             "test",
             "op-r6-f2-dead",
             2,
+            false,
         )
         .await;
     assert!(

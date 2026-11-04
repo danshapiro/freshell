@@ -764,6 +764,10 @@ pub struct FreshCodexState {
     sidecar_cleanup_probe: Arc<std::sync::OnceLock<CodexSidecarCleanupProbe>>,
     #[cfg(any(test, feature = "test-support"))]
     sidecar_capture_observer: Arc<std::sync::OnceLock<CodexSidecarCaptureObserver>>,
+    /// Deterministic pause before native session-map registration so tests
+    /// can cancel while the startup guard is waiting for the sessions lock.
+    #[cfg(any(test, feature = "test-support"))]
+    session_registration_pause: Arc<StdMutex<Option<SessionRegistrationPauseHook>>>,
     /// Unified agent names: thread id → the pre-durable naming handle
     /// admitted at create. A `thread/start` id/path is PROSPECTIVE (the
     /// rollout hasn't materialized), so the handle stays pending and the
@@ -796,6 +800,13 @@ pub struct FreshCodexState {
 /// in the `TerminalLivenessProbe` injection idiom, never env vars.
 pub type SnapshotPauseHook =
     std::sync::Arc<dyn Fn(&str) -> futures_util::future::BoxFuture<'static, ()> + Send + Sync>;
+
+#[cfg(any(test, feature = "test-support"))]
+type SessionRegistrationPauseHook = std::sync::Arc<
+    dyn Fn(String, Option<u32>, String) -> futures_util::future::BoxFuture<'static, ()>
+        + Send
+        + Sync,
+>;
 
 /// A hosted runtime reads private native metadata as the provider identity.
 /// The initialized root and exact thread ID remain the proof inputs.
@@ -1177,6 +1188,8 @@ impl FreshCodexState {
             sidecar_cleanup_probe: Arc::new(std::sync::OnceLock::new()),
             #[cfg(any(test, feature = "test-support"))]
             sidecar_capture_observer: Arc::new(std::sync::OnceLock::new()),
+            #[cfg(any(test, feature = "test-support"))]
+            session_registration_pause: Arc::new(StdMutex::new(None)),
             naming_handles: Arc::new(TokioMutex::new(HashMap::new())),
             snapshot_pause: Arc::new(StdMutex::new(None)),
             snapshot_pause_after_capture: Arc::new(StdMutex::new(None)),
@@ -1200,6 +1213,36 @@ impl FreshCodexState {
 
     pub fn set_sidecar_cleanup_probe(&self, probe: CodexSidecarCleanupProbe) {
         let _ = self.sidecar_cleanup_probe.set(probe);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_session_registration_pause_for_tests(&self, hook: SessionRegistrationPauseHook) {
+        *self
+            .session_registration_pause
+            .lock()
+            .expect("session registration pause lock") = Some(hook);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    async fn pause_before_session_registration_for_tests(
+        &self,
+        thread_id: &str,
+        sidecar_pid: Option<u32>,
+        sidecar_ownership_id: &str,
+    ) {
+        let hook = self
+            .session_registration_pause
+            .lock()
+            .expect("session registration pause lock")
+            .clone();
+        if let Some(hook) = hook {
+            hook(
+                thread_id.to_string(),
+                sidecar_pid,
+                sidecar_ownership_id.to_string(),
+            )
+            .await;
+        }
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1749,9 +1792,40 @@ impl FreshCodexState {
         let id = session_id.to_string();
         let runtime_id = runtime_id.to_string();
         guard.settle_startup_before_repair(async move {
+            let mut recorded = recorded;
             let session = {
                 let mut sessions = state.sessions.lock().await;
-                if sessions.get(&id).is_some_and(|s| s.sidecar_ownership_id == runtime_id) {
+                let exact_target_present = sessions.get(&id).is_some_and(|session| {
+                    session.sidecar_ownership_id == runtime_id
+                });
+                let target_already_absent = !sessions.contains_key(&id);
+                if exact_target_present || target_already_absent {
+                    if exact_target_present {
+                        recorded = recorded.clone().or_else(|| {
+                            sessions.get(&id).and_then(|session| {
+                                session.sidecar_pid.map(|pid| {
+                                    crate::session_lease::record_condemned_runtime_identity(
+                                        pid,
+                                        CODEX_SIDECAR_OWNERSHIP_ENV,
+                                        &runtime_id,
+                                    )
+                                })
+                            })
+                        });
+                    }
+                    // Publish the exact condemned tree before the session
+                    // map entry disappears. A handoff cleanup racing this
+                    // guard must join the same native death proof instead
+                    // of interpreting an empty map as confirmed death.
+                    if let Some(witness) = recorded.clone() {
+                        retain_codex_condemned_prior_if_current(
+                            &state.condemned_priors,
+                            &id,
+                            witness,
+                        );
+                    }
+                }
+                if exact_target_present {
                     sessions.remove(&id)
                 } else {
                     None
@@ -1780,6 +1854,7 @@ impl FreshCodexState {
                     "freshagent.codex.canceled_startup_unconfirmed: retaining ownership until writer death is proven");
                 std::future::pending::<()>().await;
             }
+            state.clear_condemned_prior_if_matching(&id, &runtime_id);
             state.leases.clear_binding_if_matches(PROVIDER, &id, &id, &runtime_id);
         });
         guard
@@ -3770,6 +3845,34 @@ impl FreshCodexState {
             Some(self.clone()),
         );
 
+        let (binding_epoch, binding_generation) =
+            match (self.ownership.as_ref(), own_ticket.as_ref()) {
+                (Some(registry), Some(ticket)) => {
+                    (Some(registry.boot_epoch()), Some(ticket.generation()))
+                }
+                _ => (None, None),
+            };
+        let binding_claim = own_ticket.as_ref().and_then(|ticket| {
+            crate::identity_sink::BindingClaim::from_ticket(
+                ticket,
+                crate::identity_sink::BindingClaimKind::Starting,
+            )
+        });
+        let mut binding_guard = Some(self.registered_binding_guard(
+            own_ticket.take(),
+            binding_claim.clone(),
+            &thread_id,
+            &sidecar_ownership_id,
+            sidecar_pid,
+        ));
+
+        #[cfg(any(test, feature = "test-support"))]
+        self.pause_before_session_registration_for_tests(
+            &thread_id,
+            sidecar_pid,
+            &sidecar_ownership_id,
+        )
+        .await;
         self.sessions.lock().await.insert(
             thread_id.clone(),
             CodexSession {
@@ -3824,15 +3927,15 @@ impl FreshCodexState {
                     "freshagent.codex.claim_late_orphan_torn_down: a close landed between the \
                      claim's commit and its registration; the registered orphan is torn down"
                 );
-                if let Some(session) = self.sessions.lock().await.remove(&thread_id) {
-                    let _ = self
-                        .settle_removed_session(
-                            &thread_id,
-                            session,
-                            own_ticket.take(),
-                            lease_guard.take(),
-                        )
-                        .await;
+                let repaired = binding_guard
+                    .as_mut()
+                    .expect("binding guard is present")
+                    .repair_now()
+                    .await;
+                if repaired {
+                    drop(binding_guard.take().and_then(|guard| guard.finish()));
+                } else {
+                    drop(binding_guard.take());
                 }
                 if let Some(mut g) = lease_guard.take() {
                     g.fail();
@@ -3853,14 +3956,17 @@ impl FreshCodexState {
         // down our own tree and answer failed.
         if let Some(mut g) = lease_guard.take() {
             if !g.complete(&thread_id) {
-                if let Some(session) = self.sessions.lock().await.remove(&thread_id) {
-                    let _ = self
-                        .settle_removed_session(&thread_id, session, own_ticket.take(), Some(g))
-                        .await;
+                let repaired = binding_guard
+                    .as_mut()
+                    .expect("binding guard is present")
+                    .repair_now()
+                    .await;
+                if repaired {
+                    drop(binding_guard.take().and_then(|guard| guard.finish()));
                 } else {
-                    g.fail();
-                    drop(own_ticket.take());
+                    drop(binding_guard.take());
                 }
+                g.fail();
                 // Finding 5's re-raise: a committed claim (the resume lane)
                 // that gets torn down here dies again — restore the close's
                 // durable record (fence re-raised, the revived row
@@ -3887,27 +3993,6 @@ impl FreshCodexState {
         // b8ke ext r22 F2: the binding row's fence pair — the pre-commit
         // ticket's generation (the delayed-write fence baseline the durable
         // row carries below).
-        let (binding_epoch, binding_generation) =
-            match (self.ownership.as_ref(), own_ticket.as_ref()) {
-                (Some(registry), Some(ticket)) => {
-                    (Some(registry.boot_epoch()), Some(ticket.generation()))
-                }
-                _ => (None, None),
-            };
-        let binding_claim = own_ticket.as_ref().and_then(|ticket| {
-            crate::identity_sink::BindingClaim::from_ticket(
-                ticket,
-                crate::identity_sink::BindingClaimKind::Starting,
-            )
-        });
-        let mut binding_guard = Some(self.registered_binding_guard(
-            own_ticket.take(),
-            binding_claim.clone(),
-            &thread_id,
-            &sidecar_ownership_id,
-            sidecar_pid,
-        ));
-
         // P1.13 identity event (Task 4): the ledger binding row for this create,
         // AWAITED before the `freshAgent.created` reply below goes out
         // (durable-before-answer). Covers both the healthy create and the
@@ -6587,6 +6672,20 @@ impl FreshCodexState {
             collaboration_mode: parent_collaboration_mode,
         } = effective;
 
+        let binding_claim = own_ticket.as_ref().and_then(|ticket| {
+            crate::identity_sink::BindingClaim::from_ticket(
+                ticket,
+                crate::identity_sink::BindingClaimKind::Starting,
+            )
+        });
+        let mut binding_guard = Some(self.registered_binding_guard(
+            own_ticket.take(),
+            binding_claim.clone(),
+            &child_id,
+            &child_ownership_id,
+            child_pid,
+        ));
+
         // Register the child on its OWN sidecar (the shared registration tail, the
         // ensure_session_resumable shape), inheriting the parent's settings. The
         // child rollout's durable session_meta is the history-mode SoT (kata 1wxv
@@ -6618,19 +6717,6 @@ impl FreshCodexState {
         // never the parent's stale park when the fork came from another tab).
         // `None` only when no source knows the attribution (a conn-less,
         // never-stamped parent) — unattributed rather than invented.
-        let binding_claim = own_ticket.as_ref().and_then(|ticket| {
-            crate::identity_sink::BindingClaim::from_ticket(
-                ticket,
-                crate::identity_sink::BindingClaimKind::Starting,
-            )
-        });
-        let mut binding_guard = Some(self.registered_binding_guard(
-            own_ticket.take(),
-            binding_claim.clone(),
-            &child_id,
-            &child_ownership_id,
-            child_pid,
-        ));
         if let Err(error) = self
             .record_codex_binding(
                 &child_id,
@@ -8601,12 +8687,33 @@ impl FreshCodexState {
             Some(self.clone()),
         );
 
+        let binding_claim = own_ticket.as_ref().and_then(|ticket| {
+            crate::identity_sink::BindingClaim::from_ticket(
+                ticket,
+                crate::identity_sink::BindingClaimKind::Starting,
+            )
+        });
+        let mut binding_guard = Some(self.registered_binding_guard(
+            own_ticket.take(),
+            binding_claim.clone(),
+            session_id,
+            &sidecar_ownership_id,
+            sidecar_pid,
+        ));
+
         // `HashMap::insert` on an existing key overwrites in place, dropping the old (dead
         // sidecar's) entry -- same convention `respawn_as_new_thread_after_crash` and
         // `ensure_session_resumable` both already rely on; its `consumer`/`watcher`
         // `JoinHandle`s are not aborted, they simply run to completion on their own (the old
         // notification stream is closed, and the old watcher already fired the self-heal
         // broadcast that got us here).
+        #[cfg(any(test, feature = "test-support"))]
+        self.pause_before_session_registration_for_tests(
+            session_id,
+            sidecar_pid,
+            &sidecar_ownership_id,
+        )
+        .await;
         {
             let mut guard = self.sessions.lock().await;
             guard.insert(
@@ -8657,19 +8764,6 @@ impl FreshCodexState {
         // Persist the recovered identity while the exact Starting ticket is
         // still held. A failed or canceled write must repair this operation's
         // row before another owner can take over the key.
-        let binding_claim = own_ticket.as_ref().and_then(|ticket| {
-            crate::identity_sink::BindingClaim::from_ticket(
-                ticket,
-                crate::identity_sink::BindingClaimKind::Starting,
-            )
-        });
-        let mut binding_guard = Some(self.registered_binding_guard(
-            own_ticket.take(),
-            binding_claim.clone(),
-            session_id,
-            &sidecar_ownership_id,
-            sidecar_pid,
-        ));
         if let Err(error) = self
             .record_codex_binding(
                 session_id,
@@ -8990,6 +9084,27 @@ impl FreshCodexState {
             Some(self.clone()),
         );
 
+        let binding_claim = own_ticket.as_ref().and_then(|ticket| {
+            crate::identity_sink::BindingClaim::from_ticket(
+                ticket,
+                crate::identity_sink::BindingClaimKind::Starting,
+            )
+        });
+        let mut binding_guard = Some(self.registered_binding_guard(
+            own_ticket.take(),
+            binding_claim.clone(),
+            &new_thread_id,
+            &sidecar_ownership_id,
+            sidecar_pid,
+        ));
+
+        #[cfg(any(test, feature = "test-support"))]
+        self.pause_before_session_registration_for_tests(
+            &new_thread_id,
+            sidecar_pid,
+            &sidecar_ownership_id,
+        )
+        .await;
         {
             let mut guard = self.sessions.lock().await;
             guard.remove(old_session_id);
@@ -9034,12 +9149,6 @@ impl FreshCodexState {
 
         // Persist the new key's identity before it becomes Live. The exact
         // Starting ticket fences cancellation and stale delayed writes.
-        let binding_claim = own_ticket.as_ref().and_then(|ticket| {
-            crate::identity_sink::BindingClaim::from_ticket(
-                ticket,
-                crate::identity_sink::BindingClaimKind::Starting,
-            )
-        });
         let settings = crate::identity_sink::FreshAgentSettings {
             collaboration_mode: collaboration_mode.map(|mode| mode.as_str().into()),
             model: (!model.is_empty()).then(|| model.clone()),
@@ -9054,13 +9163,6 @@ impl FreshCodexState {
         } else {
             crate::identity_sink::SettingsUpdate::Replace(settings)
         };
-        let mut binding_guard = Some(self.registered_binding_guard(
-            own_ticket.take(),
-            binding_claim.clone(),
-            &new_thread_id,
-            &sidecar_ownership_id,
-            sidecar_pid,
-        ));
         if let Err(error) = self
             .record_codex_binding(
                 &new_thread_id,
@@ -10812,6 +10914,35 @@ impl FreshCodexState {
         // record's settings snapshot -- blank only when no record was recoverable
         // (never-recorded historical sessions resume on defaults, exactly as before
         // this fix). (Lease completion happens right after the insert -- see below.)
+        let binding_claim = own_ticket
+            .as_ref()
+            .and_then(|ticket| {
+                crate::identity_sink::BindingClaim::from_ticket(
+                    ticket,
+                    crate::identity_sink::BindingClaimKind::Starting,
+                )
+            })
+            .or_else(|| {
+                let (operation_id, handoff_generation) = handoff?;
+                let registry = self.ownership.as_ref()?;
+                Some(crate::identity_sink::BindingClaim::handoff(
+                    PROVIDER,
+                    thread_id,
+                    operation_id,
+                    registry.boot_epoch(),
+                    handoff_generation,
+                ))
+            });
+        let binding_epoch = binding_claim.as_ref().map(|claim| claim.epoch);
+        let binding_generation = binding_claim.as_ref().map(|claim| claim.generation);
+        let mut binding_guard = Some(self.registered_binding_guard(
+            own_ticket.take(),
+            binding_claim.clone(),
+            thread_id,
+            &ownership_id,
+            sidecar_pid,
+        ));
+
         let active_turn = self
             .register_live_session(
                 thread_id,
@@ -10858,15 +10989,15 @@ impl FreshCodexState {
                 "freshagent.codex.claim_late_orphan_torn_down: a close landed between the \
                  claim's commit and its registration; the registered orphan is torn down"
             );
-            if let Some(session) = self.sessions.lock().await.remove(thread_id) {
-                let _ = self
-                    .settle_removed_session(
-                        thread_id,
-                        session,
-                        own_ticket.take(),
-                        lease_guard.take(),
-                    )
-                    .await;
+            let repaired = binding_guard
+                .as_mut()
+                .expect("binding guard is present")
+                .repair_now()
+                .await;
+            if repaired {
+                drop(binding_guard.take().and_then(|guard| guard.finish()));
+            } else {
+                drop(binding_guard.take());
             }
             if let Some(mut g) = lease_guard.take() {
                 g.fail();
@@ -10881,14 +11012,17 @@ impl FreshCodexState {
             if !g.complete(thread_id) {
                 // Revoked mid-resume (expired holder): tear our own session down and
                 // reopen the key -- never keep a session a contender may replace.
-                if let Some(session) = self.sessions.lock().await.remove(thread_id) {
-                    let _ = self
-                        .settle_removed_session(thread_id, session, own_ticket.take(), Some(g))
-                        .await;
+                let repaired = binding_guard
+                    .as_mut()
+                    .expect("binding guard is present")
+                    .repair_now()
+                    .await;
+                if repaired {
+                    drop(binding_guard.take().and_then(|guard| guard.finish()));
                 } else {
-                    g.fail();
-                    drop(own_ticket.take());
+                    drop(binding_guard.take());
                 }
+                g.fail();
                 // Finding 5's re-raise: the ONE post-commit failure arm — the
                 // close the commit undid is durable again (fence re-raised,
                 // the revived row re-retired).
@@ -10919,34 +11053,6 @@ impl FreshCodexState {
         // ticket's RAII drop settles the claim typed), in BOTH modes: the
         // under-ticket failure surfaces to the runner as the typed
         // recoverable handoff failure.
-        let binding_claim = own_ticket
-            .as_ref()
-            .and_then(|ticket| {
-                crate::identity_sink::BindingClaim::from_ticket(
-                    ticket,
-                    crate::identity_sink::BindingClaimKind::Starting,
-                )
-            })
-            .or_else(|| {
-                let (operation_id, handoff_generation) = handoff?;
-                let registry = self.ownership.as_ref()?;
-                Some(crate::identity_sink::BindingClaim::handoff(
-                    PROVIDER,
-                    thread_id,
-                    operation_id,
-                    registry.boot_epoch(),
-                    handoff_generation,
-                ))
-            });
-        let binding_epoch = binding_claim.as_ref().map(|claim| claim.epoch);
-        let binding_generation = binding_claim.as_ref().map(|claim| claim.generation);
-        let mut binding_guard = Some(self.registered_binding_guard(
-            own_ticket.take(),
-            binding_claim.clone(),
-            thread_id,
-            &ownership_id,
-            sidecar_pid,
-        ));
         {
             let settings_update = match recovered.as_ref() {
                 Some(_) => crate::identity_sink::SettingsUpdate::Replace(rec.clone()),
@@ -11151,6 +11257,13 @@ impl FreshCodexState {
             Some(turn_state.clone()),
             Some(self.clone()),
         );
+        #[cfg(any(test, feature = "test-support"))]
+        self.pause_before_session_registration_for_tests(
+            thread_id,
+            sidecar_pid,
+            &sidecar_ownership_id,
+        )
+        .await;
         self.sessions.lock().await.insert(
             thread_id.to_string(),
             CodexSession {
@@ -14647,6 +14760,181 @@ pub(crate) mod tests {
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         st.set_identity_sink(fake.clone());
         (st, rx, fake)
+    }
+
+    type SessionRegistrationPauseChannels = (
+        oneshot::Receiver<(String, Option<u32>, String)>,
+        oneshot::Sender<()>,
+    );
+
+    struct RegistrationCleanupCheck<'a> {
+        state: &'a FreshCodexState,
+        registry: &'a freshell_ownership::RuntimeOwnershipRegistry,
+        id: &'a str,
+        operation_id: &'a str,
+        generation: u64,
+        pid: u32,
+        runtime_id: &'a str,
+        cleanup_entered_rx: &'a mut tokio::sync::mpsc::UnboundedReceiver<
+            crate::session_lease::CondemnedRuntimeIdentity,
+        >,
+        cleanup_completed_rx: &'a mut tokio::sync::mpsc::UnboundedReceiver<bool>,
+        cleanup_release_tx: &'a tokio::sync::watch::Sender<bool>,
+    }
+
+    fn arm_session_registration_pause(state: &FreshCodexState) -> SessionRegistrationPauseChannels {
+        let (registration_tx, registration_rx) =
+            oneshot::channel::<(String, Option<u32>, String)>();
+        let registration_tx = Arc::new(StdMutex::new(Some(registration_tx)));
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let release_rx = Arc::new(StdMutex::new(Some(release_rx)));
+        state.set_session_registration_pause_for_tests(Arc::new(
+            move |thread_id, sidecar_pid, sidecar_ownership_id| {
+                let registration = registration_tx
+                    .lock()
+                    .expect("registration sender lock")
+                    .take();
+                let release = release_rx.lock().expect("registration release lock").take();
+                Box::pin(async move {
+                    if let Some(registration) = registration {
+                        let _ = registration.send((thread_id, sidecar_pid, sidecar_ownership_id));
+                    }
+                    if let Some(release) = release {
+                        let _ = release.await;
+                    }
+                })
+            },
+        ));
+        (registration_rx, release_tx)
+    }
+
+    fn arm_delayed_exact_cleanup(
+        state: &FreshCodexState,
+    ) -> (
+        tokio::sync::mpsc::UnboundedReceiver<crate::session_lease::CondemnedRuntimeIdentity>,
+        tokio::sync::mpsc::UnboundedReceiver<bool>,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (completed_tx, completed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        state.set_sidecar_cleanup_probe(Arc::new(move |recorded| {
+            let entered = entered_tx.clone();
+            let completed = completed_tx.clone();
+            let mut release = release_rx.clone();
+            Box::pin(async move {
+                let _ = entered.send(recorded.clone());
+                while !*release.borrow() {
+                    if release.changed().await.is_err() {
+                        return Ok(false);
+                    }
+                }
+                let confirmed = crate::session_lease::kill_and_confirm_recorded_tree_dead(
+                    &recorded,
+                    CODEX_SIDECAR_OWNERSHIP_ENV,
+                )
+                .await;
+                let _ = completed.send(confirmed);
+                Ok(confirmed)
+            })
+        }));
+        (entered_rx, completed_rx, release_tx)
+    }
+
+    async fn cancel_registration_and_confirm_cleanup<T: Send + 'static>(
+        task: tokio::task::JoinHandle<T>,
+        sessions: tokio::sync::MutexGuard<'_, HashMap<String, CodexSession>>,
+        check: RegistrationCleanupCheck<'_>,
+    ) -> (bool, bool) {
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+
+        let owner_retained = matches!(
+            check.registry.observe(PROVIDER, check.id).state,
+            freshell_ownership::OwnershipState::Starting {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                operation_id: current_operation,
+                generation: current_generation,
+                ..
+            } if current_operation == check.operation_id && current_generation == check.generation
+        );
+        let competitor = check.registry.begin_start(
+            PROVIDER,
+            check.id,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "terminal-during-codex-registration-cleanup",
+            None,
+            "codex-registration-cancellation-test",
+            crate::session_lease::now_epoch_ms(),
+        );
+        let terminal_refused = matches!(
+            &competitor,
+            freshell_ownership::BeginOutcome::Blocked {
+                state: freshell_ownership::OwnershipState::Starting {
+                    operation_id: current_operation,
+                    generation: current_generation,
+                    ..
+                },
+                ..
+            } if current_operation == check.operation_id && *current_generation == check.generation
+        );
+        if let freshell_ownership::BeginOutcome::Granted {
+            generation: competing_generation,
+        } = competitor
+        {
+            let _ = check.registry.fail(
+                PROVIDER,
+                check.id,
+                "terminal-during-codex-registration-cleanup",
+                competing_generation,
+                false,
+            );
+        }
+        drop(sessions);
+
+        let recorded =
+            match tokio::time::timeout(Duration::from_secs(10), check.cleanup_entered_rx.recv())
+                .await
+            {
+                Ok(Some(recorded)) => recorded,
+                _ => {
+                    let recorded = crate::session_lease::record_condemned_runtime_identity(
+                        check.pid,
+                        CODEX_SIDECAR_OWNERSHIP_ENV,
+                        check.runtime_id,
+                    );
+                    assert!(
+                        crate::session_lease::kill_and_confirm_recorded_tree_dead(
+                            &recorded,
+                            CODEX_SIDECAR_OWNERSHIP_ENV,
+                        )
+                        .await
+                    );
+                    panic!("cancellation did not transfer cleanup to the exact-writer probe");
+                }
+            };
+        assert_eq!(recorded.pid, check.pid);
+        assert_eq!(recorded.ownership_id, check.runtime_id);
+        check.cleanup_release_tx.send(true).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), check.cleanup_completed_rx.recv(),)
+                .await
+                .expect("cleanup confirmation settles")
+                .expect("cleanup reports its confirmation"),
+            "the exact native writer must be confirmed dead"
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !matches!(
+                check.registry.observe(PROVIDER, check.id).state,
+                freshell_ownership::OwnershipState::Vacant
+            ) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("confirmed cleanup and durable repair release the startup claim");
+        check.state.shutdown().await;
+        (owner_retained, terminal_refused)
     }
 
     /// Insert a `CodexSession` directly (bypassing the real sidecar spawn `handle_create`
@@ -21572,6 +21860,555 @@ pub(crate) mod tests {
         assert!(!state.sessions.lock().await.contains_key(id));
         assert_eq!(sink.repairs.lock().unwrap().len(), 1);
         state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registered_startup_handoff_cannot_treat_removed_target_as_already_gone() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (mut state, _rx, sink) = state_with_sink();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        state.set_ownership(registry.clone());
+        let id = "registered-startup-handoff-removal-race";
+        let stall = sink.arm_binding_stall(PROVIDER, id);
+
+        let (probe_entered_tx, mut probe_entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (probe_release_tx, probe_release_rx) = oneshot::channel::<()>();
+        let probe_release_rx = Arc::new(TokioMutex::new(Some(probe_release_rx)));
+        state.set_sidecar_cleanup_probe(Arc::new(move |recorded| {
+            let entered = probe_entered_tx.clone();
+            let release = Arc::clone(&probe_release_rx);
+            Box::pin(async move {
+                let _ = entered.send(recorded.clone());
+                let Some(release) = release.lock().await.take() else {
+                    return Ok(false);
+                };
+                if release.await.is_err() {
+                    return Ok(false);
+                }
+                Ok(crate::session_lease::kill_and_confirm_recorded_tree_dead(
+                    &recorded,
+                    CODEX_SIDECAR_OWNERSHIP_ENV,
+                )
+                .await)
+            })
+        }));
+
+        let mut msg = create_msg("registered-startup-handoff-removal-race");
+        msg.resume_session_id = Some(id.into());
+        let st = state.clone();
+        let task = tokio::spawn(async move { st.handle_create(msg, None).await });
+        stall.entered.recv_timeout(Duration::from_secs(15)).unwrap();
+        let sessions = state.sessions.lock().await;
+        let pid = sessions
+            .get(id)
+            .expect("the native writer is already registered")
+            .sidecar_pid
+            .unwrap();
+        assert!(!crate::ownership_lane::partial_pid_confirmed_dead(pid));
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(sessions);
+        let _ = stall.release.send(());
+
+        let recorded = tokio::time::timeout(Duration::from_secs(10), probe_entered_rx.recv())
+            .await
+            .expect("teardown reaches the exact-writer confirmation probe")
+            .expect("probe reports its captured writer identity");
+        assert_eq!(recorded.pid, pid);
+        assert!(
+            !state.sessions.lock().await.contains_key(id),
+            "the cleanup removed its exact target before waiting for death confirmation"
+        );
+
+        // A concurrent under-ticket handoff must not accept `AlreadyGone`
+        // while the registered-startup cleanup still owns an unconfirmed
+        // writer. The captured witness must be published before map removal.
+        let outcome = state
+            .kill_for_handoff(id, "test-registered-startup-race")
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                crate::session_handoff::StopResult::NotConfirmed { .. }
+            ),
+            "the handoff stays fenced on the recorded writer proof, got {outcome:?}"
+        );
+        assert!(matches!(
+            registry.observe(PROVIDER, id).state,
+            freshell_ownership::OwnershipState::Starting { .. }
+        ));
+
+        probe_release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !matches!(
+                registry.observe(PROVIDER, id).state,
+                freshell_ownership::OwnershipState::Vacant
+            ) {
+                assert!(
+                    crate::ownership_lane::partial_pid_confirmed_dead(pid)
+                        || !matches!(
+                            registry.observe(PROVIDER, id).state,
+                            freshell_ownership::OwnershipState::Vacant
+                        ),
+                    "ownership cannot be vacant before the native writer is confirmed dead"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("confirmed teardown repairs the binding and releases the startup claim");
+        assert!(crate::ownership_lane::partial_pid_confirmed_dead(pid));
+        assert_eq!(sink.repairs.lock().unwrap().len(), 1);
+        state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_cancellation_before_session_map_registration_keeps_the_native_claim() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (mut state, _rx, sink) = state_with_sink();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        state.set_ownership(registry.clone());
+
+        let (registration_rx, registration_release_tx) = arm_session_registration_pause(&state);
+        let (mut cleanup_entered_rx, mut cleanup_completed_rx, cleanup_release_tx) =
+            arm_delayed_exact_cleanup(&state);
+
+        let request_id = "create-cancel-before-session-map-registration";
+        let st = state.clone();
+        let task =
+            tokio::spawn(async move { st.handle_create(create_msg(request_id), None).await });
+        let (id, sidecar_pid, sidecar_ownership_id) =
+            tokio::time::timeout(Duration::from_secs(20), registration_rx)
+                .await
+                .expect("create reaches the final session registration edge")
+                .expect("the registration hook reports the exact native identity");
+        let pid = sidecar_pid.expect("the native sidecar has a process id");
+        // The create has passed its incumbent lookup and is parked immediately
+        // before the final map insertion. Holding the map now makes the next
+        // await the real cancellable registration edge.
+        let sessions = state.sessions.lock().await;
+        assert!(
+            !crate::ownership_lane::partial_pid_confirmed_dead(pid),
+            "the exact writer is alive while registration is parked"
+        );
+        let (operation_id, generation) = match registry.observe(PROVIDER, &id).state {
+            freshell_ownership::OwnershipState::Starting {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                operation_id,
+                generation,
+                ..
+            } => (operation_id, generation),
+            other => panic!("create must own its canonical Starting claim: {other:?}"),
+        };
+
+        registration_release_tx.send(()).unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "create remains blocked at session-map registration"
+        );
+
+        let (owner_retained, terminal_refused) = cancel_registration_and_confirm_cleanup(
+            task,
+            sessions,
+            RegistrationCleanupCheck {
+                state: &state,
+                registry: &registry,
+                id: &id,
+                operation_id: &operation_id,
+                generation,
+                pid,
+                runtime_id: &sidecar_ownership_id,
+                cleanup_entered_rx: &mut cleanup_entered_rx,
+                cleanup_completed_rx: &mut cleanup_completed_rx,
+                cleanup_release_tx: &cleanup_release_tx,
+            },
+        )
+        .await;
+        assert!(
+            owner_retained,
+            "the exact original Starting owner must remain current until cleanup settles"
+        );
+        assert!(
+            terminal_refused,
+            "an active terminal takeover must be refused until cleanup settles"
+        );
+        assert_eq!(sink.repairs.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fork_cancellation_before_session_map_registration_keeps_the_native_claim() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd(
+            &json!({
+                "overrides": {
+                    "thread/fork": { "result": { "thread": { "id": "child-cancel-at-registration" } } }
+                }
+            })
+            .to_string(),
+        );
+        let (mut state, mut rx, sink) = state_with_sink();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        state.set_ownership(registry.clone());
+        let parent_id = create_real_fake_session(&state, &mut rx).await;
+        let (registration_rx, registration_release_tx) = arm_session_registration_pause(&state);
+        let (mut cleanup_entered_rx, mut cleanup_completed_rx, cleanup_release_tx) =
+            arm_delayed_exact_cleanup(&state);
+
+        let (reply_sink, _captured) = capturing_sink();
+        let parent = parent_id.clone();
+        let st = state.clone();
+        let task = tokio::spawn(async move {
+            st.handle_fork(
+                fork_msg(&parent, "fork-cancel-at-registration", None),
+                None,
+                reply_sink,
+            )
+            .await;
+        });
+        let (id, sidecar_pid, sidecar_ownership_id) =
+            tokio::time::timeout(Duration::from_secs(20), registration_rx)
+                .await
+                .expect("fork reaches child session registration")
+                .expect("the registration hook reports the exact child identity");
+        assert_eq!(id, "child-cancel-at-registration");
+        let pid = sidecar_pid.expect("the fork child sidecar has a pid");
+        let sessions = state.sessions.lock().await;
+        assert!(!crate::ownership_lane::partial_pid_confirmed_dead(pid));
+        let (operation_id, generation) = match registry.observe(PROVIDER, &id).state {
+            freshell_ownership::OwnershipState::Starting {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                operation_id,
+                generation,
+                ..
+            } => (operation_id, generation),
+            other => panic!("fork child must own its canonical Starting claim: {other:?}"),
+        };
+        registration_release_tx.send(()).unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "fork is blocked at child map registration"
+        );
+
+        let (owner_retained, terminal_refused) = cancel_registration_and_confirm_cleanup(
+            task,
+            sessions,
+            RegistrationCleanupCheck {
+                state: &state,
+                registry: &registry,
+                id: &id,
+                operation_id: &operation_id,
+                generation,
+                pid,
+                runtime_id: &sidecar_ownership_id,
+                cleanup_entered_rx: &mut cleanup_entered_rx,
+                cleanup_completed_rx: &mut cleanup_completed_rx,
+                cleanup_release_tx: &cleanup_release_tx,
+            },
+        )
+        .await;
+        assert!(
+            owner_retained,
+            "the exact fork Starting owner must remain current until cleanup settles"
+        );
+        assert!(
+            terminal_refused,
+            "an active terminal takeover must be refused until fork cleanup settles"
+        );
+        assert_eq!(sink.repairs.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attach_resume_cancellation_before_session_map_registration_keeps_the_native_claim() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (mut state, mut rx, sink) = state_with_sink();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        state.set_ownership(registry.clone());
+        let id = create_real_fake_session(&state, &mut rx).await;
+
+        // Keep the durable binding but remove the first in-memory runtime so
+        // attach takes the cold `ensure_session_resumable` registration path.
+        let session = state
+            .sessions
+            .lock()
+            .await
+            .remove(&id)
+            .expect("the initial session is registered");
+        let stopped = state.stop_removed_session(&id, session).await;
+        assert!(matches!(
+            stopped,
+            crate::session_handoff::StopResult::Reaped
+                | crate::session_handoff::StopResult::AlreadyGone
+        ));
+        assert!(matches!(
+            registry.observe(PROVIDER, &id).state,
+            freshell_ownership::OwnershipState::Vacant
+        ));
+
+        let (registration_rx, registration_release_tx) = arm_session_registration_pause(&state);
+        let (mut cleanup_entered_rx, mut cleanup_completed_rx, cleanup_release_tx) =
+            arm_delayed_exact_cleanup(&state);
+        let st = state.clone();
+        let attach = attach_msg(&id);
+        let task = tokio::spawn(async move { st.handle_attach(attach).await });
+        let (resumed_id, sidecar_pid, sidecar_ownership_id) =
+            tokio::time::timeout(Duration::from_secs(20), registration_rx)
+                .await
+                .expect("cold attach reaches session registration")
+                .expect("the registration hook reports the exact resumed identity");
+        assert_eq!(resumed_id, id);
+        let pid = sidecar_pid.expect("the resumed sidecar has a pid");
+        let sessions = state.sessions.lock().await;
+        assert!(!crate::ownership_lane::partial_pid_confirmed_dead(pid));
+        let (operation_id, generation) = match registry.observe(PROVIDER, &resumed_id).state {
+            freshell_ownership::OwnershipState::Starting {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                operation_id,
+                generation,
+                ..
+            } => (operation_id, generation),
+            other => panic!("cold attach must own the canonical Starting claim: {other:?}"),
+        };
+        registration_release_tx.send(()).unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "attach is blocked at session-map registration"
+        );
+
+        let (owner_retained, terminal_refused) = cancel_registration_and_confirm_cleanup(
+            task,
+            sessions,
+            RegistrationCleanupCheck {
+                state: &state,
+                registry: &registry,
+                id: &resumed_id,
+                operation_id: &operation_id,
+                generation,
+                pid,
+                runtime_id: &sidecar_ownership_id,
+                cleanup_entered_rx: &mut cleanup_entered_rx,
+                cleanup_completed_rx: &mut cleanup_completed_rx,
+                cleanup_release_tx: &cleanup_release_tx,
+            },
+        )
+        .await;
+        assert!(
+            owner_retained,
+            "the exact attach Starting owner must remain current until cleanup settles"
+        );
+        assert!(
+            terminal_refused,
+            "an active terminal takeover must be refused until attach cleanup settles"
+        );
+        assert_eq!(sink.repairs.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn crashed_attach_recovery_cancellation_before_registration_keeps_the_native_claim() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (mut state, mut rx, sink) = state_with_sink();
+        let id = create_real_fake_session(&state, &mut rx).await;
+        let (old_pid, old_runtime_id) = {
+            let sessions = state.sessions.lock().await;
+            let session = sessions
+                .get(&id)
+                .expect("the created session is registered");
+            (
+                session.sidecar_pid.unwrap(),
+                session.sidecar_ownership_id.clone(),
+            )
+        };
+        assert!(
+            crate::session_lease::kill_and_confirm_tree_dead(
+                old_pid,
+                CODEX_SIDECAR_OWNERSHIP_ENV,
+                &old_runtime_id,
+            )
+            .await
+        );
+        if let Some(session) = state.sessions.lock().await.get(&id) {
+            session.exited.store(true, Ordering::SeqCst);
+        }
+        state.leases.clear_binding(PROVIDER, &id);
+        let has_condemned_prior = state
+            .condemned_priors
+            .lock()
+            .expect("condemned prior lock")
+            .contains_key(&id);
+        if has_condemned_prior {
+            assert!(state.confirm_fenced_prior_dead(&id).await);
+        }
+
+        // The old runtime was created before ownership wiring and is now
+        // exactly dead. Wire authority for the recovery operation itself.
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        state.set_ownership(registry.clone());
+        let (registration_rx, registration_release_tx) = arm_session_registration_pause(&state);
+        let (mut cleanup_entered_rx, mut cleanup_completed_rx, cleanup_release_tx) =
+            arm_delayed_exact_cleanup(&state);
+        let st = state.clone();
+        let attach = attach_msg(&id);
+        let task = tokio::spawn(async move { st.handle_attach(attach).await });
+        let (recovered_id, sidecar_pid, sidecar_ownership_id) =
+            tokio::time::timeout(Duration::from_secs(20), registration_rx)
+                .await
+                .expect("tracked attach recovery reaches session registration")
+                .expect("the registration hook reports the exact recovery identity");
+        assert_eq!(recovered_id, id);
+        let pid = sidecar_pid.expect("the recovered sidecar has a pid");
+        let sessions = state.sessions.lock().await;
+        assert!(!crate::ownership_lane::partial_pid_confirmed_dead(pid));
+        let (operation_id, generation) = match registry.observe(PROVIDER, &id).state {
+            freshell_ownership::OwnershipState::Starting {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                operation_id,
+                generation,
+                ..
+            } => (operation_id, generation),
+            other => panic!("crash recovery must own the canonical Starting claim: {other:?}"),
+        };
+        registration_release_tx.send(()).unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "recovery is blocked at session-map registration"
+        );
+
+        let (owner_retained, terminal_refused) = cancel_registration_and_confirm_cleanup(
+            task,
+            sessions,
+            RegistrationCleanupCheck {
+                state: &state,
+                registry: &registry,
+                id: &id,
+                operation_id: &operation_id,
+                generation,
+                pid,
+                runtime_id: &sidecar_ownership_id,
+                cleanup_entered_rx: &mut cleanup_entered_rx,
+                cleanup_completed_rx: &mut cleanup_completed_rx,
+                cleanup_release_tx: &cleanup_release_tx,
+            },
+        )
+        .await;
+        assert!(
+            owner_retained,
+            "the exact recovery Starting owner must remain current until cleanup settles"
+        );
+        assert!(
+            terminal_refused,
+            "an active terminal takeover must be refused until recovery cleanup settles"
+        );
+        assert_eq!(sink.repairs.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mint_new_respawn_cancellation_before_registration_keeps_the_native_claim() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (mut state, mut rx, sink) = state_with_sink();
+        let old_id = create_real_fake_session(&state, &mut rx).await;
+        let (old_pid, old_runtime_id) = {
+            let sessions = state.sessions.lock().await;
+            let session = sessions
+                .get(&old_id)
+                .expect("the created session is registered");
+            (
+                session.sidecar_pid.unwrap(),
+                session.sidecar_ownership_id.clone(),
+            )
+        };
+        assert!(
+            crate::session_lease::kill_and_confirm_tree_dead(
+                old_pid,
+                CODEX_SIDECAR_OWNERSHIP_ENV,
+                &old_runtime_id,
+            )
+            .await
+        );
+        if let Some(session) = state.sessions.lock().await.get(&old_id) {
+            session.exited.store(true, Ordering::SeqCst);
+        }
+        state.leases.clear_binding(PROVIDER, &old_id);
+        let has_condemned_prior = state
+            .condemned_priors
+            .lock()
+            .expect("condemned prior lock")
+            .contains_key(&old_id);
+        if has_condemned_prior {
+            assert!(state.confirm_fenced_prior_dead(&old_id).await);
+        }
+        state.mark_thread_dead(&old_id).await;
+        configure_fake_codex_cmd(
+            &json!({ "threadStartThreadId": "thread-respawn-cancel-at-registration" }).to_string(),
+        );
+
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        state.set_ownership(registry.clone());
+        let (registration_rx, registration_release_tx) = arm_session_registration_pause(&state);
+        let (mut cleanup_entered_rx, mut cleanup_completed_rx, cleanup_release_tx) =
+            arm_delayed_exact_cleanup(&state);
+        let st = state.clone();
+        let attach = attach_msg(&old_id);
+        let task = tokio::spawn(async move { st.handle_attach(attach).await });
+        let (new_id, sidecar_pid, sidecar_ownership_id) =
+            tokio::time::timeout(Duration::from_secs(20), registration_rx)
+                .await
+                .expect("crash fallback reaches new-thread registration")
+                .expect("the registration hook reports the exact respawn identity");
+        assert_eq!(new_id, "thread-respawn-cancel-at-registration");
+        let pid = sidecar_pid.expect("the respawn sidecar has a pid");
+        let sessions = state.sessions.lock().await;
+        assert!(!crate::ownership_lane::partial_pid_confirmed_dead(pid));
+        let (operation_id, generation) = match registry.observe(PROVIDER, &new_id).state {
+            freshell_ownership::OwnershipState::Starting {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                operation_id,
+                generation,
+                ..
+            } => (operation_id, generation),
+            other => panic!("minted respawn must own its canonical Starting claim: {other:?}"),
+        };
+        registration_release_tx.send(()).unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "respawn is blocked at session-map registration"
+        );
+
+        let (owner_retained, terminal_refused) = cancel_registration_and_confirm_cleanup(
+            task,
+            sessions,
+            RegistrationCleanupCheck {
+                state: &state,
+                registry: &registry,
+                id: &new_id,
+                operation_id: &operation_id,
+                generation,
+                pid,
+                runtime_id: &sidecar_ownership_id,
+                cleanup_entered_rx: &mut cleanup_entered_rx,
+                cleanup_completed_rx: &mut cleanup_completed_rx,
+                cleanup_release_tx: &cleanup_release_tx,
+            },
+        )
+        .await;
+        assert!(
+            owner_retained,
+            "the exact respawn Starting owner must remain current until cleanup settles"
+        );
+        assert!(
+            terminal_refused,
+            "an active terminal takeover must be refused until respawn cleanup settles"
+        );
+        assert_eq!(sink.repairs.lock().unwrap().len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -2160,6 +2160,252 @@ mod tests {
                 .expect("the post-commit authoritative write lands");
         }
 
+        #[tokio::test(flavor = "multi_thread")]
+        async fn live_owner_settings_refresh_survives_another_operations_same_generation_fence() {
+            let tmp = tempfile::tempdir().unwrap();
+            let ledger = Arc::new(PaneLedger::new(Some(tmp.path().to_path_buf())));
+            let registry = Arc::new(RuntimeOwnershipRegistry::new());
+            let epoch = registry.boot_epoch();
+            let operation_id = "restored-live-owner";
+            let generation = match registry.begin_start(
+                "claude",
+                SID,
+                RuntimeOwnerKind::FreshAgent,
+                operation_id,
+                None,
+                "test-live-settings-refresh",
+                EPOCH_MS,
+            ) {
+                BeginOutcome::Granted { generation } => generation,
+                other => panic!("the fresh-agent owner start must be granted: {other:?}"),
+            };
+            assert_eq!(
+                registry.commit_live(
+                    "claude",
+                    SID,
+                    operation_id,
+                    generation,
+                    OwnerIdentity {
+                        kind: RuntimeOwnerKind::FreshAgent,
+                        terminal_id: None,
+                        live_session_key: Some(SID.into()),
+                        pid: Some(42_000),
+                        ownership_id: Some(operation_id.into()),
+                    },
+                ),
+                CommitOutcome::Committed
+            );
+            let current_claim = BindingClaim::current_live_fresh_agent(&registry, "claude", SID)
+                .expect("the registry supplies the exact current live owner");
+            assert_eq!(current_claim.operation_id, operation_id);
+            assert_eq!(
+                (current_claim.epoch, current_claim.generation),
+                (epoch, generation)
+            );
+
+            let sink = LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()));
+            let upsert = |settings: FreshAgentSettings| FreshAgentBindingUpsert {
+                genesis: freshell_freshagent::GenesisUpdate::Keep,
+                name_transition: None,
+                provider: "claude".into(),
+                session_id: SID.into(),
+                mode: "freshclaude".into(),
+                create_request_id: None,
+                resolves_pending: None,
+                supersedes: None,
+                provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+                observed_epoch: Some(epoch),
+                observed_generation: Some(generation),
+                claim: Some(current_claim.clone()),
+                settings: SettingsUpdate::Replace(settings),
+            };
+            sink.record_binding(upsert(FreshAgentSettings {
+                model: Some("remembered-model".into()),
+                ..Default::default()
+            }))
+            .await
+            .expect("the exact live owner seeds its durable settings row");
+
+            // A failed sibling operation at this pair installs a scoped
+            // tombstone. Its row projection must preserve the restored live
+            // owner's exact operation identity and settings.
+            sink.repair_failed_transition(
+                "claude",
+                SID,
+                "failed-sibling-operation",
+                epoch,
+                generation,
+            )
+            .await
+            .expect("the failed sibling operation's durable fence lands");
+            let preserved = ledger
+                .load_binding("claude", SID)
+                .expect("the current owner's row survives repair");
+            assert_eq!(preserved.state, freshell_ws::pane_ledger::RowState::Bound);
+            assert_eq!(preserved.owner_operation_id.as_deref(), Some(operation_id));
+            assert_eq!(preserved.model.as_deref(), Some("remembered-model"));
+
+            // An already-validated write from the failed operation remains
+            // suppressed by the precise operation fence, even at the same
+            // ownership pair as the restored live row.
+            let failed_claim = BindingClaim {
+                provider: "claude".into(),
+                session_id: SID.into(),
+                operation_id: "failed-sibling-operation".into(),
+                epoch,
+                generation,
+                kind: BindingClaimKind::Handoff,
+            };
+            ledger
+                .record_fresh_agent_binding_claimed(
+                    &freshell_ws::pane_ledger::FreshAgentBindingWrite {
+                        collaboration_mode: None,
+                        provider: "claude",
+                        session_id: SID,
+                        mode: "freshclaude",
+                        cwd: None,
+                        create_request_id: None,
+                        model: Some("failed-operation-model"),
+                        sandbox: None,
+                        permission_mode: None,
+                        effort: None,
+                        plugins: None,
+                        genesis: freshell_ws::pane_ledger::GenesisWrite::Keep,
+                        supersedes: None,
+                        provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+                        observed_epoch: Some(epoch),
+                        observed_generation: Some(generation),
+                        now_ms: 200,
+                    },
+                    Some(&failed_claim),
+                    &SettingsUpdate::Replace(FreshAgentSettings {
+                        model: Some("failed-operation-model".into()),
+                        ..Default::default()
+                    }),
+                )
+                .expect("the exact failed-operation write is harmlessly suppressed");
+            assert_eq!(
+                ledger.load_binding("claude", SID).unwrap().model.as_deref(),
+                Some("remembered-model"),
+                "the delayed failed operation cannot overwrite current-owner settings"
+            );
+
+            // A claimless refresh is deliberately refused by the same-generation
+            // failed-operation fence, even when the observed pair belongs to a
+            // restored owner. The provider must carry an exact current-owner
+            // claim; silently inferring one here would let delayed old writes
+            // borrow the newer owner's authority.
+            let mut refresh = upsert(FreshAgentSettings {
+                model: Some("refreshed-model".into()),
+                effort: Some("high".into()),
+                ..Default::default()
+            });
+            refresh.claim = None;
+            sink.record_binding(refresh)
+                .await
+                .expect("the claimless stale refresh is harmlessly suppressed");
+            let restarted = PaneLedger::new(Some(tmp.path().to_path_buf()));
+            let durable = restarted
+                .load_binding("claude", SID)
+                .expect("the current owner's row survives ledger reload");
+            assert_eq!(durable.state, freshell_ws::pane_ledger::RowState::Bound);
+            assert_eq!(durable.owner_operation_id.as_deref(), Some(operation_id));
+            assert_eq!(durable.model.as_deref(), Some("remembered-model"));
+            assert_eq!(durable.effort, None);
+
+            // A LiveFreshAgent claim is not takeover authority for a durable
+            // active-terminal recovery row, even when it names the exact live
+            // coordinator owner and pair.
+            let terminal_session = "ses-active-terminal";
+            let terminal_registry = Arc::new(RuntimeOwnershipRegistry::new());
+            let terminal_epoch = terminal_registry.boot_epoch();
+            let terminal_owner_id = "live-agent-over-terminal-row";
+            let terminal_generation = match terminal_registry.begin_start(
+                "claude",
+                terminal_session,
+                RuntimeOwnerKind::FreshAgent,
+                terminal_owner_id,
+                None,
+                "test-active-terminal-row",
+                EPOCH_MS,
+            ) {
+                BeginOutcome::Granted { generation } => generation,
+                other => panic!("the owner start must be granted: {other:?}"),
+            };
+            assert_eq!(
+                terminal_registry.commit_live(
+                    "claude",
+                    terminal_session,
+                    terminal_owner_id,
+                    terminal_generation,
+                    OwnerIdentity {
+                        kind: RuntimeOwnerKind::FreshAgent,
+                        terminal_id: None,
+                        live_session_key: Some(terminal_session.into()),
+                        pid: Some(42_001),
+                        ownership_id: Some(terminal_owner_id.into()),
+                    },
+                ),
+                CommitOutcome::Committed
+            );
+            ledger
+                .record_binding(&freshell_ws::pane_ledger::BindingWrite {
+                    provider: "claude",
+                    session_id: terminal_session,
+                    terminal_id: "active-terminal",
+                    mode: "claude",
+                    cwd: Some("/w"),
+                    create_request_id: None,
+                    origin_create_request_id: None,
+                    provenance: freshell_ws::pane_ledger::ProvenancePolicy::Clear,
+                    observed_epoch: None,
+                    observed_generation: None,
+                    now_ms: 201,
+                })
+                .expect("the active terminal row seeds");
+            let terminal_claim = BindingClaim::current_live_fresh_agent(
+                &terminal_registry,
+                "claude",
+                terminal_session,
+            )
+            .expect("the exact live agent owner is current");
+            let terminal_attempt = LedgerIdentitySink::new(ledger.clone(), Some(terminal_registry))
+                .record_binding(FreshAgentBindingUpsert {
+                    genesis: freshell_freshagent::GenesisUpdate::Keep,
+                    name_transition: None,
+                    provider: "claude".into(),
+                    session_id: terminal_session.into(),
+                    mode: "freshclaude".into(),
+                    create_request_id: None,
+                    resolves_pending: None,
+                    supersedes: None,
+                    provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+                    observed_epoch: Some(terminal_epoch),
+                    observed_generation: Some(terminal_generation),
+                    claim: Some(terminal_claim),
+                    settings: SettingsUpdate::Replace(FreshAgentSettings {
+                        model: Some("must-not-take-over-terminal".into()),
+                        ..Default::default()
+                    }),
+                })
+                .await
+                .expect_err("a live-agent refresh cannot take over an active terminal row");
+            assert!(
+                terminal_attempt
+                    .to_string()
+                    .contains("NOT_NEWER_BINDING_OVER_TERMINAL"),
+                "active-terminal refusal remains the ledger's typed outcome: {terminal_attempt}"
+            );
+            let terminal_row = ledger
+                .load_binding("claude", terminal_session)
+                .expect("the terminal recovery row remains");
+            assert_eq!(
+                terminal_row.live_terminal_id.as_deref(),
+                Some("active-terminal")
+            );
+            assert_eq!(terminal_row.pane_kind, None);
+        }
+
         /// A SUPERSEDED handoff's stale authoritative write (a later
         /// transition moved the key to a NEWER generation) is refused —
         /// the delayed write can never clobber the newer owner's row.

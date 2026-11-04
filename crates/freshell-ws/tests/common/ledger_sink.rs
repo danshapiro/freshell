@@ -19,6 +19,9 @@ pub struct LedgerWriteGate {
     entered: tokio::sync::Notify,
     release: tokio::sync::Semaphore,
     remaining: std::sync::atomic::AtomicUsize,
+    attempts: std::sync::atomic::AtomicUsize,
+    settled: std::sync::atomic::AtomicUsize,
+    fail_all: std::sync::atomic::AtomicBool,
 }
 
 impl LedgerWriteGate {
@@ -27,6 +30,9 @@ impl LedgerWriteGate {
             entered: tokio::sync::Notify::new(),
             release: tokio::sync::Semaphore::new(0),
             remaining: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+            settled: std::sync::atomic::AtomicUsize::new(0),
+            fail_all: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -39,6 +45,19 @@ impl LedgerWriteGate {
 
     pub async fn wait_until_entered(&self) {
         self.entered.notified().await;
+    }
+
+    pub fn attempts(&self) -> usize {
+        self.attempts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn settled(&self) -> usize {
+        self.settled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn fail_all(&self) {
+        self.fail_all
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn release(&self) {
@@ -57,12 +76,19 @@ impl LedgerWriteGate {
         {
             return Ok(());
         }
+        self.attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.entered.notify_one();
         self.release
             .acquire()
             .await
             .map_err(std::io::Error::other)?
             .forget();
+        self.settled
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_all.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(std::io::Error::other("injected ledger write failure"));
+        }
         Ok(())
     }
 }
@@ -89,6 +115,7 @@ pub struct LedgerSink {
     turn_interrupted_marker_gate: Option<Arc<LedgerWriteGate>>,
     genesis_clear_gate: Option<Arc<LedgerWriteGate>>,
     binding_completed_gate: Option<Arc<LedgerWriteGate>>,
+    failed_transition_repair_gate: Option<Arc<LedgerWriteGate>>,
 }
 
 impl LedgerSink {
@@ -100,6 +127,7 @@ impl LedgerSink {
             turn_interrupted_marker_gate: None,
             genesis_clear_gate: None,
             binding_completed_gate: None,
+            failed_transition_repair_gate: None,
         }
     }
 
@@ -115,11 +143,20 @@ impl LedgerSink {
             turn_interrupted_marker_gate: None,
             genesis_clear_gate: None,
             binding_completed_gate: None,
+            failed_transition_repair_gate: None,
         }
     }
 
     pub fn with_binding_completed_gate(mut self, gate: Option<Arc<LedgerWriteGate>>) -> Self {
         self.binding_completed_gate = gate;
+        self
+    }
+
+    pub fn with_failed_transition_repair_gate(
+        mut self,
+        gate: Option<Arc<LedgerWriteGate>>,
+    ) -> Self {
+        self.failed_transition_repair_gate = gate;
         self
     }
 
@@ -485,8 +522,15 @@ impl PaneIdentitySink for LedgerSink {
             operation_id.to_string(),
         );
         let now = now_ms();
-        blocking(move || {
+        let gate = self.failed_transition_repair_gate.clone();
+        let write = blocking(move || {
             ledger.repair_failed_transition_binding(&p, &s, &op, epoch, generation, now)
+        });
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                gate.hold().await?;
+            }
+            write.await
         })
     }
 
