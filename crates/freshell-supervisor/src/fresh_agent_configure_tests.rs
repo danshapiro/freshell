@@ -2095,6 +2095,10 @@ async fn admin_native_name_rejects_stale_authority_before_host_work_and_preserve
                     reply,
                     FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Closed)
                 ),
+                "busy" => assert_eq!(
+                    reply,
+                    FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::LifecycleBusy)
+                ),
                 _ => assert!(matches!(
                     reply,
                     FreshAgentNativeNameReply::Failed(

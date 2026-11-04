@@ -9361,7 +9361,12 @@ pub(crate) mod automatic_retry_tests {
     }
     impl Drop for RetryBackend {
         fn drop(&mut self) {
-            for (_, task) in self.hosts.get_mut().unwrap().drain(..) {
+            for (_, task) in self
+                .hosts
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .drain(..)
+            {
                 task.abort();
             }
         }
@@ -10192,6 +10197,7 @@ pub(crate) mod automatic_retry_tests {
         supervisor: &Supervisor,
         backend: &RetryBackend,
         root: &Path,
+        runtime_root: &Path,
         block_store_probe: bool,
     ) -> SoulId {
         use crate::registry::{BackendCreatedRecord, LaunchPreparation};
@@ -10260,7 +10266,7 @@ pub(crate) mod automatic_retry_tests {
             })
             .await
             .unwrap();
-        let runtime_dir = root.join(format!("codex-runtime-{}", prepared.incarnation_id));
+        let runtime_dir = runtime_root.join(format!("codex-runtime-{}", prepared.incarnation_id));
         std::fs::create_dir_all(&runtime_dir).unwrap();
         supervisor
             .registry
@@ -10392,10 +10398,23 @@ pub(crate) mod automatic_retry_tests {
     async fn codex_host_restart_with_saved_resume_requires_a_fresh_exact_store_probe() {
         for block_store_probe in [false, true] {
             let dir = tempfile::tempdir().unwrap();
-            let (supervisor, backend, _) = open(dir.path(), 0);
-            let soul =
-                seed_unconfirmed_codex_host(&supervisor, &backend, dir.path(), block_store_probe)
-                    .await;
+            let long_data_root = dir
+                .path()
+                .join("fresh-agent-recovery-test-data-root-is-deliberately-long");
+            std::fs::create_dir(&long_data_root).unwrap();
+            let runtime_root = tempfile::Builder::new()
+                .prefix("rt")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let (supervisor, backend, _) = open(&long_data_root, 0);
+            let soul = seed_unconfirmed_codex_host(
+                &supervisor,
+                &backend,
+                &long_data_root,
+                runtime_root.path(),
+                block_store_probe,
+            )
+            .await;
             let mut context = supervisor
                 .registry
                 .recovery_context(soul.clone())
@@ -10429,7 +10448,8 @@ pub(crate) mod automatic_retry_tests {
                             && resume_spec.provider_session.native_session_id == "retry-root"
                 ));
             }
-            let lifecycle = std::fs::read_to_string(dir.path().join("lifecycle.jsonl")).unwrap();
+            let lifecycle =
+                std::fs::read_to_string(long_data_root.join("lifecycle.jsonl")).unwrap();
             assert!(lifecycle.contains("supervisor.recovery.unconfirmed_worker_store_probe"));
         }
     }
@@ -10571,7 +10591,7 @@ pub(crate) mod automatic_retry_tests {
             .unwrap();
             let agent: freshell_runtime_protocol::FreshAgentLaunchSpec = serde_json::from_value(serde_json::json!({
             "sessionId":"retry-fresh-codex", "provider":"codex", "sessionType":"freshcodex", "runtimeVariant":"codex-app-server-v1",
-            "providerStoreId":context.provider_store_id, "cwd":root, "workspacePath":root,
+            "providerStoreId":context.provider_store_id, "nativeSessionId":"retry-root", "cwd":root, "workspacePath":root,
             "runAsUid":65534, "runAsGid":0
         })).unwrap();
             agent.validate().unwrap();

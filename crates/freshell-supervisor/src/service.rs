@@ -23,7 +23,9 @@ use freshell_runtime_protocol::{
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex as StdMutex, OnceLock,
@@ -38,6 +40,9 @@ use tokio::{
 };
 
 /// Private cause information retained before the public runtime error projection.
+type BoxedAdminDispatch<'a> =
+    Pin<Box<dyn Future<Output = Result<AdminResult, RuntimeError>> + Send + 'a>>;
+
 struct ClassifiedFailure {
     error: RuntimeError,
     category: &'static str,
@@ -482,32 +487,34 @@ impl Supervisor {
                     .await
                     .map(AdminResult::Recovery)
             }
-            _ => Box::pin(self.dispatch_non_recovery(envelope)).await,
+            _ => self.dispatch_non_recovery(envelope).await,
         }
     }
 
     // Keep the sizeable provider operations out of the general command
     // switch's polling frame. A request only polls its own command family.
-    async fn dispatch_non_recovery(
-        &self,
+    #[inline(never)]
+    fn dispatch_non_recovery<'a>(
+        &'a self,
         envelope: Envelope<AdminCommand>,
-    ) -> Result<AdminResult, RuntimeError> {
+    ) -> BoxedAdminDispatch<'a> {
         if is_fresh_agent_admin_command(&envelope.body) {
             let request_id = envelope.request_id;
             let command = envelope.body;
-            Box::pin(self.dispatch_fresh_agent_command(request_id, command)).await
+            self.dispatch_fresh_agent_command(request_id, command)
         } else {
-            Box::pin(self.dispatch_general(envelope)).await
+            self.dispatch_general_boxed(envelope)
         }
     }
 
-    async fn dispatch_fresh_agent_command(
-        &self,
+    #[inline(never)]
+    fn dispatch_fresh_agent_command<'a>(
+        &'a self,
         request_id: RequestId,
         command: AdminCommand,
-    ) -> Result<AdminResult, RuntimeError> {
+    ) -> BoxedAdminDispatch<'a> {
         match command {
-            AdminCommand::FreshAgentPrepareNative(request) => {
+            AdminCommand::FreshAgentPrepareNative(request) => Box::pin(async move {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
@@ -515,20 +522,21 @@ impl Supervisor {
                 Ok(AdminResult::FreshAgentCommand {
                     state: CommandState::Completed,
                 })
-            }
-            command => Box::pin(self.dispatch_other_fresh_agent_command(request_id, command)).await,
+            }),
+            command => self.dispatch_other_fresh_agent_command(request_id, command),
         }
     }
 
-    async fn dispatch_other_fresh_agent_command(
-        &self,
+    #[inline(never)]
+    fn dispatch_other_fresh_agent_command<'a>(
+        &'a self,
         request_id: RequestId,
         command: AdminCommand,
-    ) -> Result<AdminResult, RuntimeError> {
-        // Heap-allocate each command's distinct future so the routing poll
-        // frame doesn't reserve stack space for every provider operation.
+    ) -> BoxedAdminDispatch<'a> {
+        // Match before making the async future so each command gets a
+        // separate heap-backed future.
         match command {
-            AdminCommand::FreshAgentSend(request) => {
+            AdminCommand::FreshAgentSend(request) => Box::pin(async move {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
@@ -541,8 +549,8 @@ impl Supervisor {
                 ))
                 .await?;
                 Ok(AdminResult::FreshAgentCommand { state })
-            }
-            AdminCommand::FreshAgentFork(request) => {
+            }),
+            AdminCommand::FreshAgentFork(request) => Box::pin(async move {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
@@ -554,8 +562,8 @@ impl Supervisor {
                 ))
                 .await?;
                 Ok(AdminResult::FreshAgentFork(result))
-            }
-            AdminCommand::FreshAgentCompact(request) => {
+            }),
+            AdminCommand::FreshAgentCompact(request) => Box::pin(async move {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
@@ -567,8 +575,8 @@ impl Supervisor {
                 ))
                 .await?;
                 Ok(AdminResult::FreshAgentCommand { state })
-            }
-            AdminCommand::FreshAgentConfigure(request) => {
+            }),
+            AdminCommand::FreshAgentConfigure(request) => Box::pin(async move {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
@@ -579,47 +587,47 @@ impl Supervisor {
                 ))
                 .await?;
                 Ok(AdminResult::FreshAgentCommand { state })
-            }
-            AdminCommand::FreshAgentRollback(request) => {
+            }),
+            AdminCommand::FreshAgentRollback(request) => Box::pin(async move {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
                 let state = Box::pin(self.fresh_agent_rollback(request_id, request)).await?;
                 Ok(AdminResult::FreshAgentCommand { state })
-            }
-            AdminCommand::FreshAgentCapture(request) => {
+            }),
+            AdminCommand::FreshAgentCapture(request) => Box::pin(async move {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
                 Ok(AdminResult::FreshAgentCapture(
                     Box::pin(self.fresh_agent_capture(request.soul_id, request.max_bytes)).await?,
                 ))
-            }
-            AdminCommand::FreshAgentModelCatalog(request) => {
+            }),
+            AdminCommand::FreshAgentModelCatalog(request) => Box::pin(async move {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
                 Ok(AdminResult::FreshAgentModelCatalog(
                     Box::pin(self.fresh_agent_model_catalog(request.soul_id, request.cwd)).await?,
                 ))
-            }
-            AdminCommand::FreshAgentNativeName(request) => {
+            }),
+            AdminCommand::FreshAgentNativeName(request) => Box::pin(async move {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
                 Ok(AdminResult::FreshAgentNativeName(
                     Box::pin(self.fresh_agent_native_name(request)).await?,
                 ))
-            }
-            AdminCommand::FreshAgentReadSnapshot(request) => {
+            }),
+            AdminCommand::FreshAgentReadSnapshot(request) => Box::pin(async move {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
                 Ok(AdminResult::FreshAgentSnapshot(
                     Box::pin(self.fresh_agent_snapshot(request.soul_id)).await?,
                 ))
-            }
-            AdminCommand::FreshAgentReadChild(request) => {
+            }),
+            AdminCommand::FreshAgentReadChild(request) => Box::pin(async move {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
@@ -627,8 +635,8 @@ impl Supervisor {
                     Box::pin(self.fresh_agent_read_child(request.soul_id, request.child_thread_id))
                         .await?,
                 ))
-            }
-            AdminCommand::FreshAgentResolve(request) => {
+            }),
+            AdminCommand::FreshAgentResolve(request) => Box::pin(async move {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
@@ -640,15 +648,15 @@ impl Supervisor {
                 ))
                 .await?;
                 Ok(AdminResult::FreshAgentCommand { state })
-            }
-            AdminCommand::FreshAgentInterrupt(request) => {
+            }),
+            AdminCommand::FreshAgentInterrupt(request) => Box::pin(async move {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
                 Box::pin(self.fresh_agent_interrupt(request.soul_id, request.request_id)).await?;
                 Ok(AdminResult::FreshAgentInterrupted)
-            }
-            AdminCommand::FreshAgentReadHistory(request) => {
+            }),
+            AdminCommand::FreshAgentReadHistory(request) => Box::pin(async move {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
@@ -703,8 +711,8 @@ impl Supervisor {
                     "sessionType": agent.session_type,
                 });
                 Ok(AdminResult::FreshAgentHistory(snapshot))
-            }
-            AdminCommand::FreshAgentReadEvents(request) => {
+            }),
+            AdminCommand::FreshAgentReadEvents(request) => Box::pin(async move {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
@@ -715,11 +723,11 @@ impl Supervisor {
                 ))
                 .await?;
                 Ok(AdminResult::FreshAgentEvents(events))
-            }
-            AdminCommand::FreshAgentPrepareNative(_) => {
+            }),
+            AdminCommand::FreshAgentPrepareNative(_) => Box::pin(async move {
                 unreachable!("native readiness is handled before other FreshAgent commands")
-            }
-            AdminCommand::FreshAgentReadRetainedState(request) => {
+            }),
+            AdminCommand::FreshAgentReadRetainedState(request) => Box::pin(async move {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
@@ -741,9 +749,17 @@ impl Supervisor {
                     }
                 };
                 Ok(AdminResult::FreshAgentEvents(events))
-            }
+            }),
             _ => unreachable!("non-FreshAgent command reached the FreshAgent switch"),
         }
+    }
+
+    #[inline(never)]
+    fn dispatch_general_boxed<'a>(
+        &'a self,
+        envelope: Envelope<AdminCommand>,
+    ) -> BoxedAdminDispatch<'a> {
+        Box::pin(self.dispatch_general(envelope))
     }
 
     async fn dispatch_general(
@@ -9437,7 +9453,29 @@ mod grant_identity_tests {
                 _ => None,
             };
             assert_eq!(accepted.native_session_id.as_deref(), expected, "{case}");
-            assert_eq!(accepted.native_identity_observation, observation, "{case}");
+            let launch_mismatch = matches!(
+                case,
+                "wrong-nonce"
+                    | "wrong-revision"
+                    | "wrong-incarnation"
+                    | "wrong-proof-root"
+                    | "wrong-requested-root"
+                    | "fixture-stale-proof"
+            );
+            if case == "current-proof"
+                || case == "fixture-stale-proof"
+                || (case.starts_with("wrong-") && !fixture)
+            {
+                assert!(
+                    observation.is_some(),
+                    "{case}: the fake host must send its configured proof"
+                );
+            }
+            let accepted_observation = if launch_mismatch { None } else { observation };
+            assert_eq!(
+                accepted.native_identity_observation, accepted_observation,
+                "{case}"
+            );
             let context = registry.recovery_context(soul).await.unwrap();
             assert_eq!(context.never_dispatched, was_never_dispatched);
             assert_eq!(context.accepted_command_count, 0);
