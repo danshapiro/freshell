@@ -71,6 +71,10 @@ use freshell_protocol::{
 use freshell_terminal::registry::{ManagedTerminalInputError, ManagedTerminalLaunch};
 use freshell_terminal::{build_child_env_from_process, FrameSink};
 
+#[cfg(all(test, unix))]
+#[path = "host_claude_restore_tests.rs"]
+mod host_claude_restore_tests;
+
 use crate::WsState;
 
 #[cfg(test)]
@@ -6092,8 +6096,19 @@ pub(crate) async fn handle_create(
                     .as_ref()
                     .map(|locator| locator.session_id.as_str()),
             ));
-    let use_managed_runtime =
-        managed_runtime_v1 && managed_runtime_mode(&mode) && !require_retained_codex;
+    // A restored host Claude conversation is not part of a newly allocated
+    // soul volume. First allow the existing managed-descriptor adoption below;
+    // if none exists, require exact original host-store authority before using
+    // the ordinary host ownership/lifecycle. Fresh managed creates are unchanged.
+    let require_host_claude_restore = managed_runtime_v1
+        && mode == "claude"
+        && (create.restore == Some(true)
+            || create_session_locator(&create)
+                .is_some_and(|locator| is_canonical_claude_session_id(&locator.session_id)));
+    let use_managed_runtime = managed_runtime_v1
+        && managed_runtime_mode(&mode)
+        && !require_retained_codex
+        && !require_host_claude_restore;
     if require_retained_codex {
         tracing::info!(
             event = "terminal.create.retained_codex",
@@ -6514,6 +6529,36 @@ pub(crate) async fn handle_create(
             .await;
         }
     }
+
+    let host_claude_restore_source = if require_host_claude_restore {
+        let session_id = resume_session_id.clone().unwrap_or_default();
+        let requested_cwd = create.cwd.as_deref().map(std::path::PathBuf::from);
+        let selected = spawn_blocking_in_span(move || {
+            freshell_freshagent::locate_host_claude_restore(&session_id, requested_cwd.as_deref())
+        })
+        .await
+        .unwrap_or(Err(freshell_freshagent::HostClaudeRestoreError::Unreadable));
+        match selected {
+            Ok(source) => {
+                resolved_cwd = Some(source.cwd.to_string_lossy().into_owned());
+                tracing::info!(event = "terminal.create.host_claude_restore",
+                    request_id = %create.request_id, session_id = ?resume_session_id,
+                    config_root = %source.config_root.display(),
+                    "Restoring the verified original host Claude conversation");
+                Some(source)
+            }
+            Err(reason) => {
+                tracing::warn!(event = "terminal.create.host_claude_restore_refused",
+                    request_id = %create.request_id, reason = reason.reason(),
+                    "Original host Claude conversation could not be verified");
+                return send_create_error(out, ErrorCode::RestoreUnavailable,
+                    "The original Claude conversation could not be verified on this host. No replacement was started.".into(),
+                    &create.request_id).await;
+            }
+        }
+    } else {
+        None
+    };
 
     // b8ke ext r7 F2: the LEARNED-identity PRE-SPAWN claim. Every
     // resume/create path retains coordinator authority through the spawn:
@@ -7209,7 +7254,15 @@ pub(crate) async fn handle_create(
             None,
         ),
     };
-    let child_env = build_child_env_from_process(&spec);
+    let mut child_env = build_child_env_from_process(&spec);
+    if let Some(source) = host_claude_restore_source.as_ref() {
+        // Keep original host HOME and explicitly select the root that supplied
+        // this conversation, including the existing CLAUDE_HOME fallback.
+        child_env.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            source.config_root.to_string_lossy().into_owned(),
+        );
+    }
 
     // Exit hook: built by `build_pty_exit_hook` (see its doc comment for the
     // reference anchors) so the auto-resume respawn seam (Task 4) reuses the
@@ -7329,7 +7382,10 @@ pub(crate) async fn handle_create(
     // every non-negotiating connection retain the legacy local spawn path.
     // PIN2_PTY_SPAWN_ANCHOR: either the local PTY spawn OR the supervisor's
     // host-owned PTY makes the preallocated identity observable.
+    #[cfg(all(test, unix))]
+    host_claude_restore_tests::before_source_revalidation(&create.request_id, &terminal_id);
     let mut provider_preparation_failure = None;
+    let mut host_claude_restore_failure = None;
     let create_result: std::io::Result<()> = if use_managed_runtime {
         let managed = ManagedTerminalLaunch {
             spec: spec.clone(),
@@ -7375,7 +7431,10 @@ pub(crate) async fn handle_create(
         let spawn_resume_session_id = resume_session_id.clone();
         let spawn_create_request_id = create.request_id.clone();
         match spawn_blocking_in_span(move || {
-            registry.create(
+            if let Some(source) = host_claude_restore_source {
+                source.revalidate()?;
+            }
+            Ok::<_, freshell_freshagent::HostClaudeRestoreError>(registry.create(
                 &spawn_spec,
                 &child_env,
                 spawn_terminal_id,
@@ -7385,11 +7444,18 @@ pub(crate) async fn handle_create(
                 Some(&spawn_create_request_id),
                 None,
                 on_exit,
-            )
+            ))
         })
         .await
         {
-            Ok(res) => res,
+            Ok(Ok(res)) => res,
+            Ok(Err(reason)) => {
+                tracing::warn!(event = "terminal.create.host_claude_restore_refused",
+                    request_id = %create.request_id, reason = reason.reason(),
+                    "Original host Claude source changed before its owned spawn");
+                host_claude_restore_failure = Some(reason);
+                Err(std::io::Error::other("original host Claude source changed"))
+            }
             Err(join_err) => Err(std::io::Error::other(format!(
                 "terminal spawn task panicked: {join_err}"
             ))),
@@ -7461,6 +7527,11 @@ pub(crate) async fn handle_create(
                 .await;
         }
         cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
+        if host_claude_restore_failure.is_some() {
+            return send_create_error(out, ErrorCode::RestoreUnavailable,
+                "The original Claude conversation changed before restoration. No replacement was started.".into(),
+                &create.request_id).await;
+        }
         let label = mode_label(&mode, cli.as_ref());
         let env_var = state
             .cli_commands
