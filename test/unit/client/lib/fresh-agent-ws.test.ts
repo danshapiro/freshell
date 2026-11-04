@@ -85,6 +85,39 @@ describe('fresh-agent-ws', () => {
     })
   })
 
+  it('keeps the final idle state when a later replay error follows an earlier running snapshot', () => {
+    const store = createFreshAgentStore()
+    const locator = {
+      provider: 'claude' as const,
+      sessionId: 'thread-replay-order',
+      sessionType: 'freshclaude' as const,
+    }
+
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      ...locator,
+      event: { type: 'freshAgent.session.snapshot', sessionId: locator.sessionId, status: 'running' },
+    })
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      ...locator,
+      event: { type: 'freshAgent.error', sessionId: locator.sessionId, code: 'PROVIDER_ERROR', message: 'provider failure' },
+    })
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.attached',
+      requestId: 'attach-replay-order',
+      viewId: 'view-mobile',
+      ...locator,
+      status: 'unknown',
+    })
+
+    expect(store.getState().freshAgent.sessions['freshclaude:claude:thread-replay-order']).toMatchObject({
+      status: 'idle',
+      streamingActive: false,
+      lastErrorCode: 'PROVIDER_ERROR',
+    })
+  })
+
   it('folds an attach failure owner fence without applying the requester error to shared session state', () => {
     const store = createFreshAgentStore()
     handleFreshAgentMessage(store.dispatch, {

@@ -865,3 +865,88 @@ async fn hosted_attaches_keep_replay_requester_scoped_and_later_events_shared() 
         assert_eq!(shared["provider"], "claude");
     }
 }
+
+#[tokio::test]
+async fn hosted_attach_keeps_earlier_status_before_later_replay_error() {
+    let fixture = readiness_fixture().await;
+    {
+        let mut events = fixture.events.lock().unwrap();
+        events.push(AgentJournalEvent {
+            sequence: 3,
+            event: AgentEvent::Provider {
+                payload: serde_json::json!({
+                    "type":"freshAgent.event", "provider":"claude",
+                    "sessionType":"freshclaude", "sessionId":NATIVE,
+                    "event":{"type":"freshAgent.status", "sessionId":NATIVE, "status":"running"},
+                }),
+            },
+        });
+        events.push(AgentJournalEvent {
+            sequence: 4,
+            event: AgentEvent::Provider {
+                payload: serde_json::json!({
+                    "type":"freshAgent.event", "provider":"claude",
+                    "sessionType":"freshclaude", "sessionId":NATIVE,
+                    "event":{"type":"freshAgent.error", "sessionId":NATIVE,
+                        "code":"PROVIDER_ERROR", "message":"the retained provider failed"},
+                }),
+            },
+        });
+    }
+    let (proxy, mut peer) = configure_proxy(
+        &fixture.control_socket,
+        HashMap::from([(("claude".into(), NATIVE.into()), fixture.soul.clone())]),
+    );
+
+    let frames = attach_with_requester(&proxy, fixture.soul.clone(), "attach-replay-order").await;
+
+    let running_status_index = frames
+        .iter()
+        .position(|frame| {
+            matches!(frame,
+                ServerMessage::FreshAgentEvent(event)
+                    if event.event["type"] == "freshAgent.status"
+                        && event.event["status"] == "running"
+            )
+        })
+        .expect("the requester receives the earlier running status");
+    let hard_error_index = frames
+        .iter()
+        .position(|frame| {
+            matches!(frame,
+                ServerMessage::FreshAgentEvent(event)
+                    if event.event["type"] == "freshAgent.error"
+                        && event.event["code"] == "PROVIDER_ERROR"
+            )
+        })
+        .expect("the requester receives the later canonical error");
+    assert!(
+        running_status_index < hard_error_index,
+        "replay order is retained: {frames:?}"
+    );
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| matches!(frame, ServerMessage::FreshAgentAttached(_)))
+            .count(),
+        1,
+        "one correlated settlement follows the replay: {frames:?}"
+    );
+    assert!(matches!(
+        frames.last(),
+        Some(ServerMessage::FreshAgentAttached(attached))
+            if attached.request_id == "attach-replay-order"
+                && attached.status == "unknown"
+                && attached.snapshot.is_none()
+    ));
+    while let Ok(raw) = peer.try_recv() {
+        let shared: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            !matches!(
+                shared["type"].as_str(),
+                Some("freshAgent.attached" | "freshAgent.attach.failed")
+            ),
+            "attach settlement is requester-scoped: {shared}"
+        );
+    }
+}
