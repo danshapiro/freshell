@@ -145,17 +145,38 @@ function nativeDiagnosticSecrets(extra: readonly string[] = []): string[] {
     .map(([, value]) => value ?? '')]
 }
 
-export const REAL_NATIVE_READER = `const redactNativeDiagnostic = ${redactNativeDiagnostic.toString()};\nconst nativeExecutionDetails = ${nativeExecutionDetails.toString()};\n` + String.raw`
+export function admitNativeSelection(value: unknown, rootSessionId: string, graphDigest: string): { sessionId: string; messageCount: number }[] {
+  const selection = value as { rootSessionId?: unknown; graphDigest?: unknown; sessions?: { sessionId: string; messageCount: number }[] } | null
+  if (!selection || selection.rootSessionId !== rootSessionId || selection.graphDigest !== graphDigest
+    || !Array.isArray(selection.sessions) || selection.sessions.length < 1 || selection.sessions.length > 50_000
+    || new Set(selection.sessions.map(session => session.sessionId)).size !== selection.sessions.length
+    || !selection.sessions.some(session => session.sessionId === rootSessionId)
+    || selection.sessions.some(session => !/^ses_[a-zA-Z0-9_-]+$/.test(session.sessionId)
+      || !Number.isSafeInteger(session.messageCount) || session.messageCount < 0)) throw new Error('native payload selection differs')
+  return selection.sessions
+}
+
+export const REAL_NATIVE_READER = `const redactNativeDiagnostic = ${redactNativeDiagnostic.toString()};\nconst nativeExecutionDetails = ${nativeExecutionDetails.toString()};\nconst admitNativeSelection = ${admitNativeSelection.toString()};\n` + String.raw`
 const fs=require('node:fs'),cp=require('node:child_process'),crypto=require('node:crypto'),{Readable}=require('node:stream'),{pipeline}=require('node:stream/promises');
 const [requestFile,resultFile]=process.argv.slice(1),input=JSON.parse(fs.readFileSync(requestFile,'utf8'));
 const descriptor=JSON.parse(fs.readFileSync(input.descriptorFile,'utf8')),manifest=JSON.parse(descriptor.manifestJson);
-const sessions=manifest.rows.filter(row=>row.table==='session').map(row=>row.key[0].value),artifacts=[];
+const artifacts=[],validations=[];
 const deadline=Date.now()+(input.nativeBudgetMs||300000)-5000;
 const remaining=()=>{const value=deadline-Date.now();if(value<1)throw Error('native owner budget expired');return value};
 const sha=file=>{const fd=fs.openSync(file,'r'),b=Buffer.alloc(65536),hash=crypto.createHash('sha256');try{for(;;){const n=fs.readSync(fd,b);if(!n)break;hash.update(b.subarray(0,n))}}finally{fs.closeSync(fd)}return hash.digest('hex')};
 const status=fs.readFileSync('/proc/self/status','utf8');
 if(process.getuid()!==65534||process.getgid()!==0||!/^CapEff:\s+0+$/m.test(status)||!/^NoNewPrivs:\s+1$/m.test(status))throw Error('provider boundary differs');
 if(cp.execFileSync('opencode',['--version'],{encoding:'utf8',timeout:Math.min(30000,remaining()),killSignal:'SIGKILL'}).trim()!=='1.18.21')throw Error('native version differs');
+let sessions;
+if(manifest.version===2){
+ const request='/scratch/native-selection-request.json';fs.writeFileSync(request,JSON.stringify({descriptorFile:input.descriptorFile,payloadFile:input.payloadFile,rootSessionId:input.rootSessionId}),{mode:0o600,flag:'wx'});
+ const selected=cp.spawnSync('/opt/transfer-stage',['--stage','selection','--request-file',request],{encoding:'utf8',timeout:remaining(),killSignal:'SIGKILL',maxBuffer:8*1024*1024});
+ if(selected.error||selected.status!==0||selected.signal)throw Error('native payload selection failed');
+ sessions=admitNativeSelection(JSON.parse(selected.stdout),input.rootSessionId,descriptor.sourceGeneration);
+}else{
+ const count=manifest.rows.filter(row=>row.table==='message'&&row.key.length===1).length;
+ sessions=manifest.rows.filter(row=>row.table==='session').map(row=>({sessionId:row.key[0].value,messageCount:count}));
+}
 const log=fs.openSync('/scratch/native-private.log','wx',0o600),server=cp.spawn('opencode',['serve','--hostname','127.0.0.1','--port','4199'],{cwd:input.workspacePath,stdio:['ignore',log,log]});fs.closeSync(log);
 let serverError,serverClosed=false;const closed=new Promise(resolve=>{server.once('error',error=>{serverError=error});server.once('close',()=>{serverClosed=true;resolve()})});
 let validation;
@@ -165,10 +186,10 @@ const stopServer=async()=>{if(settled())return;let force,limit;try{server.kill('
 for(let n=0;n<200;n++){if(serverError||settled())throw Error('native startup failed');try{if((await fetch('http://127.0.0.1:4199/global/health',{signal:AbortSignal.timeout(Math.min(500,remaining()))})).ok)break}catch{}if(n===199)throw Error('native startup failed');await new Promise(r=>setTimeout(r,100))}
 if(serverError||settled())throw Error('native startup child did not survive health read');
 const get=async(route,file)=>{const signal=AbortSignal.timeout(Math.min(120000,remaining()));const r=await fetch('http://127.0.0.1:4199'+route,{headers:{'x-opencode-directory':input.workspacePath},signal});if(!r.ok||!r.body)throw Error('typed native read failed');await pipeline(Readable.fromWeb(r.body),fs.createWriteStream(file,{mode:0o600,flags:'wx'}),{signal});return r.headers.get('x-next-cursor')};
-for(const session of sessions){
+for(const selected of sessions){const session=selected.sessionId;
  if(!/^ses_[a-zA-Z0-9_-]+$/.test(session))throw Error('native session ID differs');
  const infoFile='/scratch/native-'+session+'-info.json';await get('/session/'+encodeURIComponent(session),infoFile);
- const expectedCount=manifest.rows.filter(row=>row.table==='message'&&row.key.length===1).length;
+ const expectedCount=selected.messageCount;
  const pages=[],cursors=new Set();let before='';
  for(let page=0;;page++){
   if(page>expectedCount)throw Error('native page count exceeds full selected graph');
@@ -179,20 +200,21 @@ for(const session of sessions){
  const exportFile='/scratch/native-'+session+'-export.json',out=fs.openSync(exportFile,'wx',0o600);
  const exported=cp.spawnSync('opencode',['export',session],{cwd:input.workspacePath,stdio:['ignore',out,'pipe'],timeout:Math.min(180000,remaining()),killSignal:'SIGKILL',maxBuffer:1024*1024});fs.closeSync(out);
  if(exported.error||exported.status!==0||exported.signal){fs.appendFileSync('/scratch/native-private.log',exported.stderr||Buffer.alloc(0));throw Error('native export failed')};artifacts.push({path:exportFile,sha256:sha(exportFile)});
- const validationFile='/scratch/native-'+session+'-validation.json';fs.writeFileSync(validationFile,JSON.stringify({descriptorFile:input.descriptorFile,databaseFile:input.destinationDatabase,rootSessionId:input.rootSessionId,sessionId:session,infoFile,pageFiles:pages,exportFile}),{mode:0o600,flag:'wx'});
- const checked=cp.spawnSync('/opt/transfer-stage',['--stage','native','--request-file',validationFile],{cwd:input.workspacePath,encoding:'utf8',timeout:remaining(),killSignal:'SIGKILL',maxBuffer:1024*1024});
- if(checked.error||checked.status!==0||checked.signal){
-  validation={sessionId:session,execution:nativeExecutionDetails(checked)};
-  try{validation.diagnostic=JSON.parse(fs.readFileSync('/scratch/native-'+session+'-validation-error.json','utf8'))}
-  catch(error){validation.diagnosticReadError=nativeExecutionDetails(error)}
-  throw Error('native exact artifact validation failed');
- }
+ validations.push({descriptorFile:input.descriptorFile,payloadFile:manifest.version===2?input.payloadFile:undefined,databaseFile:input.destinationDatabase,rootSessionId:input.rootSessionId,sessionId:session,infoFile,pageFiles:pages,exportFile});
  // Preserve every original native page byte without holding a whole session.
  // One aggregate GET artifact avoids thousands of separate Docker captures.
  const readFile='/scratch/native-'+session+'-read.json',readFd=fs.openSync(readFile,'wx',0o600),buffer=Buffer.alloc(65536);
  const copy=file=>{const fd=fs.openSync(file,'r');try{for(;;){const n=fs.readSync(fd,buffer);if(!n)break;fs.writeSync(readFd,buffer.subarray(0,n))}}finally{fs.closeSync(fd)}};
  try{fs.writeSync(readFd,'{"info":');copy(infoFile);fs.writeSync(readFd,',"pages":[');for(let n=0;n<pages.length;n++){if(n)fs.writeSync(readFd,',');copy(pages[n])}fs.writeSync(readFd,']}');fs.fsyncSync(readFd)}finally{fs.closeSync(readFd)}
  artifacts.push({path:readFile,sha256:sha(readFile)});count++;
+}
+const validationFile='/scratch/native-validation-request.json';fs.writeFileSync(validationFile,JSON.stringify(validations),{mode:0o600,flag:'wx'});
+const checked=cp.spawnSync('/opt/transfer-stage',['--stage','native','--request-file',validationFile],{cwd:input.workspacePath,encoding:'utf8',timeout:remaining(),killSignal:'SIGKILL',maxBuffer:1024*1024});
+if(checked.error||checked.status!==0||checked.signal){
+ validation={execution:nativeExecutionDetails(checked)};
+ try{validation.diagnostic=JSON.parse(fs.readFileSync('/scratch/native-validation-request-error.json','utf8'))}
+ catch(error){validation.diagnosticReadError=nativeExecutionDetails(error)}
+ throw Error('native exact artifact validation failed');
 }
 if(count!==sessions.length||count<1)throw Error('native read selection incomplete');
 result={rootSessionId:input.rootSessionId,graphDigest:descriptor.sourceGeneration,nativeVersion:'1.18.21',nativeReadableSessionCount:count,providerUid:process.getuid(),providerGid:process.getgid(),snapshotSummary:input.savedSnapshotSummary,artifacts};
@@ -312,7 +334,10 @@ export async function runRealRootRehearsal(input: { manifestFile: string; scratc
       if (exported.status !== 'complete' || exported.evidence.sourceStoreId !== manifest.sourceIdentity || exported.evidence.graphDigest !== root.graphDigest) throw new Error('original source export differs from preflight')
       const descriptor = JSON.parse(fs.readFileSync(request.descriptorFile, 'utf8'))
       const selected = JSON.parse(descriptor.manifestJson)
-      const policy = realTransferPolicy(fs.statSync(request.payloadFile).size, selected.rows.filter((row: { table: string }) => row.table === 'session').length)
+      const sessionCount = selected.version === 2
+        ? admitNativeSelection(exported.evidence.nativeSelection, rootSessionId, descriptor.sourceGeneration).length
+        : selected.rows.filter((row: { table: string }) => row.table === 'session').length
+      const policy = realTransferPolicy(fs.statSync(request.payloadFile).size, sessionCount)
       phases.set(rootSessionId, 'provider_allocation')
       const owned = harness.startTransferProvider(adapter, schema, migrations, [root.workspacePath], policy)
       const inspection = harness.inspectContainer(owned.containerId)
