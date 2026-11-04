@@ -230,10 +230,22 @@ fn native_send_reply(previous: &str, native: &str, pending: Option<String>) -> H
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeSendReadiness {
+    Observed,
+    Exited,
+    ExitedWithoutRecoveryCapability,
+    ExitedWithWrongGeneration,
+    ExitedWithWrongBoot,
+    ExitedWithConflictingRoot,
+    ExitedWithNewlyAuthenticatedBoot,
+}
+
 async fn native_send_host(
     fixture: &RunningFreshAgent,
     replies: Vec<HostResult>,
     gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    initial_readiness: NativeSendReadiness,
 ) -> (
     tokio::sync::oneshot::Sender<()>,
     tokio::task::JoinHandle<usize>,
@@ -241,7 +253,6 @@ async fn native_send_host(
     let secret = b"synthetic-host-secret";
     std::fs::write(fixture.runtime_dir.join("secret"), secret).unwrap();
     let listener = UnixListener::bind(fixture.runtime_dir.join("host.sock")).unwrap();
-    let boot = HostBootId::new();
     let incarnation = fixture.incarnation.clone();
     let context = fixture
         .supervisor
@@ -250,7 +261,7 @@ async fn native_send_host(
         .await
         .unwrap();
     let mut launch = context.native_identity_launch.unwrap();
-    let mut observation = fixture
+    let view = fixture
         .supervisor
         .registry
         .inventory()
@@ -258,7 +269,14 @@ async fn native_send_host(
         .unwrap()
         .into_iter()
         .find(|view| view.incarnation_id == fixture.incarnation)
-        .unwrap()
+        .unwrap();
+    let boot = if initial_readiness == NativeSendReadiness::ExitedWithNewlyAuthenticatedBoot {
+        HostBootId::new()
+    } else {
+        view.host_boot_id
+            .expect("the original execution grant owns this boot")
+    };
+    let mut observation = view
         .native_identity_observation
         .expect("the current producer observation was published during fixture startup");
     let control_epoch = fixture.supervisor.registry.control_epoch();
@@ -272,8 +290,16 @@ async fn native_send_host(
                 tokio::select! {_=&mut stop=>break,result=listener.accept()=>result.unwrap().0};
             let envelope: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
             let result = match envelope.body {
-                HostCommand::Hello {incarnation_id,challenge} => HostResult::Hello {
-                    host_boot_id:boot.clone(),proof:host_proof(secret,&challenge,&boot,&incarnation_id),capabilities:vec!["native-identity-observation-v1".into()],effective_limits:crate::checkpoints::tests::limits()
+                HostCommand::Hello {incarnation_id,challenge} => {
+                    let mut capabilities = vec!["native-identity-observation-v1".into()];
+                    if initial_readiness != NativeSendReadiness::Observed
+                        && initial_readiness != NativeSendReadiness::ExitedWithoutRecoveryCapability
+                    {
+                        capabilities.push("fresh-agent-codex-dispatch-recovery-v1".into());
+                    }
+                    HostResult::Hello {
+                        host_boot_id:boot.clone(),proof:host_proof(secret,&challenge,&boot,&incarnation_id),capabilities,effective_limits:crate::checkpoints::tests::limits()
+                    }
                 },
                 HostCommand::Status { incarnation_id } => {
                     assert_eq!(incarnation_id, incarnation);
@@ -281,16 +307,26 @@ async fn native_send_host(
                     assert!(!ready_for_send, "only one readiness read may precede each original input");
                     assert!(observation.matches_launch(&launch));
                     ready_for_send = true;
+                    let exited = sends == 0 && initial_readiness != NativeSendReadiness::Observed;
                     HostResult::Status {
-                        host_boot_id: boot.clone(),
+                        host_boot_id: if initial_readiness == NativeSendReadiness::ExitedWithWrongBoot {
+                            HostBootId::new()
+                        } else {
+                            boot.clone()
+                        },
                         worker_pid: Some(123),
                         worker_launch_count: 1,
                         max_control_epoch: control_epoch,
-                        max_execution_generation: launch.execution_generation,
+                        max_execution_generation: launch.execution_generation
+                            + u64::from(initial_readiness == NativeSendReadiness::ExitedWithWrongGeneration),
                         fixture_evidence: serde_json::Value::Null,
-                        exited: false,
-                        native_session_id: Some(observation.native_session_id.clone()),
-                        native_identity_observation: Some(observation.clone()),
+                        exited,
+                        native_session_id: if initial_readiness == NativeSendReadiness::ExitedWithConflictingRoot {
+                            Some("another-native-root".into())
+                        } else {
+                            (!exited).then(|| observation.native_session_id.clone())
+                        },
+                        native_identity_observation: (!exited).then(|| observation.clone()),
                         opencode_transfer_receipt: None,
                         opencode_adoption: Default::default(),
                     }
@@ -329,12 +365,290 @@ async fn native_send_host(
             .unwrap();
         }
         assert!(
-            !ready_for_send,
+            !ready_for_send || initial_readiness != NativeSendReadiness::Observed,
             "an acknowledgement must not trigger a trailing native probe"
         );
         sends
     });
     (shutdown, host)
+}
+
+#[tokio::test]
+async fn ended_codex_send_commits_the_typed_recovered_identity_once() {
+    let fixture = running_fresh_provider_with_name(
+        FreshProvider::Codex,
+        Some("pending-original".into()),
+        "native-original",
+    )
+    .await;
+    let (shutdown, host) = native_send_host(
+        &fixture,
+        vec![
+            native_send_reply("native-original", "native-recovered", None),
+            native_send_reply("native-recovered", "native-recovered", None),
+        ],
+        None,
+        NativeSendReadiness::Exited,
+    )
+    .await;
+    let request = RequestId::new();
+    let first = fixture
+        .supervisor
+        .fresh_agent_send(
+            request.clone(),
+            fixture.soul.clone(),
+            "original recovery input".into(),
+            None,
+            None,
+        )
+        .await;
+    let mut following = Vec::new();
+    if first.is_ok() {
+        following.push(
+            fixture
+                .supervisor
+                .fresh_agent_send(
+                    request,
+                    fixture.soul.clone(),
+                    "original recovery input".into(),
+                    None,
+                    None,
+                )
+                .await,
+        );
+        following.push(
+            fixture
+                .supervisor
+                .fresh_agent_send(
+                    RequestId::new(),
+                    fixture.soul.clone(),
+                    "next current-source input".into(),
+                    None,
+                    None,
+                )
+                .await,
+        );
+    }
+    shutdown.send(()).unwrap();
+    let sends = host.await.unwrap();
+    assert!(
+        matches!(first, Ok(CommandState::ProviderAcked)),
+        "the ended original must reach its owned typed recovery dispatch: {first:?}"
+    );
+    assert!(matches!(following[0], Ok(CommandState::Completed)));
+    assert!(matches!(following[1], Ok(CommandState::ProviderAcked)));
+    assert_eq!(sends, 2, "the original request is never replayed");
+    let current = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        current.native_session_id.as_deref(),
+        Some("native-recovered")
+    );
+    assert_eq!(
+        current.fresh_agent.unwrap().session_id,
+        "fresh-session",
+        "the durable user reference survives recovery"
+    );
+}
+
+#[tokio::test]
+async fn ended_codex_send_requires_current_boot_generation_source_and_recovery_capability() {
+    for readiness in [
+        NativeSendReadiness::ExitedWithoutRecoveryCapability,
+        NativeSendReadiness::ExitedWithWrongGeneration,
+        NativeSendReadiness::ExitedWithWrongBoot,
+        NativeSendReadiness::ExitedWithConflictingRoot,
+    ] {
+        let fixture =
+            running_fresh_provider_with_name(FreshProvider::Codex, None, "native-original").await;
+        let (shutdown, host) = native_send_host(&fixture, vec![], None, readiness).await;
+        let result = fixture
+            .supervisor
+            .fresh_agent_send(
+                RequestId::new(),
+                fixture.soul.clone(),
+                "original recovery input".into(),
+                None,
+                None,
+            )
+            .await;
+        shutdown.send(()).unwrap();
+        assert!(
+            result.is_err(),
+            "unqualified recovery cannot admit input: {result:?}"
+        );
+        assert_eq!(host.await.unwrap(), 0);
+        let connection =
+            rusqlite::Connection::open(fixture.supervisor.registry.database_path()).unwrap();
+        let admitted: u64 = connection
+            .query_row("SELECT count(*) FROM input_commands", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(admitted, 0);
+    }
+}
+
+#[tokio::test]
+async fn ended_codex_send_rejects_new_boot_reusing_old_grant() {
+    let fixture =
+        running_fresh_provider_with_name(FreshProvider::Codex, None, "native-original").await;
+    let (shutdown, host) = native_send_host(
+        &fixture,
+        vec![native_send_reply(
+            "native-original",
+            "native-original",
+            None,
+        )],
+        None,
+        NativeSendReadiness::ExitedWithNewlyAuthenticatedBoot,
+    )
+    .await;
+    let result = fixture
+        .supervisor
+        .fresh_agent_send(
+            RequestId::new(),
+            fixture.soul.clone(),
+            "original recovery input".into(),
+            None,
+            None,
+        )
+        .await;
+    shutdown.send(()).unwrap();
+    let sends = host.await.unwrap();
+    assert!(
+        result.is_err(),
+        "a new authenticated boot cannot inherit the old grant: {result:?}"
+    );
+    assert_eq!(
+        sends, 0,
+        "custody is checked before forwarding the original input"
+    );
+}
+
+#[tokio::test]
+async fn ended_codex_send_recovers_after_observer_settles_store_unreadable() {
+    for recovered_root in ["native-recovered", "native-original"] {
+        let fixture =
+            running_fresh_provider_with_name(FreshProvider::Codex, None, "native-original").await;
+        let (shutdown, host) = native_send_host(
+            &fixture,
+            vec![native_send_reply("native-original", recovered_root, None)],
+            None,
+            NativeSendReadiness::Exited,
+        )
+        .await;
+        let fence = fixture
+            .supervisor
+            .registry
+            .recovery_write_fence(fixture.soul.clone())
+            .await
+            .unwrap();
+        fixture
+            .supervisor
+            .registry
+            .mark_recovery_blocked(
+                fixture.soul.clone(),
+                None,
+                RecoveryBlockReason::StoreUnreadable,
+                vec!["the observer inspected the archived original source".into()],
+                fence,
+            )
+            .await
+            .unwrap();
+        let result = fixture
+            .supervisor
+            .fresh_agent_send(
+                RequestId::new(),
+                fixture.soul.clone(),
+                "original recovery input".into(),
+                None,
+                None,
+            )
+            .await;
+        shutdown.send(()).unwrap();
+        let sends = host.await.unwrap();
+        assert!(
+            matches!(result, Ok(CommandState::ProviderAcked)),
+            "the first send must not race observer settlement: {result:?}"
+        );
+        assert_eq!(sends, 1);
+        let view = fixture
+            .supervisor
+            .registry
+            .inventory()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|view| view.incarnation_id == fixture.incarnation)
+            .unwrap();
+        assert_eq!(view.recovery_state, RecoveryState::Live);
+        assert_eq!(view.native_session_id.as_deref(), Some(recovered_root));
+    }
+}
+#[tokio::test]
+async fn ended_codex_send_does_not_recover_other_blocked_or_stopped_ownership() {
+    for reason in [
+        RecoveryBlockReason::AmbiguousIdentity,
+        RecoveryBlockReason::OldRuntimeNotEmpty,
+        RecoveryBlockReason::WrongNativeIdentity,
+        RecoveryBlockReason::StopIntent,
+    ] {
+        let fixture =
+            running_fresh_provider_with_name(FreshProvider::Codex, None, "native-original").await;
+        let (shutdown, host) =
+            native_send_host(&fixture, vec![], None, NativeSendReadiness::Exited).await;
+        let fence = fixture
+            .supervisor
+            .registry
+            .recovery_write_fence(fixture.soul.clone())
+            .await
+            .unwrap();
+        fixture
+            .supervisor
+            .registry
+            .mark_recovery_blocked(
+                fixture.soul.clone(),
+                None,
+                reason,
+                vec!["owned blocked-state fixture".into()],
+                fence,
+            )
+            .await
+            .unwrap();
+        if reason == RecoveryBlockReason::StopIntent {
+            fixture
+                .supervisor
+                .registry
+                .begin_stop(fixture.soul.clone())
+                .await
+                .unwrap();
+        }
+        let result = fixture
+            .supervisor
+            .fresh_agent_send(
+                RequestId::new(),
+                fixture.soul.clone(),
+                "original recovery input".into(),
+                None,
+                None,
+            )
+            .await;
+        shutdown.send(()).unwrap();
+        assert!(
+            result.is_err(),
+            "{reason:?} must remain blocked: {result:?}"
+        );
+        assert_eq!(host.await.unwrap(), 0);
+        let connection =
+            rusqlite::Connection::open(fixture.supervisor.registry.database_path()).unwrap();
+        let admitted: u64 = connection.query_row(
+            "SELECT count(*) FROM input_commands WHERE state IN ('queued','dispatching','completed')", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(admitted, 0, "{reason:?}");
+    }
 }
 
 #[tokio::test]
@@ -383,7 +697,8 @@ async fn accepted_native_recovery_preserves_presentation_and_pending_name_policy
             handle.clone(),
         ));
         let expected_sends = replies.len();
-        let (shutdown, host) = native_send_host(&fixture, replies, None).await;
+        let (shutdown, host) =
+            native_send_host(&fixture, replies, None, NativeSendReadiness::Observed).await;
         let mut results = Vec::new();
         let mut same_native = None;
         for index in 0..expected_sends {
@@ -538,6 +853,7 @@ async fn native_dispatch_rejects_stale_invalid_and_nonaccepted_identity_authorit
             &fixture,
             vec![reply],
             (scenario == "stop-intent").then(|| (entered.clone(), release.clone())),
+            NativeSendReadiness::Observed,
         )
         .await;
         let work = tokio::spawn({

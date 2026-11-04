@@ -1,5 +1,7 @@
 mod claude_source_observation;
 mod codex_activity;
+#[cfg(test)]
+mod codex_dispatch_recovery_tests;
 mod command_journal;
 mod control;
 mod native_auth_reader;
@@ -844,6 +846,7 @@ async fn dispatch_with_effects(
                     "opencode-adoption-observation-v1".into(),
                     "native-identity-observation-v1".into(),
                     "fresh-agent-native-readiness-v1".into(),
+                    "fresh-agent-codex-dispatch-recovery-v1".into(),
                     "grant-v1".into(),
                     "stop-v1".into(),
                     "security-probe-v1".into(),
@@ -1129,7 +1132,7 @@ async fn dispatch_with_effects(
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
                     let _native_command = state.fresh_native_command.lock().await;
-                    ensure_current_fresh_native_observation(state).await?;
+                    ensure_fresh_native_send_authority(state).await?;
                     let actor = state
                         .fresh_agent
                         .lock()
@@ -1147,6 +1150,20 @@ async fn dispatch_with_effects(
                         .await
                         .map_err(map_actor_error)?;
                     let after = actor.profile().await;
+                    if after.provider == freshell_runtime_protocol::FreshProvider::Codex
+                        && matches!(
+                            command_state,
+                            freshell_runtime_protocol::CommandState::ProviderAcked
+                                | freshell_runtime_protocol::CommandState::Completed
+                        )
+                    {
+                        commit_fresh_native_transition(
+                            state,
+                            &actor,
+                            before.native_session_id.as_deref(),
+                        )
+                        .await?;
+                    }
                     let native_session_id = after.native_session_id.clone();
                     let native_identity =
                         if after.provider == freshell_runtime_protocol::FreshProvider::Codex {
@@ -2758,6 +2775,57 @@ async fn commit_fresh_native_transition(
         "executionGeneration":persisted.max_execution_generation,
         "evidenceRevision":persisted.native_identity_launch.as_ref().map(|launch|launch.evidence_revision)})).ok();
     Ok(())
+}
+
+async fn ensure_fresh_native_send_authority(state: &HostState) -> Result<(), RuntimeError> {
+    let persisted = state.persisted.lock().await.clone();
+    if current_native_observation(state, &persisted)
+        .await
+        .is_some()
+    {
+        return Ok(());
+    }
+    let actor = state.fresh_agent.lock().await.clone();
+    if let (Some(launch), Some(actor)) = (persisted.native_identity_launch.as_ref(), actor) {
+        if let Some(evidence) = actor.codex_dispatch_recovery_evidence().await {
+            let profile = actor.profile().await;
+            let bound = persisted.provider.as_deref() == Some("codex")
+                && persisted.grant_id.is_some()
+                && persisted.host_boot_id.as_ref() == Some(&state.host_boot_id)
+                && launch.incarnation_id == state.incarnation_id
+                && launch.execution_generation == persisted.max_execution_generation
+                && launch
+                    .requested_native_session_id
+                    .as_ref()
+                    .is_none_or(|root| profile.native_session_id.as_ref() == Some(root))
+                && evidence["launch"] == serde_json::json!(launch)
+                && profile.native_session_id.as_deref() == evidence["nativeSessionId"].as_str()
+                && state
+                    .fresh_agent
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &actor));
+            if bound {
+                ensure_grant_running(
+                    state,
+                    persisted.max_control_epoch,
+                    persisted.max_execution_generation,
+                )?;
+                append_event_with_secret(
+                    &state.state_dir,
+                    &state.secret,
+                    "host.native_input.recovery_bound",
+                    serde_json::json!({"severity":"info", "incarnationId":state.incarnation_id,
+                        "executionGeneration":persisted.max_execution_generation,
+                        "nativeSessionId":profile.native_session_id}),
+                )
+                .ok();
+                return Ok(());
+            }
+        }
+    }
+    ensure_current_fresh_native_observation(state).await
 }
 
 async fn ensure_current_fresh_native_observation(state: &HostState) -> Result<(), RuntimeError> {

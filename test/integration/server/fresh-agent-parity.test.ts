@@ -1064,6 +1064,16 @@ tool_timeout_sec = 120
       return { ...metadata, copy }
     })
     fs.writeFileSync(path.join(archiveDirectory, 'manifest.json'), JSON.stringify(archiveManifest, null, 2), { mode: 0o600 })
+    // Let the real provider-exit observer settle before the original send.
+    // Recovery must not depend on submitting input before its store probe.
+    const observerRecovery = await rig.runtime.adminOk(rig.supervisor,
+      rig.runtime.recoverBody(beforeCrash.view.soulId, 'provider_exit'))
+    const observerSettled = (await rig.inventory()).find(row => row.containerId === providerContainerId)
+    expect(observerSettled).toMatchObject({ launchState: 'running', recoveryState: 'blocked',
+      recoveryReason: 'STORE_UNREADABLE', nativeSessionId: view.nativeSessionId })
+    rig.runtime.writeIncident('freshcodex-managed-native-observer-settled-loss', {
+      userRef: created.sessionId, observerRecovery, observerSettled, archiveManifest,
+    })
     const recoveryAccepted = await send('AWAITED_PLAN_RECOVERY')
     const recovered = await rig.runningViewForFreshSession(created.sessionId)
     rig.runtime.writeIncident('freshcodex-managed-native-crash-first-send', { userRef: created.sessionId, beforeCrash,

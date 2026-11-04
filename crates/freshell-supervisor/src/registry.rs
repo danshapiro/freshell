@@ -23,6 +23,8 @@ use std::{
 };
 
 pub const SCHEMA_VERSION: u32 = 20;
+mod codex_dispatch_recovery;
+pub(crate) use codex_dispatch_recovery::OwnedCodexDispatchRecovery;
 mod input_reservation;
 pub(crate) use input_reservation::binary_digest;
 pub use input_reservation::{BoundInputReservation, OwnedInputReservation};
@@ -49,6 +51,7 @@ enum NativeSessionTransitionEvidence {
     ClaudeClear(freshell_runtime_protocol::NativeIdentityObservation),
     AcceptedDispatch {
         pending_naming_handle: Option<String>,
+        recovery_source: Option<Arc<OwnedCodexDispatchRecovery>>,
     },
 }
 
@@ -2590,7 +2593,7 @@ impl Registry {
         data: &[u8],
         correlation: Option<&[u8]>,
     ) -> Result<(InputJournalDisposition, IncarnationId), RegistryError> {
-        self.begin_input_with_settings(soul_id, request_id, data, correlation, None)
+        self.begin_input_with_settings(soul_id, request_id, data, correlation, None, None)
             .await
     }
 
@@ -2602,8 +2605,27 @@ impl Registry {
         correlation: &[u8],
         settings: Option<FreshAgentTurnSettings>,
     ) -> Result<(InputJournalDisposition, IncarnationId), RegistryError> {
-        self.begin_input_with_settings(soul_id, request_id, data, Some(correlation), settings)
+        self.begin_input_with_settings(soul_id, request_id, data, Some(correlation), settings, None)
             .await
+    }
+
+    pub(crate) async fn begin_codex_dispatch_recovery_input(
+        &self,
+        source: Arc<OwnedCodexDispatchRecovery>,
+        request_id: RequestId,
+        data: &[u8],
+        correlation: &[u8],
+        settings: Option<FreshAgentTurnSettings>,
+    ) -> Result<(InputJournalDisposition, IncarnationId), RegistryError> {
+        self.begin_input_with_settings(
+            source.handle.soul_id().clone(),
+            request_id,
+            data,
+            Some(correlation),
+            settings,
+            Some(source),
+        )
+        .await
     }
 
     async fn begin_input_with_settings(
@@ -2613,6 +2635,7 @@ impl Registry {
         data: &[u8],
         correlation: Option<&[u8]>,
         settings: Option<FreshAgentTurnSettings>,
+        recovery_source: Option<Arc<OwnedCodexDispatchRecovery>>,
     ) -> Result<(InputJournalDisposition, IncarnationId), RegistryError> {
         let payload_digest = input_payload_digest(data, correlation);
         let protected_payload = data.to_vec();
@@ -2674,15 +2697,23 @@ impl Registry {
                 current.ok_or_else(|| RegistryError::UnknownSoul(soul_id.clone()))?;
             let incarnation_id = IncarnationId::parse(incarnation_raw)
                 .map_err(|_| RegistryError::Integrity("invalid incarnation id".into()))?;
+            let recovery_admitted = if let Some(source) = recovery_source.as_ref() {
+                codex_dispatch_recovery::validate_source(&tx, source)?;
+                source.handle.soul_id() == &soul_id
+                    && source.handle.incarnation_id() == &incarnation_id
+                    && has_data
+            } else {
+                false
+            };
             let admitted = match recovery_state.as_str() {
-                "live" => true,
+                "live" => recovery_source.is_none() || recovery_admitted,
                 "blocked" => {
-                    has_data
+                    recovery_admitted || (has_data
                         && fresh_opencode_terminal_can_accept_input_before_native_identity(
                             &tx,
                             &soul_id,
                             &incarnation_id,
-                        )?
+                        )?)
                 }
                 _ => false,
             };
@@ -3118,6 +3149,27 @@ impl Registry {
             fence,
             NativeSessionTransitionEvidence::AcceptedDispatch {
                 pending_naming_handle: identity.pending_naming_handle,
+                recovery_source: None,
+            },
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub(crate) async fn record_codex_dispatch_recovery_identity(
+        &self,
+        source: Arc<OwnedCodexDispatchRecovery>,
+        identity: NativeDispatchIdentity,
+    ) -> Result<(), RegistryError> {
+        self.transition_native_session_evidenced_fenced(
+            source.handle.soul_id().clone(),
+            source.handle.incarnation_id().clone(),
+            &identity.previous_native_session_id,
+            &identity.native_session_id,
+            source.fence.clone(),
+            NativeSessionTransitionEvidence::AcceptedDispatch {
+                pending_naming_handle: identity.pending_naming_handle,
+                recovery_source: Some(source),
             },
         )
         .await
@@ -3192,14 +3244,15 @@ impl Registry {
         fence: RecoveryWriteFence,
         evidence: NativeSessionTransitionEvidence,
     ) -> Result<RecoveryWriteFence, RegistryError> {
-        let (claude_fork, native_clear, pending_naming_handle) = match evidence {
-            NativeSessionTransitionEvidence::Operation(recipe) => (recipe, None, None),
+        let (claude_fork, native_clear, pending_naming_handle, recovery_source) = match evidence {
+            NativeSessionTransitionEvidence::Operation(recipe) => (recipe, None, None, None),
             NativeSessionTransitionEvidence::ClaudeClear(observation) => {
-                (None, Some(observation), None)
+                (None, Some(observation), None, None)
             }
             NativeSessionTransitionEvidence::AcceptedDispatch {
                 pending_naming_handle,
-            } => (None, None, Some(pending_naming_handle)),
+                recovery_source,
+            } => (None, None, Some(pending_naming_handle), recovery_source),
         };
         let preserve_presentation = pending_naming_handle.is_some();
         if let Some(recipe) = &claude_fork {
@@ -3220,6 +3273,14 @@ impl Registry {
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             validate_recovery_write_fence(&tx, &soul_id, &fence)?;
+            if let Some(source) = recovery_source.as_ref() {
+                codex_dispatch_recovery::validate_source(&tx, source)?;
+                if source.handle.soul_id() != &soul_id
+                    || source.handle.incarnation_id() != &incarnation_id
+                {
+                    return Err(RegistryError::NativeIdentityConflict);
+                }
+            }
             if incarnation_id != fence.active_incarnation_id {
                 return Err(RegistryError::NativeIdentityConflict);
             }
@@ -3309,6 +3370,9 @@ impl Registry {
                         spec.naming_handle=pending.clone();
                         tx.execute("UPDATE incarnations SET fresh_agent_spec=?1,updated_at=?2 WHERE incarnation_id=?3",params![serde_json::to_string(spec)?,now_millis(),incarnation_id.as_str()])?;
                     }
+                    if let Some(source) = recovery_source.as_ref() {
+                        codex_dispatch_recovery::commit_dispatch_acceptance(&tx, source)?;
+                    }
                     let successor = load_recovery_write_fence(&tx, &soul_id)?;
                     tx.commit()?;
                     return Ok(successor);
@@ -3391,6 +3455,9 @@ impl Registry {
                 // new root so a subsequent explicit operation can use it.
                 tx.execute("UPDATE incarnations SET native_identity_observation=?2 WHERE incarnation_id=?1",
                     params![incarnation_id.as_str(), serde_json::to_string(observation)?])?;
+            }
+            if let Some(source) = recovery_source.as_ref() {
+                codex_dispatch_recovery::commit_dispatch_acceptance(&tx, source)?;
             }
             let successor = load_recovery_write_fence(&tx, &soul_id)?;
             tx.commit()?;

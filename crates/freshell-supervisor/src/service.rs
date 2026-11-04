@@ -2670,20 +2670,29 @@ impl Supervisor {
         let active = match self.registry.active_handle_for_soul(soul_id.clone()).await {
             Ok(active) => active,
             Err(error @ RegistryError::UnknownSoul(_)) => {
-                let blocked = self
+                if let Some(source) = self
                     .registry
-                    .refuse_blocked_unadmitted_input(
-                        soul_id.clone(),
-                        request_id.clone(),
-                        text.as_bytes(),
-                        &settings_correlation,
-                    )
+                    .codex_dispatch_recovery_source(soul_id.clone())
                     .await
-                    .map_err(map_registry)?;
-                if let Some(diagnostic) = blocked {
-                    return Err(fresh_send_refusal_error(diagnostic));
+                    .map_err(map_registry)?
+                {
+                    source.handle().clone()
+                } else {
+                    let blocked = self
+                        .registry
+                        .refuse_blocked_unadmitted_input(
+                            soul_id.clone(),
+                            request_id.clone(),
+                            text.as_bytes(),
+                            &settings_correlation,
+                        )
+                        .await
+                        .map_err(map_registry)?;
+                    if let Some(diagnostic) = blocked {
+                        return Err(fresh_send_refusal_error(diagnostic));
+                    }
+                    return Err(map_registry(error));
                 }
-                return Err(map_registry(error));
             }
             Err(error) => return Err(map_registry(error)),
         };
@@ -2693,20 +2702,37 @@ impl Supervisor {
                 "soul is not a hosted fresh-agent",
             ));
         }
-        let host = self
-            .authenticate_current_fresh_host(&soul_id, &active)
-            .await?;
-        let (disposition, incarnation_id) = self
-            .registry
-            .begin_fresh_input(
-                soul_id.clone(),
-                request_id.clone(),
-                text.as_bytes(),
-                &settings_correlation,
-                settings.clone(),
+        let authenticated = self
+            .authenticate_fresh_host(
+                &soul_id,
+                &active,
+                FreshNativeRequirement::CodexDispatchRecovery,
             )
-            .await
-            .map_err(map_registry)?;
+            .await?;
+        let host = authenticated.host;
+        let recovery_source = authenticated.dispatch_recovery;
+        let (disposition, incarnation_id) = if let Some(source) = recovery_source.as_ref() {
+            self.registry
+                .begin_codex_dispatch_recovery_input(
+                    source.clone(),
+                    request_id.clone(),
+                    text.as_bytes(),
+                    &settings_correlation,
+                    settings.clone(),
+                )
+                .await
+        } else {
+            self.registry
+                .begin_fresh_input(
+                    soul_id.clone(),
+                    request_id.clone(),
+                    text.as_bytes(),
+                    &settings_correlation,
+                    settings.clone(),
+                )
+                .await
+        }
+        .map_err(map_registry)?;
         match disposition {
             InputJournalDisposition::Completed => return Ok(CommandState::Completed),
             InputJournalDisposition::Ambiguous => return Ok(CommandState::Ambiguous),
@@ -2768,15 +2794,30 @@ impl Supervisor {
                         prior_native,
                         native_session_id.as_deref(),
                     )?;
+                    if let Some(source) = recovery_source.as_ref() {
+                        self.registry
+                            .record_codex_dispatch_recovery_identity(source.clone(), identity)
+                            .await
+                    } else {
+                        self.registry
+                            .record_fresh_agent_dispatch_identity(
+                                soul_id.clone(),
+                                handle.incarnation_id().clone(),
+                                identity,
+                            )
+                            .await
+                    }
+                    .map_err(map_registry)?;
+                    tracing::info!(soul_id=%soul_id,incarnation_id=%handle.incarnation_id(),previous_native_session_id=prior_native,native_session_id=native_session_id.as_deref(),native_identity_update=?update,"freshagent.native_dispatch_identity_committed");
+                } else if recovery_source.is_some() {
                     self.registry
-                        .record_fresh_agent_dispatch_identity(
-                            soul_id.clone(),
-                            handle.incarnation_id().clone(),
-                            identity,
-                        )
+                        .mark_input_ambiguous(soul_id, request_id)
                         .await
                         .map_err(map_registry)?;
-                    tracing::info!(soul_id=%soul_id,incarnation_id=%handle.incarnation_id(),previous_native_session_id=prior_native,native_session_id=native_session_id.as_deref(),native_identity_update=?update,"freshagent.native_dispatch_identity_committed");
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::OwnershipMismatch,
+                        "native recovery input lacks its typed source receipt",
+                    ));
                 } else if let Some(native_session_id) = native_session_id {
                     self.registry
                         .record_native_session_fenced(
@@ -2855,6 +2896,17 @@ impl Supervisor {
         soul_id: &SoulId,
         active: &crate::registry::OwnedRuntimeHandle,
     ) -> Result<AuthenticatedHost, RuntimeError> {
+        self.authenticate_fresh_host(soul_id, active, FreshNativeRequirement::CurrentObservation)
+            .await
+            .map(|authenticated| authenticated.host)
+    }
+
+    async fn authenticate_fresh_host(
+        &self,
+        soul_id: &SoulId,
+        active: &crate::registry::OwnedRuntimeHandle,
+        requirement: FreshNativeRequirement,
+    ) -> Result<AuthenticatedFreshHost, RuntimeError> {
         let host = self
             .authenticate_host(active.incarnation_id(), active.runtime_dir())
             .await?;
@@ -2942,15 +2994,37 @@ impl Supervisor {
                 ));
             }
         }
-        if current.desired_state != freshell_runtime_protocol::DesiredState::Running
-            || current.prior_handle.incarnation_id() != active.incarnation_id()
-            || status.exited
-            || (!fixture
-                && (!host
+        let observed = !status.exited
+            && (fixture
+                || (host
                     .capabilities
                     .iter()
                     .any(|capability| capability == "native-identity-observation-v1")
-                    || crate::recovery::current_native_observation(&current, &status).is_none()))
+                    && crate::recovery::current_native_observation(&current, &status).is_some()));
+        let wants_recovery = requirement == FreshNativeRequirement::CodexDispatchRecovery
+            && (codex_dispatch_recovery_is_bound(&current, active, &host, &status)
+                || (observed
+                    && current.recovery_state
+                        == freshell_runtime_protocol::RecoveryState::Blocked
+                    && host
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability == "fresh-agent-codex-dispatch-recovery-v1")));
+        let dispatch_recovery = if wants_recovery {
+            self.registry
+                .codex_dispatch_recovery_source(soul_id.clone())
+                .await
+                .map_err(map_registry)?
+                .filter(|source| {
+                    source.matches_context(&current)
+                        && source.matches_host(&host.host_boot_id, status.max_execution_generation)
+                })
+        } else {
+            None
+        };
+        if current.desired_state != freshell_runtime_protocol::DesiredState::Running
+            || current.prior_handle.incarnation_id() != active.incarnation_id()
+            || (!observed && dispatch_recovery.is_none())
         {
             append_event(
                 &self.config.lifecycle_log,
@@ -2962,7 +3036,21 @@ impl Supervisor {
                 "fresh-agent input requires the current committed native identity",
             ));
         }
-        Ok(host)
+        if let Some(source) = dispatch_recovery.as_ref() {
+            append_event(
+                &self.config.lifecycle_log,
+                "fresh_agent.input_dispatch_recovery_bound",
+                serde_json::json!({"severity":"info", "soulId":soul_id,
+                    "incarnationId":active.incarnation_id(), "hostBootId":host.host_boot_id,
+                    "executionGeneration":status.max_execution_generation,
+                    "observerBlocked":source.is_blocked_store(),
+                    "nativeSessionId":current.native_session_id}),
+            );
+        }
+        Ok(AuthenticatedFreshHost {
+            host,
+            dispatch_recovery,
+        })
     }
 
     async fn fresh_agent_prepare_native(&self, soul_id: SoulId) -> Result<(), RuntimeError> {
@@ -8240,6 +8328,68 @@ fn ensure_host_actor_state_dir(
         ));
     }
     Ok(canonical)
+}
+
+struct AuthenticatedFreshHost {
+    host: AuthenticatedHost,
+    dispatch_recovery: Option<Arc<crate::registry::OwnedCodexDispatchRecovery>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FreshNativeRequirement {
+    CurrentObservation,
+    CodexDispatchRecovery,
+}
+
+fn codex_dispatch_recovery_is_bound(
+    current: &crate::registry::RecoveryContext,
+    active: &crate::registry::OwnedRuntimeHandle,
+    host: &AuthenticatedHost,
+    status: &HostStatus,
+) -> bool {
+    let Some(original) = current.native_session_id.as_deref() else {
+        return false;
+    };
+    let Some(profile) = current.fresh_agent.as_ref() else {
+        return false;
+    };
+    let Some(launch) = current.native_identity_launch.as_ref() else {
+        return false;
+    };
+    current.provider == "codex"
+        && profile.provider == freshell_runtime_protocol::FreshProvider::Codex
+        && profile.runtime_variant == "codex-app-server"
+        && profile.native_session_id.as_deref() == Some(original)
+        && active.provider_store_id() == profile.provider_store_id.as_str()
+        && active.fresh_agent().is_some_and(|captured| {
+            captured.provider == profile.provider
+                && captured.runtime_variant == profile.runtime_variant
+                && captured.provider_store_id == profile.provider_store_id
+                && captured.session_id == profile.session_id
+                && captured.native_session_id.as_deref() == Some(original)
+        })
+        && current.prior_handle.incarnation_id() == active.incarnation_id()
+        && launch.incarnation_id == *active.incarnation_id()
+        && launch.launch_nonce == active.launch_nonce().as_str()
+        && launch
+            .requested_native_session_id
+            .as_deref()
+            .is_none_or(|root| root == original)
+        && status.host_boot_id == host.host_boot_id
+        && launch.execution_generation == status.max_execution_generation
+        && status.exited
+        && status.native_session_id.is_none()
+        && status.native_identity_observation.is_none()
+        && [
+            "native-identity-observation-v1",
+            "fresh-agent-codex-dispatch-recovery-v1",
+        ]
+        .iter()
+        .all(|required| {
+            host.capabilities
+                .iter()
+                .any(|capability| capability == required)
+        })
 }
 
 #[derive(Clone)]
