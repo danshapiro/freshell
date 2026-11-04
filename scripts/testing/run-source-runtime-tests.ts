@@ -189,10 +189,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     if (!/^[a-f0-9]{40}$/.test(commit)) throw new Error('Cannot identify the source-runtime build commit.')
     const { FRESHELL_SERVER_BIN: _hostBinary, ...env } = process.env
     const sandbox = path.join(PROJECT_ROOT, 'scripts/sandbox-test.sh')
-    // The strict guest has a read-only home and no network. Prepare its
-    // sandbox-owned sidecar tree with the normal frozen prerequisite helper
-    // first; an installed workspace alone has no sidecar readiness receipt.
-    // Startup still validates the same prerequisite through normal prestart.
+    // Validate the normally prepared sandbox-owned SDK before entering the
+    // strict guest. Both this consumer and normal prestart verify the actual
+    // installation and current prepared identity without writing dependencies.
     const prerequisiteCode = await runChild(sandbox, ['node --import tsx scripts/ensure-claude-sidecar.ts'], env, false, 'sandbox-prerequisites')
     if (prerequisiteCode !== 0) return prerequisiteCode
     log('info', 'source_runtime_sandbox_route_selected', { mode: 'runtime-suite', forwardedArgumentCount: forwarded.length, commit })

@@ -21,6 +21,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { detectProjectManager, resolveManagerCommand } from './lib/package-manager.js'
+import { dependencyCacheIdentity } from '../docker/sandbox/dependency-cache.mjs'
 
 const SIDECAR_PACKAGE_NAME = 'freshell-claude-sidecar'
 const SDK_PACKAGE_NAME = '@anthropic-ai/claude-agent-sdk'
@@ -63,6 +64,8 @@ export interface EnsureClaudeSidecarDependenciesOptions {
   platform?: NodeJS.Platform
   nodeExecPath?: string
   execFileSync?: typeof defaultExecFileSync
+  /** Installed sandbox metadata; defaults to the normal image's metadata directory. */
+  sandboxMetadataDir?: string
 }
 
 type JsonObject = Record<string, unknown>
@@ -184,8 +187,13 @@ function inspectInstallIntegrity(sidecarDir: string, platform: NodeJS.Platform):
 
   if (NATIVE_PLATFORMS.has(platform)) {
     const nativeName = `${SDK_PACKAGE_NAME}-${platform}-${process.arch}`
-    if (resolveNativePackageManifest(sdkManifestPath, nativeName) === undefined) {
+    const nativeManifestPath = resolveNativePackageManifest(sdkManifestPath, nativeName)
+    if (nativeManifestPath === undefined) {
       return { ok: false, reason: `the platform native package ${nativeName} is not installed` }
+    }
+    const nativeManifest = readJsonOrNull(nativeManifestPath)
+    if (nativeManifest?.name !== nativeName || nativeManifest.version !== declaredSdkVersion) {
+      return { ok: false, reason: `the platform native package ${nativeName} does not match the SDK pin ${declaredSdkVersion}` }
     }
   }
 
@@ -213,6 +221,46 @@ function writeReadyReceipt(receiptPath: string, contents: Record<string, string>
 function defaultSidecarDir(): string {
   const scriptDir = path.dirname(fileURLToPath(import.meta.url))
   return path.resolve(scriptDir, '..', 'crates', 'freshell-claude-sidecar')
+}
+
+function preparedSandboxFingerprint(repoRoot: string, pnpmVersion: string): string {
+  // Match the normal entrypoint's frozen workspace installation policy. The
+  // cache identity separately covers package-manager config and file: inputs.
+  const digest = createHash('sha256')
+    .update(`manager=pnpm@${pnpmVersion}\npolicy=install --frozen-lockfile --store-dir /home/sandbox/.local/share/pnpm/store\n`)
+  for (const file of ['package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml',
+    'crates/freshell-claude-sidecar/package.json', 'packages/freshell-mcp-runtime/package.json']) {
+    const absolute = path.join(repoRoot, file)
+    if (existsSync(absolute)) {
+      digest.update(`${createHash('sha256').update(readFileSync(absolute)).digest('hex')}  ${file}\n`)
+    }
+  }
+  return digest.digest('hex')
+}
+
+function preparedSandboxPnpmVersion(repoRoot: string, metadataDir: string, env: NodeJS.ProcessEnv): string {
+  try {
+    const protocol = readJsonOrNull(path.join(metadataDir, 'protocol.json'))
+    const currentProtocol = readJsonOrNull(path.join(repoRoot, 'docker', 'sandbox', 'protocol.json'))
+    if (protocol === undefined || currentProtocol === undefined
+      || protocol.version !== currentProtocol.version || protocol.image !== currentProtocol.image
+      || protocol.cacheSuffix !== currentProtocol.cacheSuffix || typeof protocol.version !== 'number') {
+      throw new Error('installed sandbox protocol does not match the current workspace')
+    }
+    const foundation = readFileSync(path.join(metadataDir, 'foundation-id'), 'utf8').trim()
+    const identity = dependencyCacheIdentity(repoRoot, foundation, protocol.version)
+    const state = Object.fromEntries(readFileSync(path.join(repoRoot, 'node_modules', '.sandbox-deps-state'), 'utf8')
+      .trim().split('\n').map(line => line.split('=')))
+    const manifest = readJsonOrNull(path.join(repoRoot, 'package.json'))
+    if (env.FRESHELL_SANDBOX_DEPENDENCY_KEY !== identity || state.cache_identity !== identity
+      || state.fingerprint !== preparedSandboxFingerprint(repoRoot, state.manager_version) || state.manager !== 'pnpm'
+      || !state.manager_version || manifest?.packageManager !== `pnpm@${state.manager_version}`) {
+      throw new Error('published dependency state does not match the current inputs and pinned package manager')
+    }
+    return state.manager_version
+  } catch (error) {
+    throw new Error(`Cannot use Claude sidecar dependencies in a read-only sandbox: ${error instanceof Error ? error.message : String(error)}`)
+  }
 }
 
 function buildReadyReceipt(params: {
@@ -252,6 +300,22 @@ export function ensureClaudeSidecarDependencies(
 
   const integrity = inspectInstallIntegrity(sidecarDir, platform)
   const fingerprint = computeFingerprint(manifestPath, lockPath, workspacePath)
+
+  if (env.FRESHELL_SANDBOX_DEPENDENCY_READONLY === '1') {
+    if (!integrity.ok || fingerprint === undefined) {
+      throw new Error(`Cannot use Claude sidecar dependencies in a read-only sandbox: ${integrity.ok ? 'dependency inputs are unreadable' : integrity.reason}`)
+    }
+    const pnpmVersion = preparedSandboxPnpmVersion(repoRoot,
+      options.sandboxMetadataDir ?? '/usr/local/share/freshell-sandbox', env)
+    return buildReadyReceipt({
+      sidecarDir,
+      packageVersion: integrity.sdkVersion,
+      installCommand: ['pnpm', ...FROZEN_FILTERED_INSTALL_ARGS],
+      pnpmVersion,
+      fingerprint,
+      repaired: false,
+    })
+  }
 
   if (integrity.ok && fingerprint !== undefined) {
     const currentPnpmVersion = readCurrentReceiptPnpmVersion(receiptPath, fingerprint)

@@ -223,7 +223,10 @@ function prepareSandboxFixture(fixture: WorkspaceFixture) {
   const key = dependencyCacheIdentity(fixture.repoRoot, foundation, protocol.version)
   const statePath = path.join(fixture.repoRoot, 'node_modules/.sandbox-deps-state')
   mkdirSync(path.dirname(statePath), { recursive: true })
-  writeFileSync(statePath, `manager=pnpm\nmanager_version=${PNPM_VERSION}\nfingerprint=${'b'.repeat(64)}\ncache_identity=${key}\n`)
+  const inputFiles = ['package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'crates/freshell-claude-sidecar/package.json']
+  const inputHashes = inputFiles.map(file => `${createHash('sha256').update(readFileSync(path.join(fixture.repoRoot, file))).digest('hex')}  ${file}\n`).join('')
+  const fingerprint = createHash('sha256').update(`manager=pnpm@${PNPM_VERSION}\npolicy=install --frozen-lockfile --store-dir /home/sandbox/.local/share/pnpm/store\n${inputHashes}`).digest('hex')
+  writeFileSync(statePath, `manager=pnpm\nmanager_version=${PNPM_VERSION}\nfingerprint=${fingerprint}\ncache_identity=${key}\n`)
   return { metadataDir, statePath, key, env: { ...fixture.env, FRESHELL_SANDBOX_DEPENDENCY_READONLY: '1', FRESHELL_SANDBOX_DEPENDENCY_KEY: key } }
 }
 
@@ -245,14 +248,16 @@ describe('read-only prepared sandbox sidecar dependencies', () => {
   it.each([
     ['SDK version', (f: WorkspaceFixture) => f.writeSdk('0.3.100')],
     ['SDK entrypoint', (f: WorkspaceFixture) => rmSync(path.join(f.sidecarDir, 'node_modules', SDK_NAME, 'index.mjs'))],
-    ['native package', (f: WorkspaceFixture) => rmSync(path.join(f.sidecarDir, 'node_modules', `${SDK_NAME}-${process.platform}-${process.arch}`), { recursive: true })],
+    ['native version', (f: WorkspaceFixture) => writeFileSync(path.join(f.sidecarDir, 'node_modules', `${SDK_NAME}-${process.platform}-${process.arch}`, 'package.json'), JSON.stringify({ name: `${SDK_NAME}-${process.platform}-${process.arch}`, version: '0.0.1' }))],
     ['dependency input', (f: WorkspaceFixture) => writeFileSync(f.lockPath, 'changed input')],
     ['missing state', (_f: WorkspaceFixture, p: ReturnType<typeof prepareSandboxFixture>) => rmSync(p.statePath)],
     ['unreadable state', (_f: WorkspaceFixture, p: ReturnType<typeof prepareSandboxFixture>) => { rmSync(p.statePath); mkdirSync(p.statePath) }],
     ['stale identity', (_f: WorkspaceFixture, p: ReturnType<typeof prepareSandboxFixture>) => writeFileSync(p.statePath, readFileSync(p.statePath, 'utf8').replace(p.key, '0'.repeat(64)))],
+    ['stale fingerprint', (_f: WorkspaceFixture, p: ReturnType<typeof prepareSandboxFixture>) => writeFileSync(p.statePath, readFileSync(p.statePath, 'utf8').replace(/fingerprint=.*/, `fingerprint=${'0'.repeat(64)}`))],
     ['unpinned manager', (_f: WorkspaceFixture, p: ReturnType<typeof prepareSandboxFixture>) => writeFileSync(p.statePath, readFileSync(p.statePath, 'utf8').replace(PNPM_VERSION, '0.0.1'))],
     ['unqualified selection', (_f: WorkspaceFixture, p: ReturnType<typeof prepareSandboxFixture>) => { delete (p.env as NodeJS.ProcessEnv).FRESHELL_SANDBOX_DEPENDENCY_KEY }],
     ['missing metadata', (_f: WorkspaceFixture, p: ReturnType<typeof prepareSandboxFixture>) => rmSync(p.metadataDir, { recursive: true })],
+    ['stale protocol', (_f: WorkspaceFixture, p: ReturnType<typeof prepareSandboxFixture>) => writeFileSync(path.join(p.metadataDir, 'protocol.json'), JSON.stringify({ version: 1 }))],
   ] as const)('refuses invalid %s without installing or writing despite a current sidecar receipt', (_name, invalidate) => {
     const fixture = buildWorkspaceFixture({ writeReceipt: true })
     const prepared = prepareSandboxFixture(fixture)
@@ -263,6 +268,17 @@ describe('read-only prepared sandbox sidecar dependencies', () => {
     expect(() => ensureSidecar(fixture, execFileSync, { env: prepared.env, sandboxMetadataDir: prepared.metadataDir })).toThrow(/read-only sandbox/i)
     expect(invocations).toHaveLength(0)
     expect(readFileSync(fixture.receiptPath, 'utf8')).toBe(receiptBefore)
+  })
+
+  it('refuses an unavailable target-platform native package without invoking pnpm', () => {
+    const fixture = buildWorkspaceFixture({ writeReceipt: true })
+    const prepared = prepareSandboxFixture(fixture)
+    const { execFileSync, invocations } = createSpawnSeam()
+    expect(() => ensureSidecar(fixture, execFileSync, {
+      env: prepared.env, sandboxMetadataDir: prepared.metadataDir,
+      platform: process.platform === 'darwin' ? 'linux' : 'darwin',
+    })).toThrow(/read-only sandbox.*native package/i)
+    expect(invocations).toHaveLength(0)
   })
 })
 
