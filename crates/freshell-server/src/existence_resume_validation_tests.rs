@@ -606,8 +606,12 @@ fn seed_parseable_agy_conversation(home: &std::path::Path, id: &str) -> std::pat
 /// `AntigravitySource` rooted at `home` (the `antigravity_probe` wiring
 /// shape from `existence.rs`'s tests — the `main.rs` construction), with
 /// the antigravity provider root registered (an existing root keeps the
-/// cold answer the deferrable `Unknown`, never `ProviderUnavailable`) and
-/// the PRODUCTION by-id locator chained over the same home.
+/// cold answer the deferrable `Unknown`, never `ProviderUnavailable`)
+/// and the by-id locator chained over the same home — the single-root
+/// constructor (the union locator's per-root core; these single-store
+/// scenarios are shape-identical to the production union wiring, whose
+/// dual-root behavior is pinned separately by
+/// `antigravity_gate_finds_a_conversation_only_in_the_snap_root`).
 fn gate_probe_over(home: &std::path::Path) -> (IndexExistenceProbe, Arc<SessionIndex>) {
     gate_probe_over_store(home)
 }
@@ -753,4 +757,85 @@ fn antigravity_cold_index_missing_store_root_gate_answers_absent_not_unavailable
          positive absence (the typed refusal), never Unknown → Proceed"
     );
     let _ = std::fs::remove_dir_all(&parent);
+}
+
+/// Focused repair round 2, Major 1 — the dual-root host. The SEAM
+/// (`provider_layout::antigravity_home`) resolves ONE root (env override >
+/// default root when it holds conversations > snap root), but the binary's
+/// WRITE root is not necessarily the seam's read root: the snap binary
+/// pins its store under `$HOME/snap` while the same host can also hold
+/// conversations in the default root (the real-provider smoke scans EVERY
+/// candidate root for exactly this reason). A valid conversation that
+/// exists ONLY in the unselected root must NOT be refused with a false
+/// SESSION_MISSING: the gate's by-id locator must find it in ANY
+/// candidate root.
+///
+/// Scenario: the default root holds a DIFFERENT conversation (so the seam
+/// selects it — `root_holds_conversations(default)` wins) and the
+/// conversation under test lives ONLY in the snap root. The probe wiring
+/// mirrors `main.rs`: the `AntigravitySource` and the provider_roots entry
+/// over the seam's single resolved root; the by-id locator over the
+/// candidate roots.
+#[tokio::test]
+async fn antigravity_gate_finds_a_conversation_only_in_the_snap_root() {
+    let user_home = rv_temp_dir("agy-dual-root");
+    let default_root = user_home.join(".gemini").join("antigravity-cli");
+    let snap_root = user_home
+        .join("snap")
+        .join("antigravity-cli")
+        .join("common")
+        .join(".gemini")
+        .join("antigravity-cli");
+    let default_conv = "11111111-2222-3333-4444-555555555560";
+    let snap_conv = "11111111-2222-3333-4444-555555555561";
+    seed_parseable_agy_conversation(&default_root, default_conv);
+    seed_parseable_agy_conversation(&snap_root, snap_conv);
+    // Scenario precondition: the seam's documented selection — a default
+    // root that HOLDS conversations wins over the snap root (guarded on
+    // the ambient env override being unset; an ambient override would
+    // change the seam's choice but not the union answer below).
+    if std::env::var_os("FRESHELL_ANTIGRAVITY_HOME").is_none() {
+        assert_eq!(
+            freshell_sessions::provider_layout::resolve_antigravity_home(&user_home).home,
+            default_root,
+            "scenario precondition: the seam selects the conversation-bearing default root"
+        );
+    }
+    let seam_root = freshell_sessions::provider_layout::antigravity_home(&user_home);
+    let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
+        vec![
+            Arc::new(freshell_sessions::antigravity::AntigravitySource::new(
+                seam_root.clone(),
+            )) as Arc<dyn SessionSource>,
+        ],
+        Duration::from_millis(50),
+        None,
+    ));
+    let probe = IndexExistenceProbe::new(
+        Arc::clone(&index),
+        None,
+        HashMap::from([("antigravity".to_string(), seam_root.clone())]),
+    )
+    // The union-root locator (focused repair round 2, Major 1) — the
+    // production wiring's shape: every candidate store root, not only
+    // the seam's single resolved root.
+    .with_antigravity_transcript_locator(antigravity_union_root_locator(&user_home));
+    index.warm().await;
+    assert_eq!(
+        probe.exists_for_gate("antigravity", snap_conv),
+        SessionExistence::Present,
+        "a valid conversation in the unselected snap root must not be refused (SESSION_MISSING)"
+    );
+    assert_eq!(
+        probe.exists("antigravity", snap_conv),
+        SessionExistence::Present,
+        "the sync warm-Absent adjudication must not adjudicate a live snap-root \
+         conversation dead either — the same locator serves both arms"
+    );
+    assert_eq!(
+        probe.exists_for_gate("antigravity", "00000000-1111-2222-3333-444444444444"),
+        SessionExistence::Absent,
+        "absent from ALL candidate roots stays positive Absent"
+    );
+    let _ = std::fs::remove_dir_all(&user_home);
 }

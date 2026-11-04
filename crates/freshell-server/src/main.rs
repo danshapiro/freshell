@@ -2194,17 +2194,24 @@ async fn main() -> ExitCode {
             // check the attach arm (`agy --conversation <id>`) resolves —
             // the index's AntigravitySource drops parse-failed transcripts,
             // so a conversation dir on disk can answer a false warm Absent
-            // while the CLI would still resume it. CHEAP single-open check,
-            // so it joins the sync warm-Absent adjudication path
-            // (amplifier/opencode class, NOT codex's gate-only walk). The
-            // home is resolved with the SAME helper the provider_roots
-            // entry above uses. No resolvable provider home => probe
-            // behaves as today for antigravity.
+            // while the CLI would still resume it. CHEAP single-open check
+            // per root, so it joins the sync warm-Absent adjudication path
+            // (amplifier/opencode class, NOT codex's gate-only walk).
+            // UNION ROOTS (focused repair round 2, Major 1): the locator
+            // walks EVERY candidate store root (the env override, the
+            // default root, and the snap root — the same candidate list
+            // the real-provider smoke scans), NOT only the seam's single
+            // resolved root: the snap binary pins its store under
+            // $HOME/snap while the default root can also hold
+            // conversations, so a single-root locator would answer a
+            // false Absent (gate: false SESSION_MISSING) for a valid
+            // conversation in the unselected root. The index source and
+            // the provider_roots entry above keep the seam's single-root
+            // selection (history/search parity). No resolvable provider
+            // home => probe behaves as today for antigravity.
             let probe = match session_directory::provider_home() {
                 Some(h) => probe.with_antigravity_transcript_locator(
-                    existence::antigravity_transcript_locator(
-                        freshell_sessions::provider_layout::antigravity_home(&h),
-                    ),
+                    existence::antigravity_union_root_locator(&h),
                 ),
                 None => probe,
             };

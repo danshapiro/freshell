@@ -216,7 +216,13 @@ pub enum ServerMessage {
 
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const SERVER_MESSAGE_TYPES: [&str; 70] = [
+pub const SERVER_MESSAGE_TYPES: [&str; 72] = [
+    // Promoted from EXTENSION_SERVER_MESSAGE_TYPES by the focused-repair
+    // round 2 contract reconcile (pnpm run contract:generate re-froze the
+    // inventory with the antigravity family; the extension const's doc
+    // names this exact promotion path).
+    "antigravity.activity.list.response",
+    "antigravity.activity.updated",
     "amplifier.activity.list.response",
     "amplifier.activity.updated",
     "claude.activity.list.response",
@@ -411,26 +417,20 @@ pub struct RuntimeViewChanged {
 }
 
 /// Extension server→client discriminants declared BEYOND the generated
-/// inventory (`port/contract/ws-message-inventory.json`). Since the
-/// 2026-07-26 reconciliation the only entry is `durability.degraded` — a
-/// Rust-server-only frame (P1.8 pane-identity ledger, emitted by
-/// `crates/freshell-ws/src/pane_ledger.rs`) with no TypeScript
-/// counterpart: the inventory is generated from `shared/ws-protocol.ts`,
-/// so it cannot carry it. NOT the same family as the frozen
-/// `terminal.codex.durability.updated` (codex-sidecar durability); the
-/// name collision is nearest-neighbor only. If the client ever grows a
-/// consumer, add the Zod schema to `shared/ws-protocol.ts`, run
+/// inventory (`port/contract/ws-message-inventory.json`): Rust-server-only
+/// frames with no TypeScript counterpart — the inventory is generated from
+/// `shared/ws-protocol.ts`, so it cannot carry them. `durability.degraded`
+/// is the P1.8 pane-identity-ledger frame (emitted by
+/// `crates/freshell-ws/src/pane_ledger.rs`); NOT the same family as the
+/// frozen `terminal.codex.durability.updated` (codex-sidecar durability);
+/// the name collision is nearest-neighbor only. If the client ever grows
+/// a consumer, add the Zod schema to `shared/ws-protocol.ts`, run
 /// `pnpm run contract:generate`, and promote this into
-/// [`SERVER_MESSAGE_TYPES`]. Shape pinned by `tests/activity_extension.rs`.
-pub const EXTENSION_SERVER_MESSAGE_TYPES: [&str; 4] = [
-    "durability.degraded",
-    "freshAgent.recovery.stopped",
-    // Antigravity plan Task 8: the antigravity activity family (the
-    // amplifier family's additive twin — the generated frozen inventory is
-    // not regenerated in this task; promote on the next contract reconcile).
-    "antigravity.activity.list.response",
-    "antigravity.activity.updated",
-];
+/// [`SERVER_MESSAGE_TYPES`] — exactly how the antigravity activity family
+/// (plan Task 8) graduated in the focused-repair round 2 contract
+/// reconcile. Shapes pinned by `tests/activity_extension.rs`.
+pub const EXTENSION_SERVER_MESSAGE_TYPES: [&str; 2] =
+    ["durability.degraded", "freshAgent.recovery.stopped"];
 
 // ---------------------------------------------------------------------------
 // Server-only enums.
@@ -1806,6 +1806,32 @@ pub struct TerminalOutputGap {
     pub oldest_retained_seq: Option<i64>,
 }
 
+/// Identity disposition of a `terminal.replaced` announcement (focused
+/// repair round 2, Major 2): how the replacement terminal's session
+/// identity relates to the pane's RECORDED one — the mirror of the
+/// auto-resume hub's `RespawnedIdentity`. Additive/optional on the wire
+/// (older clients ignore the field and keep the legacy
+/// preserve-the-recorded-ref fold; absent keeps the exact legacy frame).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalReplacedIdentityDisposition {
+    /// The respawn proceeded WITH the recorded session id (the gate
+    /// passed/failed open on it, or handed it through) — the pane's
+    /// saved sessionRef stays correct.
+    Resumed,
+    /// The gate refused the recorded id and MINTED a replacement id at
+    /// spawn time (the fresh-id-minting providers, AD-3): the pane's
+    /// recorded ref is deliberately kept (the accepted AD-3 shape).
+    MintedReplacement,
+    /// The gate refused the recorded id and NO replacement id exists —
+    /// the respawn launched an identity-less FRESH conversation and the
+    /// server RELEASED the stale claim. The client must CLEAR the pane's
+    /// saved sessionRef (mirror the identity-less terminal) so the CLI's
+    /// natural rebind — a `terminal.session.associated` with a fresh id
+    /// and no `previousSessionId` — folds instead of conflicting.
+    FreshUnbound,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalReplaced {
@@ -1814,6 +1840,11 @@ pub struct TerminalReplaced {
     pub exit_code: i64,
     pub attempt: u32,
     pub max_attempts: u32,
+    /// Auto-resume identity disposition (focused repair round 2, Major 2 —
+    /// additive/optional: absent keeps the legacy frame byte-shape and the
+    /// legacy client fold). See [`TerminalReplacedIdentityDisposition`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_disposition: Option<TerminalReplacedIdentityDisposition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -83,8 +83,15 @@ pub use crate::existence_by_id::{
     CodexRolloutExistenceLocator,
 };
 // Antigravity by-id locator (plan Task 7): same focused-sibling convention.
+// The production wiring (main.rs) installs the UNION-root locator
+// (focused repair round 2, Major 1): it walks EVERY candidate store root,
+// never only the seam's single resolved root. The single-root
+// constructor's re-export is test-only (the existence/gate tests mirror
+// one-store-root wirings over an already-resolved home).
+#[cfg(test)]
+pub use crate::antigravity_existence_by_id::antigravity_transcript_locator;
 pub use crate::antigravity_existence_by_id::{
-    antigravity_transcript_locator, AntigravityTranscriptLocator,
+    antigravity_union_root_locator, AntigravityTranscriptLocator,
 };
 
 pub struct IndexExistenceProbe {
@@ -135,22 +142,30 @@ pub struct IndexExistenceProbe {
     /// and the cold path never consult it (AD-4: cold codex stays
     /// `Unknown`). `None` keeps the pure index answer.
     codex_rollout_locator: Option<CodexRolloutExistenceLocator>,
-    /// Antigravity by-id fallback (plan Task 7): the index's
-    /// `AntigravitySource` drops transcripts whose ownership/workspace
-    /// parse yields no row, so a conversation dir on disk can be
-    /// index-invisible while the attach arm (`agy --conversation <id>`)
-    /// would still resume it — the two arms must agree. The check is CHEAP
-    /// (one `File::open` on the canonical
-    /// `brain/<id>/.system_generated/logs/transcript.jsonl` path), so it
-    /// lives on the sync warm-Absent adjudication path in `exists()` beside
-    /// the amplifier/opencode arms (NOT the codex gate-only treatment —
-    /// there is no ~1s walk to keep off the reconcile path) and improves
-    /// pane-reconcile dead-session answers; since the resume-gate
-    /// activation (2026-11-03) `exists_for_gate` ALSO consults it
-    /// DIRECTLY to validate a warm-index Present and a cold-index
-    /// Unknown before the gate trusts them (the gate block below).
-    /// `None` (tests, callers that never set it) keeps the pure index
-    /// answer.
+    /// Antigravity by-id fallback (plan Task 7 + focused repair round 2,
+    /// Major 1): the index's `AntigravitySource` drops transcripts whose
+    /// ownership/workspace parse yields no row, so a conversation dir on
+    /// disk can be index-invisible while the attach arm
+    /// (`agy --conversation <id>`) would still resume it — the two arms
+    /// must agree. The check is CHEAP (one `File::open` on the canonical
+    /// `brain/<id>/.system_generated/logs/transcript.jsonl` path PER
+    /// candidate root), so it lives on the sync warm-Absent adjudication
+    /// path in `exists()` beside the amplifier/opencode arms (NOT the
+    /// codex gate-only treatment — there is no ~1s walk to keep off the
+    /// reconcile path) and improves pane-reconcile dead-session answers;
+    /// since the resume-gate activation (2026-11-03) `exists_for_gate`
+    /// ALSO consults it DIRECTLY to validate a warm-index Present and a
+    /// cold-index Unknown before the gate trusts them (the gate block
+    /// below). The PRODUCTION wiring (`main.rs`) installs the UNION-root
+    /// locator: the seam resolves ONE root, but the binary's write root
+    /// is not necessarily the seam's read root (the snap binary pins its
+    /// store under `$HOME/snap` while the default root can also hold
+    /// conversations), so a single-root walk would answer a false Absent
+    /// for a valid conversation in the unselected root — a refusal the
+    /// gate would turn into a false SESSION_MISSING. Found in ANY
+    /// candidate root ⇒ Present; absent from ALL ⇒ Absent; unreadable
+    /// somewhere with no hit ⇒ Unreadable (fail-open, G28). `None`
+    /// (tests, callers that never set it) keeps the pure index answer.
     antigravity_transcript_locator: Option<AntigravityTranscriptLocator>,
 }
 
@@ -517,13 +532,16 @@ impl SessionExistenceProbe for IndexExistenceProbe {
         // the root-existence pre-check, and passing it through fails open
         // (map_existence → Unknown → Proceed) straight into the CLI's
         // silent fresh conversation. Validate all three against the same
-        // on-disk by-id walk the Absent arm uses: disk Present confirms
-        // (and feeds the observed set — module-doc invariant), disk Absent
-        // corrects to Absent (typed refusal — over a missing store root
-        // the locator's `File::open` gives NotFound, positive absence: the
-        // CLI never ran on this machine), disk Unreadable defers as
-        // Unknown (G28 fail-open). Absent itself needs no re-check — the
-        // warm-Absent arm at exists() already disk-verified it.
+        // on-disk by-id walk the Absent arm uses (the production locator
+        // walks EVERY candidate root — focused repair round 2, Major 1 —
+        // so a conversation in an unselected root validates too): disk
+        // Present confirms (and feeds the observed set — module-doc
+        // invariant), disk Absent corrects to Absent (typed refusal —
+        // absent from ALL candidate roots the locator's `File::open`s
+        // give NotFound, positive absence: the CLI never ran on this
+        // machine), disk Unreadable defers as Unknown (G28 fail-open).
+        // Absent itself needs no re-check — the warm-Absent arm at
+        // exists() already disk-verified it.
         if provider == "antigravity" {
             if let Some(locator) = &self.antigravity_transcript_locator {
                 match base {

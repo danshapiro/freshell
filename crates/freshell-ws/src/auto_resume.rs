@@ -611,6 +611,7 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                                         ev.exit_code,
                                         attempt,
                                         max_attempts,
+                                        replacement_identity_disposition(outcome.identity),
                                     );
                                     // One successful auto-resume = one breaker
                                     // cycle (znhn item 2). Re-fetch the entry —
@@ -665,6 +666,9 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                                     ev.exit_code,
                                     attempt,
                                     max_attempts,
+                                    replacement_identity_disposition(
+                                        crate::terminal::RespawnedIdentity::FreshUnbound,
+                                    ),
                                 );
                                 // The respawn still happened — one breaker cycle
                                 // (the fresh generation shares the createRequestId
@@ -697,6 +701,26 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                 }
             }
         }
+    }
+}
+
+/// Map the respawn's identity disposition onto the `terminal.replaced`
+/// wire field (focused repair round 2, Major 2): the client needs the
+/// FreshUnbound distinction — the gate refused the recorded id, the
+/// respawn launched an identity-less fresh conversation, and the stale
+/// claim was RELEASED — to clear the pane's saved sessionRef, so the
+/// CLI's natural rebind folds without a conflict. Resumed and
+/// MintedReplacement keep the legacy preserve-the-recorded-ref client
+/// fold (AD-3 for the minted shape).
+fn replacement_identity_disposition(
+    identity: crate::terminal::RespawnedIdentity,
+) -> freshell_protocol::TerminalReplacedIdentityDisposition {
+    use crate::terminal::RespawnedIdentity as Respawned;
+    use freshell_protocol::TerminalReplacedIdentityDisposition as Disposition;
+    match identity {
+        Respawned::Resumed => Disposition::Resumed,
+        Respawned::MintedReplacement => Disposition::MintedReplacement,
+        Respawned::FreshUnbound => Disposition::FreshUnbound,
     }
 }
 
@@ -800,7 +824,24 @@ pub(crate) trait AutoResumeDriver: Send + 'static {
         attempt: u32,
         max_attempts: u32,
     );
-    fn emit_replaced(&self, old: &str, new: &str, exit_code: i64, attempt: u32, max_attempts: u32);
+    /// Broadcast `terminal.replaced`, carrying the replacement's identity
+    /// disposition (focused repair round 2, Major 2): `FreshUnbound` — the
+    /// gate refused the recorded id and the respawn launched an
+    /// identity-less fresh conversation whose stale claim was RELEASED —
+    /// tells the client to CLEAR the pane's saved sessionRef, so the
+    /// CLI's natural rebind (the fresh conversation's association with
+    /// no `previousSessionId`) folds without hitting the client's
+    /// association conflict rule. `Resumed`/`MintedReplacement` keep the
+    /// legacy client fold (the pane's recorded ref is preserved).
+    fn emit_replaced(
+        &self,
+        old: &str,
+        new: &str,
+        exit_code: i64,
+        attempt: u32,
+        max_attempts: u32,
+        identity_disposition: freshell_protocol::TerminalReplacedIdentityDisposition,
+    );
     /// Broadcast the settle frame — `terminal.status { status: 'exited' }`
     /// for the OLD terminal id (znhn item 3). Every agent-mode settle emits
     /// it: the client clears the recovering notice on a FRAME, never on a
@@ -1425,7 +1466,15 @@ impl AutoResumeDriver for WsAutoResumeDriver {
         broadcast_frame(&self.state, terminal_id, "recovering", &msg);
     }
 
-    fn emit_replaced(&self, old: &str, new: &str, exit_code: i64, attempt: u32, max_attempts: u32) {
+    fn emit_replaced(
+        &self,
+        old: &str,
+        new: &str,
+        exit_code: i64,
+        attempt: u32,
+        max_attempts: u32,
+        identity_disposition: freshell_protocol::TerminalReplacedIdentityDisposition,
+    ) {
         let msg = freshell_protocol::ServerMessage::TerminalReplaced(
             freshell_protocol::TerminalReplaced {
                 old_terminal_id: old.to_string(),
@@ -1433,6 +1482,7 @@ impl AutoResumeDriver for WsAutoResumeDriver {
                 exit_code,
                 attempt,
                 max_attempts,
+                identity_disposition: Some(identity_disposition),
             },
         );
         broadcast_frame(&self.state, old, "replaced", &msg);
@@ -1834,6 +1884,11 @@ mod tests {
         respawn_result: Result<RespawnOutcome, String>,
         recovering: Vec<(String, u32, u32)>,
         replaced: Vec<(String, String, u32)>,
+        /// Identity dispositions carried by the emitted `terminal.replaced`
+        /// announcements (focused repair round 2, Major 2), parallel to
+        /// `replaced` — recorded separately so the existing
+        /// `(old, new, attempt)` assertions stay untouched.
+        replaced_dispositions: Vec<freshell_protocol::TerminalReplacedIdentityDisposition>,
         respawns: Vec<RespawnSpec>,
         claims: Vec<String>,
         completes: Vec<String>,
@@ -1881,6 +1936,7 @@ mod tests {
                     }),
                     recovering: Vec::new(),
                     replaced: Vec::new(),
+                    replaced_dispositions: Vec::new(),
                     respawns: Vec::new(),
                     claims: Vec::new(),
                     completes: Vec::new(),
@@ -1956,6 +2012,14 @@ mod tests {
         /// (old_terminal_id, new_terminal_id, attempt)
         fn replaced_calls(&self) -> Vec<(String, String, u32)> {
             self.lock().replaced.clone()
+        }
+        /// Identity dispositions carried by the emitted `terminal.replaced`
+        /// announcements (focused repair round 2, Major 2), parallel to
+        /// [`Self::replaced_calls`].
+        fn replaced_dispositions(
+            &self,
+        ) -> Vec<freshell_protocol::TerminalReplacedIdentityDisposition> {
+            self.lock().replaced_dispositions.clone()
         }
         fn respawn_calls(&self) -> Vec<RespawnSpec> {
             self.lock().respawns.clone()
@@ -2110,10 +2174,11 @@ mod tests {
             _exit_code: i64,
             attempt: u32,
             _max_attempts: u32,
+            identity_disposition: freshell_protocol::TerminalReplacedIdentityDisposition,
         ) {
-            self.lock()
-                .replaced
-                .push((old.to_string(), new.to_string(), attempt));
+            let mut s = self.lock();
+            s.replaced.push((old.to_string(), new.to_string(), attempt));
+            s.replaced_dispositions.push(identity_disposition);
         }
         fn emit_settled(&self, terminal_id: &str, reason: &str, resume_cycles: Option<u32>) {
             self.lock().settled_frames.push((
@@ -2162,6 +2227,12 @@ mod tests {
         assert_eq!(
             fake.replaced_calls(),
             vec![("t1".into(), "t-new".into(), 1u32)]
+        );
+        // Focused repair round 2, Major 2: the Resumed replacement
+        // announces `resumed` — the client keeps the pane's recorded ref.
+        assert_eq!(
+            fake.replaced_dispositions(),
+            vec![freshell_protocol::TerminalReplacedIdentityDisposition::Resumed]
         );
         // Delta-fix-1: identity was Some from the very first query (a revival
         // landing BEFORE query#1 is hub-level indistinguishable from healthy)
@@ -2222,6 +2293,12 @@ mod tests {
         assert_eq!(
             fake.replaced_calls(),
             vec![("t-other".into(), "t-new".into(), 1u32)]
+        );
+        // Focused repair round 2, Major 2: the hold-path replacement
+        // (the Resumed shape) also announces `resumed`.
+        assert_eq!(
+            fake.replaced_dispositions(),
+            vec![freshell_protocol::TerminalReplacedIdentityDisposition::Resumed]
         );
         assert!(
             fake.recovering_calls()
@@ -2520,6 +2597,16 @@ mod tests {
             fake.replaced_calls(),
             vec![("t1".to_string(), "t-new".to_string(), 1u32)],
             "the pane still comes back — terminal.replaced IS emitted"
+        );
+        // Focused repair round 2, Major 2: the FreshUnbound replacement
+        // announces `fresh_unbound` — the client CLEARS the pane's stale
+        // sessionRef on it, so the CLI's natural rebind (the fresh
+        // conversation's association with no previousSessionId) folds
+        // instead of conflicting.
+        assert_eq!(
+            fake.replaced_dispositions(),
+            vec![freshell_protocol::TerminalReplacedIdentityDisposition::FreshUnbound],
+            "the FreshUnbound replacement carries the fresh_unbound identity disposition"
         );
         assert!(
             fake.settled_reasons().is_empty(),

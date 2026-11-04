@@ -651,6 +651,36 @@ fn terminal_input_blocked_unknown_terminal_roundtrips_and_conforms() {
 }
 
 #[test]
+fn terminal_replaced_identity_disposition_is_optional_and_additive() {
+    // Focused repair round 2, Major 2: the auto-resume replacement
+    // announcement carries the replacement's identity disposition —
+    // `fresh_unbound` (the resume gate refused the recorded id; the
+    // respawn launched an identity-less fresh conversation whose stale
+    // claim was RELEASED) tells the client to CLEAR the pane's saved
+    // sessionRef so the CLI's natural rebind (an association with a
+    // fresh id and no previousSessionId) folds instead of conflicting.
+    // Additive/optional: absent keeps the legacy frame byte-shape (the
+    // frozen client keeps the preserve-the-recorded-ref fold).
+    let legacy = r#"{"type":"terminal.replaced","oldTerminalId":"t1","newTerminalId":"t2","exitCode":137,"attempt":1,"maxAttempts":3}"#;
+    match server_roundtrip(legacy, "terminal.replaced") {
+        ServerMessage::TerminalReplaced(r) => {
+            assert_eq!(r.identity_disposition, None);
+        }
+        other => panic!("expected TerminalReplaced, got {other:?}"),
+    }
+    let wire = r#"{"type":"terminal.replaced","oldTerminalId":"t1","newTerminalId":"t2","exitCode":137,"attempt":1,"maxAttempts":3,"identityDisposition":"fresh_unbound"}"#;
+    match server_roundtrip(wire, "terminal.replaced") {
+        ServerMessage::TerminalReplaced(r) => {
+            assert_eq!(
+                r.identity_disposition,
+                Some(TerminalReplacedIdentityDisposition::FreshUnbound)
+            );
+        }
+        other => panic!("expected TerminalReplaced, got {other:?}"),
+    }
+}
+
+#[test]
 fn terminal_status_exited_settle_frame_roundtrips() {
     // znhn item 3: the auto-resume SETTLE frame — status 'exited' on the
     // existing terminal.status message, with the typed resumeCycles field

@@ -29,14 +29,17 @@ fn json_type_set(node: &serde_json::Value) -> BTreeSet<String> {
 #[test]
 fn server_types_match_inventory_exactly() {
     let inv = inventory();
+    // 72 since the focused-repair round 2 contract reconcile promoted the
+    // antigravity activity family (plan Task 8) from the extension const
+    // into the frozen surface.
     assert_eq!(
         inv["serverToClient"]["count"].as_u64(),
-        Some(70),
-        "inventory declares 70 server→client types"
+        Some(72),
+        "inventory declares 72 server→client types"
     );
     let expected = json_type_set(&inv["serverToClient"]["types"]);
     let actual: BTreeSet<String> = SERVER_MESSAGE_TYPES.iter().map(|s| s.to_string()).collect();
-    assert_eq!(actual.len(), 70, "crate declares 70 server types (no dups)");
+    assert_eq!(actual.len(), 72, "crate declares 72 server types (no dups)");
     assert_eq!(
         actual, expected,
         "SERVER_MESSAGE_TYPES must equal the frozen inventory (no missing/extra)"
@@ -44,14 +47,14 @@ fn server_types_match_inventory_exactly() {
 }
 
 #[test]
-fn combined_surface_is_112() {
+fn combined_surface_is_115() {
     let all = all_message_types();
-    assert_eq!(all.len(), 112, "42 client + 70 server = 112 discriminants");
+    assert_eq!(all.len(), 115, "43 client + 72 server = 115 discriminants");
     // sorted + unique
     let unique: BTreeSet<&str> = all.iter().copied().collect();
     assert_eq!(
         unique.len(),
-        112,
+        115,
         "no discriminant collides across directions"
     );
 }

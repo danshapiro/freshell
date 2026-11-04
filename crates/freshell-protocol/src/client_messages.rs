@@ -140,8 +140,13 @@ pub enum ClientMessage {
 
 /// The exact `type` discriminants of every client→server message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const CLIENT_MESSAGE_TYPES: [&str; 42] = [
+pub const CLIENT_MESSAGE_TYPES: [&str; 43] = [
     "amplifier.activity.list",
+    // Promoted from EXTENSION_CLIENT_MESSAGE_TYPES by the focused-repair
+    // round 2 contract reconcile (pnpm run contract:generate re-froze the
+    // inventory with the antigravity family; the extension const's doc
+    // names this exact promotion path).
+    "antigravity.activity.list",
     "claude.activity.list",
     "client.diagnostic",
     "codex.activity.list",
@@ -186,15 +191,15 @@ pub const CLIENT_MESSAGE_TYPES: [&str; 42] = [
 ];
 
 /// Extension client→server discriminants declared beyond the generated
-/// inventory. The process-only Codex recovery stop is an additive extension;
-/// the generated frozen inventory remains unchanged. The antigravity
-/// activity list request (plan Task 8) joins it — same additive pattern as
-/// the amplifier family's promotion path.
-pub const EXTENSION_CLIENT_MESSAGE_TYPES: [&str; 3] = [
-    "freshAgent.recovery.stop",
-    "freshAgent.elicitation.respond",
-    "antigravity.activity.list",
-];
+/// inventory. The process-only Codex recovery stop and the fresh-agent
+/// elicitation respond are additive extensions; the generated frozen
+/// inventory remains unchanged for them. The antigravity activity list
+/// request (plan Task 8) was PROMOTED into
+/// [`CLIENT_MESSAGE_TYPES`] by the focused-repair round 2 contract
+/// reconcile (`pnpm run contract:generate` re-froze the inventory with
+/// the antigravity family, so the extension entry graduated).
+pub const EXTENSION_CLIENT_MESSAGE_TYPES: [&str; 2] =
+    ["freshAgent.recovery.stop", "freshAgent.elicitation.respond"];
 
 // --- hello ------------------------------------------------------------------
 

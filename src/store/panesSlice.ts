@@ -2546,9 +2546,16 @@ export const panesSlice = createSlice({
         sessionRef?: SessionLocator
         corrected?: boolean
         duplicate?: boolean
+        /** FreshUnbound replacement fold (focused repair round 2, Major 2):
+         * the server released the stale claim and the replacement terminal is
+         * identity-less — clear the pane's saved sessionRef (and the dead
+         * resume intent) so the pane mirrors the server and the CLI's natural
+         * rebind (an association with a fresh id and no previousSessionId)
+         * folds without a conflict. Never set by reconcile verdicts. */
+        clearSessionIdentity?: boolean
       }>
     ) => {
-      const { tabId, paneId, terminalId, serverInstanceId, corrected, duplicate } = action.payload
+      const { tabId, paneId, terminalId, serverInstanceId, corrected, duplicate, clearSessionIdentity } = action.payload
       if (!terminalId) return
       const content = findReconcileTerminalContent(state, tabId, paneId)
       if (!content) return
@@ -2570,6 +2577,11 @@ export const panesSlice = createSlice({
         && content.serverInstanceId === serverInstanceId
         && !corrected
         && !duplicate
+        // A clear-demanding fold (the FreshUnbound replacement) always
+        // runs: a reconcile verdict may have already adopted the
+        // replacement terminal id, and the no-change gate must not keep
+        // the stale sessionRef alive on the identity-less terminal.
+        && !clearSessionIdentity
         && content.status === 'running'
         && content.restoreError === undefined
         && content.launchFailure === undefined
@@ -2589,6 +2601,13 @@ export const panesSlice = createSlice({
       content.serverInstanceId = serverInstanceId
       if (sessionRef) {
         content.sessionRef = sessionRef
+        content.resumeSessionId = undefined
+      } else if (clearSessionIdentity) {
+        // FreshUnbound replacement (focused repair round 2, Major 2): the
+        // server released the stale claim — the pane mirrors the
+        // identity-less replacement terminal. The dead resume intent goes
+        // with it: the gate refused that id.
+        content.sessionRef = undefined
         content.resumeSessionId = undefined
       }
       content.pendingReconcile = undefined

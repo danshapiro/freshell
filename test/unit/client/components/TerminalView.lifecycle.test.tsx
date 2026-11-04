@@ -6472,6 +6472,44 @@ describe('TerminalView lifecycle updates', () => {
       expect(store.getState().panes.layouts[tabId].content.sessionRef).toEqual(before.sessionRef)
     })
 
+    // Focused repair round 2, Major 2 — the FreshUnbound replacement: the
+    // resume gate refused the recorded conversation (deleted on disk), the
+    // auto-resume respawn launched an identity-less FRESH conversation, and
+    // the server RELEASED the stale claim (never completing it against the
+    // fresh terminal). The replaced frame's identityDisposition
+    // 'fresh_unbound' must make the pane's fold CLEAR its saved sessionRef
+    // (mirroring the server's identity-less terminal) so the CLI's natural
+    // rebind — a terminal.session.associated with a fresh session id and NO
+    // previousSessionId — folds instead of hitting the association
+    // conflict rule and stranding the pane on the deleted conversation.
+    it('a fresh_unbound terminal.replaced clears the saved session identity and the natural rebind folds', async () => {
+      const { store, tabId, terminalId } = await renderTerminalHarness({
+        mode: 'antigravity', terminalId: 'unbound-old-terminal', fromStore: true, clearSends: false, ackInitialAttach: false,
+        sessionRef: { provider: 'antigravity', sessionId: 'deleted-conversation' },
+      })
+      const content = () => {
+        const root = store.getState().panes.layouts[tabId]
+        if (root.type !== 'leaf') throw new Error('Expected one pane')
+        return root.content
+      }
+      expect(content().sessionRef).toEqual({ provider: 'antigravity', sessionId: 'deleted-conversation' })
+
+      act(() => messageHandler!({ type: 'terminal.replaced', oldTerminalId: terminalId,
+        newTerminalId: 'unbound-fresh-terminal', exitCode: 137, attempt: 1, maxAttempts: 3,
+        identityDisposition: 'fresh_unbound' }))
+      expect(content().terminalId).toBe('unbound-fresh-terminal')
+      expect(content().sessionRef).toBeUndefined()
+      expect(content().createRequestId).toBe('req-v2-stream')   // council rule: never re-minted
+
+      // The natural rebind: the CLI binds the fresh conversation. The
+      // association carries no previousSessionId — the server cannot name
+      // the pane's stale ref — so it only folds because the pane is now
+      // identity-less.
+      act(() => messageHandler!({ type: 'terminal.session.associated', terminalId: 'unbound-fresh-terminal',
+        sessionRef: { provider: 'antigravity', sessionId: 'fresh-conversation' } }))
+      expect(content().sessionRef).toEqual({ provider: 'antigravity', sessionId: 'fresh-conversation' })
+    })
+
     it('retains an attach target rejected after live to recovering and reattaches after live authority returns', async () => {
       const { store, term, tabId, paneId, terminalId } = await renderTerminalHarness({
         mode: 'codex', terminalId: 'automatic-transition-terminal', clearSends: false, ackInitialAttach: false, fromStore: true,

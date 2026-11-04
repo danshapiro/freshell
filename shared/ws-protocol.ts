@@ -1645,6 +1645,19 @@ export type TerminalReplacedMessage = {
   exitCode: number
   attempt: number
   maxAttempts: number
+  /** Auto-resume identity disposition (additive/optional — older servers
+   * omit it; older clients ignore it and keep the legacy
+   * preserve-the-recorded-ref fold): how the replacement terminal's
+   * session identity relates to the pane's RECORDED one.
+   * `fresh_unbound` — the resume gate refused the recorded id and the
+   * respawn launched an identity-less FRESH conversation (the stale
+   * claim was RELEASED server-side) — tells the client to CLEAR the
+   * pane's saved sessionRef, so the CLI's natural rebind (the fresh
+   * conversation's `terminal.session.associated` with a new session id
+   * and NO previousSessionId) folds instead of conflicting. `resumed`
+   * keeps the recorded ref (still correct); `minted_replacement` keeps
+   * it too (the accepted AD-3 shape). */
+  identityDisposition?: 'resumed' | 'minted_replacement' | 'fresh_unbound'
 }
 
 export type TerminalOutputMessage = {

@@ -6665,7 +6665,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             // applyReconcileAttach unconditionally overwrites serverInstanceId
             // (panesSlice.ts:1904), so supply the current one. The replaced
             // frame carries no verdict data, so sessionRef/corrected/duplicate
-            // stay unset — the reducer preserves the pane's sessionRef.
+            // stay unset — the reducer preserves the pane's sessionRef — EXCEPT
+            // the FreshUnbound disposition (focused repair round 2, Major 2):
+            // the server RELEASED the stale claim and the replacement is an
+            // identity-less fresh conversation, so the pane must MIRROR that
+            // (clear its saved sessionRef) or the CLI's natural rebind — the
+            // fresh conversation's terminal.session.associated with a new id
+            // and no previousSessionId — hits the association conflict rule
+            // and strands the pane on the deleted conversation.
             // Bind-before-attach holds: the reducer's epoch bump re-fires the
             // create-or-attach effect after this rebind.
             dispatch(applyReconcileAttach({
@@ -6673,6 +6680,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               paneId: paneIdRef.current,
               terminalId: msg.newTerminalId,
               serverInstanceId: serverInstanceIdRef.current,
+              ...(msg.identityDisposition === 'fresh_unbound'
+                ? { clearSessionIdentity: true }
+                : {}),
             }))
           }
           return

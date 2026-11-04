@@ -117,6 +117,59 @@ describe('reconcile reducers', () => {
       .toBe('A duplicate terminal for this session was detected and ignored.')
   })
 
+  // Focused repair round 2, Major 2 — the FreshUnbound replacement's
+  // identity-clearing fold: the server RELEASED the stale claim and the
+  // replacement terminal is identity-less, so the pane must MIRROR that
+  // (its saved sessionRef and the dead resume intent cleared) or the
+  // CLI's natural rebind — an association with a fresh session id and
+  // NO previousSessionId — hits the association conflict rule and the
+  // pane stays bound to the deleted conversation.
+  it('applyReconcileAttach with clearSessionIdentity clears the saved session identity but keeps the live-handle folds', () => {
+    const state = stateWithTerminalPane({
+      createRequestId: 'cr-keep',
+      terminalId: 'term-old',
+      serverInstanceId: 'srv-1',
+      status: 'running',
+      sessionRef: { provider: 'antigravity', sessionId: 'deleted-conversation' },
+      resumeSessionId: 'deleted-conversation',
+    })
+    const next = panesReducer(state, applyReconcileAttach({
+      tabId: 'tab1',
+      paneId: 'p1',
+      terminalId: 'term-new',
+      serverInstanceId: 'srv-1',
+      clearSessionIdentity: true,
+    }))
+    const c = terminalContent(next, 'tab1', 'p1')
+    expect(c.terminalId).toBe('term-new')
+    expect(c.createRequestId).toBe('cr-keep')   // council rule: never re-minted
+    expect(c.reconcileEpoch).toBe(1)            // the fold still re-fires the lifecycle effect
+    expect(c.sessionRef).toBeUndefined()
+    expect(c.resumeSessionId).toBeUndefined()
+  })
+
+  // The legacy replaced frame (no identity disposition — and the
+  // Resumed/MintedReplacement dispositions) keeps the CURRENT fold: the
+  // pane's recorded sessionRef is preserved untouched.
+  it('applyReconcileAttach without clearSessionIdentity preserves the saved sessionRef', () => {
+    const state = stateWithTerminalPane({
+      createRequestId: 'cr-keep',
+      terminalId: 'term-old',
+      serverInstanceId: 'srv-1',
+      status: 'running',
+      sessionRef: { provider: 'antigravity', sessionId: 'kept-conversation' },
+    })
+    const next = panesReducer(state, applyReconcileAttach({
+      tabId: 'tab1',
+      paneId: 'p1',
+      terminalId: 'term-new',
+      serverInstanceId: 'srv-1',
+    }))
+    const c = terminalContent(next, 'tab1', 'p1')
+    expect(c.terminalId).toBe('term-new')
+    expect(c.sessionRef).toEqual({ provider: 'antigravity', sessionId: 'kept-conversation' })
+  })
+
   // Task-009b (goal 4): a verdict that CONFIRMS the pane's exact current
   // identity is a no-change fold — it must not bump the volatile epoch (the
   // bump re-fired the lifecycle effect on every reconnect flap and its
