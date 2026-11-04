@@ -197,6 +197,9 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
         "missing",
         "source-changes",
         "unavailable",
+        "admission-busy",
+        "admission-busy-source-changes",
+        "rpc-busy",
         "unsupported",
         "refused",
         "timeout",
@@ -221,7 +224,7 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
                     AdminCommand::Inventory => {
                         inventories += 1;
                         AdminResult::Inventory(vec![serde_json::from_value(serde_json::json!({
-                            "soulId":"name-soul","incarnationId":"name-incarnation","hostBootId":if scenario=="source-changes"&&inventories>1 {"replaced-boot"}else{"name-boot"},
+                            "soulId":"name-soul","incarnationId":"name-incarnation","hostBootId":if (scenario=="source-changes"||scenario=="admission-busy-source-changes")&&inventories>1 {"replaced-boot"}else{"name-boot"},
                             "launchState":"running","cleanupState":"none","intentRevision":3,"executionGeneration":2,
                             "desiredState":"running","recoveryState":"live","durabilityState":"unknown","allocationState":"allocated",
                             "evidenceRevision":0,"successfulRecoveriesInWindow":0,"provider":"codex",
@@ -249,6 +252,13 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
                         seen.lock().await.push(request);
                         AdminResult::FreshAgentNativeName(match scenario {
                             "ok" | "source-changes" => Reply::Title(Some("Native title".into())),
+                            "admission-busy" | "admission-busy-source-changes" => {
+                                Reply::Failed(Error::AdmissionBusy)
+                            }
+                            "rpc-busy" => Reply::Failed(Error::Rpc {
+                                code: -32000,
+                                message: "native provider busy".into(),
+                            }),
                             "unavailable" => Reply::Failed(Error::Unavailable {
                                 message: "current connection absent".into(),
                             }),
@@ -306,7 +316,11 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
             "ok" => assert!(
                 matches!(reply,NativeCallResult::Confirmed(value) if value.title.as_deref()==Some("Native title"))
             ),
-            "missing" | "unavailable" | "refused" | "transport" => assert!(
+            "admission-busy" | "admission-busy-source-changes" => assert!(
+                matches!(reply, NativeCallResult::AdmissionBusy),
+                "{scenario}: {reply:?}"
+            ),
+            "missing" | "unavailable" | "refused" | "transport" | "rpc-busy" => assert!(
                 matches!(reply, NativeCallResult::Undelivered(_)),
                 "{scenario}: {reply:?}"
             ),

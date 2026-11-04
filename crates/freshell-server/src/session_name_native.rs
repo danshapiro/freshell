@@ -112,6 +112,15 @@ const DISCOVERY_RETRY_WINDOW: Duration = Duration::from_secs(30);
 #[derive(Clone, Debug, PartialEq)]
 pub enum NativeCallResult<T> {
     Confirmed(T),
+    /// Authenticated supervisor admission refused before any host/native call.
+    #[cfg_attr(
+        not(any(feature = "managed-runtime-v1", test)),
+        expect(
+            dead_code,
+            reason = "only the managed supervisor adapter produces admission refusals"
+        )
+    )]
+    AdmissionBusy,
     Undelivered(String),
     Ambiguous(String),
     Unsupported(String),
@@ -122,6 +131,8 @@ pub enum NativeCallResult<T> {
 /// it into the operation's own `NativeCallResult<T>`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum NativeClassified {
+    #[cfg(feature = "managed-runtime-v1")]
+    AdmissionBusy,
     Undelivered(String),
     Ambiguous(String),
     Unsupported(String),
@@ -130,6 +141,8 @@ pub enum NativeClassified {
 impl NativeClassified {
     pub(crate) fn into_call<T>(self) -> NativeCallResult<T> {
         match self {
+            #[cfg(feature = "managed-runtime-v1")]
+            Self::AdmissionBusy => NativeCallResult::AdmissionBusy,
             Self::Undelivered(reason) => NativeCallResult::Undelivered(reason),
             Self::Ambiguous(reason) => NativeCallResult::Ambiguous(reason),
             Self::Unsupported(reason) => NativeCallResult::Unsupported(reason),
@@ -221,6 +234,14 @@ pub struct NativeWorkItem {
 }
 
 /// The charged attempt returned by [`SessionNames::claim_native_cycle`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeCyclePhase {
+    BeforeRead,
+    Write,
+    ConfirmRead,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeCycleClaim {
     pub target: SessionNameRef,
@@ -237,6 +258,8 @@ pub struct NativeCycleClaim {
     pub source: NameSource,
     pub receipt_id: String,
     pub cycle: u32,
+    pub(crate) phase: NativeCyclePhase,
+    pub(crate) admission_id: String,
 }
 
 impl NativeCycleClaim {
@@ -260,6 +283,13 @@ impl NativeCycleClaim {
 /// One classified outcome folded back into the durable series.
 #[derive(Clone, Debug, PartialEq)]
 pub enum NativeOutcomeFold {
+    /// The authenticated supervisor did not admit this operation. Keep this
+    /// cycle's exact unfinished phase; only its undispatched read charge may
+    /// be released, once, under the admission/series/location fences.
+    AdmissionBusy {
+        admission_id: String,
+        phase: NativeCyclePhase,
+    },
     /// A current-target read result (the cycle's pre-write check when it
     /// resolves the cycle, or the confirming readback after a write).
     Read {
@@ -715,6 +745,26 @@ fn select_next(
         .cloned()
 }
 
+/// Persist only a typed no-host-dispatch refusal, bound to this exact claim.
+/// The durable continuation resumes its phase without repeating native work.
+async fn pause_admission(
+    names: &Arc<SessionNames>,
+    claim: &NativeCycleClaim,
+    phase: NativeCyclePhase,
+) {
+    fold(
+        names,
+        &claim.target,
+        claim.location_revision,
+        claim.series_epoch,
+        NativeOutcomeFold::AdmissionBusy {
+            admission_id: claim.admission_id.clone(),
+            phase,
+        },
+    )
+    .await;
+}
+
 /// Drive ONE finite cycle for `target`: claim (charged), one current-target
 /// read, at most one write, one confirming read — folding every classified
 /// outcome into the durable series. A late/ambiguous acknowledgement can
@@ -747,142 +797,154 @@ async fn run_cycle(
     let location_revision = claim.location_revision;
     let series_epoch = claim.series_epoch;
 
-    // 1. One current-target read before any retry/reconciliation. Matching
-    //    titles synchronize immediately (the native already holds the exact
-    //    desired value); a readback of `None` reports an EXISTING target
-    //    holding no title yet — divergence the write below reconciles.
-    if !names
-        .charge_native_read(claim_target.clone(), series_epoch)
-        .await
-        .unwrap_or(false)
-    {
-        // Read allowance exhausted (or the series superseded) before the
-        // cycle could even read: the series retains its incomplete status
-        // and stops repair.
-        let _ = names
-            .fold_native_outcome(
-                claim_target.clone(),
+    if claim.phase == NativeCyclePhase::BeforeRead {
+        // 1. One current-target read before any retry/reconciliation. Matching
+        //    titles synchronize immediately (the native already holds the exact
+        //    desired value); a readback of `None` reports an EXISTING target
+        //    holding no title yet — divergence the write below reconciles.
+        if !names
+            .charge_native_read(claim_target.clone(), series_epoch)
+            .await
+            .unwrap_or(false)
+        {
+            // Read allowance exhausted (or the series superseded) before the
+            // cycle could even read: the series retains its incomplete status
+            // and stops repair.
+            let _ = names
+                .fold_native_outcome(
+                    claim_target.clone(),
+                    location_revision,
+                    series_epoch,
+                    NativeOutcomeFold::Undelivered {
+                        reason: "native read allowance exhausted".to_string(),
+                    },
+                )
+                .await;
+            return;
+        }
+        let observed = match native
+            .read(NativeNameTarget {
+                name_ref: claim_target.clone(),
+                location: claim.location.clone(),
+                location_revision,
+            })
+            .await
+        {
+            NativeCallResult::Confirmed(readback) => readback.title,
+            NativeCallResult::AdmissionBusy => {
+                pause_admission(names, &claim, NativeCyclePhase::BeforeRead).await;
+                return;
+            }
+            NativeCallResult::Undelivered(reason) => {
+                fold(
+                    names,
+                    &claim_target,
+                    location_revision,
+                    series_epoch,
+                    NativeOutcomeFold::Undelivered { reason },
+                )
+                .await;
+                return;
+            }
+            NativeCallResult::Ambiguous(reason) => {
+                fold(
+                    names,
+                    &claim_target,
+                    location_revision,
+                    series_epoch,
+                    NativeOutcomeFold::Ambiguous { reason },
+                )
+                .await;
+                return;
+            }
+            NativeCallResult::Unsupported(reason) => {
+                fold(
+                    names,
+                    &claim_target,
+                    location_revision,
+                    series_epoch,
+                    NativeOutcomeFold::Unsupported { reason },
+                )
+                .await;
+                return;
+            }
+        };
+        if observed.as_deref() == Some(claim.title.as_str()) {
+            // The native already holds the exact desired name: a
+            // current-revision readback synchronizes this exact revision.
+            fold(
+                names,
+                &claim_target,
                 location_revision,
                 series_epoch,
-                NativeOutcomeFold::Undelivered {
-                    reason: "native read allowance exhausted".to_string(),
+                NativeOutcomeFold::Read {
+                    observed,
+                    receipt: Some(claim.receipt_id.clone()),
                 },
             )
             .await;
-        return;
-    }
-    let observed = match native
-        .read(NativeNameTarget {
-            name_ref: claim_target.clone(),
-            location: claim.location.clone(),
-            location_revision,
-        })
-        .await
-    {
-        NativeCallResult::Confirmed(readback) => readback.title,
-        NativeCallResult::Undelivered(reason) => {
-            fold(
-                names,
-                &claim_target,
-                location_revision,
-                series_epoch,
-                NativeOutcomeFold::Undelivered { reason },
-            )
-            .await;
-            return;
-        }
-        NativeCallResult::Ambiguous(reason) => {
-            fold(
-                names,
-                &claim_target,
-                location_revision,
-                series_epoch,
-                NativeOutcomeFold::Ambiguous { reason },
-            )
-            .await;
-            return;
-        }
-        NativeCallResult::Unsupported(reason) => {
-            fold(
-                names,
-                &claim_target,
-                location_revision,
-                series_epoch,
-                NativeOutcomeFold::Unsupported { reason },
-            )
-            .await;
-            return;
-        }
-    };
-    if observed.as_deref() == Some(claim.title.as_str()) {
-        // The native already holds the exact desired name: a
-        // current-revision readback synchronizes this exact revision.
-        fold(
-            names,
-            &claim_target,
-            location_revision,
-            series_epoch,
-            NativeOutcomeFold::Read {
-                observed,
-                receipt: Some(claim.receipt_id.clone()),
-            },
-        )
-        .await;
-        return;
-    }
-    // Divergent title (including `None` — an existing target with no title
-    // yet, exactly the state the writeback exists to fill): the write below
-    // reconciles. A missing target can never reach here — the adapters
-    // diagnose it through their error paths as an explicit native failure.
-    // 2. At most one write per cycle, bounded to 20 seconds by the adapter.
-    match native.write(claim.attempt()).await {
-        NativeCallResult::Confirmed(()) => {
-            fold(
-                names,
-                &claim_target,
-                location_revision,
-                series_epoch,
-                NativeOutcomeFold::WriteAcknowledged {
-                    receipt: claim.receipt_id.clone(),
-                },
-            )
-            .await;
-        }
-        NativeCallResult::Undelivered(reason) => {
-            fold(
-                names,
-                &claim_target,
-                location_revision,
-                series_epoch,
-                NativeOutcomeFold::Undelivered { reason },
-            )
-            .await;
-            return;
-        }
-        NativeCallResult::Ambiguous(reason) => {
-            fold(
-                names,
-                &claim_target,
-                location_revision,
-                series_epoch,
-                NativeOutcomeFold::Ambiguous { reason },
-            )
-            .await;
-            return;
-        }
-        NativeCallResult::Unsupported(reason) => {
-            fold(
-                names,
-                &claim_target,
-                location_revision,
-                series_epoch,
-                NativeOutcomeFold::Unsupported { reason },
-            )
-            .await;
             return;
         }
     }
-
+    if claim.phase != NativeCyclePhase::ConfirmRead {
+        // Divergent title (including `None` — an existing target with no title
+        // yet, exactly the state the writeback exists to fill): the write below
+        // reconciles. A missing target can never reach here — the adapters
+        // diagnose it through their error paths as an explicit native failure.
+        // 2. At most one write per cycle; provider dispatch keeps its own
+        //    deadline within the adapter's total request budget.
+        match native.write(claim.attempt()).await {
+            NativeCallResult::Confirmed(()) => {
+                fold(
+                    names,
+                    &claim_target,
+                    location_revision,
+                    series_epoch,
+                    NativeOutcomeFold::WriteAcknowledged {
+                        receipt: claim.receipt_id.clone(),
+                    },
+                )
+                .await;
+            }
+            NativeCallResult::AdmissionBusy => {
+                pause_admission(names, &claim, NativeCyclePhase::Write).await;
+                return;
+            }
+            NativeCallResult::Undelivered(reason) => {
+                fold(
+                    names,
+                    &claim_target,
+                    location_revision,
+                    series_epoch,
+                    NativeOutcomeFold::Undelivered { reason },
+                )
+                .await;
+                return;
+            }
+            NativeCallResult::Ambiguous(reason) => {
+                fold(
+                    names,
+                    &claim_target,
+                    location_revision,
+                    series_epoch,
+                    NativeOutcomeFold::Ambiguous { reason },
+                )
+                .await;
+                return;
+            }
+            NativeCallResult::Unsupported(reason) => {
+                fold(
+                    names,
+                    &claim_target,
+                    location_revision,
+                    series_epoch,
+                    NativeOutcomeFold::Unsupported { reason },
+                )
+                .await;
+                return;
+            }
+        }
+    }
     // 3. One confirming read afterward — only a current-revision readback can
     //    establish the target as synchronized.
     if !names
@@ -923,6 +985,9 @@ async fn run_cycle(
                 },
             )
             .await;
+        }
+        NativeCallResult::AdmissionBusy => {
+            pause_admission(names, &claim, NativeCyclePhase::ConfirmRead).await;
         }
         NativeCallResult::Undelivered(reason) => {
             fold(
@@ -1224,6 +1289,7 @@ impl NativeNameBackend for ClaudeNativeNameAdapter {
                 NativeCallResult::Undelivered(reason) => NativeCallResult::Undelivered(reason),
                 NativeCallResult::Ambiguous(reason) => NativeCallResult::Ambiguous(reason),
                 NativeCallResult::Unsupported(reason) => NativeCallResult::Unsupported(reason),
+                NativeCallResult::AdmissionBusy => NativeCallResult::AdmissionBusy,
             }
         })
     }
@@ -1253,6 +1319,7 @@ impl NativeNameBackend for ClaudeNativeNameAdapter {
                 NativeCallResult::Undelivered(reason) => NativeCallResult::Undelivered(reason),
                 NativeCallResult::Ambiguous(reason) => NativeCallResult::Ambiguous(reason),
                 NativeCallResult::Unsupported(reason) => NativeCallResult::Unsupported(reason),
+                NativeCallResult::AdmissionBusy => NativeCallResult::AdmissionBusy,
             }
         })
     }

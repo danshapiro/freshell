@@ -98,12 +98,26 @@ pub enum FreshAgentNativeNameOperation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FreshAgentNativeNameError {
-    Unavailable { message: String },
-    Rpc { code: i64, message: String },
-    Timeout { timeout_ms: u64 },
+    /// Supervisor admission refused before any host/native operation. A host
+    /// reply must never use this as evidence that an operation was not sent.
+    AdmissionBusy,
+    Unavailable {
+        message: String,
+    },
+    Rpc {
+        code: i64,
+        message: String,
+    },
+    Timeout {
+        timeout_ms: u64,
+    },
     Closed,
-    Transport { message: String },
-    InvalidResponse { detail: String },
+    Transport {
+        message: String,
+    },
+    InvalidResponse {
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,4 +138,8 @@ pub struct FreshAgentNativeNameRequest {
     pub operation: FreshAgentNativeNameOperation,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_control_epoch: Option<u64>,
+    /// Absolute caller budget, including inventory, admission and host work.
+    /// The supervisor also imposes its own monotonic upper bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_unix_ms: Option<i64>,
 }

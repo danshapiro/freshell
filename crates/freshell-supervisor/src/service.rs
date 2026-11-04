@@ -3503,150 +3503,205 @@ impl Supervisor {
         request: freshell_runtime_protocol::FreshAgentNativeNameRequest,
     ) -> Result<freshell_runtime_protocol::FreshAgentNativeNameReply, RuntimeError> {
         use freshell_runtime_protocol::{FreshAgentNativeNameError, FreshAgentNativeNameReply};
-        let unavailable = || {
-            FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Unavailable {
-                message: "native naming source is no longer current".into(),
+        const BUDGET_MS: u64 = 20_000;
+        let remaining_ms = request
+            .deadline_unix_ms
+            .map(|deadline| {
+                deadline
+                    .saturating_sub(now_millis())
+                    .clamp(0, BUDGET_MS as i64) as u64
             })
-        };
-        let lifecycle_lock = self.lifecycle_lock(&request.soul_id).await;
-        // Metadata discovery must not queue behind lifecycle work and then
-        // dispatch after the name worker's existing request budget expired.
-        let Ok(_guard) = lifecycle_lock.try_lock() else {
-            append_event(
-                &self.config.lifecycle_log,
-                "freshagent.native_name_refused",
-                serde_json::json!({
-                    "severity":"info",
-                    "reason":"lifecycle_busy",
-                    "soulId":request.soul_id,
-                    "nativeSessionId":request.source.native_session_id,
-                    "operation":match &request.operation {
-                        freshell_runtime_protocol::FreshAgentNativeNameOperation::Probe => "probe",
-                        freshell_runtime_protocol::FreshAgentNativeNameOperation::Read => "read",
-                        freshell_runtime_protocol::FreshAgentNativeNameOperation::Write { .. } => "write",
+            .unwrap_or(BUDGET_MS);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(remaining_ms);
+        let work = async {
+            let unavailable = || {
+                FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Unavailable {
+                    message: "native naming source is no longer current".into(),
+                })
+            };
+            let lifecycle_lock = self.lifecycle_lock(&request.soul_id).await;
+            // Tokio's mutex admits queued metadata fairly. Drop the actual lock
+            // future on expiry: no detached waiter may dispatch after this reply.
+            let admission_deadline =
+                deadline.min(tokio::time::Instant::now() + std::time::Duration::from_secs(1));
+            let Ok(_guard) =
+                tokio::time::timeout_at(admission_deadline, lifecycle_lock.lock()).await
+            else {
+                append_event(
+                    &self.config.lifecycle_log,
+                    "freshagent.native_name_refused",
+                    serde_json::json!({
+                        "severity":"info", "reason":"lifecycle_busy",
+                        "soulId":request.soul_id,
+                        "nativeSessionId":request.source.native_session_id,
+                        "operation":match &request.operation {
+                            freshell_runtime_protocol::FreshAgentNativeNameOperation::Probe => "probe",
+                            freshell_runtime_protocol::FreshAgentNativeNameOperation::Read => "read",
+                            freshell_runtime_protocol::FreshAgentNativeNameOperation::Write { .. } => "write",
+                        },
+                    }),
+                );
+                return Ok(FreshAgentNativeNameReply::Failed(
+                    FreshAgentNativeNameError::AdmissionBusy,
+                ));
+            };
+            self.registry
+                .assert_epoch(request.expected_control_epoch)
+                .map_err(map_registry)?;
+            let handle = self
+                .registry
+                .active_handle_for_soul(request.soul_id.clone())
+                .await
+                .map_err(map_registry)?;
+            let before = find_view(&self.registry, handle.incarnation_id()).await?;
+            let matches_source = |view: &RuntimeView| {
+                view.incarnation_id == request.source.incarnation_id
+                    && view.host_boot_id.as_ref() == Some(&request.source.host_boot_id)
+                    && view.execution_generation == request.source.execution_generation
+                    && view.intent_revision == request.source.intent_revision
+                    && view.native_session_id.as_deref()
+                        == Some(request.source.native_session_id.as_str())
+                    && view.launch_state == LaunchState::Running
+                    && view.recovery_state == freshell_runtime_protocol::RecoveryState::Live
+                    && view.desired_state == freshell_runtime_protocol::DesiredState::Running
+            };
+            if !matches_source(&before) {
+                append_event(
+                    &self.config.lifecycle_log,
+                    "freshagent.native_name_refused",
+                    serde_json::json!({
+                        "severity":"warning",
+                        "reason":"source_mismatch",
+                        "soulId":request.soul_id,
+                        "requestedIncarnationId":request.source.incarnation_id,
+                        "currentIncarnationId":before.incarnation_id,
+                        "requestedHostBootId":request.source.host_boot_id,
+                        "currentHostBootId":before.host_boot_id,
+                        "requestedExecutionGeneration":request.source.execution_generation,
+                        "currentExecutionGeneration":before.execution_generation,
+                        "requestedIntentRevision":request.source.intent_revision,
+                        "currentIntentRevision":before.intent_revision,
+                        "requestedNativeSessionId":request.source.native_session_id,
+                        "currentNativeSessionId":before.native_session_id,
+                        "currentLaunchState":before.launch_state,
+                        "currentRecoveryState":before.recovery_state,
+                        "currentDesiredState":before.desired_state,
+                    }),
+                );
+                return Ok(unavailable());
+            }
+            let is_fresh_codex = handle.fresh_agent().is_some_and(|agent| {
+                agent.provider == freshell_runtime_protocol::FreshProvider::Codex
+            });
+            if !is_fresh_codex {
+                append_event(
+                    &self.config.lifecycle_log,
+                    "freshagent.native_name_refused",
+                    serde_json::json!({
+                        "severity":"warning",
+                        "reason":"provider_mismatch",
+                        "soulId":request.soul_id,
+                        "hasFreshAgent":handle.fresh_agent().is_some(),
+                        "providerIsCodex":is_fresh_codex,
+                    }),
+                );
+                return Ok(unavailable());
+            }
+            if request.codex_home.is_empty() {
+                append_event(
+                    &self.config.lifecycle_log,
+                    "freshagent.native_name_refused",
+                    serde_json::json!({
+                        "severity":"warning",
+                        "reason":"missing_codex_home",
+                        "soulId":request.soul_id,
+                        "codexHomePresent":false,
+                    }),
+                );
+                return Ok(unavailable());
+            }
+            let host = self
+                .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+                .await?;
+            if host.host_boot_id != request.source.host_boot_id {
+                append_event(
+                    &self.config.lifecycle_log,
+                    "freshagent.native_name_refused",
+                    serde_json::json!({
+                        "severity":"warning",
+                        "reason":"host_boot_mismatch",
+                        "soulId":request.soul_id,
+                        "requestedHostBootId":request.source.host_boot_id,
+                        "currentHostBootId":host.host_boot_id,
+                    }),
+                );
+                return Ok(unavailable());
+            }
+            // Stop persists intent before taking this mutex; authentication also
+            // yields. Recheck both source and control authority immediately before
+            // dispatch, even when they were valid at initial admission.
+            self.registry
+                .assert_epoch(request.expected_control_epoch)
+                .map_err(map_registry)?;
+            if !matches_source(&find_view(&self.registry, handle.incarnation_id()).await?) {
+                return Ok(unavailable());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(FreshAgentNativeNameReply::Failed(
+                    FreshAgentNativeNameError::Timeout {
+                        timeout_ms: BUDGET_MS,
                     },
-                }),
-            );
-            return Ok(unavailable());
+                ));
+            }
+            let reply = self
+                .send_authenticated_host_command(
+                    handle.incarnation_id().clone(),
+                    handle.runtime_dir(),
+                    &host,
+                    HostCommand::FreshAgentNativeName {
+                        incarnation_id: handle.incarnation_id().clone(),
+                        native_session_id: request.source.native_session_id.clone(),
+                        codex_home: request.codex_home.clone(),
+                        operation: request.operation.clone(),
+                    },
+                )
+                .await?;
+            let HostResult::FreshAgentNativeName(value) = reply else {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::HostAuthenticationFailed,
+                    "unexpected native naming reply",
+                ));
+            };
+            // Only this supervisor's admission result proves no dispatch. A host
+            // response carrying that variant is invalid and remains ambiguous.
+            if matches!(
+                value,
+                FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::AdmissionBusy)
+            ) {
+                return Ok(FreshAgentNativeNameReply::Failed(
+                    FreshAgentNativeNameError::InvalidResponse {
+                        detail: "host returned supervisor-only admission result".into(),
+                    },
+                ));
+            }
+            let after = find_view(&self.registry, handle.incarnation_id()).await?;
+            let after_host = self
+                .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+                .await?;
+            if !matches_source(&after) || after_host.host_boot_id != host.host_boot_id {
+                return Ok(FreshAgentNativeNameReply::Failed(
+                    FreshAgentNativeNameError::Closed,
+                ));
+            }
+            Ok(value)
         };
-        let handle = self
-            .registry
-            .active_handle_for_soul(request.soul_id.clone())
-            .await
-            .map_err(map_registry)?;
-        let before = find_view(&self.registry, handle.incarnation_id()).await?;
-        let matches_source = |view: &RuntimeView| {
-            view.incarnation_id == request.source.incarnation_id
-                && view.host_boot_id.as_ref() == Some(&request.source.host_boot_id)
-                && view.execution_generation == request.source.execution_generation
-                && view.intent_revision == request.source.intent_revision
-                && view.native_session_id.as_deref()
-                    == Some(request.source.native_session_id.as_str())
-                && view.launch_state == LaunchState::Running
-                && view.recovery_state == freshell_runtime_protocol::RecoveryState::Live
-                && view.desired_state == freshell_runtime_protocol::DesiredState::Running
-        };
-        if !matches_source(&before) {
-            append_event(
-                &self.config.lifecycle_log,
-                "freshagent.native_name_refused",
-                serde_json::json!({
-                    "severity":"warning",
-                    "reason":"source_mismatch",
-                    "soulId":request.soul_id,
-                    "requestedIncarnationId":request.source.incarnation_id,
-                    "currentIncarnationId":before.incarnation_id,
-                    "requestedHostBootId":request.source.host_boot_id,
-                    "currentHostBootId":before.host_boot_id,
-                    "requestedExecutionGeneration":request.source.execution_generation,
-                    "currentExecutionGeneration":before.execution_generation,
-                    "requestedIntentRevision":request.source.intent_revision,
-                    "currentIntentRevision":before.intent_revision,
-                    "requestedNativeSessionId":request.source.native_session_id,
-                    "currentNativeSessionId":before.native_session_id,
-                    "currentLaunchState":before.launch_state,
-                    "currentRecoveryState":before.recovery_state,
-                    "currentDesiredState":before.desired_state,
-                }),
-            );
-            return Ok(unavailable());
-        }
-        let is_fresh_codex = handle
-            .fresh_agent()
-            .is_some_and(|agent| agent.provider == freshell_runtime_protocol::FreshProvider::Codex);
-        if !is_fresh_codex {
-            append_event(
-                &self.config.lifecycle_log,
-                "freshagent.native_name_refused",
-                serde_json::json!({
-                    "severity":"warning",
-                    "reason":"provider_mismatch",
-                    "soulId":request.soul_id,
-                    "hasFreshAgent":handle.fresh_agent().is_some(),
-                    "providerIsCodex":is_fresh_codex,
-                }),
-            );
-            return Ok(unavailable());
-        }
-        if request.codex_home.is_empty() {
-            append_event(
-                &self.config.lifecycle_log,
-                "freshagent.native_name_refused",
-                serde_json::json!({
-                    "severity":"warning",
-                    "reason":"missing_codex_home",
-                    "soulId":request.soul_id,
-                    "codexHomePresent":false,
-                }),
-            );
-            return Ok(unavailable());
-        }
-        let host = self
-            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
-            .await?;
-        if host.host_boot_id != request.source.host_boot_id {
-            append_event(
-                &self.config.lifecycle_log,
-                "freshagent.native_name_refused",
-                serde_json::json!({
-                    "severity":"warning",
-                    "reason":"host_boot_mismatch",
-                    "soulId":request.soul_id,
-                    "requestedHostBootId":request.source.host_boot_id,
-                    "currentHostBootId":host.host_boot_id,
-                }),
-            );
-            return Ok(unavailable());
-        }
-        let reply = self
-            .send_authenticated_host_command(
-                handle.incarnation_id().clone(),
-                handle.runtime_dir(),
-                &host,
-                HostCommand::FreshAgentNativeName {
-                    incarnation_id: handle.incarnation_id().clone(),
-                    native_session_id: request.source.native_session_id.clone(),
-                    codex_home: request.codex_home.clone(),
-                    operation: request.operation.clone(),
+        tokio::time::timeout_at(deadline, work).await.unwrap_or({
+            Ok(FreshAgentNativeNameReply::Failed(
+                FreshAgentNativeNameError::Timeout {
+                    timeout_ms: BUDGET_MS,
                 },
-            )
-            .await?;
-        let HostResult::FreshAgentNativeName(value) = reply else {
-            return Err(RuntimeError::new(
-                RuntimeErrorCode::HostAuthenticationFailed,
-                "unexpected native naming reply",
-            ));
-        };
-        let after = find_view(&self.registry, handle.incarnation_id()).await?;
-        let after_host = self
-            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
-            .await?;
-        if !matches_source(&after) || after_host.host_boot_id != host.host_boot_id {
-            return Ok(FreshAgentNativeNameReply::Failed(
-                FreshAgentNativeNameError::Closed,
-            ));
-        }
-        Ok(value)
+            ))
+        })
     }
 
     async fn fresh_agent_model_catalog(

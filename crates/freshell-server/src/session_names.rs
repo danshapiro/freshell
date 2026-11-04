@@ -302,6 +302,10 @@ struct NativeWriteState {
     cycles_consumed: u32,
     #[serde(default)]
     reads_consumed: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    admission_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    admission_continuation: Option<crate::session_name_native::NativeCyclePhase>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     attempted_receipts: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1272,7 +1276,10 @@ impl SessionNames {
         let now = effective_now_ms(&self.core.data_dir);
         let mut items = Vec::new();
         for (key, state) in &document.native_write {
-            if state.settled || state.cycles_consumed >= MAX_NATIVE_CYCLES {
+            if state.settled
+                || (state.cycles_consumed >= MAX_NATIVE_CYCLES
+                    && current_native_continuation(document, key).is_none())
+            {
                 continue;
             }
             if state.status == NativeSyncStatus::Synced
@@ -2699,6 +2706,8 @@ fn reset_native_series(document: &mut StoredDocument, key: &str, record: &Sessio
     entry.cycles_consumed = 0;
     entry.reads_consumed = 0;
     entry.receipt_id = None;
+    entry.admission_id = None;
+    entry.admission_continuation = None;
     entry.unsynced_reason = None;
 }
 
@@ -2785,6 +2794,8 @@ fn transfer_native_write(
     if let Some(mut pending_state) = document.native_write.remove(from_key) {
         match document.native_write.get_mut(to_key) {
             Some(durable) => {
+                durable.admission_id = None;
+                durable.admission_continuation = None;
                 durable.cycles_consumed = (durable.cycles_consumed + pending_state.cycles_consumed)
                     .min(MAX_NATIVE_CYCLES);
                 durable.reads_consumed =
@@ -3886,6 +3897,19 @@ fn native_retry_delay_ms(cycles_consumed: u32) -> Option<i64> {
     }
 }
 
+fn current_native_continuation(
+    document: &StoredDocument,
+    key: &str,
+) -> Option<crate::session_name_native::NativeCyclePhase> {
+    let state = document.native_write.get(key)?;
+    let phase = state.admission_continuation?;
+    let (location, revision) = native_route_of(document, key)?;
+    (state.receipt_id.is_some()
+        && state.attempted_location.as_ref() == Some(&location)
+        && state.attempted_location_revision == Some(revision))
+    .then_some(phase)
+}
+
 /// Whether an armed series is claimable RIGHT NOW: a current writable series
 /// with remaining cycles, not settled, and due. Consumes nothing on refusal.
 fn native_series_claimable(
@@ -3894,7 +3918,10 @@ fn native_series_claimable(
     now: i64,
 ) -> Option<(SessionNameRecord, NameSource)> {
     let state = document.native_write.get(key)?;
-    if state.settled || state.cycles_consumed >= MAX_NATIVE_CYCLES {
+    if state.settled
+        || (state.cycles_consumed >= MAX_NATIVE_CYCLES
+            && current_native_continuation(document, key).is_none())
+    {
         return None;
     }
     if state.status == NativeSyncStatus::Synced || state.status == NativeSyncStatus::Unsupported {
@@ -3927,6 +3954,7 @@ fn claim_native_cycle_decision(
     let Some((location, location_revision)) = native_route_of(document, &key) else {
         return Ok(Decision::Read(None));
     };
+    let continuation = current_native_continuation(document, &key);
     // Charge the cycle and persist the full attempt before dispatch: desired
     // revision, attempted location/locationRevision, title, source, and the
     // unique own-write receipt. A restart discovering this interrupted cycle
@@ -3942,11 +3970,18 @@ fn claim_native_cycle_decision(
         if entry.series_epoch.is_none() {
             entry.series_epoch = Some(record.revision);
         }
-        entry.cycles_consumed += 1;
-        entry.receipt_id = Some(receipt_id.to_string());
-        if !entry.attempted_receipts.contains(&receipt_id.to_string()) {
-            entry.attempted_receipts.push(receipt_id.to_string());
+        if continuation.is_none() {
+            entry.cycles_consumed += 1;
+            entry.receipt_id = Some(receipt_id.to_string());
+            if !entry.attempted_receipts.contains(&receipt_id.to_string()) {
+                entry.attempted_receipts.push(receipt_id.to_string());
+            }
         }
+        // Each admission gets a fresh nonce, while a paused cycle retains its
+        // original own-write receipt. A replayed Busy fold cannot refund a
+        // later dispatch's read charge, even in the same cycle.
+        entry.admission_id = Some(receipt_id.to_string());
+        entry.admission_continuation = None;
         entry.attempted_location = Some(location.clone());
         entry.attempted_location_revision = Some(location_revision);
     }
@@ -3966,7 +4001,15 @@ fn claim_native_cycle_decision(
         series_epoch,
         title: record.name.clone(),
         source,
-        receipt_id: receipt_id.to_string(),
+        receipt_id: document
+            .native_write
+            .get(&key)
+            .unwrap()
+            .receipt_id
+            .clone()
+            .unwrap(),
+        phase: continuation.unwrap_or(crate::session_name_native::NativeCyclePhase::BeforeRead),
+        admission_id: receipt_id.to_string(),
         cycle: document
             .native_write
             .get(&key)
@@ -4061,6 +4104,32 @@ fn fold_native_outcome_decision(
         return Ok(Decision::Read(read_update(document, &key)));
     }
 
+    if let NativeOutcomeFold::AdmissionBusy {
+        admission_id,
+        phase,
+    } = &outcome
+    {
+        if state.admission_id.as_ref() != Some(admission_id) {
+            return Ok(Decision::Read(read_update(document, &key)));
+        }
+        if *phase != crate::session_name_native::NativeCyclePhase::Write {
+            let Some(reads) = state.reads_consumed.checked_sub(1) else {
+                return Ok(Decision::Read(read_update(document, &key)));
+            };
+            state.reads_consumed = reads;
+        }
+        state.admission_id = None;
+        state.admission_continuation = Some(*phase);
+        state.status = NativeSyncStatus::Pending;
+        state.settled = false;
+        state.next_due = Some(meta.now_ms + 2_000);
+        state.unsynced_reason = Some("waiting for native lifecycle admission".into());
+        return Ok(commit_decision_publishing_status(document, &key));
+    }
+    if !matches!(outcome, NativeOutcomeFold::WriteAcknowledged { .. }) {
+        state.admission_id = None;
+        state.admission_continuation = None;
+    }
     let now = meta.now_ms;
     let desired_name = state
         .desired_name
@@ -4085,6 +4154,9 @@ fn fold_native_outcome_decision(
     }
 
     match outcome {
+        NativeOutcomeFold::AdmissionBusy { .. } => {
+            unreachable!("handled before ordinary native outcome folding")
+        }
         NativeOutcomeFold::Read { observed, receipt } => {
             let matching = observed.as_deref() == Some(desired_name.as_str());
             if matching {

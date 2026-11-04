@@ -925,6 +925,16 @@ fn fake_host_with_boot(
     change_boot: bool,
     boot: HostBootId,
 ) -> (Arc<StdMutex<Vec<HostCommand>>>, tokio::task::JoinHandle<()>) {
+    fake_host_with_native_behavior(runtime_dir, change_boot, boot, None, false)
+}
+
+fn fake_host_with_native_behavior(
+    runtime_dir: &std::path::Path,
+    change_boot: bool,
+    boot: HostBootId,
+    auth_gate: Option<Arc<tokio::sync::Notify>>,
+    host_busy: bool,
+) -> (Arc<StdMutex<Vec<HostCommand>>>, tokio::task::JoinHandle<()>) {
     let secret = b"synthetic-host-secret";
     std::fs::write(runtime_dir.join("secret"), secret).unwrap();
     let listener = UnixListener::bind(runtime_dir.join("host.sock")).unwrap();
@@ -943,6 +953,9 @@ fn fake_host_with_boot(
                     incarnation_id,
                     challenge,
                 } => {
+                    if let Some(gate) = &auth_gate {
+                        gate.notified().await;
+                    }
                     hello_count += 1;
                     let current = if change_boot && hello_count > 1 {
                         HostBootId::new()
@@ -970,16 +983,20 @@ fn fake_host_with_boot(
                 } => {
                     assert_eq!(native_session_id, "name-native");
                     assert_eq!(codex_home, "/owning/codex");
-                    HostResult::FreshAgentNativeName(match operation {
-                        FreshAgentNativeNameOperation::Probe => {
-                            FreshAgentNativeNameReply::Available
-                        }
-                        FreshAgentNativeNameOperation::Read => {
-                            FreshAgentNativeNameReply::Title(Some("Native title".into()))
-                        }
-                        FreshAgentNativeNameOperation::Write { title } => {
-                            assert_eq!(title, "Manual title");
-                            FreshAgentNativeNameReply::Renamed
+                    HostResult::FreshAgentNativeName(if host_busy {
+                        FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::AdmissionBusy)
+                    } else {
+                        match operation {
+                            FreshAgentNativeNameOperation::Probe => {
+                                FreshAgentNativeNameReply::Available
+                            }
+                            FreshAgentNativeNameOperation::Read => {
+                                FreshAgentNativeNameReply::Title(Some("Native title".into()))
+                            }
+                            FreshAgentNativeNameOperation::Write { title } => {
+                                assert_eq!(title, "Manual title");
+                                FreshAgentNativeNameReply::Renamed
+                            }
                         }
                     })
                 }
@@ -991,15 +1008,14 @@ fn fake_host_with_boot(
                 },
                 other => panic!("configure sent an unexpected host command {other:?}"),
             };
-            write_frame(
+            let _ = write_frame(
                 &mut socket,
                 &HostReply {
                     request_id: envelope.request_id,
                     result: Ok(result),
                 },
             )
-            .await
-            .unwrap();
+            .await;
         }
     });
     (received, task)
@@ -1304,6 +1320,66 @@ fn host_configure_gets_the_fresh_agent_command_budget() {
 }
 
 #[tokio::test]
+async fn native_name_transient_lifecycle_admission_preserves_the_current_request() {
+    let fixture = running_fresh_provider_with_name(FreshProvider::Codex, None, "name-native").await;
+    let view = fixture
+        .supervisor
+        .registry
+        .inventory()
+        .await
+        .unwrap()
+        .remove(0);
+    let (received, host) = fake_host_with_boot(
+        &fixture.runtime_dir,
+        false,
+        view.host_boot_id.clone().unwrap(),
+    );
+    let lifecycle = fixture.supervisor.lifecycle_lock(&fixture.soul).await;
+    let held = lifecycle.lock().await;
+    let mut operation = Box::pin(fixture.supervisor.fresh_agent_native_name(
+        FreshAgentNativeNameRequest {
+            soul_id: fixture.soul.clone(),
+            source: FreshAgentNativeNameSource {
+                incarnation_id: view.incarnation_id,
+                host_boot_id: view.host_boot_id.unwrap(),
+                execution_generation: view.execution_generation,
+                intent_revision: view.intent_revision,
+                native_session_id: "name-native".into(),
+            },
+            codex_home: "/owning/codex".into(),
+            operation: FreshAgentNativeNameOperation::Write {
+                title: "Manual title".into(),
+            },
+            expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
+            deadline_unix_ms: None,
+        },
+    ));
+    let pending = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(operation.as_mut(), cx).is_pending())
+    })
+    .await;
+    assert!(pending, "transient lifecycle contention must queue the same current request, not spend a native attempt on a false source refusal");
+    assert!(
+        received.lock().unwrap().is_empty(),
+        "waiting admission performs no host/native work"
+    );
+    drop(held);
+    let reply = operation.await.unwrap();
+    host.abort();
+    let _ = host.await;
+    assert_eq!(reply, FreshAgentNativeNameReply::Renamed);
+    assert_eq!(
+        received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|command| matches!(command, HostCommand::FreshAgentNativeName { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn admin_native_name_rejects_stale_authority_before_host_work_and_preserves_recovery() {
     for scenario in [
         "read",
@@ -1380,6 +1456,7 @@ async fn admin_native_name_rejects_stale_authority_before_host_work_and_preserve
                     "probe" => FreshAgentNativeNameOperation::Probe,
                     _ => FreshAgentNativeNameOperation::Read,
                 },
+                deadline_unix_ms: None,
                 expected_control_epoch: Some(if scenario == "stale-epoch" {
                     epoch + 1
                 } else {
@@ -1413,6 +1490,10 @@ async fn admin_native_name_rejects_stale_authority_before_host_work_and_preserve
                 ),
                 "write" => assert_eq!(reply, FreshAgentNativeNameReply::Renamed),
                 "probe" => assert_eq!(reply, FreshAgentNativeNameReply::Available),
+                "busy" => assert_eq!(
+                    reply,
+                    FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::AdmissionBusy)
+                ),
                 "boot-changes" => assert_eq!(
                     reply,
                     FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Closed)
@@ -1582,4 +1663,212 @@ async fn admin_model_catalog_uses_authenticated_current_host_and_preserves_recov
             "catalog reads must never reconfigure recovery"
         );
     }
+}
+
+async fn native_name_request(fixture: &RunningFreshAgent) -> FreshAgentNativeNameRequest {
+    let view = fixture
+        .supervisor
+        .registry
+        .inventory()
+        .await
+        .unwrap()
+        .remove(0);
+    FreshAgentNativeNameRequest {
+        soul_id: fixture.soul.clone(),
+        source: FreshAgentNativeNameSource {
+            incarnation_id: view.incarnation_id,
+            host_boot_id: view.host_boot_id.unwrap(),
+            execution_generation: view.execution_generation,
+            intent_revision: view.intent_revision,
+            native_session_id: "name-native".into(),
+        },
+        codex_home: "/owning/codex".into(),
+        operation: FreshAgentNativeNameOperation::Write {
+            title: "Manual title".into(),
+        },
+        expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
+        deadline_unix_ms: None,
+    }
+}
+
+#[tokio::test]
+async fn native_name_queued_stop_cancellation_and_deadline_never_dispatch_late() {
+    for case in ["stop", "cancel", "deadline", "epoch"] {
+        let fixture =
+            running_fresh_provider_with_name(FreshProvider::Codex, None, "name-native").await;
+        let mut request = native_name_request(&fixture).await;
+        let (received, host) = fake_host_with_boot(
+            &fixture.runtime_dir,
+            false,
+            request.source.host_boot_id.clone(),
+        );
+        if case == "deadline" {
+            request.deadline_unix_ms = Some(super::now_millis() + 5_000);
+        }
+        if case == "epoch" {
+            request.expected_control_epoch = Some(fixture.supervisor.registry.control_epoch() + 1);
+        }
+        let lifecycle = fixture.supervisor.lifecycle_lock(&fixture.soul).await;
+        let held = lifecycle.lock().await;
+        let mut operation = Box::pin(fixture.supervisor.fresh_agent_native_name(request));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                std::future::Future::poll(operation.as_mut(), cx).is_pending()
+            ))
+            .await
+        );
+        if case == "stop" {
+            fixture
+                .supervisor
+                .registry
+                .begin_stop_expected(fixture.soul.clone(), None)
+                .await
+                .unwrap();
+        }
+        match case {
+            "cancel" => drop(operation),
+            "deadline" => {
+                tokio::time::pause();
+                tokio::time::advance(std::time::Duration::from_millis(5_001)).await;
+                let reply = operation.await.unwrap();
+                tokio::time::resume();
+                assert!(matches!(
+                    reply,
+                    FreshAgentNativeNameReply::Failed(
+                        FreshAgentNativeNameError::Timeout { .. }
+                            | FreshAgentNativeNameError::AdmissionBusy
+                    )
+                ));
+            }
+            _ => {
+                drop(held);
+                let reply = operation.await;
+                if case == "epoch" {
+                    assert_eq!(reply.unwrap_err().code, RuntimeErrorCode::StaleControlEpoch);
+                } else {
+                    assert!(
+                        reply.is_err()
+                            || matches!(
+                                reply.unwrap(),
+                                FreshAgentNativeNameReply::Failed(
+                                    FreshAgentNativeNameError::Unavailable { .. }
+                                )
+                            )
+                    );
+                }
+                tokio::task::yield_now().await;
+                assert!(
+                    received.lock().unwrap().is_empty(),
+                    "{case}: superseded queued work never authenticates or dispatches"
+                );
+                host.abort();
+                let _ = host.await;
+                continue;
+            }
+        }
+        drop(held);
+        tokio::task::yield_now().await;
+        assert!(
+            received.lock().unwrap().is_empty(),
+            "{case}: cancelled queue entry must not survive its caller"
+        );
+        host.abort();
+        let _ = host.await;
+    }
+}
+
+#[tokio::test]
+async fn native_name_rechecks_stop_and_deadline_after_delayed_authentication() {
+    for case in ["stop", "deadline"] {
+        let fixture =
+            running_fresh_provider_with_name(FreshProvider::Codex, None, "name-native").await;
+        let mut request = native_name_request(&fixture).await;
+        if case == "deadline" {
+            request.deadline_unix_ms = Some(super::now_millis() + 5_000);
+        }
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (received, host) = fake_host_with_native_behavior(
+            &fixture.runtime_dir,
+            false,
+            request.source.host_boot_id.clone(),
+            Some(gate.clone()),
+            false,
+        );
+        let mut operation = Box::pin(fixture.supervisor.fresh_agent_native_name(request));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    reply = &mut operation => panic!("metadata settled before authentication was released: {reply:?}"),
+                    _ = tokio::task::yield_now() => {}
+                }
+                if !received.lock().unwrap().is_empty() { break; }
+            }
+        }).await.unwrap();
+        if case == "stop" {
+            fixture
+                .supervisor
+                .registry
+                .begin_stop_expected(fixture.soul.clone(), None)
+                .await
+                .unwrap();
+            gate.notify_one();
+            assert!(matches!(
+                operation.await.unwrap(),
+                FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Unavailable { .. })
+            ));
+        } else {
+            tokio::time::pause();
+            tokio::time::advance(std::time::Duration::from_millis(5_001)).await;
+            let reply = operation.await.unwrap();
+            tokio::time::resume();
+            assert!(matches!(
+                reply,
+                FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Timeout { .. })
+            ));
+            gate.notify_one();
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            !received
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|command| matches!(command, HostCommand::FreshAgentNativeName { .. })),
+            "{case}: delayed auth cannot authorize late native work"
+        );
+        host.abort();
+        let _ = host.await;
+    }
+}
+
+#[tokio::test]
+async fn native_name_host_reply_cannot_forge_undispatched_admission_proof() {
+    let fixture = running_fresh_provider_with_name(FreshProvider::Codex, None, "name-native").await;
+    let request = native_name_request(&fixture).await;
+    let (received, host) = fake_host_with_native_behavior(
+        &fixture.runtime_dir,
+        false,
+        request.source.host_boot_id.clone(),
+        None,
+        true,
+    );
+    assert!(matches!(
+        fixture
+            .supervisor
+            .fresh_agent_native_name(request)
+            .await
+            .unwrap(),
+        FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::InvalidResponse { .. })
+    ));
+    assert_eq!(
+        received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|command| matches!(command, HostCommand::FreshAgentNativeName { .. }))
+            .count(),
+        1
+    );
+    host.abort();
+    let _ = host.await;
 }
