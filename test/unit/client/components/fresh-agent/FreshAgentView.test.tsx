@@ -1897,6 +1897,40 @@ describe('new conversation close acceptance', () => {
 })
 
 describe('FreshAgentView', () => {
+  it('keeps one readable memory-loss disclosure across repeated recovery errors', async () => {
+    const store = createStore()
+    const locator = { sessionId: 'memory-loss-recovery', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ status: 'idle', capabilities: { send: true, interrupt: true }, turns: [] })
+    store.dispatch(sessionInit(locator))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      kind: 'fresh-agent', ...locator, createRequestId: 'memory-loss-create', status: 'idle',
+    } }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeEnabled())
+    const message = 'Codex crashed and this pane was restarted as a new thread. The agent no longer has memory of the earlier conversation in this pane.'
+    const recover = () => act(() => {
+      handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator,
+        event: { type: 'freshAgent.error', sessionId: locator.sessionId, code: 'THREAD_MEMORY_LOST', message } })
+    })
+    recover()
+    recover()
+    const disclosure = document.querySelectorAll<HTMLDetailsElement>('[data-agent-error="session"]')
+    expect(disclosure).toHaveLength(1)
+    const summary = disclosure[0].querySelector('summary')!
+    expect(summary).toHaveAccessibleName(/no longer has memory/)
+    expect(summary).toBeVisible()
+    const body = disclosure[0].querySelector('.fresh-agent-diagnostic-body')!
+    expect(body).toHaveTextContent(message)
+    expect(body).not.toBeVisible()
+    await userEvent.click(summary)
+    expect(body).toBeVisible()
+    // A repeated delivery updates the same disclosure without closing its readable details.
+    recover()
+    expect(document.querySelectorAll('[data-agent-error="session"]')).toHaveLength(1)
+    expect(body).toBeVisible()
+    expect(body).toHaveTextContent(message)
+  })
+
   it('converges Codex native settings into the next send while preserving newer staged choices and absent metadata', async () => {
     const store = createStore()
     const locator = { sessionId: 'settings-convergence', sessionType: 'freshcodex' as const, provider: 'codex' as const }

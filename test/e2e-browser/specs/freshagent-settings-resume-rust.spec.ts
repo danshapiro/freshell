@@ -739,11 +739,21 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
 
       // Task 6's contract: memory loss must be user-visible, not server-log-only.
       const memoryLoss = paneRoot.locator('[data-agent-error="session"]')
-      const banner = memoryLoss.getByText(/no longer has memory/)
-      await expect(banner).toHaveCount(1, { timeout: 15_000 })
+      await expect(memoryLoss).toHaveCount(1, { timeout: 15_000 })
+      const summary = memoryLoss.locator('summary')
+      await expect(summary).toHaveAccessibleName(/no longer has memory/)
+      await expect(summary).toBeVisible()
+      const matches = await memoryLoss.getByText(/no longer has memory/).evaluateAll(nodes => nodes.map(node => ({
+        tag: node.tagName,
+        inSummary: Boolean(node.closest('summary')),
+        inBody: Boolean(node.closest('.fresh-agent-diagnostic-body')),
+        visible: node.getClientRects().length > 0 && getComputedStyle(node).visibility !== 'hidden',
+      })))
+      console.info(JSON.stringify({ severity: 'info', event: 'memory_loss_disclosure_dom', disclosures: await memoryLoss.count(), matches }))
       if (!(await memoryLoss.evaluate(node => node.hasAttribute('open')))) {
-        await memoryLoss.locator('summary').click()
+        await summary.click()
       }
+      const banner = memoryLoss.locator('.fresh-agent-diagnostic-body').getByText(/no longer has memory/)
       await expect(banner, 'memory loss must be user-visible, not just a server warn').toBeVisible({ timeout: 15000 })
 
       // "New thread minted" = TWO thread/start entries in the op log. The fake
