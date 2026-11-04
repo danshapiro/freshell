@@ -3240,6 +3240,7 @@ async fn plan_codex_managed_launch(
     state: &WsState,
     setup: &CodexManagedLaunchSetup,
     resume_session_id: Option<&str>,
+    require_retained_sidecar: bool,
     class: freshell_codex::launch_lifecycle::LaunchClass,
     cancel: Option<&mut tokio::sync::watch::Receiver<bool>>,
 ) -> Result<freshell_codex::launch_lifecycle::CodexTerminalLaunch, PlanLaunchError> {
@@ -3254,6 +3255,7 @@ async fn plan_codex_managed_launch(
         model: plan_model.as_deref(),
         sandbox: plan_sandbox.as_deref(),
         approval_policy: plan_approval.as_deref(),
+        require_retained_sidecar,
         sidecar_context: setup.sidecar_context.clone(),
     };
     let manager = freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global();
@@ -3676,6 +3678,14 @@ pub(crate) struct LaunchPrep {
 /// extracted, so there is no error path.
 fn managed_runtime_mode(mode: &str) -> bool {
     mode == "shell" || freshell_agent_runtime::managed_provider_enabled(mode)
+}
+
+fn has_verified_codex_terminal_sidecar(mode: &str, session_id: Option<&str>) -> bool {
+    mode == "codex"
+        && session_id.is_some_and(|session_id| {
+            freshell_codex::sidecar_reconcile::codex_sidecar_reconciler()
+                .is_some_and(|reconciler| reconciler.has_verified_terminal_session(session_id))
+        })
 }
 
 fn managed_opencode_endpoint(
@@ -4710,6 +4720,9 @@ impl Drop for PreparedCodexLaunch {
 /// Everything a restore-class create computes BEFORE the spawn-gate permit.
 pub(crate) struct PreparedLaunch {
     pub prep: LaunchPrep,
+    /// A prior host-owned agent stays on its existing runtime through a
+    /// managed upgrade. Planning is deferred until create ownership settles.
+    pub require_retained_codex: bool,
     /// Some(..) ONLY when a resume session id was derived; None means
     /// "not planned pre-gate" and handle_create plans on-permit inline.
     pub codex_launch: Option<PreparedCodexLaunch>,
@@ -4768,7 +4781,9 @@ async fn gate_wire_resume(
                     "opencode" => state.fresh_opencode.has_live_session(sid).await,
                     _ => false,
                 };
-            registry_row_live || fresh_agent_live
+            registry_row_live
+                || fresh_agent_live
+                || has_verified_codex_terminal_sidecar(mode, Some(sid))
         }
     };
     if candidate_is_live {
@@ -5136,6 +5151,8 @@ pub(crate) async fn prepare_launch(
     // disagree).
     let mode = create.mode.clone();
     let mut prep = derive_launch_prep(create, &mode);
+    let require_retained_codex = managed_runtime_v1
+        && has_verified_codex_terminal_sidecar(&mode, prep.resume_session_id.as_deref());
     // Resume-validation door 1, codex leg (reconciled with #589): codex
     // restore-class planning happens OFF-permit right below, so the
     // disk-existence gate for codex WIRE ids must run before it — a
@@ -5175,7 +5192,9 @@ pub(crate) async fn prepare_launch(
     let managed_flag =
         std::env::var(freshell_codex::launch_plan::FRESHELL_CODEX_MANAGED_LAUNCH_ENV).ok();
     // The managed session host plans its own Codex app-server and proxy.
-    // Only a legacy web-owned launch needs a plan before the spawn gate.
+    // A retained host owner is claimed only after handle_create's ownership
+    // guards and spawn-gate wait. Cancelling a queued restore must leave its
+    // existing agent unclaimed and alive.
     let codex_launch = if !managed_runtime_v1
         && prep.resume_session_id.is_some()
         && codex_create_uses_managed_launch(&mode, managed_flag.as_deref())
@@ -5203,6 +5222,7 @@ pub(crate) async fn prepare_launch(
             state,
             &setup,
             prep.resume_session_id.as_deref(),
+            false,
             freshell_codex::launch_lifecycle::LaunchClass::Restore,
             Some(cancel),
         )
@@ -5218,6 +5238,7 @@ pub(crate) async fn prepare_launch(
     };
     Ok(PreparedLaunch {
         prep,
+        require_retained_codex,
         codex_launch,
         resume_gate,
     })
@@ -5308,13 +5329,18 @@ pub(crate) async fn handle_create(
     // the TOP so `prepared_codex`'s Drop guard is alive across EVERY
     // pre-plan early return below (keyed-create adopt, D8 lease, rate
     // limit, unknown mode, claude ladder, D7 guard, opencode port).
-    let (prep, mut prepared_codex, prepared_resume_gate) = match prepared {
+    let (prep, mut prepared_codex, prepared_resume_gate, prepared_retained_codex) = match prepared {
         // p.codex_launch is None for non-codex modes AND for the A4
         // fresh-plan exclusion (no derived resume session id) — the None
         // arm of the plan site below then plans on-permit, byte-identical
         // to today.
-        Some(p) => (Some(p.prep), p.codex_launch, p.resume_gate),
-        None => (None, None, None),
+        Some(p) => (
+            Some(p.prep),
+            p.codex_launch,
+            p.resume_gate,
+            p.require_retained_codex,
+        ),
+        None => (None, None, None, false),
     };
     // Single-flight create-dedupe (reconciliation design §5.4, the council's
     // two-tab double-respawn blocker): on `paneReconcileV1` connections ONLY,
@@ -6057,8 +6083,24 @@ pub(crate) async fn handle_create(
     // Managed create retries must be payload-identical across web-process
     // replacement, so their terminal and stream IDs derive from the pane's
     // durable createRequestId. Other creates retain their existing IDs.
+    let managed_runtime_v1 = state.registry.managed_runtime_connection(conn_id);
+    let require_retained_codex = prepared_retained_codex
+        || (managed_runtime_v1
+            && has_verified_codex_terminal_sidecar(
+                &mode,
+                create_session_locator(&create)
+                    .as_ref()
+                    .map(|locator| locator.session_id.as_str()),
+            ));
     let use_managed_runtime =
-        state.registry.managed_runtime_connection(conn_id) && managed_runtime_mode(&mode);
+        managed_runtime_v1 && managed_runtime_mode(&mode) && !require_retained_codex;
+    if require_retained_codex {
+        tracing::info!(
+            event = "terminal.create.retained_codex",
+            request_id = %create.request_id,
+            "Reusing a verified host-owned Codex agent during managed restore"
+        );
+    }
     let host_os = host_os_live();
     let is_wsl = is_wsl_env_live();
     let shell = map_shell(create.shell);
@@ -6973,7 +7015,8 @@ pub(crate) async fn handle_create(
     let (codex_setup, codex_launch) = match prepared_pair {
         Some((setup, launch)) => (Some(setup), Some(launch)),
         None if !use_managed_runtime
-            && codex_create_uses_managed_launch(&mode, managed_flag.as_deref()) =>
+            && (require_retained_codex
+                || codex_create_uses_managed_launch(&mode, managed_flag.as_deref())) =>
         {
             let setup = match build_codex_managed_launch_setup(
                 terminal_id.clone(),
@@ -6999,6 +7042,7 @@ pub(crate) async fn handle_create(
                 state,
                 &setup,
                 resume_session_id.as_deref(),
+                require_retained_codex,
                 freshell_codex::launch_lifecycle::LaunchClass::Interactive,
                 None,
             )
@@ -7965,6 +8009,17 @@ pub(crate) async fn handle_create(
         }
     }
 
+    if require_retained_codex {
+        if let Err(message) = freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+            .commit_ownership(&terminal_id)
+            .await
+        {
+            state.registry.kill(&terminal_id);
+            return send_create_error(out, ErrorCode::PtySpawnFailed, message, &create.request_id)
+                .await;
+        }
+    }
+
     // Unified agent names (Task 2): the scoped-create naming admission —
     // BEFORE the frame acknowledges creation, so the pane content and the
     // identity/registry rows never observable precede the name binding. A
@@ -8270,6 +8325,7 @@ pub async fn respawn_agent_terminal(
                 state,
                 setup,
                 resume_session_id.as_deref(),
+                false,
                 freshell_codex::launch_lifecycle::LaunchClass::Interactive,
                 None,
             )

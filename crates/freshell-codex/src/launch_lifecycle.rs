@@ -99,6 +99,12 @@ pub trait CodexLaunchRuntime: Send + Sync {
         generation: u64,
     ) -> BoxFuture<'_, Result<(), String>>;
 
+    /// Complete a borrowed retained owner's transfer only after the create's
+    /// final coordinator settlement. Ordinary freshly-owned runtimes no-op.
+    fn commit_ownership(&self) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Task 4: note the codex session/thread id once it is known — resume
     /// launches at plan time, fresh launches when the proxy captures the
     /// thread candidate. Default no-op: only runtimes with a durable sidecar
@@ -283,6 +289,14 @@ impl CodexLaunchSidecar {
         self.assert_adoptable().await?;
         self.planner_active.lock().unwrap().remove(&self.id);
         Ok(())
+    }
+
+    async fn commit_ownership(&self) -> Result<(), String> {
+        let inner = self.inner.lock().await;
+        if inner.shutdown_started {
+            return Err(CODEX_SIDECAR_NOT_ADOPTABLE_MESSAGE.to_string());
+        }
+        self.runtime.commit_ownership().await
     }
 
     /// Task 10 server-shutdown retention: close the proxy (its listener dies
@@ -862,6 +876,21 @@ impl CodexTerminalLaunchManager {
     /// the create error the caller is already surfacing is the primary failure.
     pub async fn discard(&self, launch: CodexTerminalLaunch) {
         let _ = launch.sidecar.shutdown().await;
+    }
+
+    /// The terminal's coordinator claim has won. Until this point a retained
+    /// runtime is still borrowed and failed creation must return its custody.
+    pub async fn commit_ownership(&self, terminal_id: &str) -> Result<(), String> {
+        let sidecar = self
+            .adopted
+            .lock()
+            .unwrap()
+            .get(terminal_id)
+            .map(|entry| entry.sidecar.clone());
+        match sidecar {
+            Some(sidecar) => sidecar.commit_ownership().await,
+            None => Err("The created Codex terminal exited before ownership committed.".into()),
+        }
     }
 
     /// [`Self::discard`] for sync contexts (RAII Drop guards): fire-and-forget

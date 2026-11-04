@@ -40,7 +40,7 @@
 #![cfg(target_os = "linux")]
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -48,6 +48,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::net::TcpListener;
+use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use freshell_codex::launch_lifecycle::{
@@ -84,6 +85,67 @@ static TEST_FAIL_ADOPTION: AtomicBool = AtomicBool::new(false);
 /// strictly after the PTY was spawned, which is the prepared-launch boundary.
 struct FailingAdoptionRuntime {
     inner: SpawnedCodexAppServerRuntime,
+}
+
+type OwnershipStageHook = Arc<dyn Fn() + Send + Sync>;
+static TEST_OWNERSHIP_STAGE_HOOK: Mutex<Option<OwnershipStageHook>> = Mutex::new(None);
+static TEST_READY_STAGE_HOOK: Mutex<Option<OwnershipStageHook>> = Mutex::new(None);
+
+struct RuntimeStageHooksReset;
+
+impl Drop for RuntimeStageHooksReset {
+    fn drop(&mut self) {
+        *TEST_OWNERSHIP_STAGE_HOOK.lock().unwrap() = None;
+        *TEST_READY_STAGE_HOOK.lock().unwrap() = None;
+    }
+}
+
+struct OwnershipStageRuntime {
+    inner: Arc<dyn CodexLaunchRuntime>,
+    hook: Option<OwnershipStageHook>,
+    ready_hook: Option<OwnershipStageHook>,
+}
+
+impl CodexLaunchRuntime for OwnershipStageRuntime {
+    fn ensure_ready(
+        &self,
+        cwd: Option<String>,
+    ) -> BoxFuture<'_, Result<CodexRuntimeReady, String>> {
+        Box::pin(async move {
+            let ready = self.inner.ensure_ready(cwd).await?;
+            if let Some(hook) = self.ready_hook.as_ref() {
+                hook();
+            }
+            Ok(ready)
+        })
+    }
+    fn update_ownership_metadata(
+        &self,
+        terminal: String,
+        generation: u64,
+    ) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            self.inner
+                .update_ownership_metadata(terminal, generation)
+                .await?;
+            if let Some(hook) = self.hook.as_ref() {
+                hook();
+            }
+            Ok(())
+        })
+    }
+    fn note_session_id(&self, session: String) -> BoxFuture<'_, Result<(), String>> {
+        self.inner.note_session_id(session)
+    }
+    fn commit_ownership(&self) -> BoxFuture<'_, Result<(), String>> {
+        self.inner.commit_ownership()
+    }
+    fn prepare_retention(&self, reason: String) -> BoxFuture<'_, Result<(), String>> {
+        self.inner.prepare_retention(reason)
+    }
+    fn shutdown(&self) -> BoxFuture<'_, Result<(), String>> {
+        self.inner.shutdown()
+    }
 }
 
 impl FailingAdoptionRuntime {
@@ -181,12 +243,24 @@ fn install_global_manager() {
             let reconciler = TEST_RECONCILER.lock().unwrap().clone();
             let store = TEST_STORE.lock().unwrap().clone();
             let sidecar_context = plan.sidecar_context.clone();
+            let ownership_hook = TEST_OWNERSHIP_STAGE_HOOK.lock().unwrap().clone();
+            let ready_hook = TEST_READY_STAGE_HOOK.lock().unwrap().clone();
             Box::pin(async move {
                 if TEST_FAIL_ADOPTION.load(Ordering::SeqCst) {
                     Arc::new(FailingAdoptionRuntime::new(sidecar_context))
                         as Arc<dyn CodexLaunchRuntime>
                 } else {
-                    select_codex_runtime(reconciler.as_ref(), store.as_ref(), plan).await
+                    let runtime =
+                        select_codex_runtime(reconciler.as_ref(), store.as_ref(), plan).await;
+                    if ownership_hook.is_some() || ready_hook.is_some() {
+                        Arc::new(OwnershipStageRuntime {
+                            inner: runtime,
+                            hook: ownership_hook,
+                            ready_hook,
+                        }) as Arc<dyn CodexLaunchRuntime>
+                    } else {
+                        runtime
+                    }
                 }
             })
         }));
@@ -201,6 +275,9 @@ fn swap_test_reconciler(
     reconciler: Option<Arc<SidecarReconciler>>,
     store: Option<Arc<CodexSidecarStore>>,
 ) {
+    if let Some(reconciler) = reconciler.as_ref() {
+        freshell_codex::sidecar_reconcile::set_codex_sidecar_reconciler(reconciler.clone());
+    }
     *TEST_RECONCILER.lock().unwrap() = reconciler;
     *TEST_STORE.lock().unwrap() = store;
 }
@@ -388,11 +465,126 @@ struct CapturedCodexProcess {
 }
 
 async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
+    let (url, registry, _) = spawn_server_with_managed_runtime(false).await;
+    (url, registry)
+}
+
+struct NoReplacementController(Arc<AtomicUsize>);
+
+impl freshell_terminal::registry::ManagedTerminalController for NoReplacementController {
+    fn lookup_terminal<'a>(
+        &'a self,
+        _: &'a str,
+        _: Option<String>,
+    ) -> freshell_terminal::registry::ManagedTerminalFuture<
+        'a,
+        Result<Option<freshell_terminal::registry::ManagedTerminalDescriptor>, String>,
+    > {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn launch<'a>(
+        &'a self,
+        _: freshell_terminal::registry::ManagedTerminalLaunch,
+    ) -> freshell_terminal::registry::ManagedTerminalFuture<
+        'a,
+        Result<
+            freshell_terminal::registry::ManagedTerminalDescriptor,
+            freshell_terminal::registry::ManagedTerminalLaunchError,
+        >,
+    > {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err("test intercepted a replacement managed launch".into()) })
+    }
+
+    fn input<'a>(
+        &'a self,
+        _: freshell_terminal::registry::ManagedTerminalDescriptor,
+        _: String,
+    ) -> freshell_terminal::registry::ManagedTerminalFuture<
+        'a,
+        Result<(), freshell_terminal::registry::ManagedTerminalInputError>,
+    > {
+        Box::pin(async { panic!("no managed terminal was created") })
+    }
+
+    fn resize<'a>(
+        &'a self,
+        _: freshell_terminal::registry::ManagedTerminalDescriptor,
+        _: u16,
+        _: u16,
+    ) -> freshell_terminal::registry::ManagedTerminalFuture<'a, Result<(), String>> {
+        Box::pin(async { panic!("no managed terminal was created") })
+    }
+
+    fn stop<'a>(
+        &'a self,
+        _: freshell_terminal::registry::ManagedTerminalDescriptor,
+    ) -> freshell_terminal::registry::ManagedTerminalFuture<'a, Result<(), String>> {
+        Box::pin(async { panic!("no managed terminal was created") })
+    }
+
+    fn read_output<'a>(
+        &'a self,
+        _: freshell_terminal::registry::ManagedTerminalDescriptor,
+        _: i64,
+        _: u64,
+    ) -> freshell_terminal::registry::ManagedTerminalFuture<
+        'a,
+        Result<freshell_terminal::registry::ManagedOutputRead, String>,
+    > {
+        Box::pin(async { panic!("no managed terminal was created") })
+    }
+}
+
+async fn spawn_server_with_managed_runtime(
+    managed: bool,
+) -> (
+    String,
+    freshell_terminal::TerminalRegistry,
+    Arc<AtomicUsize>,
+) {
+    spawn_server_with_gate(
+        managed,
+        Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
+    )
+    .await
+}
+
+async fn spawn_server_with_gate(
+    managed: bool,
+    spawn_gate: Arc<freshell_ws::spawn_gate::SpawnGate>,
+) -> (
+    String,
+    freshell_terminal::TerminalRegistry,
+    Arc<AtomicUsize>,
+) {
+    spawn_server_with_ownership(managed, spawn_gate, None).await
+}
+
+async fn spawn_server_with_ownership(
+    managed: bool,
+    spawn_gate: Arc<freshell_ws::spawn_gate::SpawnGate>,
+    ownership: Option<Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
+) -> (
+    String,
+    freshell_terminal::TerminalRegistry,
+    Arc<AtomicUsize>,
+) {
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let settings =
         Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
-    let registry = freshell_terminal::TerminalRegistry::new();
+    let registry = match ownership.as_ref() {
+        Some(ownership) => {
+            freshell_terminal::TerminalRegistry::new().with_ownership(ownership.clone())
+        }
+        None => freshell_terminal::TerminalRegistry::new(),
+    };
+    let launches = Arc::new(AtomicUsize::new(0));
+    if managed {
+        registry.set_managed_controller(Some(Arc::new(NoReplacementController(launches.clone()))));
+    }
 
     let state = WsState {
         session_index_ready: None,
@@ -438,7 +630,7 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
         ws_max_payload_bytes: 16 * 1024 * 1024,
         term09: freshell_ws::backpressure::Term09Config::default(),
         create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
-        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
+        spawn_gate,
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
@@ -451,7 +643,7 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
-        ownership: None,
+        ownership,
     };
 
     let router = freshell_ws::router(state);
@@ -463,13 +655,17 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
         let _ = axum::serve(listener, router).await;
     });
 
-    (format!("ws://{addr}/ws"), registry)
+    (format!("ws://{addr}/ws"), registry, launches)
 }
 
 type TestWs =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn connect_and_handshake(url: &str) -> TestWs {
+    connect_with_managed_negotiation(url, false).await
+}
+
+async fn connect_with_managed_negotiation(url: &str, managed: bool) -> TestWs {
     let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
         .await
         .expect("ws connect");
@@ -478,6 +674,7 @@ async fn connect_and_handshake(url: &str) -> TestWs {
             "type": "hello",
             "token": AUTH_TOKEN,
             "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
+            "capabilities": { "managedRuntimeV1": managed },
         })
         .to_string(),
     ))
@@ -1005,6 +1202,341 @@ fn prepared_codex_launch_reuses_reserved_setup_and_discards_after_adopt_failure(
 
 #[test]
 fn restore_reattaches_tui_to_surviving_sidecar_preserving_in_flight_turn() {
+    assert_survivor_restoration(false);
+}
+
+#[test]
+fn managed_negotiation_restores_verified_host_sidecar_without_replacement() {
+    assert_survivor_restoration(true);
+}
+
+#[test]
+fn failed_retained_tui_spawn_preserves_original_native_owner_and_claim() {
+    assert_failed_retained_create(false);
+}
+
+#[test]
+fn post_adopt_ownership_loss_returns_original_native_owner_and_claim() {
+    assert_failed_retained_create(true);
+}
+
+fn assert_failed_retained_create(ownership_loss: bool) {
+    reattach_rt().block_on(async {
+        let _serial = test_lock().lock().await;
+        install_global_manager();
+        ensure_mcp_deps_resolvable();
+        let _environment = TestEnvRestore::capture(&["CODEX_CMD", "CODEX_ARGV_CAPTURE_PATH"]);
+        let _hooks = RuntimeStageHooksReset;
+        let session_id = "0199da92-1111-4444-8aaa-aaaaaaaaaaaa";
+        let ownership_id = "codex-sidecar-owned-pty-failure";
+        let (mut child, pid, ws_url) =
+            spawn_survivor(ownership_id, &json!({ "loadedThreadIds": [session_id] })).await;
+        let dir = tempfile::tempdir().expect("owned failure fixture");
+        std::env::set_var("CODEX_CMD", if ownership_loss {
+            codex_dispatcher().to_string_lossy().into_owned()
+        } else {
+            "freshell-owned-test-missing-tui-program".into()
+        });
+        let cwd = dir.path().join("owned-tui-cwd");
+        std::fs::create_dir(&cwd).unwrap();
+        let readiness_observed = Arc::new(AtomicBool::new(false));
+        *TEST_READY_STAGE_HOOK.lock().unwrap() = Some(Arc::new({
+            let readiness_observed = readiness_observed.clone();
+            move || { readiness_observed.store(true, Ordering::SeqCst); }
+        }));
+        let capture = dir.path().join("tui-capture.json");
+        std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &capture);
+        let store = Arc::new(CodexSidecarStore::new(dir.path().join("records")));
+        let original = CodexSidecarRecord {
+            record_version: SIDECAR_RECORD_VERSION,
+            ownership_id: ownership_id.into(),
+            pid,
+            starttime: proc_starttime(pid as i32).unwrap(),
+            cmdline: proc_cmdline(pid as i32).unwrap(),
+            ws_url,
+            session_id: Some(session_id.into()),
+            terminal_id: Some("prior-owned-terminal".into()),
+            server_instance_id: "prior-server".into(),
+            created_at: 1,
+            updated_at: 2,
+            state: SidecarRecordState::Retained {
+                reason: "prior-shutdown".into(),
+            },
+            lane: None,
+        };
+        store.write(&original).unwrap();
+        let (reconciler, _) = SidecarReconciler::boot_reconcile(store.clone());
+        let reconciler = Arc::new(reconciler);
+        swap_test_reconciler(Some(reconciler.clone()), Some(store.clone()));
+        let ownership =
+            ownership_loss.then(|| Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new()));
+        let hook_fired = Arc::new(AtomicBool::new(false));
+        if let Some(ownership) = ownership.as_ref() {
+            let ownership = ownership.clone();
+            let hook_fired = hook_fired.clone();
+            *TEST_OWNERSHIP_STAGE_HOOK.lock().unwrap() = Some(Arc::new(move || {
+                let snapshot = ownership.observe("codex", session_id);
+                let operation = snapshot
+                    .state
+                    .operation_id()
+                    .expect("create holds the real coordinator ticket")
+                    .to_owned();
+                ownership.fail("codex", session_id, &operation, snapshot.generation, false);
+                hook_fired.store(true, Ordering::SeqCst);
+            }));
+        }
+        let (url, registry, launches) = spawn_server_with_ownership(
+            true,
+            Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
+            ownership,
+        )
+        .await;
+        let mut ws = connect_with_managed_negotiation(&url, true).await;
+        let response = create_codex_restore_terminal_expect_error(
+            &mut ws,
+            "request-pty-failure",
+            cwd.to_str().unwrap(),
+            session_id,
+        )
+        .await;
+        if ownership_loss {
+            timeout(RECV_TIMEOUT, async {
+                while reconciler.unclaimed_len() == 0
+                    && proc_starttime(pid as i32) == Some(original.starttime)
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("late ownership loser settles teardown");
+        }
+        let same_process = proc_starttime(pid as i32) == Some(original.starttime);
+        let same_record = store.load_all() == vec![original];
+        let discoverable = reconciler.has_verified_terminal_session(session_id);
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        swap_test_reconciler(None, None);
+        *TEST_OWNERSHIP_STAGE_HOOK.lock().unwrap() = None;
+        *TEST_READY_STAGE_HOOK.lock().unwrap() = None;
+        assert_eq!(
+            response["code"],
+            json!(if ownership_loss {
+                "INTERNAL_ERROR"
+            } else {
+                "PTY_SPAWN_FAILED"
+            })
+        );
+        assert_eq!(hook_fired.load(Ordering::SeqCst), ownership_loss);
+        assert!(readiness_observed.load(Ordering::SeqCst), "the failure must occur after the existing native owner was actually claimed and probed");
+        assert!(
+            same_process,
+            "failed TUI creation must leave the original agent alive"
+        );
+        assert!(
+            same_record,
+            "failed TUI creation must preserve the exact prior record"
+        );
+        assert!(
+            discoverable,
+            "failed TUI creation must return the retained claim"
+        );
+        assert!(
+            registry
+                .directory()
+                .iter()
+                .all(|row| !registry.is_pty_running(&row.terminal_id)),
+            "a late ownership loser must stop only its new TUI"
+        );
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[test]
+fn cancelled_managed_restore_does_not_claim_or_reap_the_host_sidecar() {
+    reattach_rt().block_on(async {
+        let _serial = test_lock().lock().await;
+        install_global_manager();
+        ensure_mcp_deps_resolvable();
+        let _environment = TestEnvRestore::capture(&["CODEX_CMD", "CODEX_ARGV_CAPTURE_PATH"]);
+        std::env::set_var("CODEX_CMD", codex_dispatcher());
+        let session_id = "owned-retained-cancel-session";
+        let ownership_id = "codex-sidecar-owned-cancel-session";
+        let (mut child, pid, ws_url) =
+            spawn_survivor(ownership_id, &json!({ "loadedThreadIds": [session_id] })).await;
+        let starttime = proc_starttime(pid as i32).expect("owned sidecar alive");
+        let dir = tempfile::tempdir().expect("owned sidecar store");
+        let store = Arc::new(CodexSidecarStore::new(dir.path().to_path_buf()));
+        store
+            .write(&CodexSidecarRecord {
+                record_version: SIDECAR_RECORD_VERSION,
+                ownership_id: ownership_id.into(),
+                pid,
+                starttime,
+                cmdline: proc_cmdline(pid as i32).expect("owned process argv"),
+                ws_url,
+                session_id: Some(session_id.into()),
+                terminal_id: Some("prior-owned-cancel-terminal".into()),
+                server_instance_id: "prior-server".into(),
+                created_at: 1,
+                updated_at: 2,
+                state: SidecarRecordState::Retained {
+                    reason: "server-shutdown".into(),
+                },
+                lane: None,
+            })
+            .expect("write owned record");
+        let (reconciler, _) = SidecarReconciler::boot_reconcile(store.clone());
+        let reconciler = Arc::new(reconciler);
+        swap_test_reconciler(Some(reconciler.clone()), Some(store));
+
+        let gate = Arc::new(freshell_ws::spawn_gate::SpawnGate::new(1, 64));
+        let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        let held_permit = gate
+            .acquire_unbounded(&mut cancel_rx)
+            .await
+            .expect("hold own spawn gate");
+        let (url, registry, launches) = spawn_server_with_gate(true, gate.clone()).await;
+        let mut ws = connect_with_managed_negotiation(&url, true).await;
+        let capture = capture_path("cancel-retained");
+        std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &capture);
+        ws.send(WsMessage::Text(
+            json!({
+                "type": "terminal.create", "requestId": "request-owned-cancel",
+                "mode": "codex", "shell": "system", "restore": true,
+                "cwd": scenario_cwd("cancel-retained"),
+                "sessionRef": {"provider": "codex", "sessionId": session_id},
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send owned restore");
+        tokio::time::timeout(RECV_TIMEOUT, async {
+            while gate.queued_total() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("restore queued behind owned permit");
+        ws.close(None).await.expect("close restoring client");
+        tokio::time::timeout(RECV_TIMEOUT, async {
+            while gate.cancellations() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("queued restore cancelled");
+
+        let same_process_alive = proc_starttime(pid as i32) == Some(starttime);
+        let unclaimed = reconciler.unclaimed_len();
+        let no_terminal = registry.directory().is_empty();
+        drop(held_permit);
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        swap_test_reconciler(None, None);
+        assert!(
+            same_process_alive,
+            "cancelling a restore must not stop its existing agent"
+        );
+        assert_eq!(
+            unclaimed, 1,
+            "cancelled restores leave the native owner available for a later reconnect"
+        );
+        assert!(
+            no_terminal && !capture.exists(),
+            "cancellation must not create a TUI"
+        );
+        assert_eq!(
+            launches.load(Ordering::SeqCst),
+            0,
+            "cancellation must not start a replacement container"
+        );
+    });
+}
+
+#[test]
+fn managed_restore_does_not_adopt_absent_unverified_or_fresh_agent_sidecars() {
+    reattach_rt().block_on(async {
+        let _serial = test_lock().lock().await;
+        install_global_manager();
+        ensure_mcp_deps_resolvable();
+        let _environment = TestEnvRestore::capture(&["CODEX_CMD", "CODEX_ARGV_CAPTURE_PATH"]);
+        std::env::set_var("CODEX_CMD", codex_dispatcher());
+
+        for kind in [
+            "absent",
+            "wrong-session",
+            "wrong-incarnation",
+            "fresh-agent",
+            "unadopted",
+        ] {
+            let session_id = format!("owned-managed-restore-{kind}");
+            let ownership_id = format!("codex-sidecar-managed-restore-{kind}");
+            let dir = tempfile::tempdir().expect("owned sidecar records");
+            let store = Arc::new(CodexSidecarStore::new(dir.path().to_path_buf()));
+            let mut child = None;
+            if kind != "absent" {
+                let (owned_child, pid, ws_url) =
+                    spawn_survivor(&ownership_id, &json!({ "loadedThreadIds": [session_id] }))
+                        .await;
+                store
+                    .write(&CodexSidecarRecord {
+                        record_version: SIDECAR_RECORD_VERSION,
+                        ownership_id: ownership_id.clone(),
+                        pid,
+                        starttime: proc_starttime(pid as i32).expect("owned process alive")
+                            + u64::from(kind == "wrong-incarnation"),
+                        cmdline: proc_cmdline(pid as i32).expect("owned process argv"),
+                        ws_url,
+                        session_id: Some(if kind == "wrong-session" {
+                            "another-owned-session".into()
+                        } else {
+                            session_id.clone()
+                        }),
+                        terminal_id: (kind != "unadopted").then(|| "prior-owned-terminal".into()),
+                        server_instance_id: "prior-server".into(),
+                        created_at: 1,
+                        updated_at: 2,
+                        state: SidecarRecordState::Retained {
+                            reason: "server-shutdown".into(),
+                        },
+                        lane: (kind == "fresh-agent")
+                            .then_some(freshell_codex::sidecar_store::SidecarLane::FreshAgent),
+                    })
+                    .expect("write owned record");
+                child = Some(owned_child);
+            }
+            let (reconciler, _) = SidecarReconciler::boot_reconcile(store.clone());
+            swap_test_reconciler(Some(Arc::new(reconciler)), Some(store));
+            let (url, _, launches) = spawn_server_with_managed_runtime(true).await;
+            let mut ws = connect_with_managed_negotiation(&url, true).await;
+            let capture = capture_path(kind);
+            std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &capture);
+            let result = create_codex_restore_terminal_expect_error(
+                &mut ws,
+                &format!("request-{kind}"),
+                scenario_cwd(kind).to_str().expect("owned cwd"),
+                &session_id,
+            )
+            .await;
+            if let Some(mut child) = child {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
+            swap_test_reconciler(None, None);
+            assert_eq!(
+                launches.load(Ordering::SeqCst),
+                1,
+                "{kind} must retain managed routing"
+            );
+            assert!(result["message"].as_str().is_some_and(
+                |message| message.contains("intercepted a replacement managed launch")
+            ));
+            assert!(!capture.exists(), "{kind} must not create a host TUI");
+        }
+    });
+}
+
+fn assert_survivor_restoration(managed: bool) {
     reattach_rt().block_on(async {
         let _serial = test_lock().lock().await;
         install_global_manager();
@@ -1051,7 +1583,7 @@ fn restore_reattaches_tui_to_surviving_sidecar_preserving_in_flight_turn() {
                 cmdline: proc_cmdline(survivor_pid as i32).expect("live survivor has a cmdline"),
                 ws_url: survivor_ws_url.clone(),
                 session_id: Some(session_id.to_string()),
-                terminal_id: None,
+                terminal_id: managed.then(|| "prior-owned-terminal".to_string()),
                 server_instance_id: "srv-prev-gen".to_string(),
                 created_at: 1_700_000_000_000,
                 updated_at: 1_700_000_000_001,
@@ -1069,8 +1601,8 @@ fn restore_reattaches_tui_to_surviving_sidecar_preserving_in_flight_turn() {
         swap_test_reconciler(Some(reconciler.clone()), Some(store.clone()));
 
         // (2) The restore create through the WS door.
-        let (ws_url, registry) = spawn_server().await;
-        let mut ws = connect_and_handshake(&ws_url).await;
+        let (ws_url, registry, managed_launches) = spawn_server_with_managed_runtime(managed).await;
+        let mut ws = connect_with_managed_negotiation(&ws_url, managed).await;
         let capture = capture_path("reattach");
         let replacement_capture = capture_path("reattach-replacement-sidecar");
         std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &capture);
@@ -1157,6 +1689,7 @@ fn restore_reattaches_tui_to_surviving_sidecar_preserving_in_flight_turn() {
             "the survivor's record must gain the new terminal id at adopt"
         );
         assert_eq!(unclaimed, 0, "the one-shot claim was consumed");
+        assert_eq!(managed_launches.load(Ordering::SeqCst), 0, "a verified host writer must not be replaced by a managed container");
     });
 }
 

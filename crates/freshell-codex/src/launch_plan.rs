@@ -206,6 +206,9 @@ pub struct CodexLaunchPlanInput<'a> {
     pub model: Option<&'a str>,
     pub sandbox: Option<&'a str>,
     pub approval_policy: Option<&'a str>,
+    /// A verified existing terminal owner must be reused or refused. Losing
+    /// its claim never authorizes spawning another writer.
+    pub require_retained_sidecar: bool,
     /// Spawn-only configuration/context for a newly created app-server. A
     /// claimed survivor deliberately does not consume this new context.
     pub sidecar_context: CodexSidecarLaunchContext,
@@ -218,6 +221,7 @@ pub struct CodexLaunchPlan {
     /// `plan.sessionId` — set ONLY on resume (`launch-planner.ts:145`; fresh plans
     /// leave it unset, `:158-163`).
     pub session_id: Option<String>,
+    pub require_retained_sidecar: bool,
     /// `getCodexSessionBindingReason('codex', resume)` (`ws-handler.ts:2496-2498`).
     /// S5.d.3 DECISION (2026-07-30, recorded — spec S5.d.3): computed for plan
     /// parity and the wire-string pin test, then deliberately DROPPED at
@@ -255,12 +259,18 @@ pub fn plan_codex_launch(
 ) -> Result<CodexLaunchPlan, CodexLaunchConfigError> {
     let sandbox = normalize_codex_sandbox_setting(input.sandbox)?;
     let resume_session_id = input.resume_session_id.filter(|id| !id.is_empty());
+    if input.require_retained_sidecar && resume_session_id.is_none() {
+        return Err(CodexLaunchConfigError {
+            message: "An existing Codex sidecar requires an exact native session identity.".into(),
+        });
+    }
     let binding_reason = match resume_session_id {
         Some(_) => CodexSessionBindingReason::Resume,
         None => CodexSessionBindingReason::Start,
     };
     Ok(CodexLaunchPlan {
         session_id: resume_session_id.map(str::to_string),
+        require_retained_sidecar: input.require_retained_sidecar,
         binding_reason,
         proxy_required: true,
         require_candidate_persistence: resume_session_id.is_none(),
@@ -560,6 +570,7 @@ mod tests {
             }),
             Ok(CodexLaunchPlan {
                 session_id: None,
+                require_retained_sidecar: false,
                 binding_reason: CodexSessionBindingReason::Start,
                 proxy_required: true,
                 require_candidate_persistence: true,
@@ -570,6 +581,23 @@ mod tests {
                 sidecar_context: CodexSidecarLaunchContext::default(),
             })
         );
+    }
+
+    #[test]
+    fn retained_only_plan_requires_a_native_resume_identity() {
+        assert!(plan_codex_launch(&CodexLaunchPlanInput {
+            require_retained_sidecar: true,
+            ..Default::default()
+        })
+        .is_err());
+        let plan = plan_codex_launch(&CodexLaunchPlanInput {
+            resume_session_id: Some("owned-native-thread"),
+            require_retained_sidecar: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(plan.require_retained_sidecar);
+        assert_eq!(plan.session_id.as_deref(), Some("owned-native-thread"));
     }
 
     #[test]
@@ -584,6 +612,7 @@ mod tests {
             }),
             Ok(CodexLaunchPlan {
                 session_id: Some("thread-ready".to_string()),
+                require_retained_sidecar: false,
                 binding_reason: CodexSessionBindingReason::Resume,
                 proxy_required: true,
                 require_candidate_persistence: false,
@@ -606,10 +635,12 @@ mod tests {
                 model: Some("gpt-5.2-codex"),
                 sandbox: Some("workspace-write"),
                 approval_policy: Some("on-request"),
+                require_retained_sidecar: false,
                 sidecar_context: CodexSidecarLaunchContext::default(),
             }),
             Ok(CodexLaunchPlan {
                 session_id: Some("thread-s".to_string()),
+                require_retained_sidecar: false,
                 binding_reason: CodexSessionBindingReason::Resume,
                 proxy_required: true,
                 require_candidate_persistence: false,
