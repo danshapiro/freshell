@@ -19,7 +19,7 @@ Fix freshell#mdmw: give the 8 GiB test sandbox a measured safe default build con
 - Do not deploy, restart production, change host policy, or create a PR without the user's explicit approval; commit focused completed work.
 
 ### Accepted tradeoffs and residuals
-- The user approved proceeding from the recorded failing base for this scoped fix, with existing failures recorded separately. The full gate exited 1 despite passing cloud test verdicts; the failing phase remains unidentified, so later failures cannot be assumed pre-existing without evidence.
+- The user approved proceeding from the recorded failing base for this scoped fix, with existing failures recorded separately. The full gate exited 1 despite passing cloud shard verdicts; the failing phase remains unidentified, so later failures cannot be assumed pre-existing without evidence.
 - The user approved addressing the sandbox review findings and expanding the work to resolve the Codex blockers so verification can be rerun.
 
 **Goal:** Ordinary and managed-runtime sandbox launches use a real two-CPU, 8 GiB budget whose native Cargo default is two jobs, preserve deliberate Cargo configuration/environment/CLI overrides, and produce secret-safe effective-limit and failure receipts backed by launcher tests and isolated current-source cold Clippy evidence. Strengthen the identified sandbox tests and failure diagnostics, resolve Codex blockers without weakening their behavior coverage, and complete the full-suite verification.
@@ -31,7 +31,7 @@ Fix freshell#mdmw: give the 8 GiB test sandbox a measured safe default build con
 ## Global Constraints
 
 1. Keep immutable approved base cbae31df487bc150c1d57ba93b63f18910ce5098 and worktree /home/dan/code/freshell/.worktrees/mdmw-sandbox-budget on branch the-usual/mdmw-sandbox-budget. Main advanced with unrelated UI changes; do not rebase this approved run or alter the older broad crash-resilience work.
-2. Follow repository AGENTS.md, pnpm 10.34.5, frozen installs, configured cloud backends and coordinated broad gates. Tests run in this task worktree. Tiny generated projects are required fixtures; the exact archive inside the explicitly required isolated guest is acceptance input, not an additional host test checkout.
+2. Follow repository AGENTS.md, pnpm 10.34.5, frozen installs, configured cloud backends and coordinated broad gates. Tests run in this task worktree, shared with the isolated guest where needed. Tiny generated projects are required fixtures. Do not create a source archive or an additional checkout or workspace copy as a test environment.
 3. Preserve --rm, --init, exact name/CID ownership, owner-guard and signals, cache identity/mounts/labels, early specialized dispatches, both runtime preparation/execution phases, runtime restrictions, and cleanup failure returning 1. No second lifecycle owner, retained-container framework, generic redactor, supervisor, or audit trail.
 4. Apply --cpus 2, --memory 8g, --memory-swap 16g, and --pids-limit 512 in the shared launch arguments. Total RAM-plus-swap is explicit; do not introduce a no-swap product policy. The fixed aggregate CPU quota applies to every sandbox workload, including explicit higher Cargo job counts; this change adds no CPU-limit override. Document that throughput tradeoff. The required full-suite gate must treat any resulting timeout as a failure to investigate, not a presumed baseline failure.
 5. The normal default leaves CARGO_BUILD_JOBS absent. Cargo 1.96's native selector reads cgroup quotas; do not inject an environment fallback that masks project build.jobs. Preserve project configuration, nonempty exported environment strings, inline assignments, and CLI overrides. Never parse arbitrary project TOML, rewrite the caller command, or add a fallback config unless actual scheduling disproves the selected native path.
@@ -170,7 +170,7 @@ Expected: staged whitespace check exits 0 and the summary shows both new .mjs fi
 
 **Interfaces:**
 
-- Consume clean final commit/tree and exact source archive digest; each attempt has a new owned directory and immutable result evidence.
+- Consume the exact commit/tree and source identity from the existing task worktree shared with the isolated guest, including the preserved draft's digest and mode when present; each attempt has a new owned directory and immutable result evidence.
 - Produce distinct actual workload/attached-Docker/launcher/cleanup statuses plus a separate acceptance judgment. Never change child statuses to encode a policy pass.
 - A small task-specific setup/runner may orchestrate this one guest and finite evidence collection. No prescribed permanent driver API, cloning framework, host-pressure monitor or product supervisor.
 
@@ -190,7 +190,7 @@ Keep evidence sampling finite and focused on the guest workload. Hard outer cont
 
 - [x] **Step 2: Exercise actual defaults, overrides, diagnostics and selftest**
 
-Transfer the exact clean Task 1 archive; record commit/tree/archive and file manifest. Install pinned dependencies frozen in this isolated source. Attribute canonical image identity and actual Rust/Cargo version. Guest source is the required isolated acceptance input; no extra host checkout is created.
+The historical Task 1 source archive and its commit, tree, digest and file manifest remain attributed in the evidence below. For any affected follow-up, use the existing task worktree shared with the isolated guest; do not create a source archive or another checkout. Reuse the prepared dependencies, updating them when the inputs require it. Attribute canonical image identity and actual Rust/Cargo version.
 
 Repeat the strict/impacted commands where their real route needs the guest. First finish a separate ordinary wrapper setup container that warms only fingerprinted Node dependencies. Verify subsequent measured entrypoints reuse them; a dependency reinstall invalidates that tiny smoke measurement and requires completing setup before a fresh measured container. This warmup does not compile Cargo. Run actual ordinary default and project/exported/inline/CLI override smokes, then runtime default and at least a discriminating native project override:
 
@@ -218,7 +218,7 @@ Retain --rm and corroborate published full CID after ordinary auto-removal befor
 
 The completed historical cold measurement below used a directly created task container. The current follow-up must also run this payload through the actual unmodified launcher and canonical image; the historical direct-container result remains separately attributed sizing evidence, not a substitute for that launcher run or its review.
 
-Commit any scoped correction discovered in Step 2, run its affected verification and repeat affected real smokes before this step. Archive that new clean commit and run the cold payload against it. A later follow-up may reuse the actual-launcher result only after proving that the workload and complete compiled input closure are unchanged and that the launch path, canonical image and relevant runtime configuration are equivalent. If that proof fails, repeat the actual-launcher cold payload on the corrected source, preserving exact source and image attribution.
+Commit any scoped correction discovered in Step 2, run its affected verification and repeat affected real smokes before this step. Run the cold payload against the existing task worktree shared with the isolated guest, recording the exact commit/tree and source identity, including the preserved draft's digest and mode when present. Do not create a source archive or another checkout. A later follow-up may reuse the actual-launcher result only after proving that the workload and complete compiled input closure are unchanged and that the launch path, canonical image and relevant runtime configuration are equivalent. If that proof fails, repeat the actual-launcher cold payload on the corrected source, preserving exact source and image attribution.
 
 Use fresh exact-owned target, registry and Git caches. Before invoking the launcher, establish that its actual target volume is empty and rule out inherited target/compiler-cache redirection; bind the running container to that volume. Network/toolchain preparation may not precompile the graph. Record image ABI/UID/tools, source and actual supported toolchain.
 
