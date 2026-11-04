@@ -153,6 +153,7 @@ class Fixture:
         self.results.mkdir(mode=0o700)
         self.projects, self.jobs, self.direct, self.images = [], [], [], {}
         self.standard_images = set()
+        self.standard_foundations = {}
         self.containers, self.targets = {}, {}
         self.command_count = 0
         require(not self.capture(["docker", "volume", "ls", "--format",
@@ -499,6 +500,36 @@ class Fixture:
             require(self.installs(a) == 2 and self.ack(recovered)["key"],
                     "incomplete preparation was not retried successfully")
 
+    def cleanup_standard_foundations(self):
+        foundation_cleanup = []
+        for tag, owned in self.standard_foundations.items():
+            item = self.image(tag)
+            require(item["Id"] == owned["id"],
+                    "test foundation tag identity changed")
+            consumers = self.capture(["docker", "ps", "-aq", "--filter",
+                                      "ancestor=" + item["Id"]]).splitlines()
+            ids = sorted(set(self.capture(["docker", "image", "ls", "-aq",
+                                            "--no-trunc"]).splitlines()))
+            layers = self.capture(["docker", "image", "inspect", "--format",
+                                   "{{json .RootFS.Layers}}", *ids]).splitlines()
+            own_layers = item["RootFS"]["Layers"]
+            descendants = [image for image, raw in zip(ids, layers)
+                           if image != item["Id"] and own_layers and
+                           json.loads(raw)[:len(own_layers)] == own_layers]
+            unreferenced = (item.get("RepoTags") == owned["tags"] and
+                            item.get("RepoDigests") == owned["digests"] and
+                            not consumers and not descendants)
+            record = dict(owned, tag=tag, consumers=consumers,
+                          descendants=descendants,
+                          currentTags=item.get("RepoTags"),
+                          currentDigests=item.get("RepoDigests"), removed=False)
+            if unreferenced:
+                self.capture(["docker", "image", "rm", tag])
+                record["removed"] = True
+            foundation_cleanup.append(record)
+        write(self.results / "foundation-cleanup.json",
+              json.dumps(foundation_cleanup), 0o600)
+
     def cleanup(self):
         errors = []
         for project in self.projects:
@@ -566,6 +597,7 @@ class Fixture:
                             (expected is None or item["Id"] == expected),
                             "task image ownership changed")
                     self.capture(["docker","image","rm",tag])  # Exact tag, no prune.
+            self.cleanup_standard_foundations()
             # Retain the small synthetic inputs, never mounted dependency or
             # target data, before removing this fixture's host files.
             with tarfile.open(self.results / "fixture-inputs.tar.gz", "w:gz") as archive:
@@ -675,6 +707,9 @@ def standard_builder(f):
                 .returncode != 0, "task image already existed")
         env = os.environ.copy()
         env.update(FRESHELL_SANDBOX_IMAGE=tag, TMPDIR=str(f.root))
+        before = [json.loads(line) for line in f.capture([
+            "docker", "image", "ls", "-a", "--no-trunc", "--format",
+            "{{json .}}"]).splitlines()]
         f.standard_images.add(tag)
         f.capture(["bash", str(a / "scripts/sandbox-build.sh")],
                   env=env, timeout=600)
@@ -682,6 +717,27 @@ def standard_builder(f):
         # The standard builder sets no test ownership label. Record the exact
         # ID immediately; cleanup checks that ID before removing only our tag.
         f.images[tag] = item["Id"]
+        foundation_id = item["Config"]["Labels"][FOUNDATION]
+        foundation_tag = ("freshell-sandbox:dependency-foundation-v2-" +
+                          foundation_id.removeprefix("sha256:"))
+        foundation = f.image(foundation_tag)
+        require(foundation["Id"] == foundation_id,
+                "standard builder foundation tag identity differs")
+        tag_absent = all(row["Repository"] + ":" + row["Tag"] !=
+                         foundation_tag for row in before)
+        id_absent = all(row["ID"] != foundation_id for row in before)
+        if tag_absent and id_absent:
+            require(foundation.get("RepoTags") == [foundation_tag],
+                    "new test foundation already has other references")
+            f.standard_foundations[foundation_tag] = dict(
+                id=foundation_id, tags=foundation["RepoTags"],
+                digests=foundation.get("RepoDigests"),
+                priorTagAbsent=True, priorImageAbsent=True)
+        write(f.results / "foundation-ownership.json", json.dumps({
+            "owned": f.standard_foundations,
+            "lastObserved": dict(tag=foundation_tag, id=foundation_id,
+                                 priorTagAbsent=tag_absent,
+                                 priorImageAbsent=id_absent)}), 0o600)
         job = f.start(a, name, image=tag)
         f.finish(job)
         ack = f.ack(job)
@@ -701,7 +757,7 @@ def standard_builder(f):
     require(first["key"] == second["key"] and second["installs"] == 1,
             "standard builder reinstalled unchanged dependencies")
     write(a / "docker/sandbox/Dockerfile", original.replace(boundary,
-          'RUN printf "fixture-toolchain-revision\\n" > /usr/local/share/freshell-foundation-revision\n' + boundary))
+          'RUN printf "fixture-toolchain-revision-' + f.token + '\\n" > /usr/local/share/freshell-foundation-revision\n' + boundary))
     third = build_and_import("builder-foundation")
     require(third["foundation"] != first["foundation"] and
             third["key"] != first["key"] and third["installs"] == 2,
