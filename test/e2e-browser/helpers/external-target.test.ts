@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { createE2eServerHandle, ExternalServer } from './external-target.js'
+import { managedEnvironmentProbeServer } from './managed-environment-probe.js'
 
 const externalTargetScript = String.raw`
 const http = require('node:http')
@@ -21,25 +22,6 @@ for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
 server.listen(0, '127.0.0.1', () => {
   process.stdout.write('ready:' + server.address().port + '\n')
 })
-`
-
-const managedEnvironmentProbeServer = String.raw`#!/usr/bin/env node
-const fs = require('node:fs')
-const http = require('node:http')
-fs.writeFileSync(
-  process.env.FRESHELL_E2E_MANAGED_ENV_CAPTURE,
-  process.env.FRESHELL_MANAGED_RUNTIME_V1 ?? '<unset>',
-  { mode: 0o600 },
-)
-const server = http.createServer((request, response) => {
-  response.writeHead(request.url === '/api/health' || request.url === '/api/server-info' ? 200 : 404, {
-    'content-type': 'application/json',
-  })
-  if (request.url === '/api/health') return response.end(JSON.stringify({ ok: true }))
-  if (request.url === '/api/server-info') return response.end(JSON.stringify({ runtime: 'rust', commit: 'fixture' }))
-  response.end('{}')
-})
-server.listen(Number(process.env.PORT), '127.0.0.1')
 `
 
 async function waitForReady(child: ChildProcess, output: () => string): Promise<number> {

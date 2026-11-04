@@ -66,10 +66,21 @@ export function applyServerHomeEnvironment(
   homeDir: string,
   runtimeRootMode: 'project' | 'isolated' = 'project',
 ): Record<string, string> {
-  if (runtimeRootMode === 'isolated' || process.platform === 'win32') {
-    return applyIsolatedHomeEnvironment(env, homeDir)
-  }
-  return applyAppDataIsolation(env, homeDir)
+  const nextEnv = runtimeRootMode === 'isolated' || process.platform === 'win32'
+    ? applyIsolatedHomeEnvironment(env, homeDir)
+    : applyAppDataIsolation(env, homeDir)
+  // Hand-rolled server spawns (specs that cannot reuse the RustServer
+  // fixture, e.g. cfg01/cfg03's spawnServerAgainstHome) share this entry
+  // point, so it must enforce the same ambient isolation RustServer's env
+  // scrub provides: the self-hosted machine exports
+  // FRESHELL_MANAGED_RUNTIME_V1 into every spawned shell, and a
+  // non-feature-built freshell-server refuses to boot with that value
+  // (main.rs managed_runtime_feature_error). Unconditional by design —
+  // this helper's consumers are plain-server scenarios; managed-runtime
+  // rigs go through ManagedRuntimeOwner's explicit-env RustServer
+  // construct instead.
+  delete (nextEnv as Record<string, string | undefined>).FRESHELL_MANAGED_RUNTIME_V1
+  return nextEnv
 }
 
 const recentlyIssuedPorts: number[] = []

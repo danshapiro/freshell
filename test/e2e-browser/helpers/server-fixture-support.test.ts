@@ -1,11 +1,28 @@
 import { describe, expect, it } from 'vitest'
 import {
   applyIsolatedHomeEnvironment,
+  applyServerHomeEnvironment,
   findFreePort,
   homeIsolationConflicts,
 } from './server-fixture-support.js'
 
 describe('server fixture support', () => {
+  it('strips the ambient managed-runtime opt-in from a hand-rolled server spawn env', () => {
+    // Hand-rolled spawns (cfg01/cfg03's spawnServerAgainstHome) cannot
+    // reuse the RustServer fixture's env scrub; the helper they share
+    // must strip the ambient opt-in itself — the self-hosted machine
+    // exports it into every spawned shell, and a non-feature-built
+    // freshell-server refuses to boot with it (main.rs
+    // managed_runtime_feature_error).
+    const env = applyServerHomeEnvironment({
+      HOME: '/real-home',
+      FRESHELL_MANAGED_RUNTIME_V1: '1',
+      KEEP: 'x',
+    }, '/tmp/owned-home', 'isolated')
+    expect(env.FRESHELL_MANAGED_RUNTIME_V1).toBeUndefined()
+    expect(env.KEEP).toBe('x')
+  })
+
   it('isolates every provider home under the supplied owned home', () => {
     const env = applyIsolatedHomeEnvironment({ HOME: '/real-home', CLAUDE_CONFIG_DIR: '/ambient' }, '/tmp/owned-home')
     expect(env.HOME).toBe('/tmp/owned-home')
