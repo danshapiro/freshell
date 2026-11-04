@@ -14,9 +14,9 @@
 #   scripts/sandbox-test.sh --runtime-suite --checkpoint-fixture "cargo test -p freshell-server --features managed-runtime-v1 --locked --test code_checkpoint_permissions"
 #   scripts/sandbox-test.sh --external-browser <private-p2-g01-descriptor.json>
 #
-# --runtime-suite prepares dependencies first, then runs the caller in the
-# stricter managed-runtime lifecycle mode: no network, no real provider corpus,
-# no Docker/admin socket, read-only container root.
+# Ordinary and --runtime-suite invocations prepare dependencies first, then
+# mount the completed dependency trees read-only for the caller. Runtime mode
+# also has no network, no provider corpus/admin socket, and a read-only root.
 #
 # --corpus mounts ~/.codex/sessions and ~/.claude/projects READ-ONLY at their
 # natural paths inside the container, for realistic-data perf tests. Without
@@ -38,7 +38,7 @@ read -r DEPENDENCY_PROTOCOL DEFAULT_IMAGE_TAG DEPENDENCY_CACHE_SUFFIX < <(
   node -e 'const p=require(process.argv[1]); console.log(p.version,p.image,p.cacheSuffix)' \
     "${REPO_ROOT}/docker/sandbox/protocol.json"
 )
-IMAGE_TAG="${FRESHELL_SANDBOX_IMAGE:-${DEFAULT_IMAGE_TAG}}"
+IMAGE_TAG="${FRESHELL_SANDBOX_SELECTED_IMAGE:-${FRESHELL_SANDBOX_IMAGE:-${DEFAULT_IMAGE_TAG}}}"
 CACHE_PREFIX="${FRESHELL_SANDBOX_CACHE_PREFIX:-freshell-sandbox}"
 PNPM_STORE_VOLUME="${CACHE_PREFIX}-pnpm-store"
 P2_G01_RUN_ID="${FRESHELL_SANDBOX_P2_G01_RUN_ID:-}"
@@ -403,6 +403,7 @@ PY
   # sandbox construction policy. Every other runtime suite keeps Docker's
   # existing default. Verify before the install-capable entrypoint can run.
   CODEX_NATIVE_CONTRACT=0
+  CODEX_BASE_IMAGE_ID=""
   if [ "${RUNTIME_SUITE}" -eq 1 ]; then
     case "${CMD}" in
       'pnpm run test:vitest run test/integration/providers/codex-cli-contract.test.ts --config config/vitest/vitest.config.ts' | \
@@ -423,11 +424,18 @@ PY
       'node test/integration/providers/codex-cli-contract.mjs --scenario text-history --history-mode legacy --persistence-mode missing' | \
       'node test/integration/providers/codex-cli-contract.mjs --scenario text-history --history-mode paginated --persistence-mode missing' | \
       'node test/integration/providers/codex-cli-contract.mjs --scenario approval-policy-restricted-exec')
-        node "${REPO_ROOT}/scripts/testing/prepare-codex-contract.mjs" --verify-sandbox >/dev/null
+        CODEX_QUALIFICATION="$(node "${REPO_ROOT}/scripts/testing/prepare-codex-contract.mjs" --verify-sandbox)"
         CODEX_NATIVE_CONTRACT=1
-        if [ -z "${FRESHELL_SANDBOX_SELECTED_DEPENDENCY_KEY:-}" ]; then
-          IMAGE_TAG="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).image)' "${WORKSPACE_ROOT}/.runtime-build/codex-contract/staged.json")"
+        read -r CODEX_BASE_IMAGE_ID CONTRACT_IMAGE_ID < <(
+          node -e 'const m=JSON.parse(process.argv[1]).manifest; console.log(m.baseImage ?? m.image,m.image)' \
+            "${CODEX_QUALIFICATION}"
+        )
+        if [ -n "${FRESHELL_SANDBOX_SELECTED_IMAGE:-}" ] \
+          && [ "${FRESHELL_SANDBOX_SELECTED_IMAGE}" != "${CONTRACT_IMAGE_ID}" ]; then
+          printf '{"severity":"error","event":"sandbox_contract_image_mismatch"}\n' >&2
+          exit 2
         fi
+        IMAGE_TAG="${CONTRACT_IMAGE_ID}"
         ;;
     esac
   fi
@@ -474,7 +482,10 @@ PY
   fi
   NODE_MODULES_CACHE_PREFIX="${CACHE_PREFIX}-${DEPENDENCY_CACHE_SUFFIX}-${DEPENDENCY_KEY}"
   DEPENDENCY_PHASE_ENV=(
-    "FRESHELL_SANDBOX_IMAGE=${RESOLVED_IMAGE_ID}"
+    # The closed Codex verifier always interprets IMAGE as the qualified base.
+    # Keep its derivative workload pin separate across both wrapper phases.
+    "FRESHELL_SANDBOX_IMAGE=${CODEX_BASE_IMAGE_ID:-${RESOLVED_IMAGE_ID}}"
+    "FRESHELL_SANDBOX_SELECTED_IMAGE=${RESOLVED_IMAGE_ID}"
     "FRESHELL_SANDBOX_SELECTED_DEPENDENCY_KEY=${DEPENDENCY_KEY}"
   )
 
@@ -848,10 +859,9 @@ DOCKER_ARGS=(
   -v "${PNPM_STORE_VOLUME}:/home/sandbox/.local/share/pnpm/store"
   --mount "type=volume,src=${TARGET_CACHE_VOLUME},dst=/workspace/target,${TARGET_CACHE_LABEL_OPTIONS}"
   -v "${NODE_MODULES_CACHE_PREFIX}-node-modules:/workspace/node_modules:${NODE_MODULES_ACCESS}"
-  # pnpm workspace members with their own dependencies get their own
-  # sandbox-owned node_modules (the entrypoint chowns and, on fingerprint
-  # changes, purges these only as mounted volumes). On legacy npm-era
-  # branches these stay mounted-but-unused and harmless.
+  # Workspace members use the same input-specific prepared identity. Only
+  # preparation initializes cold/incomplete mounted trees; callers use them
+  # read-only. Legacy npm-era branches leave these member mounts unused.
   -v "${NODE_MODULES_CACHE_PREFIX}-sidecar-node-modules:/workspace/crates/freshell-claude-sidecar/node_modules:${NODE_MODULES_ACCESS}"
   -v "${NODE_MODULES_CACHE_PREFIX}-mcp-node-modules:/workspace/packages/freshell-mcp-runtime/node_modules:${NODE_MODULES_ACCESS}"
   -v "${CACHE_PREFIX}-playwright-cache:/home/sandbox/.cache/ms-playwright"
