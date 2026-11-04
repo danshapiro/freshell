@@ -299,12 +299,25 @@ describe('runtime synchronous subprocess watchdogs', () => {
       if (program === 'docker' && (args[0] === 'ps' || args.join(' ') === 'volume ls --format {{.Name}}')) return ''
       throw new Error(`unexpected cleanup command: ${program} ${args.join(' ')}`)
     })
-    browser.web = { stop: vi.fn().mockRejectedValue(error) } as unknown as typeof browser.web
+    const web = new RustServer()
+    let settleRetry: () => void = () => { throw new Error('retry stop was not initialized') }
+    const retryStopped = new Promise<void>(resolve => { settleRetry = resolve })
+    const stop = vi.spyOn(web, 'stop').mockRejectedValueOnce(error).mockReturnValue(retryStopped)
+    const kill = vi.spyOn(web, 'kill').mockResolvedValue(undefined)
+    browser.web = web
     fs.mkdirSync(browser.runtime.buildDir, { recursive: true })
     fs.writeFileSync(path.join(browser.runtime.buildDir, 'retained-build'), 'owned evidence')
     const cleanup = vi.spyOn(browser.runtime, 'cleanup')
-    const result = await browser.stop()
+    const stopping = browser.stop()
+    await vi.waitFor(() => expect(stop).toHaveBeenCalledTimes(2))
+    expect(kill).toHaveBeenCalledExactlyOnceWith('SIGKILL')
+    expect(stop.mock.invocationCallOrder[0]).toBeLessThan(kill.mock.invocationCallOrder[0])
+    expect(kill.mock.invocationCallOrder[0]).toBeLessThan(stop.mock.invocationCallOrder[1])
+    expect(cleanup).not.toHaveBeenCalled()
+    settleRetry()
+    const result = await stopping
     expect(cleanup).toHaveBeenCalledExactlyOnceWith([`web stop: ${error.message}`])
+    expect(stop.mock.invocationCallOrder[1]).toBeLessThan(cleanup.mock.invocationCallOrder[0])
     expect(result.ok).toBe(false)
     expect(result.errors).toEqual([`web stop: ${error.message}`])
     const receipt = JSON.parse(fs.readFileSync(path.join(browser.runtime.evidenceDir, 'cleanup.json'), 'utf8'))
