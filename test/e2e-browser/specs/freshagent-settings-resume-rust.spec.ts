@@ -671,12 +671,16 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
     const threadOpsPath = path.join(sharedRoot, 'thread-ops.jsonl')
     const projectDir = path.join(sharedRoot, 'proj')
     await fsp.mkdir(projectDir, { recursive: true })
-    // ONE static behavior for the whole test (V4/A6). The static thread/resume
-    // error is fine: the first spawn goes through thread/start (a fresh session
-    // never resumes) and the only resume attempt is the post-crash one, which
-    // must fail so the respawn mints a new thread.
+    // The exact typed error proves the requested rollout is missing; an
+    // ambiguous provider error must not cause recovery to mint a new thread.
+    const threadId = 'thread-new-1'
     const behavior = {
-      overrides: { 'thread/resume': { error: { code: -32602, message: 'thread not found' } } },
+      threadStartThreadId: threadId,
+      overrides: {
+        'thread/resume': {
+          error: { code: -32600, message: `no rollout found for thread id ${threadId}` },
+        },
+      },
       crashOnPromptMarker: 'CRASH_NOW',
       crashOnPromptMarkerOnceMarkerPath: path.join(sharedRoot, 'crash.once'),
       appendThreadOperationLogPath: threadOpsPath,
@@ -704,7 +708,7 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
         })
         .toBe('idle')
       const sessionId: string = findFreshAgentLeaf(await harness.getPaneLayout(tabId))?.content?.sessionId
-      expect(sessionId).toBeTruthy()
+      expect(sessionId).toBe(threadId)
 
       // First send via the pane composer: the sidecar hard-exits(1) mid-turn
       // (once, cross-process marker), simulating a codex crash.
@@ -747,7 +751,7 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
       await expect(banner, 'memory loss must be user-visible, not just a server warn').toBeVisible({ timeout: 15000 })
 
       // "New thread minted" = TWO thread/start entries in the op log. The fake
-      // reuses the same thread id (threadStartThreadId default) and errored
+      // reuses the same configured thread id and errored
       // thread/resume ops are NOT logged -- do NOT assert id inequality or a
       // logged resume (V4/A6).
       const ops = fs.readFileSync(threadOpsPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l))
