@@ -258,6 +258,26 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_absent_refuses_with_notice_and_never_mints_a_fresh_id() {
+        let out = validate_wire_resume(
+            "antigravity",
+            Some("stale-agy".into()),
+            LaunchIntent::Resume,
+            &absent(),
+        );
+        // The `_` SpawnFresh arm: no fresh id minted (unlike
+        // claude/amplifier), the stale id is named, and the notice rides
+        // for the consumer's typed SESSION_MISSING refusal.
+        assert_eq!(out.resume_session_id, None);
+        assert_eq!(out.launch_intent, LaunchIntent::Resume);
+        assert!(!out.claude_fresh_prealloc);
+        assert_eq!(out.stale_session_id.as_deref(), Some("stale-agy"));
+        let notice = out.notice.expect("notice set");
+        assert!(notice.contains("stale-agy"));
+        assert!(notice.contains("could not be found"));
+    }
+
+    #[test]
     fn unknown_provider_unavailable_and_unreadable_fail_open() {
         // Kata vnpc Task 4: `Unreadable` maps beside `Unknown` — a store the
         // probe cannot read must never mint a fresh session over a stale id
@@ -314,17 +334,18 @@ mod tests {
                 panic!("probe must not be consulted");
             }
         }
-        // `antigravity` is the gate-DEFERRAL pin (plan Task 7, load-bearing
-        // A2): it stays OUT of `resume_gate.rs VALIDATED_PROVIDERS` until
-        // real-binary transcript-store evidence exists — a wrong record
-        // schema would make real conversations answer Absent and visibly
-        // SpawnFresh every restore with a misleading "not found on disk"
-        // notice. Until then a stale antigravity resume id passes through
-        // UNGATED (gemini-style): never blocked, never SpawnFresh-substituted
-        // — the CLI's own error surfaces in-pane. If antigravity ever joins
-        // VALIDATED_PROVIDERS, this row goes red (the probe consult panics)
-        // and forces the activation to be a deliberate, evidenced decision.
-        for mode in ["gemini", "kimi", "antigravity", "shell", "third-party"] {
+        // Antigravity is VALIDATED (activated 2026-11-03 on real-binary
+        // transcript evidence (2026-11-02) + a proven settings-conformant
+        // real resume (2026-11-03; Provider Contract Record rows 74/75/76;
+        // evidence: real-binary-transcript-evidence.md)): the probe IS
+        // consulted at the spawn doors, and a stale antigravity id with
+        // positive absence answers the typed SESSION_MISSING refusal —
+        // pinned by the
+        // `antigravity_absent_refuses_with_notice_and_never_mints_a_fresh_id`
+        // test above. The remaining rows are the genuinely unvalidated
+        // modes (gemini/kimi have no resumeArgs; shell and third-party
+        // extensions are not session providers).
+        for mode in ["gemini", "kimi", "shell", "third-party"] {
             let out = validate_wire_resume(
                 mode,
                 Some("id".into()),

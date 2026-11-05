@@ -99,8 +99,17 @@ pub use crate::existence_by_id::{
     CodexRolloutExistenceLocator,
 };
 // Antigravity by-id locator (plan Task 7): same focused-sibling convention.
+// The production wiring (main.rs) installs the AUTHORITY-LADDER locator
+// (focused repair round 3, Major 1): by-id answers are rooted in the
+// binary's own store, resolved per the operator-override /
+// single-populated / dual-populated ladder (see
+// antigravity_existence_by_id.rs). The single-root constructor's
+// re-export is test-only (the existence/gate tests mirror one-store-root
+// wirings over an already-resolved home).
+#[cfg(test)]
+pub use crate::antigravity_existence_by_id::antigravity_transcript_locator;
 pub use crate::antigravity_existence_by_id::{
-    antigravity_transcript_locator, AntigravityTranscriptLocator,
+    antigravity_authority_root_locator, AntigravityTranscriptLocator,
 };
 
 pub struct IndexExistenceProbe {
@@ -151,20 +160,30 @@ pub struct IndexExistenceProbe {
     /// and the cold path never consult it (AD-4: cold codex stays
     /// `Unknown`). `None` keeps the pure index answer.
     codex_rollout_locator: Option<CodexRolloutExistenceLocator>,
-    /// Antigravity by-id fallback (plan Task 7): the index's
-    /// `AntigravitySource` drops transcripts whose ownership/workspace
-    /// parse yields no row, so a conversation dir on disk can be
-    /// index-invisible while the attach arm (`agy --conversation <id>`)
-    /// would still resume it — the two arms must agree. The check is CHEAP
-    /// (one `File::open` on the canonical
-    /// `brain/<id>/.system_generated/logs/transcript.jsonl` path), so it
-    /// lives on the sync warm-Absent adjudication path in `exists()` beside
-    /// the amplifier/opencode arms (NOT the codex gate-only treatment —
-    /// there is no ~1s walk to keep off the reconcile path) and improves
-    /// pane-reconcile dead-session answers today; `exists_for_gate`
-    /// inherits it through `exists()` for the deferred future gate
-    /// activation. `None` (tests, callers that never set it) keeps the
-    /// pure index answer.
+    /// Antigravity by-id fallback (plan Task 7 + focused repair round 2,
+    /// Major 1): the index's `AntigravitySource` drops transcripts whose
+    /// ownership/workspace parse yields no row, so a conversation dir on
+    /// disk can be index-invisible while the attach arm
+    /// (`agy --conversation <id>`) would still resume it — the two arms
+    /// must agree. The check is CHEAP (one `File::open` on the canonical
+    /// `brain/<id>/.system_generated/logs/transcript.jsonl` path PER
+    /// candidate root), so it lives on the sync warm-Absent adjudication
+    /// path in `exists()` beside the amplifier/opencode arms (NOT the
+    /// codex gate-only treatment — there is no ~1s walk to keep off the
+    /// reconcile path) and improves pane-reconcile dead-session answers;
+    /// since the resume-gate activation (2026-11-03) `exists_for_gate`
+    /// ALSO consults it DIRECTLY to validate a warm-index Present and a
+    /// cold-index Unknown before the gate trusts them (the gate block
+    /// below). The PRODUCTION wiring (`main.rs`) installs the UNION-root
+    /// locator: the seam resolves ONE root, but the binary's write root
+    /// is not necessarily the seam's read root (the snap binary pins its
+    /// store under `$HOME/snap` while the default root can also hold
+    /// conversations), so a single-root walk would answer a false Absent
+    /// for a valid conversation in the unselected root — a refusal the
+    /// gate would turn into a false SESSION_MISSING. Found in ANY
+    /// candidate root ⇒ Present; absent from ALL ⇒ Absent; unreadable
+    /// somewhere with no hit ⇒ Unreadable (fail-open, G28). `None`
+    /// (tests, callers that never set it) keeps the pure index answer.
     antigravity_transcript_locator: Option<AntigravityTranscriptLocator>,
 }
 
@@ -252,7 +271,10 @@ impl IndexExistenceProbe {
     /// the monotone observed-set), a clean miss is positive Absent, and an
     /// unreadable store stays `Unknown` while the index is cold —
     /// pre-readiness uncertainty is warming (the scan may still speak),
-    /// never the post-readiness `Unreadable`.
+    /// never the post-readiness `Unreadable`. The antigravity authority
+    /// ladder's dual-root `Defer` (focused repair round 3, Major 1) maps
+    /// fail-open exactly like `Unreadable` here: an ambiguous store must not
+    /// adjudicate a found conversation dead OR present while cold.
     fn cold_by_id_to_existence(
         &self,
         provider: &str,
@@ -271,6 +293,7 @@ impl IndexExistenceProbe {
             }
             ByIdAnswer::Absent => SessionExistence::Absent,
             ByIdAnswer::Unreadable => SessionExistence::Unknown,
+            ByIdAnswer::Defer => SessionExistence::Unknown,
         }
     }
 }
@@ -517,6 +540,10 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                                 return SessionExistence::Present;
                             }
                             ByIdAnswer::Unreadable => return SessionExistence::Unreadable,
+                            // Never produced by the amplifier locator; mapped
+                            // fail-open exactly like an unreadable store if a
+                            // future locator ever emits it.
+                            ByIdAnswer::Defer => return SessionExistence::Unreadable,
                             ByIdAnswer::Absent => {
                                 fallback_adjudicated = true;
                             }
@@ -530,14 +557,21 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                 // AntigravitySource drops parse-failed transcripts (no
                 // ownership record, no usable workspace path), so a
                 // conversation dir on disk can be index-invisible yet
-                // resumable. CHEAP single-open check (the amplifier/opencode
-                // class, NOT codex's gate-only ~1s walk), so it stays on
+                // resumable. CHEAP single-open check per resolved authority
+                // root (the amplifier/opencode class, NOT codex's gate-only
+                // ~1s walk; the round-3 authority ladder adds two cheap
+                // brain/ readdirs for the population probe), so it stays on
                 // this sync reconcile-consulted path and improves
-                // pane-reconcile dead-session answers today;
-                // `exists_for_gate` inherits it through `exists()` for the
-                // deferred future gate activation. An unreadable store is
+                // pane-reconcile dead-session answers; since the
+                // resume-gate activation (2026-11-03) `exists_for_gate`
+                // ALSO consults it directly (the gate block below), so
+                // after this arm `Absent` for antigravity is POSITIVE
+                // absence for BOTH callers. An unreadable store is
                 // honest `Unreadable` (kata vnpc Task 4:
-                // error{session_store_unreadable}), NEVER Absent.
+                // error{session_store_unreadable}), NEVER Absent —
+                // and so is the ladder's dual-root Defer (focused repair
+                // round 3, Major 1): an ambiguous store must not adjudicate
+                // a found conversation dead OR present; the binary decides.
                 if provider == "antigravity" {
                     if let Some(locator) = &self.antigravity_transcript_locator {
                         match locator(session_id) {
@@ -552,6 +586,13 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                                 return SessionExistence::Present;
                             }
                             ByIdAnswer::Unreadable => return SessionExistence::Unreadable,
+                            // Dual-root defer (round 3, Major 1): the id was
+                            // found but the store-root authority is ambiguous —
+                            // the same honest unreadable-store deferral
+                            // (identity preserved, retryable), never a
+                            // finalized Absent that could adjudicate a live
+                            // conversation dead, never a wrong-root Present.
+                            ByIdAnswer::Defer => return SessionExistence::Unreadable,
                             ByIdAnswer::Absent => {
                                 fallback_adjudicated = true;
                             }
@@ -598,17 +639,82 @@ impl SessionExistenceProbe for IndexExistenceProbe {
             .contains(&format!("{provider}:{session_id}"))
     }
 
-    /// Gate-caller variant (trait doc): `exists()` plus the EXPENSIVE codex
-    /// by-id rollout walk (~1s on a real store) on a warm-Absent answer.
-    /// The walk lives HERE and not in `exists()` because `exists()` is
-    /// consulted inline on the sync reconcile path, whose IO discipline is
-    /// ~250ms per consult (see `opencode_db_locator`); gate callers run this
-    /// variant inside `tokio::task::spawn_blocking` (A13: never inline on
-    /// the async runtime). AD-4 is preserved exactly: cold-index codex
-    /// answers `Unknown` from `exists()`, and the walk only runs on
-    /// `Absent`, so it still NEVER runs on the cold path.
+    /// Gate-caller variant (trait doc): `exists()` plus (a) the EXPENSIVE
+    /// codex by-id rollout walk (~1s on a real store) on a warm-Absent
+    /// answer, and (b) the antigravity Present/Unknown/ProviderUnavailable
+    /// disk validation (see the gate block below — activated 2026-11-03).
+    /// The expensive work lives HERE and not in `exists()` because
+    /// `exists()` is consulted inline on the sync reconcile path, whose IO
+    /// discipline is ~250ms per consult (see `opencode_db_locator`); gate
+    /// callers run this variant inside `tokio::task::spawn_blocking` (A13:
+    /// never inline on the async runtime). AD-4 is preserved exactly:
+    /// cold-index codex answers `Unknown` from `exists()`, and the walk
+    /// only runs on `Absent`, so it still NEVER runs on the cold path.
     fn exists_for_gate(&self, provider: &str, session_id: &str) -> SessionExistence {
         let base = self.exists(provider, session_id);
+        // Antigravity gate validation (activated 2026-11-03 on real-binary
+        // transcript evidence (2026-11-02) + a proven settings-conformant
+        // real resume (2026-11-03; real-binary-transcript-evidence.md)):
+        // neither a warm-index hit nor a cold-index Unknown is sufficient
+        // evidence for the resume gate — the index can be stale for a
+        // conversation deleted from disk, and the cold window precedes
+        // every warm-up, while the CLI's documented missing-ID behavior
+        // silently starts a FRESH conversation (GC3 violation). The SAME
+        // hole holds for ProviderUnavailable (GC3 hole #3, focused review
+        // round 1): a cold index over a MISSING store root answers it from
+        // the root-existence pre-check, and passing it through fails open
+        // (map_existence → Unknown → Proceed) straight into the CLI's
+        // silent fresh conversation. Validate all three against the same
+        // on-disk by-id walk the Absent arm uses — the production locator
+        // is the AUTHORITY LADDER (focused repair round 3, Major 1): by-id
+        // answers are rooted in the binary's own store (operator override;
+        // the single conversation-bearing candidate; the dual-populated
+        // defer), so the ladder never answers Present for an id the
+        // resolved authority root cannot resume: disk Present confirms
+        // (and feeds the observed set — module-doc invariant), disk Absent
+        // corrects to Absent (typed refusal — the resolved authority's
+        // `File::open`s give NotFound, positive absence), disk Unreadable
+        // defers as Unknown (G28 fail-open), and the dual-root Defer
+        // defers as Unknown too (the binary's own missing-ID warning is
+        // visible in the pane — the documented pre-gate behavior, never a
+        // silent substitution). Absent itself needs no re-check — the
+        // warm-Absent arm at exists() already disk-verified it.
+        // Kata vnpc merge note: `Unreadable` joins the validation set —
+        // main's post-readiness honest-error label (which the merged
+        // exists() now also mints for the dual-root Defer) is exactly the
+        // class of non-definitive answer this block exists to re-check, and
+        // the ladder's own gate mapping restores the fail-open Unknown the
+        // gate contract pins (map_existence treats both as Proceed either
+        // way; the re-check keeps the probe-level answer honest AND
+        // defer-shaped).
+        if provider == "antigravity" {
+            if let Some(locator) = &self.antigravity_transcript_locator {
+                match base {
+                    SessionExistence::Present
+                    | SessionExistence::Unknown
+                    | SessionExistence::ProviderUnavailable
+                    | SessionExistence::Unreadable => {
+                        return match locator(session_id) {
+                            ByIdAnswer::Present => {
+                                self.observed
+                                    .lock()
+                                    .expect("observed set lock")
+                                    .insert(format!("{provider}:{session_id}"));
+                                SessionExistence::Present
+                            }
+                            ByIdAnswer::Absent => SessionExistence::Absent,
+                            ByIdAnswer::Unreadable => SessionExistence::Unknown,
+                            // Dual-root defer (round 3, Major 1): found on
+                            // disk, but the binary's read root is ambiguous
+                            // — Unknown defers to the CLI (fail-open), never
+                            // a wrong-root Present, never a typed refusal.
+                            ByIdAnswer::Defer => SessionExistence::Unknown,
+                        };
+                    }
+                    _ => {}
+                }
+            }
+        }
         if base == SessionExistence::Absent && provider == "codex" {
             if let Some(locator) = &self.codex_rollout_locator {
                 return match locator(session_id) {
@@ -623,6 +729,9 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                         SessionExistence::Present
                     }
                     ByIdAnswer::Unreadable => SessionExistence::Unknown,
+                    // Never produced by the codex locator; mapped fail-open
+                    // like Unreadable if ever emitted.
+                    ByIdAnswer::Defer => SessionExistence::Unknown,
                     ByIdAnswer::Absent => SessionExistence::Absent,
                 };
             }

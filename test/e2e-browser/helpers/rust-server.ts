@@ -315,11 +315,6 @@ export interface RustServerOptions extends Pick<RuntimeWebConstructOptions, 'pro
    * only add/override keys — never delete inherited `process.env` keys — so
    * proving a lane's STRUCTURAL independence from a developer machine's
    * credentials (e.g. `['GEMINI_']` for the AGENT-24 kilroy lane) lives here.
-   * The shared runtime-web scrub additionally ALWAYS strips the ambient
-   * managed-runtime opt-in (`FRESHELL_MANAGED_RUNTIME_V1`) unless `env`
-   * explicitly configures it — a non-feature-built freshell-server refuses
-   * to boot with that ambient value, and the self-hosted machine exports it
-   * into every terminal it spawns.
    */
   stripEnvPrefixes?: string[]
   /** Hook to populate the isolated HOME before the server boots. */

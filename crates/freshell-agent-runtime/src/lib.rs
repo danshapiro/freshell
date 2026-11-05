@@ -576,8 +576,9 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
     // managed claim stays off until the named blocker chain clears: the
     // qualification spec, QUALIFIABLE_TERMINAL_PROVIDERS, the runtime image
     // pin, the ProviderPreparation/secret/bootstrap arms, and any managed
-    // doorway. The identity/state values record the Stage-1 candidate
-    // contract honestly (terminal locator + the documented transcript path);
+    // doorway. The identity/state values record the real-binary-validated
+    // store contract honestly (terminal locator + the documented transcript
+    // path, validated against real agy 1.4.12 transcripts 2026-11-02);
     // neither is a managed-recovery claim.
     ProviderCapability {
         provider: "antigravity",
@@ -588,8 +589,8 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
         recovery_paths: &[],
         managed_modes: &["antigravity"],
         execution_boundary: "legacy-extension",
-        identity_capture: "terminal locator (candidate contract; managed identity unimplemented)",
-        state_store: "$HOME/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl (candidate)",
+        identity_capture: "terminal locator (store real-binary-validated 2026-11-02; managed identity unimplemented)",
+        state_store: "$HOME/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl (real-binary-validated 2026-11-02)",
         resume_command: None,
         zero_turn_policy: "no-continuity-claim",
         checkpoint_policy: "none",
@@ -4669,11 +4670,11 @@ mod tests {
         assert_eq!(row.execution_boundary, "legacy-extension");
         assert_eq!(
             row.identity_capture,
-            "terminal locator (candidate contract; managed identity unimplemented)"
+            "terminal locator (store real-binary-validated 2026-11-02; managed identity unimplemented)"
         );
         assert_eq!(
             row.state_store,
-            "$HOME/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl (candidate)"
+            "$HOME/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl (real-binary-validated 2026-11-02)"
         );
         assert_eq!(row.resume_command, None);
         assert_eq!(row.zero_turn_policy, "no-continuity-claim");

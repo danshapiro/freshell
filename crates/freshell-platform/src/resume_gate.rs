@@ -16,7 +16,8 @@ use std::sync::Arc;
 /// MUST stay a subset of `freshell-server`'s `KNOWN_PROVIDERS`: the probe's
 /// contract maps unknown providers to `Absent`, so callers must check this
 /// list BEFORE consulting the probe.
-pub const VALIDATED_PROVIDERS: [&str; 4] = ["claude", "codex", "opencode", "amplifier"];
+pub const VALIDATED_PROVIDERS: [&str; 5] =
+    ["claude", "codex", "opencode", "amplifier", "antigravity"];
 
 pub fn provider_validated(provider: &str) -> bool {
     VALIDATED_PROVIDERS.contains(&provider)
@@ -162,6 +163,24 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_absent_spawns_fresh_and_present_proceeds() {
+        // Activated 2026-11-03 on real-binary transcript evidence
+        // (2026-11-02) + a proven settings-conformant real resume
+        // (2026-11-03; Provider Contract Record rows 74/75/76; evidence:
+        // real-binary-transcript-evidence.md).
+        assert_eq!(
+            evaluate_resume_gate("antigravity", Absent, true),
+            SpawnFresh
+        );
+        assert_eq!(
+            evaluate_resume_gate("antigravity", Absent, false),
+            SpawnFresh
+        );
+        assert_eq!(evaluate_resume_gate("antigravity", Present, false), Proceed);
+        assert_eq!(evaluate_resume_gate("antigravity", Unknown, false), Proceed);
+    }
+
+    #[test]
     fn present_and_unknown_always_proceed() {
         for p in VALIDATED_PROVIDERS {
             assert_eq!(evaluate_resume_gate(p, Present, false), Proceed);
@@ -188,6 +207,7 @@ mod tests {
             "codex",
             "opencode",
             "amplifier",
+            "antigravity",
             "gemini",
             "kimi",
             "shell",

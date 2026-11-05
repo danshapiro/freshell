@@ -3060,6 +3060,14 @@
               "duplicate": {
                 "type": "string"
               },
+              "identityDisposition": {
+                "enum": [
+                  "resumed",
+                  "minted_replacement",
+                  "fresh_unbound"
+                ],
+                "type": "string"
+              },
               "paneKey": {
                 "type": "string"
               },
@@ -3081,6 +3089,9 @@
                   "sessionId"
                 ],
                 "type": "object"
+              },
+              "staleSessionNotice": {
+                "type": "string"
               },
               "terminalId": {
                 "type": "string"
@@ -5857,6 +5868,14 @@
         "exitCode": {
           "type": "number"
         },
+        "identityDisposition": {
+          "enum": [
+            "resumed",
+            "minted_replacement",
+            "fresh_unbound"
+          ],
+          "type": "string"
+        },
         "maxAttempts": {
           "type": "number"
         },
@@ -5864,6 +5883,9 @@
           "type": "string"
         },
         "oldTerminalId": {
+          "type": "string"
+        },
+        "staleSessionNotice": {
           "type": "string"
         },
         "type": {

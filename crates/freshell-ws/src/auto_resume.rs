@@ -55,6 +55,7 @@ pub(crate) const AUTO_RESUME_DEFAULT_CYCLE_WINDOW_MS: i64 = 3_600_000;
 pub(crate) const SETTLE_REASON_CANCELLED: &str = "auto-resume cancelled";
 
 use crate::env_parse;
+use crate::terminal::RespawnOutcome;
 
 pub(crate) fn auto_resume_max_cycles() -> u32 {
     env_parse(
@@ -619,34 +620,156 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                         replaces_terminal_id: ev.terminal_id.clone(),
                     };
                     match driver.respawn(&spec).await {
-                        Ok(new_tid) => {
-                            if driver
-                                .complete_claim(&provider, &session_id, &key, &new_tid)
-                                .await
-                            {
-                                driver.emit_replaced(
-                                    &ev.terminal_id,
-                                    &new_tid,
-                                    ev.exit_code,
-                                    attempt,
-                                    max_attempts,
-                                );
-                                // One successful auto-resume = one breaker
-                                // cycle (znhn item 2). Re-fetch the entry —
-                                // the earlier borrow ended before the awaits.
-                                attempts
-                                    .entry(key.clone())
-                                    .or_default()
-                                    .cycles
-                                    .push(crate::terminal::now_ms());
-                            } else {
-                                // Binding raced away between claim and completion; the
-                                // driver already killed its own orphan child. No
-                                // terminal.replaced — the pane stays settled exited.
-                                driver.emit_settled(&ev.terminal_id, "lease_completion_lost", None);
-                                driver.log_settled(&ev.terminal_id, "lease_completion_lost");
+                        Ok(outcome) => match outcome.identity {
+                            crate::terminal::RespawnedIdentity::Resumed
+                            | crate::terminal::RespawnedIdentity::MintedReplacement => {
+                                if driver
+                                    .complete_claim(
+                                        &provider,
+                                        &session_id,
+                                        &key,
+                                        &outcome.terminal_id,
+                                    )
+                                    .await
+                                {
+                                    driver.emit_replaced(ReplacedAnnouncement {
+                                        old_terminal_id: &ev.terminal_id,
+                                        new_terminal_id: &outcome.terminal_id,
+                                        exit_code: ev.exit_code,
+                                        attempt,
+                                        max_attempts,
+                                        identity_disposition: replacement_identity_disposition(
+                                            outcome.identity,
+                                        ),
+                                        // Resumed/MintedReplacement pass no
+                                        // stale-id notice (round 3, Major 2).
+                                        stale_session_notice: None,
+                                    });
+                                    // One successful auto-resume = one breaker
+                                    // cycle (znhn item 2). Re-fetch the entry —
+                                    // the earlier borrow ended before the awaits.
+                                    attempts
+                                        .entry(key.clone())
+                                        .or_default()
+                                        .cycles
+                                        .push(crate::terminal::now_ms());
+                                } else {
+                                    // Binding raced away between claim and completion; the
+                                    // driver already killed its own orphan child. No
+                                    // terminal.replaced — the pane stays settled exited.
+                                    driver.emit_settled(
+                                        &ev.terminal_id,
+                                        "lease_completion_lost",
+                                        None,
+                                    );
+                                    driver.log_settled(&ev.terminal_id, "lease_completion_lost");
+                                }
                             }
-                        }
+                            // The gate refused the recorded id and the respawn
+                            // launched an identity-less FRESH conversation
+                            // (no replacement id minted — codex/opencode/
+                            // antigravity). The pane DID come back, so on a
+                            // healthy claim the replacement is announced —
+                            // but the STALE
+                            // identity must not survive over the fresh
+                            // conversation: the claim is RELEASED, never
+                            // completed against the fresh terminal (GC3's
+                            // no-silent-replacement rule; the direct create
+                            // path refuses the same id with the typed
+                            // SESSION_MISSING error). The pane has NO
+                            // saved identity; any later re-bind is the
+                            // provider's own machinery — codex/opencode
+                            // re-associate through real session discovery,
+                            // while antigravity's typed-prompt rebind
+                            // engages only on Freshell's fake-contract
+                            // fixtures (real-format antigravity sessions
+                            // never re-bind per-pane; README's binding
+                            // paragraph);
+                            // the replaced frame carries the gate's notice
+                            // naming the stale id (round 3, Major 2) — the
+                            // respawn's Recovering broadcast names it too,
+                            // but addressed to the NEW terminal id the pane
+                            // cannot match, and this fold clears the
+                            // recovery notice.
+                            //
+                            // Focused repair round 4, Major 2 — the
+                            // revoked-lease discipline: the fresh child
+                            // EXISTS by this point, and the claim may have
+                            // been revoked mid-respawn (pane closed / claim
+                            // taken over). The release is REVOCATION-AWARE:
+                            // a HEALTHY claim releases and announces exactly
+                            // as before; a LOST claim means the driver has
+                            // already killed its own orphan child (the
+                            // complete_claim false-path mirror) — NO
+                            // terminal.replaced for a retired pane, and the
+                            // event settles with the honest lost-lease
+                            // reason (the resume branch's
+                            // "lease_completion_lost" naming precedent —
+                            // this lease was lost at RELEASE time).
+                            crate::terminal::RespawnedIdentity::FreshUnbound => {
+                                if driver
+                                    .release_fresh_unbound_claim(
+                                        &provider,
+                                        &session_id,
+                                        &key,
+                                        &outcome.terminal_id,
+                                    )
+                                    .await
+                                {
+                                    tracing::info!(
+                                        old_terminal_id = %ev.terminal_id,
+                                        new_terminal_id = %outcome.terminal_id,
+                                        provider = %provider,
+                                        stale_session_id = %session_id,
+                                        "terminal.auto_resume.stale_identity_released: the resume \
+                                         gate refused the recorded session; the respawn launched an \
+                                         identity-less fresh conversation — the stale claim is \
+                                         released, never completed against it"
+                                    );
+                                    driver.emit_replaced(ReplacedAnnouncement {
+                                        old_terminal_id: &ev.terminal_id,
+                                        new_terminal_id: &outcome.terminal_id,
+                                        exit_code: ev.exit_code,
+                                        attempt,
+                                        max_attempts,
+                                        identity_disposition: replacement_identity_disposition(
+                                            crate::terminal::RespawnedIdentity::FreshUnbound,
+                                        ),
+                                        // Focused repair round 3, Major 2: carry the
+                                        // gate's notice naming the stale id on the
+                                        // frame the pane consumes — the pane knows
+                                        // only the OLD terminal id, so the respawn's
+                                        // Recovering broadcast (addressed to the
+                                        // NEW id) can never reach it, and this fold
+                                        // clears the recovery notice anyway.
+                                        stale_session_notice: outcome
+                                            .stale_session_notice
+                                            .as_deref(),
+                                    });
+                                    // The respawn still happened — one breaker cycle
+                                    // (the fresh generation shares the createRequestId
+                                    // and must stay inside the crash-loop bound).
+                                    attempts
+                                        .entry(key.clone())
+                                        .or_default()
+                                        .cycles
+                                        .push(crate::terminal::now_ms());
+                                } else {
+                                    // Lost lease: the driver killed its own
+                                    // orphan child before answering false. No
+                                    // replacement frame for the retired pane,
+                                    // no breaker cycle (the fresh generation
+                                    // is dead — the resume branch's lost
+                                    // path settles the same way).
+                                    driver.emit_settled(
+                                        &ev.terminal_id,
+                                        "lease_release_lost",
+                                        None,
+                                    );
+                                    driver.log_settled(&ev.terminal_id, "lease_release_lost");
+                                }
+                            }
+                        },
                         Err(err) => {
                             driver.fail_claim(&provider, &session_id, &key);
                             tracing::warn!(terminal_id = %ev.terminal_id, error = %err, "terminal.auto_resume.respawn_failed");
@@ -671,6 +794,49 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
     }
 }
 
+/// Map the respawn's identity disposition onto the `terminal.replaced`
+/// wire field (focused repair round 2, Major 2): the client needs the
+/// FreshUnbound distinction — the gate refused the recorded id, the
+/// respawn launched an identity-less fresh conversation, and the stale
+/// claim was RELEASED — to clear the pane's saved sessionRef, so a later
+/// re-bind association (where the provider's machinery emits one) folds
+/// without a conflict. Resumed and
+/// MintedReplacement keep the legacy preserve-the-recorded-ref client
+/// fold (AD-3 for the minted shape).
+fn replacement_identity_disposition(
+    identity: crate::terminal::RespawnedIdentity,
+) -> freshell_protocol::TerminalReplacedIdentityDisposition {
+    use crate::terminal::RespawnedIdentity as Respawned;
+    use freshell_protocol::TerminalReplacedIdentityDisposition as Disposition;
+    match identity {
+        Respawned::Resumed => Disposition::Resumed,
+        Respawned::MintedReplacement => Disposition::MintedReplacement,
+        Respawned::FreshUnbound => Disposition::FreshUnbound,
+    }
+}
+
+/// The `terminal.replaced` announcement's payload — the frame fields the
+/// hub hands the driver, grouped so the trait method stays inside
+/// clippy's argument-count bound once round 3 (Major 2) added the
+/// stale-id notice.
+pub(crate) struct ReplacedAnnouncement<'a> {
+    pub old_terminal_id: &'a str,
+    pub new_terminal_id: &'a str,
+    pub exit_code: i64,
+    pub attempt: u32,
+    pub max_attempts: u32,
+    pub identity_disposition: freshell_protocol::TerminalReplacedIdentityDisposition,
+    /// Focused repair round 3, Major 2: the gate's operator-visible notice
+    /// naming the REFUSED stale conversation, passed ONLY on the FreshUnbound
+    /// shape — the frame is the path the pane actually consumes (the
+    /// respawn's Recovering broadcast names the stale id but is addressed
+    /// to the NEW terminal id, which the pane cannot match before this
+    /// frame, and this fold clears the recovery notice).
+    /// `Resumed`/`MintedReplacement` pass `None` (their folds stay exactly
+    /// as today).
+    pub stale_session_notice: Option<&'a str>,
+}
+
 /// Orchestrator-facing effects, faked in unit tests.
 ///
 /// LEASE-SHAPE NOTE (fresh-eyes fix): the trait mirrors the REAL registry
@@ -682,12 +848,14 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
 /// trait exposes `complete_claim` / `fail_claim` distinctly, and the claim call
 /// carries the holder create-request-id the registry keys the lease by.
 ///
-/// ASYNC-SHAPE NOTE: `claim_session` and `complete_claim` return futures (the
-/// same RPITIT shape as `respawn`) because the production impl must AWAIT the
-/// kill→confirm discipline on its lease paths — `ExpiredNeedsKill` in the
-/// claim rounds, and the kill-own-child mirror on a lost completion — exactly
-/// like the create ingress does (`terminal.rs` claim rounds / complete==false
-/// path). A sync signature would force blocking a runtime worker.
+/// ASYNC-SHAPE NOTE: `claim_session`, `complete_claim`, and
+/// `release_fresh_unbound_claim` return futures (the same RPITIT shape as
+/// `respawn`) because the production impl must AWAIT the kill→confirm
+/// discipline on its lease paths — `ExpiredNeedsKill` in the claim rounds,
+/// and the kill-own-child mirror on a lost completion or a lost FreshUnbound
+/// release — exactly like the create ingress does (`terminal.rs` claim
+/// rounds / complete==false path). A sync signature would force blocking a
+/// runtime worker.
 pub(crate) trait AutoResumeDriver: Send + 'static {
     /// Production supplies the server-wide maintenance admission gate. Test
     /// drivers may omit it when exercising unrelated recovery decisions.
@@ -756,12 +924,51 @@ pub(crate) trait AutoResumeDriver: Send + 'static {
         create_request_id: &str,
         new_terminal_id: &str,
     ) -> impl std::future::Future<Output = bool> + Send;
-    /// Release a claim whose respawn failed (fail_session_ref_claim).
+    /// Release a claim whose respawn FAILED (fail_session_ref_claim) — no
+    /// child exists (the spawn itself errored), so the release is safe even
+    /// for a revoked lease. NOT the FreshUnbound seam: a FreshUnbound
+    /// respawn SUCCEEDED and its fresh child exists — that release is
+    /// [`Self::release_fresh_unbound_claim`].
     fn fail_claim(&self, provider: &str, session_id: &str, create_request_id: &str);
+    /// Release the stale claim after a FreshUnbound respawn — the gate
+    /// refused the recorded id and the respawn spawned an identity-less
+    /// fresh conversation (focused repair round 4, Major 2: the
+    /// REVOCATION-AWARE release). `true` = the lease was still ours and
+    /// has been released (the registry's release-if-held own-check, the
+    /// parked coordinator ticket and attach guard dropped — fail_claim's
+    /// discipline): the fresh child STAYS, the hub announces the
+    /// replacement. `false` = the lease was revoked, gone, or held
+    /// elsewhere mid-respawn — the PRODUCTION impl has already killed its
+    /// own just-spawned orphan child (kill → confirm → force-release, the
+    /// mirror of [`Self::complete_claim`]'s false path) and dropped the
+    /// ticket: the hub must emit NO `terminal.replaced` and settle the
+    /// event with the lost-lease reason. Async for the same reason as
+    /// `complete_claim`: the lost path must await the kill→confirm
+    /// discipline before the hub proceeds.
+    fn release_fresh_unbound_claim(
+        &self,
+        provider: &str,
+        session_id: &str,
+        create_request_id: &str,
+        spawned_terminal_id: &str,
+    ) -> impl std::future::Future<Output = bool> + Send;
+    /// Spawn the replacement terminal. The outcome's `identity` is the
+    /// claim disposition input: `Resumed`/`MintedReplacement` complete the
+    /// claimed lease against the new terminal; `FreshUnbound` (the gate
+    /// refused the recorded id and NO replacement id was minted —
+    /// codex/opencode/antigravity) MUST have the claim RELEASED
+    /// ([`Self::release_fresh_unbound_claim`]), never completed: the fresh
+    /// terminal is an identity-less fresh conversation, and the stale
+    /// locator's lease bound to it is exactly the silent replacement the
+    /// direct create path refuses (GC3). The release is revocation-aware
+    /// because the fresh child EXISTS by then: a lease lost mid-respawn
+    /// (pane closed / claim taken over) kills the orphan and suppresses
+    /// the replacement announcement rather than leaving a live ownerless
+    /// child beside a broadcast for a retired pane.
     fn respawn(
         &self,
         req: &RespawnSpec,
-    ) -> impl std::future::Future<Output = Result<String, String>> + Send;
+    ) -> impl std::future::Future<Output = Result<RespawnOutcome, String>> + Send;
     fn emit_recovering(
         &self,
         terminal_id: &str,
@@ -770,7 +977,27 @@ pub(crate) trait AutoResumeDriver: Send + 'static {
         attempt: u32,
         max_attempts: u32,
     );
-    fn emit_replaced(&self, old: &str, new: &str, exit_code: i64, attempt: u32, max_attempts: u32);
+    /// Broadcast `terminal.replaced`, carrying the replacement's identity
+    /// disposition (focused repair round 2, Major 2): `FreshUnbound` — the
+    /// gate refused the recorded id and the respawn launched an
+    /// identity-less fresh conversation whose stale claim was RELEASED —
+    /// tells the client to CLEAR the pane's saved sessionRef, so a later
+    /// re-bind association (the fresh conversation's association with
+    /// no `previousSessionId`, emitted only by providers whose
+    /// association machinery re-binds) folds without hitting the client's
+    /// association conflict rule. `Resumed`/`MintedReplacement` keep the
+    /// legacy client fold (the pane's recorded ref is preserved).
+    ///
+    /// `stale_session_notice` (focused repair round 3, Major 2) is the
+    /// gate's operator-visible notice naming the REFUSED stale
+    /// conversation, passed ONLY on the FreshUnbound shape — the frame
+    /// is the path the pane actually consumes (the respawn's Recovering
+    /// broadcast names the stale id but is addressed to the NEW terminal
+    /// id, which the pane cannot match before this frame, and this fold
+    /// clears the recovery notice). `Resumed`/`MintedReplacement` pass
+    /// `None` (their folds stay exactly as today). See
+    /// [`ReplacedAnnouncement`].
+    fn emit_replaced(&self, announcement: ReplacedAnnouncement<'_>);
     /// Broadcast the settle frame — `terminal.status { status: 'exited' }`
     /// for the OLD terminal id (znhn item 3). Every agent-mode settle emits
     /// it: the client clears the recovering notice on a FRAME, never on a
@@ -1352,10 +1579,82 @@ impl AutoResumeDriver for WsAutoResumeDriver {
             .fail_session_ref_claim(&session_locator(provider, session_id), create_request_id);
     }
 
+    /// The FreshUnbound release (focused repair round 4, Major 2):
+    /// REVOCATION-AWARE, because the respawn's fresh child already EXISTS
+    /// when this runs. The registry's release-if-held own-check
+    /// (`release_session_ref_claim_if_held`) releases the lease ONLY while
+    /// it is still ours and unrevoked — one leases-lock acquisition, the
+    /// atomic mirror of `complete_session_ref_claim`'s own-check. Healthy:
+    /// the parked coordinator ticket and attach guard drop (fail_claim's
+    /// discipline) and `true` goes back — the fresh child stays, the hub
+    /// announces the replacement. Lost: the orphan discipline kills our
+    /// own just-spawned child (kill → confirm → force-release, the exact
+    /// mirror of `complete_claim`'s false path above), the ticket/guard
+    /// drop, and `false` goes back — never a live ownerless child beside a
+    /// replacement broadcast for a retired pane.
+    fn release_fresh_unbound_claim(
+        &self,
+        provider: &str,
+        session_id: &str,
+        create_request_id: &str,
+        spawned_terminal_id: &str,
+    ) -> impl std::future::Future<Output = bool> + Send {
+        let state = self.state.clone();
+        let pending_slot = std::sync::Arc::clone(&self.pending_ownership);
+        let pending_attach_guard_slot = std::sync::Arc::clone(&self.pending_attach_guard);
+        let locator = session_locator(provider, session_id);
+        let create_request_id = create_request_id.to_string();
+        let spawned_terminal_id = spawned_terminal_id.to_string();
+        async move {
+            // b8ke ext r13 F2: the Adopt path's held window closes on every
+            // release path (fail_claim's discipline).
+            drop(
+                pending_attach_guard_slot
+                    .lock()
+                    .expect("pending attach guard lock")
+                    .take(),
+            );
+            if state
+                .registry
+                .release_session_ref_claim_if_held(&locator, &create_request_id)
+            {
+                // Healthy claim: the stale locator's lease is released; the
+                // fresh child stays. The parked coordinator ticket drops
+                // (RAII typed fail — no orphan Starting record).
+                drop(pending_slot.lock().expect("pending ownership lock").take());
+                true
+            } else {
+                // Lost/revoked mid-respawn: the fresh conversation is an
+                // ownerless orphan — kill it and force-release, mirroring
+                // complete_claim's false path. The revoked-but-ours lease is
+                // held closed until this confirmed kill opens it.
+                let pid = state.registry.pid_of(&spawned_terminal_id);
+                state.registry.kill(&spawned_terminal_id);
+                let confirmed = match pid {
+                    Some(pid) => crate::terminal::confirm_pid_dead_within_500ms(pid).await,
+                    // No pid handle to probe: the registry kill removed the
+                    // row; nothing is left to signal, so treat as confirmed.
+                    None => true,
+                };
+                if confirmed {
+                    state.registry.force_release_after_confirmed_kill(&locator);
+                } else {
+                    tracing::error!(target: "invariant",
+                        terminal_id = %spawned_terminal_id,
+                        provider = %locator.provider,
+                        session_id = %locator.session_id,
+                        "fresh_unbound_lease_lost_child_kill_unconfirmed: holding lease closed");
+                }
+                drop(pending_slot.lock().expect("pending ownership lock").take());
+                false
+            }
+        }
+    }
+
     fn respawn(
         &self,
         req: &RespawnSpec,
-    ) -> impl std::future::Future<Output = Result<String, String>> + Send {
+    ) -> impl std::future::Future<Output = Result<RespawnOutcome, String>> + Send {
         let state = self.state.clone();
         let req = crate::terminal::AgentRespawnRequest {
             mode: req.mode.clone(),
@@ -1401,17 +1700,19 @@ impl AutoResumeDriver for WsAutoResumeDriver {
         broadcast_frame(&self.state, terminal_id, "recovering", &msg);
     }
 
-    fn emit_replaced(&self, old: &str, new: &str, exit_code: i64, attempt: u32, max_attempts: u32) {
+    fn emit_replaced(&self, announcement: ReplacedAnnouncement<'_>) {
         let msg = freshell_protocol::ServerMessage::TerminalReplaced(
             freshell_protocol::TerminalReplaced {
-                old_terminal_id: old.to_string(),
-                new_terminal_id: new.to_string(),
-                exit_code,
-                attempt,
-                max_attempts,
+                old_terminal_id: announcement.old_terminal_id.to_string(),
+                new_terminal_id: announcement.new_terminal_id.to_string(),
+                exit_code: announcement.exit_code,
+                attempt: announcement.attempt,
+                max_attempts: announcement.max_attempts,
+                identity_disposition: Some(announcement.identity_disposition),
+                stale_session_notice: announcement.stale_session_notice.map(str::to_string),
             },
         );
-        broadcast_frame(&self.state, old, "replaced", &msg);
+        broadcast_frame(&self.state, announcement.old_terminal_id, "replaced", &msg);
     }
 
     fn emit_settled(&self, terminal_id: &str, reason: &str, resume_cycles: Option<u32>) {
@@ -1806,14 +2107,34 @@ mod tests {
         insert_cancel_on_respawn: bool,
         claim_ok: bool,
         complete_ok: bool,
+        /// Focused repair round 4, Major 2 knob: the revocation-aware
+        /// FreshUnbound release's answer. `false` simulates a lease
+        /// revoked/gone/held-elsewhere mid-respawn (the production driver
+        /// has already killed its own orphan child before answering false).
+        fresh_unbound_release_ok: bool,
         panic_next_recovering: bool,
-        respawn_result: Result<String, String>,
+        respawn_result: Result<RespawnOutcome, String>,
         recovering: Vec<(String, u32, u32)>,
         replaced: Vec<(String, String, u32)>,
+        /// Identity dispositions carried by the emitted `terminal.replaced`
+        /// announcements (focused repair round 2, Major 2), parallel to
+        /// `replaced` — recorded separately so the existing
+        /// `(old, new, attempt)` assertions stay untouched.
+        replaced_dispositions: Vec<freshell_protocol::TerminalReplacedIdentityDisposition>,
+        /// Stale-id notices carried by the emitted `terminal.replaced`
+        /// announcements (focused repair round 3, Major 2), parallel to
+        /// `replaced` — `Some(text)` only on the FreshUnbound shape;
+        /// Resumed/MintedReplacement record `None`.
+        replaced_stale_notices: Vec<Option<String>>,
         respawns: Vec<RespawnSpec>,
         claims: Vec<String>,
         completes: Vec<String>,
         fails: Vec<String>,
+        /// create_request_ids released through the revocation-aware
+        /// FreshUnbound seam (focused repair round 4, Major 2) — parallel to
+        /// `fails`, recorded separately so the Err-path `fail_calls`
+        /// assertions stay untouched.
+        unbound_releases: Vec<String>,
         settled: Vec<(String, String)>,
         /// (terminal_id, reason, resume_cycles) — settle FRAMES broadcast
         /// (znhn item 3), distinct from the `settled` log records.
@@ -1852,14 +2173,22 @@ mod tests {
                     insert_cancel_on_respawn: false,
                     claim_ok: true,
                     complete_ok: true,
+                    fresh_unbound_release_ok: true,
                     panic_next_recovering: false,
-                    respawn_result: Ok("t-new".into()),
+                    respawn_result: Ok(RespawnOutcome {
+                        terminal_id: "t-new".into(),
+                        identity: crate::terminal::RespawnedIdentity::Resumed,
+                        stale_session_notice: None,
+                    }),
                     recovering: Vec::new(),
                     replaced: Vec::new(),
+                    replaced_dispositions: Vec::new(),
+                    replaced_stale_notices: Vec::new(),
                     respawns: Vec::new(),
                     claims: Vec::new(),
                     completes: Vec::new(),
                     fails: Vec::new(),
+                    unbound_releases: Vec::new(),
                     settled: Vec::new(),
                     settled_frames: Vec::new(),
                     retired: Vec::new(),
@@ -1897,7 +2226,12 @@ mod tests {
         fn set_complete_ok(&self, v: bool) {
             self.lock().complete_ok = v;
         }
-        fn set_respawn_result(&self, v: Result<String, String>) {
+        /// Focused repair round 4, Major 2: the revocation-aware FreshUnbound
+        /// release's answer — `false` simulates a lease lost mid-respawn.
+        fn set_fresh_unbound_release_ok(&self, v: bool) {
+            self.lock().fresh_unbound_release_ok = v;
+        }
+        fn set_respawn_result(&self, v: Result<RespawnOutcome, String>) {
             self.lock().respawn_result = v;
         }
         fn set_panic_next_recovering(&self, v: bool) {
@@ -1940,6 +2274,17 @@ mod tests {
         fn replaced_calls(&self) -> Vec<(String, String, u32)> {
             self.lock().replaced.clone()
         }
+        /// Identity dispositions carried by the emitted `terminal.replaced`
+        /// announcements (focused repair round 2, Major 2), parallel to
+        /// [`Self::replaced_calls`].
+        fn replaced_dispositions(
+            &self,
+        ) -> Vec<freshell_protocol::TerminalReplacedIdentityDisposition> {
+            self.lock().replaced_dispositions.clone()
+        }
+        fn replaced_stale_notices(&self) -> Vec<Option<String>> {
+            self.lock().replaced_stale_notices.clone()
+        }
         fn respawn_calls(&self) -> Vec<RespawnSpec> {
             self.lock().respawns.clone()
         }
@@ -1951,6 +2296,11 @@ mod tests {
         }
         fn fail_calls(&self) -> Vec<String> {
             self.lock().fails.clone()
+        }
+        /// create_request_ids released through the revocation-aware
+        /// FreshUnbound seam (focused repair round 4, Major 2).
+        fn unbound_release_calls(&self) -> Vec<String> {
+            self.lock().unbound_releases.clone()
         }
         fn settled_reasons(&self) -> Vec<String> {
             self.lock().settled.iter().map(|(_, r)| r.clone()).collect()
@@ -2044,10 +2394,24 @@ mod tests {
         fn fail_claim(&self, _provider: &str, _session_id: &str, create_request_id: &str) {
             self.lock().fails.push(create_request_id.to_string());
         }
+        fn release_fresh_unbound_claim(
+            &self,
+            _provider: &str,
+            _session_id: &str,
+            create_request_id: &str,
+            _spawned_terminal_id: &str,
+        ) -> impl std::future::Future<Output = bool> + Send {
+            let ok = {
+                let mut s = self.lock();
+                s.unbound_releases.push(create_request_id.to_string());
+                s.fresh_unbound_release_ok
+            };
+            std::future::ready(ok)
+        }
         fn respawn(
             &self,
             req: &RespawnSpec,
-        ) -> impl std::future::Future<Output = Result<String, String>> + Send {
+        ) -> impl std::future::Future<Output = Result<RespawnOutcome, String>> + Send {
             let result = {
                 let mut s = self.lock();
                 s.respawns.push(req.clone());
@@ -2092,17 +2456,17 @@ mod tests {
                 panic!("test-injected driver panic");
             }
         }
-        fn emit_replaced(
-            &self,
-            old: &str,
-            new: &str,
-            _exit_code: i64,
-            attempt: u32,
-            _max_attempts: u32,
-        ) {
-            self.lock()
-                .replaced
-                .push((old.to_string(), new.to_string(), attempt));
+        fn emit_replaced(&self, announcement: ReplacedAnnouncement<'_>) {
+            let mut s = self.lock();
+            s.replaced.push((
+                announcement.old_terminal_id.to_string(),
+                announcement.new_terminal_id.to_string(),
+                announcement.attempt,
+            ));
+            s.replaced_dispositions
+                .push(announcement.identity_disposition);
+            s.replaced_stale_notices
+                .push(announcement.stale_session_notice.map(str::to_string));
         }
         fn emit_settled(&self, terminal_id: &str, reason: &str, resume_cycles: Option<u32>) {
             self.lock().settled_frames.push((
@@ -2151,6 +2515,12 @@ mod tests {
         assert_eq!(
             fake.replaced_calls(),
             vec![("t1".into(), "t-new".into(), 1u32)]
+        );
+        // Focused repair round 2, Major 2: the Resumed replacement
+        // announces `resumed` — the client keeps the pane's recorded ref.
+        assert_eq!(
+            fake.replaced_dispositions(),
+            vec![freshell_protocol::TerminalReplacedIdentityDisposition::Resumed]
         );
         // Delta-fix-1: identity was Some from the very first query (a revival
         // landing BEFORE query#1 is hub-level indistinguishable from healthy)
@@ -2243,6 +2613,19 @@ mod tests {
         assert_eq!(
             fake.replaced_calls(),
             vec![("t-other".into(), "t-new".into(), 1u32)]
+        );
+        // Focused repair round 2, Major 2: the hold-path replacement
+        // (the Resumed shape) also announces `resumed`.
+        assert_eq!(
+            fake.replaced_dispositions(),
+            vec![freshell_protocol::TerminalReplacedIdentityDisposition::Resumed]
+        );
+        // Focused repair round 3, Major 2: the Resumed shape passes NO
+        // stale-id notice — its fold stays exactly as today.
+        assert_eq!(
+            fake.replaced_stale_notices(),
+            vec![None],
+            "the Resumed replacement carries no staleSessionNotice"
         );
         assert!(
             fake.recovering_calls()
@@ -2496,6 +2879,152 @@ mod tests {
         assert_eq!(
             fake.settled_frames(),
             vec![("t1".to_string(), "lease_completion_lost".to_string(), None)]
+        );
+    }
+
+    /// Focused repair round 1, Major 1 — the hub side of the antigravity
+    /// recovery-path discipline: a respawn that reports
+    /// `RespawnedIdentity::FreshUnbound` (the resume gate refused the
+    /// recorded id and NO replacement id was minted at spawn time —
+    /// codex/opencode/antigravity) must have its claim RELEASED
+    /// (`fail_claim`), NEVER completed against the fresh terminal —
+    /// completing it would re-bind the STALE identity over an
+    /// identity-less fresh conversation (GC3's silent replacement). The
+    /// pane still comes back: `terminal.replaced` IS emitted (recovery
+    /// is not refused) and the breaker cycle still counts (the fresh
+    /// generation shares the createRequestId and must stay inside the
+    /// crash-loop bound). No settle: the replacement is a success.
+    #[tokio::test(start_paused = true)]
+    async fn fresh_unbound_respawn_releases_the_claim_and_still_replaces() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        let stale_notice = "Saved antigravity session stale-agy could not be found on disk — started a fresh session instead.";
+        fake.set_respawn_result(Ok(RespawnOutcome {
+            terminal_id: "t-new".into(),
+            identity: crate::terminal::RespawnedIdentity::FreshUnbound,
+            stale_session_notice: Some(stale_notice.to_string()),
+        }));
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![2_000, 10_000]));
+
+        tx.send(crash("t1", 1, "antigravity", Some("cr-1"), 1_000))
+            .unwrap();
+        drain().await;
+        tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+        drain().await;
+        assert_eq!(fake.respawn_calls().len(), 1);
+        assert_eq!(
+            fake.unbound_release_calls(),
+            vec!["cr-1".to_string()],
+            "the stale locator's claim is RELEASED through the revocation-aware \
+             FreshUnbound seam (focused repair round 4, Major 2)"
+        );
+        assert!(
+            fake.fail_calls().is_empty(),
+            "fail_claim is the spawn-FAILED release only — the FreshUnbound \
+             respawn SUCCEEDED, so its release runs through the revocation-aware \
+             seam"
+        );
+        assert!(
+            fake.complete_calls().is_empty(),
+            "the stale locator's claim must never be completed against the \
+             identity-less fresh terminal"
+        );
+        assert_eq!(
+            fake.replaced_calls(),
+            vec![("t1".to_string(), "t-new".to_string(), 1u32)],
+            "the pane still comes back — terminal.replaced IS emitted"
+        );
+        // Focused repair round 2, Major 2: the FreshUnbound replacement
+        // announces `fresh_unbound` — the client CLEARS the pane's stale
+        // sessionRef on it, so a later re-bind association (the fresh
+        // conversation's association with no previousSessionId, where
+        // the provider's machinery emits one) folds instead of
+        // conflicting.
+        assert_eq!(
+            fake.replaced_dispositions(),
+            vec![freshell_protocol::TerminalReplacedIdentityDisposition::FreshUnbound],
+            "the FreshUnbound replacement carries the fresh_unbound identity disposition"
+        );
+        // Focused repair round 3, Major 2: the FreshUnbound replacement
+        // carries the gate's notice NAMING the stale id on the frame the
+        // pane actually consumes — the respawn's Recovering broadcast
+        // names it too, but addressed to the NEW terminal id the pane
+        // cannot match before this frame, and this fold clears the
+        // recovery notice. Without the carried notice the fresh pane
+        // shows no explanation naming the lost conversation.
+        assert_eq!(
+            fake.replaced_stale_notices(),
+            vec![Some(stale_notice.to_string())],
+            "the FreshUnbound replacement carries the gate's stale-id notice"
+        );
+        assert!(
+            fake.settled_reasons().is_empty(),
+            "no settle: recovery was not refused: {:?}",
+            fake.settled_reasons()
+        );
+    }
+
+    /// Focused repair round 4, Major 2 — the FreshUnbound branch's
+    /// revoked-lease race: a claim revoked while the fresh conversation
+    /// was spawning (the pane closed, or the claim was taken over) must
+    /// NOT announce a replacement for the retired pane and must NOT leave
+    /// the spawned fresh child running ownerless. The revocation-aware
+    /// release answers false (the production driver has already killed its
+    /// own orphan child by then): the hub emits NO `terminal.replaced`,
+    /// settles the event with the lost-lease reason (the resume branch's
+    /// `lease_completion_lost` naming precedent — this lease was lost at
+    /// RELEASE time), and the breaker cycle does not advance (the fresh
+    /// generation is dead and the pane is retired — nothing left to
+    /// count, mirroring the resume branch's lost path).
+    #[tokio::test(start_paused = true)]
+    async fn fresh_unbound_respawn_with_revoked_claim_settles_without_replaced_frame() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        fake.set_respawn_result(Ok(RespawnOutcome {
+            terminal_id: "t-new".into(),
+            identity: crate::terminal::RespawnedIdentity::FreshUnbound,
+            stale_session_notice: Some("stale id refused".into()),
+        }));
+        fake.set_fresh_unbound_release_ok(false);
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![2_000, 10_000]));
+
+        tx.send(crash("t1", 1, "antigravity", Some("cr-1"), 1_000))
+            .unwrap();
+        drain().await;
+        tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+        drain().await;
+        assert_eq!(fake.respawn_calls().len(), 1);
+        assert!(
+            fake.replaced_calls().is_empty(),
+            "NO terminal.replaced for a revoked lease — the pane is retired: {:?}",
+            fake.replaced_calls()
+        );
+        // The release went through the revocation-aware seam — and answered
+        // false. The production driver has already killed its own orphan
+        // child before that false came back.
+        assert_eq!(
+            fake.unbound_release_calls(),
+            vec!["cr-1".to_string()],
+            "the FreshUnbound release must run through the revocation-aware seam"
+        );
+        assert!(
+            fake.fail_calls().is_empty(),
+            "a lost FreshUnbound release is NOT the spawn-failed fail_claim"
+        );
+        assert!(
+            fake.complete_calls().is_empty(),
+            "the stale locator's claim must never be completed against the \
+             identity-less fresh terminal"
+        );
+        assert_eq!(
+            fake.settled_reasons(),
+            vec!["lease_release_lost".to_string()],
+            "the event settles with the honest lost-lease reason"
+        );
+        assert_eq!(
+            fake.settled_frames(),
+            vec![("t1".to_string(), "lease_release_lost".to_string(), None)],
+            "the settle frame broadcasts so the pane clears its recovering notice"
         );
     }
 

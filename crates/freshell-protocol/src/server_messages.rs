@@ -427,15 +427,14 @@ pub struct RuntimeViewChanged {
 }
 
 /// Extension server→client discriminants declared BEYOND the generated
-/// inventory (`port/contract/ws-message-inventory.json`). Since the
-/// 2026-07-26 reconciliation the only entry is `durability.degraded` — a
-/// Rust-server-only frame (P1.8 pane-identity ledger, emitted by
-/// `crates/freshell-ws/src/pane_ledger.rs`) with no TypeScript
-/// counterpart: the inventory is generated from `shared/ws-protocol.ts`,
-/// so it cannot carry it. NOT the same family as the frozen
-/// `terminal.codex.durability.updated` (codex-sidecar durability); the
-/// name collision is nearest-neighbor only. If the client ever grows a
-/// consumer, add the Zod schema to `shared/ws-protocol.ts`, run
+/// inventory (`port/contract/ws-message-inventory.json`): Rust-server-only
+/// frames with no TypeScript counterpart — the inventory is generated from
+/// `shared/ws-protocol.ts`, so it cannot carry them. `durability.degraded`
+/// is the P1.8 pane-identity-ledger frame (emitted by
+/// `crates/freshell-ws/src/pane_ledger.rs`); NOT the same family as the
+/// frozen `terminal.codex.durability.updated` (codex-sidecar durability);
+/// the name collision is nearest-neighbor only. If the client ever grows
+/// a consumer, add the Zod schema to `shared/ws-protocol.ts`, run
 /// `pnpm run contract:generate`, and promote this into
 /// [`SERVER_MESSAGE_TYPES`]. Shape pinned by `tests/activity_extension.rs`.
 pub const EXTENSION_SERVER_MESSAGE_TYPES: [&str; 2] =
@@ -1240,6 +1239,37 @@ pub struct PaneVerdict {
     /// merely flags the duplicate `terminalId`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duplicate: Option<String>,
+    /// `attach` only, the `fresh_unbound` shape (focused repair round 5,
+    /// Major — additive/optional; older clients ignore it and keep the
+    /// legacy preserve-the-recorded-ref fold): the attached terminal is an
+    /// identity-less FreshUnbound replacement — the resume gate refused its
+    /// predecessor's recorded id and the server RELEASED the stale claim.
+    /// This is the reconnect-path mirror of `terminal.replaced`'s
+    /// [`TerminalReplacedIdentityDisposition`]: a browser that was
+    /// disconnected during the server-side auto-resume (or reloaded after
+    /// it) missed the replaced frame, and its reconciliation attach must
+    /// carry the same identity-clearing signal or the pane keeps a stale
+    /// saved sessionRef and a later re-bind association — the fresh
+    /// conversation's `terminal.session.associated` with a new id and no
+    /// `previousSessionId`, emitted only by providers whose association
+    /// machinery re-binds (real-format antigravity sessions never do) —
+    /// folds as a conflict. Only `fresh_unbound` is ever set on a verdict
+    /// (resumed/minted replacements carry their identity in `session_ref`)
+    /// and never beside a `session_ref`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_disposition: Option<TerminalReplacedIdentityDisposition>,
+    /// `attach` only, beside `identity_disposition: fresh_unbound` (final-
+    /// delta review round 2, Fix 1 — additive/optional; absent keeps the
+    /// legacy verdict byte-shape): the gate's stale-id notice naming the
+    /// REFUSED conversation, carried on the reconnect path exactly as the
+    /// live `terminal.replaced` frame carries it. A pane disconnected
+    /// during the server-side auto-resume missed the replaced frame — and
+    /// with it the only visible explanation naming the lost conversation —
+    /// so the verdict carries the same notice and the client fold surfaces
+    /// the same pane-level dismissible notice. Absent on every other
+    /// verdict shape. Prose is presentational-only (council 7w4h/xkhx).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_session_notice: Option<String>,
 }
 
 /// Sent ONLY in response to `pane.reconcile.request` — the server never
@@ -1837,6 +1867,36 @@ pub struct TerminalOutputGap {
     pub oldest_retained_seq: Option<i64>,
 }
 
+/// Identity disposition of a `terminal.replaced` announcement (focused
+/// repair round 2, Major 2): how the replacement terminal's session
+/// identity relates to the pane's RECORDED one — the mirror of the
+/// auto-resume hub's `RespawnedIdentity`. Additive/optional on the wire
+/// (older clients ignore the field and keep the legacy
+/// preserve-the-recorded-ref fold; absent keeps the exact legacy frame).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalReplacedIdentityDisposition {
+    /// The respawn proceeded WITH the recorded session id (the gate
+    /// passed/failed open on it, or handed it through) — the pane's
+    /// saved sessionRef stays correct.
+    Resumed,
+    /// The gate refused the recorded id and MINTED a replacement id at
+    /// spawn time (the fresh-id-minting providers, AD-3): the pane's
+    /// recorded ref is deliberately kept (the accepted AD-3 shape).
+    MintedReplacement,
+    /// The gate refused the recorded id and NO replacement id exists —
+    /// the respawn launched an identity-less FRESH conversation and the
+    /// server RELEASED the stale claim. The client must CLEAR the pane's
+    /// saved sessionRef (mirror the identity-less terminal) so a later
+    /// re-bind association — a `terminal.session.associated` with a fresh
+    /// id and no `previousSessionId`, emitted only by providers whose
+    /// association machinery re-binds (codex/opencode; antigravity's
+    /// typed-prompt rebind is the fake-contract fixtures only, so
+    /// real-format antigravity sessions never re-bind per-pane) — folds
+    /// instead of conflicting.
+    FreshUnbound,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalReplaced {
@@ -1845,6 +1905,25 @@ pub struct TerminalReplaced {
     pub exit_code: i64,
     pub attempt: u32,
     pub max_attempts: u32,
+    /// Auto-resume identity disposition (focused repair round 2, Major 2 —
+    /// additive/optional: absent keeps the legacy frame byte-shape and the
+    /// legacy client fold). See [`TerminalReplacedIdentityDisposition`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_disposition: Option<TerminalReplacedIdentityDisposition>,
+    /// The gate's stale-id notice (focused repair round 3, Major 2 —
+    /// additive/optional: absent keeps the legacy frame byte-shape):
+    /// the operator-visible text naming the REFUSED stale conversation,
+    /// carried on the path the pane ACTUALLY consumes. The server also
+    /// broadcasts the notice as a `terminal.status{recovering}` frame,
+    /// but for the NEW terminal id BEFORE this frame — the pane matches
+    /// frames by the OLD id it knows, never sees that one, and this
+    /// replaced fold clears the recovery notice — so without this field
+    /// the fresh pane shows no explanation naming the lost conversation.
+    /// Only the `FreshUnbound` disposition carries it; `Resumed` and
+    /// `MintedReplacement` frames omit it (their folds stay exactly as
+    /// today). Prose is presentational-only (council 7w4h/xkhx).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_session_notice: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

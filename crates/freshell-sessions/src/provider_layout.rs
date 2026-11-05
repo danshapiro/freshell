@@ -279,10 +279,13 @@ impl ProviderLayout for AmplifierLayout {
 
 /// Antigravity: `<antigravity_home>/brain/<conversationId>/.system_generated/logs/transcript.jsonl`.
 ///
-/// // Stage-1 candidate contract: the transcript PATH is
-/// documented+probe-validated, but only `transcript.jsonl` files with the
-/// full ancestor chain are treated as sessions; the record schema inside is
-/// fixture-validated only (see `parse/antigravity.rs`).
+/// The transcript PATH is real-binary-validated (2026-11-02, agy 1.2.11 +
+/// 1.4.12 corpus, store-log-attributed, schemas identical; evidence:
+/// `.worktrees/.the-usual-logs/antigravity-transcript-validation/reports/
+/// real-binary-transcript-evidence.md`), and the record schema inside is
+/// the corrected real-binary contract (see `parse/antigravity.rs`) — no
+/// Stage-1 candidate caveat remains on either; only `transcript.jsonl`
+/// files with the full ancestor chain are treated as sessions.
 ///
 /// `home` here is the ALREADY-RESOLVED antigravity home (the
 /// `antigravity-cli` subtree — callers apply [`antigravity_home`] at their
@@ -292,6 +295,34 @@ impl ProviderLayout for AmplifierLayout {
 /// identity evidence (plan Global Constraint 2): it never qualifies and its
 /// churn never dirty-marks the provider.
 pub struct AntigravityLayout;
+
+impl AntigravityLayout {
+    /// The conversation id from a canonical transcript path — the
+    /// `brain/<conversationId>/.system_generated/logs/transcript.jsonl`
+    /// directory component. Real records carry NO id field (binary
+    /// v1.4.12): the directory name IS the conversation identity.
+    pub fn conversation_id_from_path(path: &std::path::Path) -> Option<String> {
+        let mut components = path.components().rev();
+        // Reversed walk of brain/<conversationId>/.system_generated/logs/transcript.jsonl:
+        // consume the file name first, then each directory component in reverse order.
+        if components.next()?.as_os_str().to_str()? != "transcript.jsonl" {
+            return None;
+        }
+        for expected in ["logs", ".system_generated"] {
+            if components.next()?.as_os_str().to_str()? != expected {
+                return None;
+            }
+        }
+        let id = components.next()?.as_os_str().to_str()?;
+        if components.next()?.as_os_str().to_str()? != "brain" {
+            return None;
+        }
+        if id.is_empty() {
+            return None;
+        }
+        Some(id.to_string())
+    }
+}
 
 impl ProviderLayout for AntigravityLayout {
     fn name(&self) -> &str {
@@ -866,6 +897,61 @@ mod tests {
         assert!(AntigravityLayout.qualifies(&antigravity_transcript(
             "11111111-2222-3333-4444-555555555555"
         )));
+    }
+
+    #[test]
+    fn antigravity_conversation_id_from_path_reads_the_brain_directory() {
+        // The conversation id IS the brain/<id> directory name (real
+        // records carry no id field — binary v1.4.12): the reversed walk
+        // consumes transcript.jsonl first, then logs/.system_generated,
+        // then the id, and requires `brain` as its parent.
+        assert_eq!(
+            AntigravityLayout::conversation_id_from_path(&antigravity_transcript(
+                "11111111-2222-3333-4444-555555555555"
+            )),
+            Some("11111111-2222-3333-4444-555555555555".to_string())
+        );
+        // A relative canonical chain works too (the source joins paths
+        // from the resolved home, which may be relative in tests).
+        assert_eq!(
+            AntigravityLayout::conversation_id_from_path(Path::new(
+                "brain/conv-x/.system_generated/logs/transcript.jsonl"
+            )),
+            Some("conv-x".to_string())
+        );
+        // Every deviation from the canonical chain is rejected.
+        let home = Path::new(ANTIGRAVITY_HOME);
+        assert_eq!(
+            AntigravityLayout::conversation_id_from_path(
+                &home.join("cache/last_conversations.json")
+            ),
+            None
+        );
+        assert_eq!(
+            AntigravityLayout::conversation_id_from_path(
+                &home.join("brain/conv-1/logs/transcript.jsonl")
+            ),
+            None
+        );
+        assert_eq!(
+            AntigravityLayout::conversation_id_from_path(
+                &home.join("brain/conv-1/.system_generated/logs/sub/transcript.jsonl")
+            ),
+            None
+        );
+        assert_eq!(
+            AntigravityLayout::conversation_id_from_path(&home.join("brain/transcript.jsonl")),
+            None
+        );
+        // A missing conversation component (the double separator
+        // collapses; `brain` becomes the id candidate with no `brain`
+        // parent behind it) is rejected.
+        assert_eq!(
+            AntigravityLayout::conversation_id_from_path(
+                &home.join("brain//.system_generated/logs/transcript.jsonl")
+            ),
+            None
+        );
     }
 
     #[test]

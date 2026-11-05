@@ -3,13 +3,9 @@
 // start() must retry with a fresh port instead of failing the whole fixture.
 import { describe, it, expect } from 'vitest'
 import fs from 'node:fs'
-import fsp from 'node:fs/promises'
 import net from 'node:net'
 import http from 'node:http'
-import os from 'node:os'
-import path from 'node:path'
 import { RustServer, GEMINI_STRIP_ENV_PREFIXES } from './rust-server.js'
-import { managedEnvironmentProbeServer } from './managed-environment-probe.js'
 import { findFreePort } from './server-fixture-support.js'
 
 describe('RustServer.start bind-race retry', () => {
@@ -219,56 +215,6 @@ describe('RustServer stripEnvPrefixes', () => {
       }
       await server.stop()
     }
-  }, 600_000)
-})
-
-describe('RustServer ambient managed-runtime isolation', () => {
-  // The self-hosted server runs as a managed runtime (its systemd drop-in
-  // sets FRESHELL_MANAGED_RUNTIME_V1=1), so every shell it spawns — every
-  // agent terminal driving e2e on this machine — inherits the opt-in. A
-  // freshell-server built WITHOUT the managed-runtime-v1 feature REFUSES to
-  // boot with that ambient value (main.rs managed_runtime_feature_error), so
-  // a direct RustServer construction inheriting process.env fails at spawn
-  // (observed: every direct-construction spec failed locally with "exited
-  // with code 1 before becoming ready"). The runtime-web env scrub therefore
-  // strips the ambient opt-in by default, while a construction explicitly
-  // configuring the key in options.env (the managed-runtime owner's web
-  // construct does exactly that, runtime-sandbox.ts) keeps it: the
-  // intentional managed fixture seam survives, ambient leakage does not.
-  const probeBoot = async (options: ConstructorParameters<typeof RustServer>[0]) => {
-    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-e2e-managed-probe-'))
-    const serverBinary = path.join(root, 'server-probe')
-    const captureFile = path.join(root, 'managed-runtime-flag')
-    await fsp.writeFile(serverBinary, managedEnvironmentProbeServer, { mode: 0o755 })
-    await fsp.chmod(serverBinary, 0o755)
-    const keys = ['FRESHELL_E2E_RUST_SERVER_BIN', 'FRESHELL_E2E_MANAGED_ENV_CAPTURE', 'FRESHELL_MANAGED_RUNTIME_V1']
-    const saved = new Map(keys.map(key => [key, process.env[key]]))
-    let server: RustServer | undefined
-    try {
-      process.env.FRESHELL_E2E_RUST_SERVER_BIN = serverBinary
-      process.env.FRESHELL_E2E_MANAGED_ENV_CAPTURE = captureFile
-      process.env.FRESHELL_MANAGED_RUNTIME_V1 = '1'
-      server = new RustServer(options)
-      await server.start()
-      return await fsp.readFile(captureFile, 'utf8')
-    } finally {
-      await server?.stop().catch(() => undefined)
-      for (const [key, value] of saved) {
-        if (value === undefined) delete process.env[key]
-        else process.env[key] = value
-      }
-      await fsp.rm(root, { recursive: true, force: true })
-    }
-  }
-
-  it('drops an ambient managed-runtime opt-in from the spawned server env', async () => {
-    await expect(probeBoot({})).resolves.toBe('<unset>')
-  }, 600_000)
-
-  it('preserves a managed-runtime opt-in explicitly configured in options.env', async () => {
-    await expect(
-      probeBoot({ env: { FRESHELL_MANAGED_RUNTIME_V1: '1' } }),
-    ).resolves.toBe('1')
   }, 600_000)
 })
 
