@@ -6313,7 +6313,11 @@ await import(parameters.source)
     async fn model_catalog_uses_the_same_initialized_native_actor_process_without_a_turn() {
         let logs = tempfile::tempdir().unwrap();
         let log = logs.path().join("requests.jsonl");
-        let fixture=native_codex_fixture(json!({"appendRequestLogPath":log,"modelCatalogPages":[
+        let native_thread_id = "catalog-native-thread";
+        let fixture=native_codex_fixture(json!({"appendRequestLogPath":log,
+            "threadStartThreadId":native_thread_id,
+            "notificationsAfterMethods":{"thread/start":[{"method":"thread/status/changed","params":{"threadId":native_thread_id,"status":{"type":"idle"}}}]},
+            "modelCatalogPages":[
             {"data":[{"id":"catalog-record","model":"gpt-6.1-sol","displayName":"Native Sol","supportedReasoningEfforts":[{"reasoningEffort":"xhigh"}],"defaultReasoningEffort":"xhigh","inputModalities":["text","image"]}],"nextCursor":"1"},
             {"data":[{"id":"record-current","model":"provider-current","displayName":"Provider Current","supportedReasoningEfforts":[{"reasoningEffort":"ultra"}],"defaultReasoningEffort":"ultra","inputModalities":["text"]}],"nextCursor":null},
         ]})).await;
@@ -6325,8 +6329,8 @@ await import(parameters.source)
         .await
         .unwrap();
         let before = actor.profile().await;
-        // Ordinary creation queues its created + idle snapshot frames. Join
-        // that existing startup boundary before testing a read-only operation.
+        // The fixture explicitly emits a supported native idle-status event;
+        // thread/started is opted out. Join that startup boundary before the read.
         tokio::time::timeout(Duration::from_secs(10),async {
             loop {
                 if actor.read_events(0,256).await.events.iter().any(|entry|matches!(&entry.event,

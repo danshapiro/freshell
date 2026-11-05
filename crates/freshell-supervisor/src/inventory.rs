@@ -338,6 +338,19 @@ impl Supervisor {
                                 .await
                             {
                                 Ok(status) if status.exited => Some(RecoveryTrigger::ProviderExit),
+                                Ok(status) if host.is_retained_v1() => {
+                                    match supervisor.verify_retained_terminal_owner_status(&handle, &host, &status).await {
+                                        Ok(()) => None,
+                                        Err(error) => {
+                                            append_event(
+                                                &supervisor.config.lifecycle_log,
+                                                "supervisor.runtime_observer.retained_owner_changed",
+                                                serde_json::json!({"severity":"warning","soulId":view.soul_id,"errorCode":error.code,"message":error.message}),
+                                            );
+                                            Some(RecoveryTrigger::HostUnreachable)
+                                        }
+                                    }
+                                }
                                 Ok(_) => {
                                     if view.provider.as_deref() != Some("shell")
                                         && !matches!(

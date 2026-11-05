@@ -573,10 +573,22 @@ fn native_send_reply(previous: &str, native: &str, pending: Option<String>) -> H
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeSendReadiness {
+    Observed,
+    Exited,
+    ExitedWithoutRecoveryCapability,
+    ExitedWithWrongGeneration,
+    ExitedWithWrongBoot,
+    ExitedWithConflictingRoot,
+    ExitedWithNewlyAuthenticatedBoot,
+}
+
 async fn native_send_host(
     fixture: &RunningFreshAgent,
     replies: Vec<HostResult>,
     gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    initial_readiness: NativeSendReadiness,
 ) -> (
     tokio::sync::oneshot::Sender<()>,
     tokio::task::JoinHandle<usize>,
@@ -584,7 +596,6 @@ async fn native_send_host(
     let secret = b"synthetic-host-secret";
     std::fs::write(fixture.runtime_dir.join("secret"), secret).unwrap();
     let listener = UnixListener::bind(fixture.runtime_dir.join("host.sock")).unwrap();
-    let boot = HostBootId::new();
     let incarnation = fixture.incarnation.clone();
     let context = fixture
         .supervisor
@@ -593,7 +604,7 @@ async fn native_send_host(
         .await
         .unwrap();
     let mut launch = context.native_identity_launch.unwrap();
-    let mut observation = fixture
+    let view = fixture
         .supervisor
         .registry
         .inventory()
@@ -601,7 +612,14 @@ async fn native_send_host(
         .unwrap()
         .into_iter()
         .find(|view| view.incarnation_id == fixture.incarnation)
-        .unwrap()
+        .unwrap();
+    let boot = if initial_readiness == NativeSendReadiness::ExitedWithNewlyAuthenticatedBoot {
+        HostBootId::new()
+    } else {
+        view.host_boot_id
+            .expect("the original execution grant owns this boot")
+    };
+    let mut observation = view
         .native_identity_observation
         .expect("the current producer observation was published during fixture startup");
     let control_epoch = fixture.supervisor.registry.control_epoch();
@@ -615,8 +633,16 @@ async fn native_send_host(
                 tokio::select! {_=&mut stop=>break,result=listener.accept()=>result.unwrap().0};
             let envelope: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
             let result = match envelope.body {
-                HostCommand::Hello {incarnation_id,challenge} => HostResult::Hello {
-                    host_boot_id:boot.clone(),proof:host_proof(secret,&challenge,&boot,&incarnation_id),capabilities:vec!["native-identity-observation-v1".into()],effective_limits:crate::checkpoints::tests::limits()
+                HostCommand::Hello {incarnation_id,challenge} => {
+                    let mut capabilities = vec!["native-identity-observation-v1".into()];
+                    if initial_readiness != NativeSendReadiness::Observed
+                        && initial_readiness != NativeSendReadiness::ExitedWithoutRecoveryCapability
+                    {
+                        capabilities.push("fresh-agent-codex-dispatch-recovery-v1".into());
+                    }
+                    HostResult::Hello {
+                        host_boot_id:boot.clone(),proof:host_proof(secret,&challenge,&boot,&incarnation_id),capabilities,effective_limits:crate::checkpoints::tests::limits()
+                    }
                 },
                 HostCommand::Status { incarnation_id } => {
                     assert_eq!(incarnation_id, incarnation);
@@ -624,16 +650,26 @@ async fn native_send_host(
                     assert!(!ready_for_send, "only one readiness read may precede each original input");
                     assert!(observation.matches_launch(&launch));
                     ready_for_send = true;
+                    let exited = sends == 0 && initial_readiness != NativeSendReadiness::Observed;
                     HostResult::Status {
-                        host_boot_id: boot.clone(),
+                        host_boot_id: if initial_readiness == NativeSendReadiness::ExitedWithWrongBoot {
+                            HostBootId::new()
+                        } else {
+                            boot.clone()
+                        },
                         worker_pid: Some(123),
                         worker_launch_count: 1,
                         max_control_epoch: control_epoch,
-                        max_execution_generation: launch.execution_generation,
+                        max_execution_generation: launch.execution_generation
+                            + u64::from(initial_readiness == NativeSendReadiness::ExitedWithWrongGeneration),
                         fixture_evidence: serde_json::Value::Null,
-                        exited: false,
-                        native_session_id: Some(observation.native_session_id.clone()),
-                        native_identity_observation: Some(observation.clone()),
+                        exited,
+                        native_session_id: if initial_readiness == NativeSendReadiness::ExitedWithConflictingRoot {
+                            Some("another-native-root".into())
+                        } else {
+                            (!exited).then(|| observation.native_session_id.clone())
+                        },
+                        native_identity_observation: (!exited).then(|| observation.clone()),
                         native_readiness_receipt: None,
                         opencode_transfer_receipt: None,
                         opencode_adoption: Default::default(),
@@ -673,12 +709,290 @@ async fn native_send_host(
             .unwrap();
         }
         assert!(
-            !ready_for_send,
+            !ready_for_send || initial_readiness != NativeSendReadiness::Observed,
             "an acknowledgement must not trigger a trailing native probe"
         );
         sends
     });
     (shutdown, host)
+}
+
+#[tokio::test]
+async fn ended_codex_send_commits_the_typed_recovered_identity_once() {
+    let fixture = running_fresh_provider_with_name(
+        FreshProvider::Codex,
+        Some("pending-original".into()),
+        "native-original",
+    )
+    .await;
+    let (shutdown, host) = native_send_host(
+        &fixture,
+        vec![
+            native_send_reply("native-original", "native-recovered", None),
+            native_send_reply("native-recovered", "native-recovered", None),
+        ],
+        None,
+        NativeSendReadiness::Exited,
+    )
+    .await;
+    let request = RequestId::new();
+    let first = fixture
+        .supervisor
+        .fresh_agent_send(
+            request.clone(),
+            fixture.soul.clone(),
+            "original recovery input".into(),
+            None,
+            None,
+        )
+        .await;
+    let mut following = Vec::new();
+    if first.is_ok() {
+        following.push(
+            fixture
+                .supervisor
+                .fresh_agent_send(
+                    request,
+                    fixture.soul.clone(),
+                    "original recovery input".into(),
+                    None,
+                    None,
+                )
+                .await,
+        );
+        following.push(
+            fixture
+                .supervisor
+                .fresh_agent_send(
+                    RequestId::new(),
+                    fixture.soul.clone(),
+                    "next current-source input".into(),
+                    None,
+                    None,
+                )
+                .await,
+        );
+    }
+    shutdown.send(()).unwrap();
+    let sends = host.await.unwrap();
+    assert!(
+        matches!(first, Ok(CommandState::ProviderAcked)),
+        "the ended original must reach its owned typed recovery dispatch: {first:?}"
+    );
+    assert!(matches!(following[0], Ok(CommandState::Completed)));
+    assert!(matches!(following[1], Ok(CommandState::ProviderAcked)));
+    assert_eq!(sends, 2, "the original request is never replayed");
+    let current = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        current.native_session_id.as_deref(),
+        Some("native-recovered")
+    );
+    assert_eq!(
+        current.fresh_agent.unwrap().session_id,
+        "fresh-session",
+        "the durable user reference survives recovery"
+    );
+}
+
+#[tokio::test]
+async fn ended_codex_send_requires_current_boot_generation_source_and_recovery_capability() {
+    for readiness in [
+        NativeSendReadiness::ExitedWithoutRecoveryCapability,
+        NativeSendReadiness::ExitedWithWrongGeneration,
+        NativeSendReadiness::ExitedWithWrongBoot,
+        NativeSendReadiness::ExitedWithConflictingRoot,
+    ] {
+        let fixture =
+            running_fresh_provider_with_name(FreshProvider::Codex, None, "native-original").await;
+        let (shutdown, host) = native_send_host(&fixture, vec![], None, readiness).await;
+        let result = fixture
+            .supervisor
+            .fresh_agent_send(
+                RequestId::new(),
+                fixture.soul.clone(),
+                "original recovery input".into(),
+                None,
+                None,
+            )
+            .await;
+        shutdown.send(()).unwrap();
+        assert!(
+            result.is_err(),
+            "unqualified recovery cannot admit input: {result:?}"
+        );
+        assert_eq!(host.await.unwrap(), 0);
+        let connection =
+            rusqlite::Connection::open(fixture.supervisor.registry.database_path()).unwrap();
+        let admitted: u64 = connection
+            .query_row("SELECT count(*) FROM input_commands", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(admitted, 0);
+    }
+}
+
+#[tokio::test]
+async fn ended_codex_send_rejects_new_boot_reusing_old_grant() {
+    let fixture =
+        running_fresh_provider_with_name(FreshProvider::Codex, None, "native-original").await;
+    let (shutdown, host) = native_send_host(
+        &fixture,
+        vec![native_send_reply(
+            "native-original",
+            "native-original",
+            None,
+        )],
+        None,
+        NativeSendReadiness::ExitedWithNewlyAuthenticatedBoot,
+    )
+    .await;
+    let result = fixture
+        .supervisor
+        .fresh_agent_send(
+            RequestId::new(),
+            fixture.soul.clone(),
+            "original recovery input".into(),
+            None,
+            None,
+        )
+        .await;
+    shutdown.send(()).unwrap();
+    let sends = host.await.unwrap();
+    assert!(
+        result.is_err(),
+        "a new authenticated boot cannot inherit the old grant: {result:?}"
+    );
+    assert_eq!(
+        sends, 0,
+        "custody is checked before forwarding the original input"
+    );
+}
+
+#[tokio::test]
+async fn ended_codex_send_recovers_after_observer_settles_store_unreadable() {
+    for recovered_root in ["native-recovered", "native-original"] {
+        let fixture =
+            running_fresh_provider_with_name(FreshProvider::Codex, None, "native-original").await;
+        let (shutdown, host) = native_send_host(
+            &fixture,
+            vec![native_send_reply("native-original", recovered_root, None)],
+            None,
+            NativeSendReadiness::Exited,
+        )
+        .await;
+        let fence = fixture
+            .supervisor
+            .registry
+            .recovery_write_fence(fixture.soul.clone())
+            .await
+            .unwrap();
+        fixture
+            .supervisor
+            .registry
+            .mark_recovery_blocked(
+                fixture.soul.clone(),
+                None,
+                RecoveryBlockReason::StoreUnreadable,
+                vec!["the observer inspected the archived original source".into()],
+                fence,
+            )
+            .await
+            .unwrap();
+        let result = fixture
+            .supervisor
+            .fresh_agent_send(
+                RequestId::new(),
+                fixture.soul.clone(),
+                "original recovery input".into(),
+                None,
+                None,
+            )
+            .await;
+        shutdown.send(()).unwrap();
+        let sends = host.await.unwrap();
+        assert!(
+            matches!(result, Ok(CommandState::ProviderAcked)),
+            "the first send must not race observer settlement: {result:?}"
+        );
+        assert_eq!(sends, 1);
+        let view = fixture
+            .supervisor
+            .registry
+            .inventory()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|view| view.incarnation_id == fixture.incarnation)
+            .unwrap();
+        assert_eq!(view.recovery_state, RecoveryState::Live);
+        assert_eq!(view.native_session_id.as_deref(), Some(recovered_root));
+    }
+}
+#[tokio::test]
+async fn ended_codex_send_does_not_recover_other_blocked_or_stopped_ownership() {
+    for reason in [
+        RecoveryBlockReason::AmbiguousIdentity,
+        RecoveryBlockReason::OldRuntimeNotEmpty,
+        RecoveryBlockReason::WrongNativeIdentity,
+        RecoveryBlockReason::StopIntent,
+    ] {
+        let fixture =
+            running_fresh_provider_with_name(FreshProvider::Codex, None, "native-original").await;
+        let (shutdown, host) =
+            native_send_host(&fixture, vec![], None, NativeSendReadiness::Exited).await;
+        let fence = fixture
+            .supervisor
+            .registry
+            .recovery_write_fence(fixture.soul.clone())
+            .await
+            .unwrap();
+        fixture
+            .supervisor
+            .registry
+            .mark_recovery_blocked(
+                fixture.soul.clone(),
+                None,
+                reason,
+                vec!["owned blocked-state fixture".into()],
+                fence,
+            )
+            .await
+            .unwrap();
+        if reason == RecoveryBlockReason::StopIntent {
+            fixture
+                .supervisor
+                .registry
+                .begin_stop(fixture.soul.clone())
+                .await
+                .unwrap();
+        }
+        let result = fixture
+            .supervisor
+            .fresh_agent_send(
+                RequestId::new(),
+                fixture.soul.clone(),
+                "original recovery input".into(),
+                None,
+                None,
+            )
+            .await;
+        shutdown.send(()).unwrap();
+        assert!(
+            result.is_err(),
+            "{reason:?} must remain blocked: {result:?}"
+        );
+        assert_eq!(host.await.unwrap(), 0);
+        let connection =
+            rusqlite::Connection::open(fixture.supervisor.registry.database_path()).unwrap();
+        let admitted: u64 = connection.query_row(
+            "SELECT count(*) FROM input_commands WHERE state IN ('queued','dispatching','completed')", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(admitted, 0, "{reason:?}");
+    }
 }
 
 #[tokio::test]
@@ -727,7 +1041,8 @@ async fn accepted_native_recovery_preserves_presentation_and_pending_name_policy
             handle.clone(),
         ));
         let expected_sends = replies.len();
-        let (shutdown, host) = native_send_host(&fixture, replies, None).await;
+        let (shutdown, host) =
+            native_send_host(&fixture, replies, None, NativeSendReadiness::Observed).await;
         let mut results = Vec::new();
         let mut same_native = None;
         for index in 0..expected_sends {
@@ -1532,6 +1847,7 @@ async fn native_dispatch_rejects_stale_invalid_and_nonaccepted_identity_authorit
             &fixture,
             vec![reply],
             (scenario == "stop-intent").then(|| (entered.clone(), release.clone())),
+            NativeSendReadiness::Observed,
         )
         .await;
         let work = tokio::spawn({
@@ -1603,6 +1919,16 @@ fn fake_host_with_boot(
     change_boot: bool,
     boot: HostBootId,
 ) -> (Arc<StdMutex<Vec<HostCommand>>>, tokio::task::JoinHandle<()>) {
+    fake_host_with_native_behavior(runtime_dir, change_boot, boot, None, false)
+}
+
+fn fake_host_with_native_behavior(
+    runtime_dir: &std::path::Path,
+    change_boot: bool,
+    boot: HostBootId,
+    auth_gate: Option<Arc<tokio::sync::Notify>>,
+    host_busy: bool,
+) -> (Arc<StdMutex<Vec<HostCommand>>>, tokio::task::JoinHandle<()>) {
     let secret = b"synthetic-host-secret";
     std::fs::write(runtime_dir.join("secret"), secret).unwrap();
     let listener = UnixListener::bind(runtime_dir.join("host.sock")).unwrap();
@@ -1621,6 +1947,9 @@ fn fake_host_with_boot(
                     incarnation_id,
                     challenge,
                 } => {
+                    if let Some(gate) = &auth_gate {
+                        gate.notified().await;
+                    }
                     hello_count += 1;
                     let current = if change_boot && hello_count > 1 {
                         HostBootId::new()
@@ -1648,16 +1977,20 @@ fn fake_host_with_boot(
                 } => {
                     assert_eq!(native_session_id, "name-native");
                     assert_eq!(codex_home, "/owning/codex");
-                    HostResult::FreshAgentNativeName(match operation {
-                        FreshAgentNativeNameOperation::Probe => {
-                            FreshAgentNativeNameReply::Available
-                        }
-                        FreshAgentNativeNameOperation::Read => {
-                            FreshAgentNativeNameReply::Title(Some("Native title".into()))
-                        }
-                        FreshAgentNativeNameOperation::Write { title } => {
-                            assert_eq!(title, "Manual title");
-                            FreshAgentNativeNameReply::Renamed
+                    HostResult::FreshAgentNativeName(if host_busy {
+                        FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::LifecycleBusy)
+                    } else {
+                        match operation {
+                            FreshAgentNativeNameOperation::Probe => {
+                                FreshAgentNativeNameReply::Available
+                            }
+                            FreshAgentNativeNameOperation::Read => {
+                                FreshAgentNativeNameReply::Title(Some("Native title".into()))
+                            }
+                            FreshAgentNativeNameOperation::Write { title } => {
+                                assert_eq!(title, "Manual title");
+                                FreshAgentNativeNameReply::Renamed
+                            }
                         }
                     })
                 }
@@ -1669,15 +2002,14 @@ fn fake_host_with_boot(
                 },
                 other => panic!("configure sent an unexpected host command {other:?}"),
             };
-            write_frame(
+            let _ = write_frame(
                 &mut socket,
                 &HostReply {
                     request_id: envelope.request_id,
                     result: Ok(result),
                 },
             )
-            .await
-            .unwrap();
+            .await;
         }
     });
     (received, task)
@@ -1982,6 +2314,57 @@ fn host_configure_gets_the_fresh_agent_command_budget() {
 }
 
 #[tokio::test]
+async fn native_name_transient_lifecycle_admission_preserves_the_current_request() {
+    let fixture = running_fresh_provider_with_name(FreshProvider::Codex, None, "name-native").await;
+    let request = native_name_request(&fixture).await;
+    let (received, host) = fake_host_with_boot(
+        &fixture.runtime_dir,
+        false,
+        request.source.host_boot_id.clone(),
+    );
+    let lifecycle = fixture.supervisor.lifecycle_lock(&fixture.soul).await;
+    let held = lifecycle.lock().await;
+    let mut operation = Box::pin(fixture.supervisor.fresh_agent_native_name(request));
+    let first_poll = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(operation.as_mut(), cx))
+    })
+    .await;
+    let std::task::Poll::Ready(reply) = first_poll else {
+        panic!("lifecycle contention must refuse immediately rather than queue native work");
+    };
+    assert_eq!(
+        reply.unwrap(),
+        FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::LifecycleBusy)
+    );
+    assert!(
+        received.lock().unwrap().is_empty(),
+        "refused admission performs no host/native work"
+    );
+    drop(operation);
+    drop(held);
+    // Only a new request with freshly observed authority may use the released
+    // lock. The refused future must never resume or spend a native attempt.
+    let fresh = native_name_request(&fixture).await;
+    let reply = fixture
+        .supervisor
+        .fresh_agent_native_name(fresh)
+        .await
+        .unwrap();
+    host.abort();
+    let _ = host.await;
+    assert_eq!(reply, FreshAgentNativeNameReply::Renamed);
+    assert_eq!(
+        received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|command| matches!(command, HostCommand::FreshAgentNativeName { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn admin_native_name_rejects_stale_authority_before_host_work_and_preserves_recovery() {
     for scenario in [
         "read",
@@ -2058,6 +2441,7 @@ async fn admin_native_name_rejects_stale_authority_before_host_work_and_preserve
                     "probe" => FreshAgentNativeNameOperation::Probe,
                     _ => FreshAgentNativeNameOperation::Read,
                 },
+                deadline_unix_ms: None,
                 expected_control_epoch: Some(if scenario == "stale-epoch" {
                     epoch + 1
                 } else {
@@ -2091,13 +2475,13 @@ async fn admin_native_name_rejects_stale_authority_before_host_work_and_preserve
                 ),
                 "write" => assert_eq!(reply, FreshAgentNativeNameReply::Renamed),
                 "probe" => assert_eq!(reply, FreshAgentNativeNameReply::Available),
-                "boot-changes" => assert_eq!(
-                    reply,
-                    FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Closed)
-                ),
                 "busy" => assert_eq!(
                     reply,
                     FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::LifecycleBusy)
+                ),
+                "boot-changes" => assert_eq!(
+                    reply,
+                    FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Closed)
                 ),
                 _ => assert!(matches!(
                     reply,
@@ -2207,6 +2591,7 @@ async fn native_name_lifecycle_busy_is_typed_and_fresh_retry_dispatches_once() {
                 codex_home: "/owning/codex".into(),
                 operation: FreshAgentNativeNameOperation::Read,
                 expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
+                deadline_unix_ms: None,
             }),
         );
         request.auth = Some(SECRET.into());
@@ -2340,4 +2725,221 @@ async fn admin_model_catalog_uses_authenticated_current_host_and_preserves_recov
             "catalog reads must never reconfigure recovery"
         );
     }
+}
+
+async fn native_name_request(fixture: &RunningFreshAgent) -> FreshAgentNativeNameRequest {
+    let view = fixture
+        .supervisor
+        .registry
+        .inventory()
+        .await
+        .unwrap()
+        .remove(0);
+    FreshAgentNativeNameRequest {
+        soul_id: fixture.soul.clone(),
+        source: FreshAgentNativeNameSource {
+            incarnation_id: view.incarnation_id,
+            host_boot_id: view.host_boot_id.unwrap(),
+            execution_generation: view.execution_generation,
+            intent_revision: view.intent_revision,
+            native_session_id: "name-native".into(),
+        },
+        codex_home: "/owning/codex".into(),
+        operation: FreshAgentNativeNameOperation::Write {
+            title: "Manual title".into(),
+        },
+        expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
+        deadline_unix_ms: None,
+    }
+}
+
+#[tokio::test]
+async fn native_name_queued_stop_cancellation_and_deadline_never_dispatch_late() {
+    for case in ["stop", "cancel", "deadline", "epoch"] {
+        let fixture =
+            running_fresh_provider_with_name(FreshProvider::Codex, None, "name-native").await;
+        let mut request = native_name_request(&fixture).await;
+        if case == "deadline" {
+            request.deadline_unix_ms = Some(super::now_millis() + 5_000);
+        }
+        let (received, host) = fake_host_with_boot(
+            &fixture.runtime_dir,
+            false,
+            request.source.host_boot_id.clone(),
+        );
+        let lifecycle = fixture.supervisor.lifecycle_lock(&fixture.soul).await;
+        let held = lifecycle.lock().await;
+        let mut operation = Box::pin(fixture.supervisor.fresh_agent_native_name(request.clone()));
+        let first_poll = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(operation.as_mut(), cx))
+        })
+        .await;
+        let std::task::Poll::Ready(reply) = first_poll else {
+            panic!("{case}: lifecycle contention must not leave a queued request");
+        };
+        assert_eq!(
+            reply.unwrap(),
+            FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::LifecycleBusy)
+        );
+        assert!(
+            received.lock().unwrap().is_empty(),
+            "{case}: typed refusal must precede every host/native operation"
+        );
+        drop(operation);
+        match case {
+            "stop" => {
+                fixture
+                    .supervisor
+                    .registry
+                    .begin_stop_expected(fixture.soul.clone(), None)
+                    .await
+                    .unwrap();
+            }
+            "deadline" => {
+                // Even after the refused request's old deadline and lock
+                // release, no detached queue entry may survive its caller.
+                tokio::time::pause();
+                tokio::time::advance(std::time::Duration::from_millis(5_001)).await;
+                tokio::time::resume();
+            }
+            "epoch" => {
+                request.expected_control_epoch =
+                    Some(fixture.supervisor.registry.control_epoch() + 1)
+            }
+            "cancel" => {}
+            _ => unreachable!(),
+        }
+        drop(held);
+        if matches!(case, "stop" | "epoch") {
+            // A fresh attempt must reject the stopped source or stale epoch
+            // before authenticating, rather than revive the old refusal.
+            let reply = fixture.supervisor.fresh_agent_native_name(request).await;
+            if case == "epoch" {
+                assert_eq!(reply.unwrap_err().code, RuntimeErrorCode::StaleControlEpoch);
+            } else {
+                assert!(
+                    reply.is_err()
+                        || matches!(
+                            reply.unwrap(),
+                            FreshAgentNativeNameReply::Failed(
+                                FreshAgentNativeNameError::Unavailable { .. }
+                            )
+                        )
+                );
+            }
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            received.lock().unwrap().is_empty(),
+            "{case}: refused or cancelled work must never authenticate or dispatch after release"
+        );
+        host.abort();
+        let _ = host.await;
+    }
+}
+
+#[tokio::test]
+async fn native_name_rechecks_stop_and_deadline_after_delayed_authentication() {
+    for case in ["stop", "deadline", "cancel"] {
+        let fixture =
+            running_fresh_provider_with_name(FreshProvider::Codex, None, "name-native").await;
+        let mut request = native_name_request(&fixture).await;
+        if case == "deadline" {
+            request.deadline_unix_ms = Some(super::now_millis() + 5_000);
+        }
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (received, host) = fake_host_with_native_behavior(
+            &fixture.runtime_dir,
+            false,
+            request.source.host_boot_id.clone(),
+            Some(gate.clone()),
+            false,
+        );
+        let mut operation = Box::pin(fixture.supervisor.fresh_agent_native_name(request));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    reply = &mut operation => panic!("metadata settled before authentication was released: {reply:?}"),
+                    _ = tokio::task::yield_now() => {}
+                }
+                if !received.lock().unwrap().is_empty() { break; }
+            }
+        }).await.unwrap();
+        if case == "stop" {
+            fixture
+                .supervisor
+                .registry
+                .begin_stop_expected(fixture.soul.clone(), None)
+                .await
+                .unwrap();
+            gate.notify_one();
+            assert!(matches!(
+                operation.await.unwrap(),
+                FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Unavailable { .. })
+            ));
+        } else if case == "deadline" {
+            tokio::time::pause();
+            tokio::time::advance(std::time::Duration::from_millis(5_001)).await;
+            let reply = operation.await.unwrap();
+            tokio::time::resume();
+            assert!(matches!(
+                reply,
+                FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Timeout { .. })
+            ));
+            gate.notify_one();
+        } else {
+            // Cancellation is exercised while real host authentication is
+            // pending; immediate Busy refusals have no queued future to abort.
+            drop(operation);
+            let lifecycle = fixture.supervisor.lifecycle_lock(&fixture.soul).await;
+            assert!(
+                lifecycle.try_lock().is_ok(),
+                "caller cancellation must release lifecycle admission"
+            );
+            gate.notify_one();
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            !received
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|command| matches!(command, HostCommand::FreshAgentNativeName { .. })),
+            "{case}: delayed auth cannot authorize late native work"
+        );
+        host.abort();
+        let _ = host.await;
+    }
+}
+
+#[tokio::test]
+async fn native_name_host_reply_cannot_forge_undispatched_admission_proof() {
+    let fixture = running_fresh_provider_with_name(FreshProvider::Codex, None, "name-native").await;
+    let request = native_name_request(&fixture).await;
+    let (received, host) = fake_host_with_native_behavior(
+        &fixture.runtime_dir,
+        false,
+        request.source.host_boot_id.clone(),
+        None,
+        true,
+    );
+    assert!(matches!(
+        fixture
+            .supervisor
+            .fresh_agent_native_name(request)
+            .await
+            .unwrap(),
+        FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::InvalidResponse { .. })
+    ));
+    assert_eq!(
+        received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|command| matches!(command, HostCommand::FreshAgentNativeName { .. }))
+            .count(),
+        1
+    );
+    host.abort();
+    let _ = host.await;
 }

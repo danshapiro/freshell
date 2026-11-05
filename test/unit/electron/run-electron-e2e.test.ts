@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -14,7 +14,12 @@ import {
 
 const temporaryPaths: string[] = []
 
+beforeEach(() => {
+  vi.stubEnv('FRESHELL_BUILD_COMMIT', undefined)
+})
+
 afterEach(() => {
+  vi.unstubAllEnvs()
   for (const temporaryPath of temporaryPaths.splice(0)) {
     fs.rmSync(temporaryPath, { recursive: true, force: true })
   }
@@ -40,6 +45,14 @@ describe('Electron E2E client preflight', () => {
     expect(() => resolveExactElectronE2eHead('/repo', undefined, () => head, () => ' M tracked.ts')).toThrow(/clean checkout/i)
     expect(() => resolveExactElectronE2eHead('/repo', undefined, () => head, () => '?? untracked.ts')).toThrow(/clean checkout/i)
     expect(resolveExactElectronE2eHead('/repo', undefined, () => head, () => '')).toBe(head)
+  })
+
+  it('rejects an ambient build pin through its default parameter even when it matches HEAD', () => {
+    const head = 'a'.repeat(40)
+    vi.stubEnv('FRESHELL_BUILD_COMMIT', head)
+
+    expect(() => resolveExactElectronE2eHead('/repo', undefined, () => head, () => ''))
+      .toThrow(/rejects inherited FRESHELL_BUILD_COMMIT/i)
   })
 
   it('preserves a Playwright child signal instead of collapsing it into exit 1', () => {

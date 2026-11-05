@@ -197,6 +197,7 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
         "missing",
         "source-changes",
         "unavailable",
+        "rpc-busy",
         "lifecycle-busy",
         "lifecycle-busy-source-changes",
         "lifecycle-busy-postflight-fails",
@@ -263,6 +264,10 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
                             | "lifecycle-busy-postflight-fails" => {
                                 Reply::Failed(Error::LifecycleBusy)
                             }
+                            "rpc-busy" => Reply::Failed(Error::Rpc {
+                                code: -32000,
+                                message: "busy".into(),
+                            }),
                             "unsupported" => Reply::Failed(Error::Rpc {
                                 code: -32601,
                                 message: "method unavailable".into(),
@@ -332,7 +337,7 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
                     "{scenario}: {reply:?}"
                 )
             }
-            "missing" | "unavailable" | "refused" | "transport" => assert!(
+            "missing" | "unavailable" | "refused" | "transport" | "rpc-busy" => assert!(
                 matches!(reply, NativeCallResult::Undelivered(_)),
                 "{scenario}: {reply:?}"
             ),
@@ -815,6 +820,7 @@ mod initial_grant_reference_tests {
                                 fixture_evidence: serde_json::json!({}),
                                 native_session_id: native_root.clone(),
                                 native_identity_observation: None,
+                                native_readiness_receipt: None,
                                 opencode_transfer_receipt: None,
                                 opencode_adoption: Default::default(),
                             }

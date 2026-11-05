@@ -5253,3 +5253,467 @@ async fn an_invalid_observation_title_retains_provenance_without_offering_or_rea
     assert_eq!(sync.status, NativeSyncStatus::Pending);
     assert!(sync.reason.is_none());
 }
+
+/// Only typed supervisor admission refusals count here. A busy operation has
+/// not reached the provider, unlike a native RPC error whose text says busy.
+struct AdmissionContentionBackend {
+    phase: &'static str,
+    remaining: AtomicU32,
+    refused: AtomicU32,
+    reads: AtomicU32,
+    writes: AtomicU32,
+    title: Mutex<Option<String>>,
+}
+impl AdmissionContentionBackend {
+    fn refuses(&self, phase: &str) -> bool {
+        if self.phase == phase
+            && self
+                .remaining
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        {
+            self.refused.fetch_add(1, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+}
+impl NativeNameBackend for AdmissionContentionBackend {
+    fn read(&self, _target: NativeNameTarget) -> super::NativeFuture<NativeNameReadback> {
+        let phase = if self.writes.load(Ordering::SeqCst) == 0 {
+            "pre-read"
+        } else {
+            "confirm"
+        };
+        if self.refuses(phase) {
+            return Box::pin(async { NativeCallResult::LifecycleBusy });
+        }
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        let title = self.title.lock().unwrap().clone();
+        Box::pin(async move { NativeCallResult::Confirmed(NativeNameReadback { title }) })
+    }
+    fn write(&self, attempt: super::NativeNameAttempt) -> super::NativeFuture<()> {
+        if self.refuses("write") {
+            return Box::pin(async { NativeCallResult::LifecycleBusy });
+        }
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        *self.title.lock().unwrap() = Some(attempt.title);
+        Box::pin(async { NativeCallResult::Confirmed(()) })
+    }
+    fn route_available(&self, _target: NativeNameTarget) -> super::NativeProbeFuture {
+        Box::pin(async { super::NativeProbeResult::Available })
+    }
+}
+
+#[tokio::test]
+async fn admission_busy_retries_each_native_phase_without_repeating_acknowledged_writes() {
+    for phase in ["pre-read", "write", "confirm"] {
+        let dir = temp_data_dir();
+        let mut now = 1_700_000_000_000_i64;
+        let set_now = |time| {
+            crate::session_names::set_test_hooks(
+                dir.path(),
+                vec![crate::session_names::TestHook::FrozenClockMs(time)],
+            )
+        };
+        set_now(now);
+        let mut store = open_store(dir.path());
+        let target = armed_pending(&store, "h-admission", "/h/.claude").await;
+        let revision = store.get(vec![target.clone()]).await.unwrap()[0]
+            .record
+            .revision;
+        let backend = AdmissionContentionBackend {
+            phase,
+            remaining: AtomicU32::new(5),
+            refused: AtomicU32::new(0),
+            reads: AtomicU32::new(0),
+            writes: AtomicU32::new(0),
+            title: Mutex::new(Some("Divergent".into())),
+        };
+        for refusal in 1..=5 {
+            super::run_cycle(&store, &backend, &target).await;
+            let sync = native_sync_of(&store, target.clone()).await.unwrap();
+            assert_eq!(
+                sync.status,
+                NativeSyncStatus::Pending,
+                "{phase}: a local admission refusal cannot abandon the current desired revision"
+            );
+            assert_eq!(sync.desired_revision, revision);
+            let document = document_json(dir.path());
+            let state = native_entry_of(&document);
+            assert_eq!(
+                state["cyclesConsumed"],
+                if phase == "confirm" { 1 } else { 0 },
+                "{phase}: undispatched writes refund their cycle; acknowledged writes retain read-only claims"
+            );
+            assert_eq!(
+                state["readsConsumed"],
+                backend.reads.load(Ordering::SeqCst),
+                "only actually dispatched reads remain charged"
+            );
+            assert_eq!(backend.refused.load(Ordering::SeqCst), refusal);
+            let due = state["nextDue"]
+                .as_i64()
+                .expect("busy work has a finite reprobe delay");
+            assert!(due > now);
+            set_now(due - 1);
+            assert!(
+                store.native_work_snapshot().is_empty(),
+                "busy retry must not spin before its scheduled delay"
+            );
+            now = due;
+            set_now(now);
+            drop(store);
+            store = open_store(dir.path());
+            assert_eq!(
+                store.native_work_snapshot().len(),
+                1,
+                "{phase}: paused phase survives reopening the real store"
+            );
+        }
+        super::run_cycle(&store, &backend, &target).await;
+        if phase == "write" {
+            // Five refused writes consumed five real pre-reads. The sixth
+            // read admits one write; its confirmation must get a bounded
+            // fresh window rather than abandon the acknowledged receipt.
+            let doc = document_json(dir.path());
+            let state = native_entry_of(&doc);
+            assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+            assert_eq!(state["readsConsumed"], 6);
+            assert_eq!(state["cyclesConsumed"], 1);
+            assert_eq!(state["attemptedReceipts"].as_array().unwrap().len(), 1);
+            let due = state["nextDue"]
+                .as_i64()
+                .expect("confirmation cooldown is persisted");
+            assert_eq!(
+                due - now,
+                crate::session_names::NATIVE_LIFECYCLE_BUSY_COOLDOWN_MS
+            );
+            assert_eq!(
+                state["lifecycleBusyDeferrals"], 5,
+                "read-window exhaustion must not fabricate another busy refusal"
+            );
+            set_now(due);
+            drop(store);
+            store = open_store(dir.path());
+            super::run_cycle(&store, &backend, &target).await;
+        }
+        let sync = native_sync_of(&store, target.clone()).await.unwrap();
+        assert_eq!(
+            sync.status,
+            NativeSyncStatus::Synced,
+            "{phase}: release must synchronize the same desired name"
+        );
+        assert_eq!(sync.desired_revision, revision);
+        if phase == "write" {
+            assert_eq!(
+                native_entry_of(&document_json(dir.path()))["lifecycleBusyDeferrals"],
+                5,
+                "the confirmation read-window retry preserves every actual busy refusal"
+            );
+        }
+        assert_eq!(
+            backend.reads.load(Ordering::SeqCst),
+            if phase == "write" { 7 } else { 2 },
+            "{phase}: every actual pre-read/confirmation is counted; refused reads consume nothing"
+        );
+        assert_eq!(
+            backend.writes.load(Ordering::SeqCst),
+            1,
+            "{phase}: acknowledged writes are never repeated"
+        );
+        assert_eq!(
+            native_entry_of(&document_json(dir.path()))["cyclesConsumed"],
+            match phase {
+                "confirm" | "write" => 2,
+                _ => 1,
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn admission_busy_continuation_does_not_follow_a_new_name_or_location() {
+    for change in ["name", "location"] {
+        let dir = temp_data_dir();
+        let now = 1_700_000_000_000_i64;
+        crate::session_names::set_test_hooks(
+            dir.path(),
+            vec![crate::session_names::TestHook::FrozenClockMs(now)],
+        );
+        let store = open_store(dir.path());
+        let target = armed_pending(&store, "h-busy-superseded", "/h/.claude").await;
+        let backend = AdmissionContentionBackend {
+            phase: "write",
+            remaining: AtomicU32::new(1),
+            refused: AtomicU32::new(0),
+            reads: AtomicU32::new(0),
+            writes: AtomicU32::new(0),
+            title: Mutex::new(Some("Divergent".into())),
+        };
+        super::run_cycle(&store, &backend, &target).await;
+        assert_eq!(backend.reads.load(Ordering::SeqCst), 1);
+        if change == "name" {
+            rename_user(&store, target.clone(), "Latest manual name")
+                .await
+                .unwrap();
+        } else {
+            record_acquisition(
+                &store,
+                target.clone(),
+                verified_acquisition(claude_location("/new/.claude", "h-busy-superseded")),
+            )
+            .await
+            .unwrap();
+            crate::session_names::set_test_hooks(
+                dir.path(),
+                vec![crate::session_names::TestHook::FrozenClockMs(now + 2_000)],
+            );
+        }
+        super::run_cycle(&store, &backend, &target).await;
+        assert_eq!(
+            backend.reads.load(Ordering::SeqCst),
+            3,
+            "{change}: a new authority requires a new pre-read, not the old write continuation"
+        );
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            backend.title.lock().unwrap().as_deref(),
+            Some(if change == "name" {
+                "Latest manual name"
+            } else {
+                "Manual Title"
+            })
+        );
+        assert_eq!(
+            native_sync_of(&store, target).await.unwrap().status,
+            NativeSyncStatus::Synced
+        );
+    }
+}
+
+#[tokio::test]
+async fn admission_busy_proof_cannot_refund_a_later_claim_or_a_new_series() {
+    let dir = temp_data_dir();
+    let now = 1_700_000_000_000_i64;
+    crate::session_names::set_test_hooks(
+        dir.path(),
+        vec![crate::session_names::TestHook::FrozenClockMs(now)],
+    );
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-busy-replay", "/h/.claude").await;
+    let first = store
+        .claim_native_cycle(target.clone(), "first-admission".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(store.charge_native_read(first.clone()).await.unwrap());
+    assert!(matches!(
+        store
+            .defer_native_lifecycle_busy(first.clone(), true, true)
+            .await
+            .unwrap(),
+        super::NativeLifecycleDeferralResult::Deferred { .. }
+    ));
+    crate::session_names::set_test_hooks(
+        dir.path(),
+        vec![crate::session_names::TestHook::FrozenClockMs(now + 2_000)],
+    );
+    let next = store
+        .claim_native_cycle(target.clone(), "next-admission".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(store.charge_native_read(next.clone()).await.unwrap());
+    assert_eq!(
+        store
+            .defer_native_lifecycle_busy(first, true, true)
+            .await
+            .unwrap(),
+        super::NativeLifecycleDeferralResult::Stale
+    );
+    assert_eq!(
+        native_entry_of(&document_json(dir.path()))["readsConsumed"],
+        1,
+        "replayed no-dispatch proof cannot refund a new admission"
+    );
+    rename_user(&store, target.clone(), "New revision")
+        .await
+        .unwrap();
+    let latest = store
+        .claim_native_cycle(target, "new-series".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(store.charge_native_read(latest).await.unwrap());
+    assert_eq!(
+        store
+            .defer_native_lifecycle_busy(next, true, true)
+            .await
+            .unwrap(),
+        super::NativeLifecycleDeferralResult::Stale
+    );
+    assert_eq!(
+        native_entry_of(&document_json(dir.path()))["readsConsumed"],
+        1,
+        "a superseded series cannot refund a current native operation"
+    );
+}
+
+#[tokio::test]
+async fn admission_busy_on_the_final_cycle_preserves_actual_native_limits() {
+    let dir = temp_data_dir();
+    let mut now = 1_700_000_000_000_i64;
+    crate::session_names::set_test_hooks(
+        dir.path(),
+        vec![crate::session_names::TestHook::FrozenClockMs(now)],
+    );
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-busy-final", "/h/.claude").await;
+    let dispatched_failures =
+        ScriptedBackend::new(vec![WriteStep::Undelivered, WriteStep::Undelivered]);
+    dispatched_failures.set_title(Some("Divergent"));
+    for _ in 0..2 {
+        super::run_cycle(&store, dispatched_failures.as_ref(), &target).await;
+        now = native_entry_of(&document_json(dir.path()))["nextDue"]
+            .as_i64()
+            .unwrap();
+        crate::session_names::set_test_hooks(
+            dir.path(),
+            vec![crate::session_names::TestHook::FrozenClockMs(now)],
+        );
+    }
+    let backend = AdmissionContentionBackend {
+        phase: "confirm",
+        remaining: AtomicU32::new(5),
+        refused: AtomicU32::new(0),
+        reads: AtomicU32::new(0),
+        writes: AtomicU32::new(0),
+        title: Mutex::new(Some("Divergent".into())),
+    };
+    for _ in 0..5 {
+        super::run_cycle(&store, &backend, &target).await;
+        let doc = document_json(dir.path());
+        let state = native_entry_of(&doc);
+        assert_eq!(state["cyclesConsumed"], 3);
+        assert_eq!(state["readsConsumed"], 3);
+        // Earlier real write failures remain Unsynced in the upstream
+        // projection. The acknowledged receipt is still live and read-only,
+        // so typed contention must neither settle it nor spend more writes.
+        assert_eq!(
+            native_sync_of(&store, target.clone()).await.unwrap().status,
+            NativeSyncStatus::Unsynced
+        );
+        assert_eq!(state["settled"], false);
+        assert!(state["confirmationPendingReceipt"].as_str().is_some());
+        now = state["nextDue"].as_i64().unwrap();
+        crate::session_names::set_test_hooks(
+            dir.path(),
+            vec![crate::session_names::TestHook::FrozenClockMs(now)],
+        );
+        assert_eq!(
+            store.native_work_snapshot().len(),
+            1,
+            "the final acknowledged cycle remains eligible for confirmation"
+        );
+    }
+    super::run_cycle(&store, &backend, &target).await;
+    assert_eq!(
+        native_sync_of(&store, target.clone()).await.unwrap().status,
+        NativeSyncStatus::Synced
+    );
+    let doc = document_json(dir.path());
+    let state = native_entry_of(&doc);
+    assert_eq!(state["cyclesConsumed"], 3);
+    assert_eq!(state["readsConsumed"], 4);
+    assert_eq!(
+        dispatched_failures.writes() + backend.writes.load(Ordering::SeqCst),
+        3
+    );
+    assert!(store.native_work_snapshot().is_empty());
+}
+
+#[tokio::test]
+async fn admission_busy_worker_retries_after_repeated_contention_then_converges() {
+    let dir = temp_data_dir();
+    let mut now = 1_700_000_000_000_i64;
+    crate::session_names::set_test_hooks(
+        dir.path(),
+        vec![crate::session_names::TestHook::FrozenClockMs(now)],
+    );
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-busy-worker", "/h/.claude").await;
+    let backend = Arc::new(AdmissionContentionBackend {
+        phase: "write",
+        remaining: AtomicU32::new(5),
+        refused: AtomicU32::new(0),
+        reads: AtomicU32::new(0),
+        writes: AtomicU32::new(0),
+        title: Mutex::new(Some("Divergent".into())),
+    });
+    let worker =
+        SessionNameWorker::start(store.clone(), backend.clone(), inert_generation(dir.path()));
+    for expected in 1..=5 {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if backend.refused.load(Ordering::SeqCst) == expected {
+                    let doc = document_json(dir.path());
+                    if let Some(due) = native_entry_of(&doc)["nextDue"]
+                        .as_i64()
+                        .filter(|due| *due > now)
+                    {
+                        now = due;
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the actual worker must persist each bounded busy retry");
+        assert_eq!(backend.reads.load(Ordering::SeqCst), expected);
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+        crate::session_names::set_test_hooks(
+            dir.path(),
+            vec![crate::session_names::TestHook::FrozenClockMs(now)],
+        );
+    }
+    // Let the successful write consume the sixth pre-read, then advance
+    // only the persisted bounded confirmation cooldown. No second write is
+    // permitted while the acknowledged receipt is waiting for its readback.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if backend.writes.load(Ordering::SeqCst) == 1 {
+                let doc = document_json(dir.path());
+                if let Some(due) = native_entry_of(&doc)["nextDue"]
+                    .as_i64()
+                    .filter(|due| *due > now)
+                {
+                    now = due;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("acknowledged write must schedule bounded confirmation recovery");
+    crate::session_names::set_test_hooks(
+        dir.path(),
+        vec![crate::session_names::TestHook::FrozenClockMs(now)],
+    );
+    let mut published = store.subscribe();
+    await_published_native_status(
+        &store,
+        &mut published,
+        &target,
+        NativeSyncStatus::Synced,
+        REAL_CLOCK_CONVERGENCE_BOUND,
+        "release after five refusals must retain and synchronize the desired revision",
+    )
+    .await;
+    worker.abort();
+    assert_eq!(backend.reads.load(Ordering::SeqCst), 7);
+    assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+}

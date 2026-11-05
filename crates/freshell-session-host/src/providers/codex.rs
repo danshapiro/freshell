@@ -208,6 +208,7 @@ pub async fn prepare(
         model: terminal.provider_model.as_deref(),
         sandbox: terminal.provider_sandbox.as_deref(),
         approval_policy: terminal.provider_permission_mode.as_deref(),
+        require_retained_sidecar: false,
         // The managed session host owns the sidecar inside the soul enclosure.
         // It has no web-owned MCP context to inherit, so use the explicit
         // empty launch context rather than silently reintroducing web state.

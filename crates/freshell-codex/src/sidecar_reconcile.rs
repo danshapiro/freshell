@@ -217,6 +217,49 @@ impl SidecarReconciler {
         self.claim_first_still_held(session_id, &ranked)
     }
 
+    /// Read-only routing evidence for an already adopted terminal from a
+    /// previous server generation. The actual claim re-verifies identity.
+    /// Session ids and a matching cwd alone never qualify a process.
+    pub fn has_verified_terminal_session(&self, session_id: &str) -> bool {
+        self.held.lock().unwrap().values().any(|record| {
+            record.session_id.as_deref() == Some(session_id)
+                && record
+                    .terminal_id
+                    .as_deref()
+                    .is_some_and(|id| !id.is_empty())
+                && record.lane != Some(SidecarLane::FreshAgent)
+                && verify_sidecar_identity(record) == IdentityVerdict::Verified
+        })
+    }
+
+    /// Return an uncommitted borrow without rewriting its original durable
+    /// owner. Claim and sweep use this same held -> index lock order.
+    pub(crate) fn return_uncommitted_claim(&self, record: CodexSidecarRecord) {
+        let mut held = self.held.lock().unwrap();
+        let mut by_session = self.by_session.lock().unwrap();
+        if held.contains_key(&record.ownership_id) {
+            tracing::error!(
+                event = "codex.retained_sidecar_return_conflict",
+                ownership_id = %record.ownership_id,
+                "Existing held ownership was preserved instead of overwritten"
+            );
+            return;
+        }
+        if let Some(session_id) = record.session_id.as_ref() {
+            by_session
+                .entry(session_id.clone())
+                .or_default()
+                .push(record.ownership_id.clone());
+        }
+        tracing::info!(
+            event = "codex.retained_sidecar_claim_returned",
+            ownership_id = %record.ownership_id,
+            pid = record.pid,
+            "Uncommitted restore returned its original owner without signalling it"
+        );
+        held.insert(record.ownership_id.clone(), record);
+    }
+
     /// Records still held (unclaimed) — the sweep's future workload.
     pub fn unclaimed_len(&self) -> usize {
         self.held.lock().unwrap().len()
@@ -450,6 +493,17 @@ impl ReattachedCodexAppServerRuntime {
             store,
             verified_usable: AtomicBool::new(false),
         }
+    }
+
+    /// The retained-claim lease already checked readiness and has now won
+    /// final create ownership. Ordinary pane teardown owns this process.
+    pub(crate) fn from_committed_claim(
+        record: CodexSidecarRecord,
+        store: Arc<CodexSidecarStore>,
+    ) -> Self {
+        let runtime = Self::new(record, store);
+        runtime.verified_usable.store(true, Ordering::SeqCst);
+        runtime
     }
 }
 

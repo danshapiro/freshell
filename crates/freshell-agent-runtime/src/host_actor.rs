@@ -2408,6 +2408,35 @@ impl FreshAgentHostActor {
         self.transport.native_identity_evidence().await
     }
 
+    /// Retain the original Codex source binding for its owned recovery send.
+    /// This is past evidence, never a current native observation. The caller
+    /// must bind it to its exact launch; dispatch still verifies the original
+    /// writer's termination and supplies the typed replacement receipt.
+    pub async fn codex_dispatch_recovery_evidence(&self) -> Option<Value> {
+        if self.stopped.load(Ordering::SeqCst)
+            || self.native_identity_transition.load(Ordering::SeqCst)
+            || self.is_live().await
+        {
+            return None;
+        }
+        let original = {
+            let state = self.state.lock().await;
+            if state.profile.provider != FreshProvider::Codex
+                || state.profile.runtime_variant != "codex-app-server"
+            {
+                return None;
+            }
+            state.profile.native_session_id.clone()?
+        };
+        let evidence = self.transport.native_identity_evidence().await?;
+        let state = self.state.lock().await;
+        (!self.stopped.load(Ordering::SeqCst)
+            && !self.native_identity_transition.load(Ordering::SeqCst)
+            && state.profile.native_session_id.as_deref() == Some(original.as_str())
+            && evidence["nativeSessionId"].as_str() == Some(original.as_str()))
+        .then_some(evidence)
+    }
+
     pub async fn observe_native_identity(
         &self,
         native_session_id: String,

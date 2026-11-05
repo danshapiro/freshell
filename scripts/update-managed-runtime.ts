@@ -828,7 +828,12 @@ export async function waitForSupervisorReadiness<T>(
     if (result !== undefined) return result
     const afterCheckMs = deadline - Date.now()
     if (afterCheckMs <= 0) break
-    await new Promise(resolve => setTimeout(resolve, Math.min(intervalMs, afterCheckMs)))
+    const waitMs = Math.min(intervalMs, afterCheckMs)
+    await new Promise(resolve => setTimeout(resolve, waitMs))
+    // This wait spent the remaining deadline. Timer rounding can leave the
+    // wall clock 1 ms short; another subprocess probe cannot meaningfully
+    // establish readiness and would replace the last actionable failure.
+    if (waitMs === afterCheckMs) break
   }
   const message = options.timeoutMessage
     ?? 'The restarted managed-runtime supervisor did not become ready with its verified process and authenticated Health identity before the timeout.'

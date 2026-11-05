@@ -50,7 +50,7 @@ pub struct CodexSidecarRecord {
     pub starttime: u64,
     /// `/proc/<pid>/cmdline` argv, NUL-split.
     pub cmdline: Vec<String>,
-    /// The app-server's `--listen` URL.
+    /// The app-server's actual bound endpoint. Its captured argv may request port0.
     pub ws_url: String,
     /// Codex thread id, enriched when known.
     #[serde(skip_serializing_if = "Option::is_none")]

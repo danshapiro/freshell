@@ -54,9 +54,13 @@ pub mod managed_launch;
 #[cfg(feature = "real-transport")]
 pub mod remote_proxy;
 #[cfg(feature = "real-transport")]
+mod retained_sidecar;
+#[cfg(feature = "real-transport")]
 pub mod runtime_select;
 #[cfg(feature = "real-transport")]
 pub mod sidecar_reconcile;
+#[cfg(feature = "real-transport")]
+pub mod sidecar_startup;
 #[cfg(feature = "real-transport")]
 pub mod sidecar_store;
 #[cfg(feature = "real-transport")]

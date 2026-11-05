@@ -604,7 +604,8 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   }, 240_000)
 })
 
-describe('installed Codex through the managed gateway and durable actor', () => {
+describe.each(['warm host', 'cold replacement'] as const)(
+  'installed Codex through the managed gateway and durable actor (%s)', recoveryOwner => {
   let rig: ManagedRuntimeBrowserRig
   let home: string
   let workspace: string
@@ -872,8 +873,13 @@ tool_timeout_sec = 120
         try{appServer=fs.readFileSync('/proc/'+pid+'/cmdline','utf8').split(String.fromCharCode(0)).includes('app-server')}catch{}
         if(executable!==layout.nativeExecutable&&!appServer&&field('Name')!=='codex')return[];
         let cwd,cwdError,workspace;try{cwd=fs.readlinkSync('/proc/'+pid+'/cwd');const s=fs.statSync(cwd);let writable=false;try{fs.accessSync(cwd,fs.constants.W_OK);writable=true}catch{}workspace={uid:s.uid,gid:s.gid,mode:(s.mode&511).toString(8),writable}}catch(error){cwdError=error.code}
+        const stat=fs.readFileSync('/proc/'+pid+'/stat','utf8');
+        const starttime=stat.slice(stat.lastIndexOf(')')+2).split(' ')[19];
+        const argv=fs.readFileSync('/proc/'+pid+'/cmdline','utf8').split(String.fromCharCode(0)).filter(Boolean);
+        const ownership=fs.readFileSync('/proc/'+pid+'/environ','utf8').split(String.fromCharCode(0)).find(value=>value.startsWith('FRESHELL_CODEX_SIDECAR_ID='))?.slice('FRESHELL_CODEX_SIDECAR_ID='.length);
+        if(!starttime||!ownership)throw Error('Owned native process identity is incomplete');
         return[{pid:Number(pid),parentPid:Number(field('PPid')),state:field('State'),uid:Number(field('Uid')?.split(String.fromCharCode(9))[0]),gid:Number(field('Gid')?.split(String.fromCharCode(9))[0]),
-          executable,exeError,appServer,cwd,cwdError,workspace,noNewPrivs:field('NoNewPrivs'),capEff:field('CapEff')}];
+          executable,exeError,appServer,cwd,cwdError,workspace,noNewPrivs:field('NoNewPrivs'),capEff:field('CapEff'),processIdentity:{pid:Number(pid),starttime,argv,ownership,executable,cwd,namespace:{net:fs.readlinkSync('/proc/'+pid+'/ns/net'),pid:fs.readlinkSync('/proc/'+pid+'/ns/pid'),mnt:fs.readlinkSync('/proc/'+pid+'/ns/mnt')}}}];
       }catch{return[]}});const found=candidates.filter(row=>row.executable===layout.nativeExecutable&&row.appServer&&row.cwd===expectedCwd);
       if(found.length!==1)throw Error('Expected one actual installed native Codex app-server for the accepted working directory: '+JSON.stringify({expectedNative:layout.nativeExecutable,expectedCwd,matches:found.length,candidates}));process.stdout.write(JSON.stringify(found[0]));`]))
     const inspectNativeAppServers = async () => JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
@@ -1320,9 +1326,23 @@ tool_timeout_sec = 120
     const nativeSessionId = view.nativeSessionId
     if (typeof nativeSessionId !== 'string') throw new Error('Managed Codex view has no native session ID')
     const readNativeName = async (nativeId = view.nativeSessionId, context = nativeContext) => JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
-      const fs=require('node:fs');const argv=fs.readFileSync('/proc/${context.pid}/cmdline','utf8').split(String.fromCharCode(0));
-      const endpoint=argv[argv.indexOf('--listen')+1];const target=new URL(endpoint);
-      if(target.protocol!=='ws:'||target.hostname!=='127.0.0.1'||!target.port)throw Error('Expected the existing native loopback endpoint');
+      const fs=require('node:fs');const root='/proc/${context.pid}';const expected=${JSON.stringify(context.processIdentity)};
+      const identity=()=>{const stat=fs.readFileSync(root+'/stat','utf8');return{pid:${context.pid},
+        starttime:stat.slice(stat.lastIndexOf(')')+2).split(' ')[19],
+        argv:fs.readFileSync(root+'/cmdline','utf8').split(String.fromCharCode(0)).filter(Boolean),
+        ownership:fs.readFileSync(root+'/environ','utf8').split(String.fromCharCode(0)).find(value=>value.startsWith('FRESHELL_CODEX_SIDECAR_ID='))?.slice('FRESHELL_CODEX_SIDECAR_ID='.length),
+        executable:fs.readlinkSync(root+'/exe'),cwd:fs.readlinkSync(root+'/cwd'),namespace:{net:fs.readlinkSync(root+'/ns/net'),pid:fs.readlinkSync(root+'/ns/pid'),mnt:fs.readlinkSync(root+'/ns/mnt')}};};
+      const qualify=()=>{const actual=identity();if(!expected||JSON.stringify(actual)!==JSON.stringify(expected))throw Error('Owned native process identity changed');return actual;};
+      const proof=qualify();if(proof.namespace.net!==fs.readlinkSync('/proc/self/ns/net'))throw Error('Native metadata observer is outside the owned network namespace');const at=proof.argv.indexOf('--listen');
+      if(!proof.argv.includes('app-server')||at<0||proof.argv.filter(value=>value==='--listen').length!==1)throw Error('Expected one owned native app-server listen request');
+      const requested=new URL(proof.argv[at+1]);
+      if(requested.protocol!=='ws:'||requested.hostname!=='127.0.0.1'||requested.username||requested.password||requested.search||requested.hash||!requested.port)throw Error('Expected the owned native loopback listen request');
+      const listener=()=>{qualify();const owned=new Set(fs.readdirSync(root+'/fd').flatMap(fd=>{try{const value=fs.readlinkSync(root+'/fd/'+fd);return value.startsWith('socket:[')&&value.endsWith(']')?[value.slice(8,-1)]:[];}catch{return[];}}));
+        const matches=fs.readFileSync(root+'/net/tcp','utf8').trim().split(String.fromCharCode(10)).slice(1).flatMap(line=>{const fields=line.trim().split(' ').filter(Boolean);const [ip,port]=fields[1].split(':');const value=parseInt(port,16);
+          return fields[3]==='0A'&&ip==='0100007F'&&owned.has(fields[9])&&value>0&&value<=65535?[{port:value,inode:fields[9]}]:[];});
+        if(matches.length!==1)throw Error('Expected exactly one loopback listener owned by the native process');qualify();return matches[0];};
+      const selected=listener();if(Number(requested.port)!==0&&Number(requested.port)!==selected.port)throw Error('Owned native listener differs from its fixed-port request');
+      const endpoint='ws://127.0.0.1:'+selected.port;
       const socket=new WebSocket(endpoint);let settled=false;
       const finish=(error,value)=>{if(settled)return;settled=true;clearTimeout(timer);socket.close();
         if(error){process.stderr.write(String(error));process.exit(1)}process.stdout.write(JSON.stringify(value),()=>process.exit(0));};
@@ -1331,7 +1351,8 @@ tool_timeout_sec = 120
       socket.addEventListener('open',()=>socket.send(JSON.stringify({id:1,method:'initialize',params:{clientInfo:{name:'freshell_name_read_probe',version:'1'}}})));
       socket.addEventListener('message',event=>{const frame=JSON.parse(String(event.data));if(frame.error)return finish(frame.error.message);
         if(frame.id===1){socket.send(JSON.stringify({method:'initialized'}));socket.send(JSON.stringify({id:2,method:'thread/read',params:{threadId:${JSON.stringify(nativeId)},includeTurns:false}}));}
-        if(frame.id===2)finish(null,{id:frame.result.thread.id,title:frame.result.thread.name??null});});`]))
+        if(frame.id===2){try{const current=listener();if(current.port!==selected.port||current.inode!==selected.inode||frame.result.thread.id!==${JSON.stringify(nativeId)})throw Error('Owned native metadata source changed');
+          finish(null,{id:frame.result.thread.id,title:frame.result.thread.name??null});}catch(error){finish(error instanceof Error?error.message:String(error));}}});`]))
     const nativeNameBeforeWait = await readNativeName()
     rig.runtime.writeIncident('freshcodex-managed-native-name-writeback', { canonicalName, nativeNameBeforeWait, view, nativeContext })
     await waitForNativeNameSync(durableNameRef, canonicalName, 'managed native name synchronization',
@@ -1509,20 +1530,22 @@ tool_timeout_sec = 120
       collaborationMode: 'plan', permissionMode: 'never', sandbox: 'read-only' })
     const beforeCrash = { view: await rig.runningViewForFreshSession(created.sessionId), snapshot: await snapshot(),
       name: await readName(), nativeContext: await inspectNativeContext(), trafficCursor: (await model.readTraffic()).length }
+    if (!beforeCrash.view) throw new Error('Owned Codex runtime is missing before the native crash')
     expect(beforeCrash.name).toEqual(canonicalName)
     rig.runtime.writeIncident('freshcodex-managed-native-before-crash', beforeCrash)
-    // Pause only this receipt-owned session host so it cannot take the live
-    // readiness path while the provider history is removed. The supervisor
-    // must recover through a new host and its durable cold-start receipt.
     const lifecycleBeforeHostPause = readSupervisorLifecycle()
     const supervisorSequenceBeforeHostPause = lifecycleBeforeHostPause.reduce((latest, row) =>
       Number.isSafeInteger(row.sequence) ? Math.max(latest, row.sequence) : latest, 0)
-    const stoppedSessionHostPid = rig.signalOwnedSessionHostExact(
-      providerContainerId, beforeCrash.view!.incarnationId, 'SIGSTOP')
-    pausedSessionHost = {
-      containerId: providerContainerId,
-      incarnationId: beforeCrash.view!.incarnationId,
-      pid: stoppedSessionHostPid,
+    let stoppedSessionHostPid: number | undefined
+    if (recoveryOwner === 'cold replacement') {
+      // Pause only this exact owned host so the cold case cannot recover in place.
+      stoppedSessionHostPid = rig.signalOwnedSessionHostExact(
+        providerContainerId, beforeCrash.view!.incarnationId, 'SIGSTOP')
+      pausedSessionHost = {
+        containerId: providerContainerId,
+        incarnationId: beforeCrash.view!.incarnationId,
+        pid: stoppedSessionHostPid,
+      }
     }
     // Kill only this receipt-owned, inspected release native PID. Archive its
     // REAL native-generated history after exit, keeping every original byte.
@@ -1772,85 +1795,125 @@ tool_timeout_sec = 120
     expect(postArchiveCensus.complete).toBe(true)
     expect(postArchiveCensus.sessionDirectoryState).toBe('readable')
     expect(postArchiveCensus.targetHeaderCount).toBe(0)
-    const beforeColdHostRetirement = await rig.runningViewForFreshSession(created.sessionId)
-    expect(beforeColdHostRetirement?.incarnationId).toBe(beforeCrash.view!.incarnationId)
-    expect(beforeColdHostRetirement?.nativeSessionId).toBe(view.nativeSessionId)
-    expect(rig.runtime.isContainerRunning(providerContainerId)).toBe(true)
-    const priorHostTraffic = await model.readTraffic()
-    retainedModelTraffic = [...retainedModelTraffic, ...priorHostTraffic]
-    // The actor is paused, so a provider-exit observer cannot complete an
-    // in-place readiness change. Retire its exact container before waiting
-    // for the observer, forcing recovery to open a new actor process.
-    expect(stoppedSessionHostPid).toBeGreaterThan(1)
-    rig.runtime.killOwnedRuntimeExact(providerContainerId)
-    pausedSessionHost = undefined
-    model = undefined
-    let coldRecovery: { trigger: any; settled: any }
-    try {
-      coldRecovery = await waitFor('cold Codex replacement recovery settlement', async () => {
-        const rows = readSupervisorLifecycle()
-        const trigger = rows.find(row => row.sequence > supervisorSequenceBeforeHostPause
-          && row.event === 'supervisor.runtime_observer.recovery_scheduled'
-          && row.data?.soulId === beforeCrash.view!.soulId
-          && row.data?.trigger === 'host_unreachable')
-        if (!trigger) return undefined
-        const settlements = rows.filter(row => row.sequence > trigger.sequence
-          && row.data?.soulId === beforeCrash.view!.soulId
-          && ['supervisor.recovery_retry.settled', 'supervisor.recovery_retry.exhausted']
-            .includes(row.event))
-        for (const settled of settlements.reverse()) {
-          if (settled.event === 'supervisor.recovery_retry.exhausted') return { trigger, settled }
-          if (settled.data?.reason !== 'recovered' || typeof settled.data?.incarnationId !== 'string') continue
-          const hostPath = path.join(rig.supervisor.runtimeRoot,
-            settled.data.incarnationId, 'host-lifecycle.jsonl')
-          try {
-            const hostEvents = readBoundedTail(hostPath, 1024 * 1024).split('\n').flatMap(line => {
-              try { return [JSON.parse(line)] } catch { return [] }
-            })
-            if (hostEvents.some(row => row.event === 'host.native_identity.readiness_receipt_committed')) {
-              return { trigger, settled }
-            }
-          } catch { /* A later settlement may still carry its host receipt. */ }
-        }
-        return undefined
-      }, 150_000)
-    } catch (error) {
-      const diagnostic = coldRecoveryDiagnostics()
-      try { rig.runtime.writeIncident('freshcodex-managed-native-cold-recovery-failed', diagnostic) } catch { /* Preserve the recovery failure. */ }
-      throw new Error(`cold Codex host recovery did not settle: ${error instanceof Error ? error.message : String(error)}; ${JSON.stringify(diagnostic)}`)
+    let recovered: Awaited<ReturnType<typeof rig.runningViewForFreshSession>>
+    let coldRecovery: { trigger: any; settled: any } | undefined
+    if (recoveryOwner === 'warm host') {
+      // Let the real provider-exit observer settle before the original send.
+      // Recovery must not depend on submitting input before its store probe.
+      const observerRecovery = await rig.runtime.adminOk(rig.supervisor,
+        rig.runtime.recoverBody(beforeCrash.view.soulId, 'provider_exit'))
+      const observerSettled = (await rig.inventory()).find(row => row.containerId === providerContainerId)
+      expect(observerSettled).toMatchObject({ launchState: 'running', recoveryState: 'blocked',
+        recoveryReason: 'IMPLEMENTATION_UNAVAILABLE', nativeSessionId: view.nativeSessionId })
+      const responsesBeforeBlockedSend = (await model!.readTraffic())
+        .filter((row: any) => row.path === '/v1/responses').length
+      const blockedRequestId = `send-${randomUUID()}`
+      wire.send({ type: 'freshAgent.send', sessionType: 'freshcodex', provider: 'codex',
+        sessionId: created.sessionId, requestId: blockedRequestId, text: 'AWAITED_PLAN_RECOVERY' })
+      const blockedSend = await wire.wait(frame => frame.requestId === blockedRequestId
+        && ['freshAgent.send.accepted', 'error'].includes(frame.type))
+      expect(blockedSend.type, JSON.stringify(blockedSend)).toBe('error')
+      expect(blockedSend.message).toContain('IMPLEMENTATION_UNAVAILABLE')
+      const responsesAfterBlockedSend = (await model!.readTraffic())
+        .filter((row: any) => row.path === '/v1/responses').length
+      expect(responsesAfterBlockedSend).toBe(responsesBeforeBlockedSend)
+      const blockedView = await rig.runningViewForFreshSession(created.sessionId)
+      expect(blockedView).toMatchObject({ incarnationId: beforeCrash.view!.incarnationId,
+        hostBootId: beforeCrash.view!.hostBootId, nativeSessionId: view.nativeSessionId })
+      rig.runtime.writeIncident('freshcodex-managed-native-observer-settled-loss', {
+        userRef: created.sessionId, observerRecovery, observerSettled, blockedSend,
+        modelResponsesBefore: responsesBeforeBlockedSend, modelResponsesAfter: responsesAfterBlockedSend,
+        blockedView, archiveManifest,
+      })
+      // Legacy mode must keep this conversation blocked; the cold case below
+      // exercises positive recovery through a replacement conversation.
+      return
+    } else {
+      const beforeColdHostRetirement = await rig.runningViewForFreshSession(created.sessionId)
+      expect(beforeColdHostRetirement?.incarnationId).toBe(beforeCrash.view!.incarnationId)
+      expect(beforeColdHostRetirement?.nativeSessionId).toBe(view.nativeSessionId)
+      expect(rig.runtime.isContainerRunning(providerContainerId)).toBe(true)
+      const priorHostTraffic = await model.readTraffic()
+      retainedModelTraffic = [...retainedModelTraffic, ...priorHostTraffic]
+      // The actor is paused, so a provider-exit observer cannot complete an
+      // in-place readiness change. Retire its exact container before waiting
+      // for the observer, forcing recovery to open a new actor process.
+      expect(stoppedSessionHostPid).toBeGreaterThan(1)
+      rig.runtime.killOwnedRuntimeExact(providerContainerId)
+      pausedSessionHost = undefined
+      model = undefined
+      let settledColdRecovery: { trigger: any; settled: any }
+      try {
+        settledColdRecovery = await waitFor('cold Codex replacement recovery settlement', async () => {
+          const rows = readSupervisorLifecycle()
+          const trigger = rows.find(row => row.sequence > supervisorSequenceBeforeHostPause
+            && row.event === 'supervisor.runtime_observer.recovery_scheduled'
+            && row.data?.soulId === beforeCrash.view!.soulId
+            // Polling can observe the exact host kill before or after exit.
+            && ['host_unreachable', 'provider_exit'].includes(row.data?.trigger))
+          if (!trigger) return undefined
+          const settlements = rows.filter(row => row.sequence > trigger.sequence
+            && row.data?.soulId === beforeCrash.view!.soulId
+            && ['supervisor.recovery_retry.settled', 'supervisor.recovery_retry.exhausted']
+              .includes(row.event))
+          for (const settled of settlements.reverse()) {
+            if (settled.event === 'supervisor.recovery_retry.exhausted') return { trigger, settled }
+            if (settled.data?.reason !== 'recovered' || typeof settled.data?.incarnationId !== 'string') continue
+            const hostPath = path.join(rig.supervisor.runtimeRoot,
+              settled.data.incarnationId, 'host-lifecycle.jsonl')
+            try {
+              const hostEvents = readBoundedTail(hostPath, 1024 * 1024).split('\n').flatMap(line => {
+                try { return [JSON.parse(line)] } catch { return [] }
+              })
+              if (hostEvents.some(row => row.event === 'host.native_identity.readiness_receipt_committed')) {
+                return { trigger, settled }
+              }
+            } catch { /* A later settlement may still carry its host receipt. */ }
+          }
+          return undefined
+        }, 150_000)
+      } catch (error) {
+        const diagnostic = coldRecoveryDiagnostics()
+        try { rig.runtime.writeIncident('freshcodex-managed-native-cold-recovery-failed', diagnostic) } catch { /* Preserve the recovery failure. */ }
+        throw new Error(`cold Codex host recovery did not settle: ${error instanceof Error ? error.message : String(error)}; ${JSON.stringify(diagnostic)}`)
+      }
+      const coldRecoveryDiagnostic = coldRecoveryDiagnostics()
+      rig.runtime.writeIncident('freshcodex-managed-native-cold-recovery-settlement', coldRecoveryDiagnostic)
+      expect(['host_unreachable', 'provider_exit']).toContain(settledColdRecovery.trigger.data.trigger)
+      expect(settledColdRecovery.settled.event).toBe('supervisor.recovery_retry.settled')
+      expect(settledColdRecovery.settled.data.reason).toBe('recovered')
+      expect(settledColdRecovery.settled.data.incarnationId).not.toBe(beforeCrash.view!.incarnationId)
+      recovered = await waitFor('cold replacement Codex actor running', async () => {
+        const current = await rig.runningViewForFreshSession(created.sessionId)
+        if (!current || !current.containerId || !current.hostBootId
+          || current.incarnationId !== settledColdRecovery.settled.data.incarnationId
+          || !rig.runtime.isContainerRunning(current.containerId)) return undefined
+        return current
+      })
+      expect(recovered.incarnationId).not.toBe(beforeCrash.view!.incarnationId)
+      expect(recovered.hostBootId).not.toBe(beforeCrash.view!.hostBootId)
+      expect(recovered.nativeSessionId).toBeTruthy()
+      expect(recovered.nativeSessionId).not.toBe(view.nativeSessionId)
+      providerContainerId = recovered.containerId!
+      const recoveredHostLifecyclePath = path.join(rig.supervisor.runtimeRoot,
+        recovered.incarnationId, 'host-lifecycle.jsonl')
+      const recoveredHostEvents = readBoundedTail(recoveredHostLifecyclePath, 1024 * 1024)
+        .split('\n').flatMap(line => { try { return [JSON.parse(line)] } catch { return [] } })
+      expect(recoveredHostEvents.some(row => row.event === 'host.native_identity.readiness_receipt_committed'))
+        .toBe(true)
+      model = await startInManagedContext(rig, { containerId: providerContainerId, handlerSource })
+      coldRecovery = settledColdRecovery
     }
-    const coldRecoveryDiagnostic = coldRecoveryDiagnostics()
-    rig.runtime.writeIncident('freshcodex-managed-native-cold-recovery-settlement', coldRecoveryDiagnostic)
-    expect(coldRecovery.trigger.data.trigger).toBe('host_unreachable')
-    expect(coldRecovery.settled.event).toBe('supervisor.recovery_retry.settled')
-    expect(coldRecovery.settled.data.reason).toBe('recovered')
-    expect(coldRecovery.settled.data.incarnationId).not.toBe(beforeCrash.view!.incarnationId)
-    const recovered = await waitFor('cold replacement Codex actor running', async () => {
-      const current = await rig.runningViewForFreshSession(created.sessionId)
-      if (!current || !current.containerId || !current.hostBootId
-        || current.incarnationId !== coldRecovery.settled.data.incarnationId
-        || !rig.runtime.isContainerRunning(current.containerId)) return undefined
-      return current
-    })
-    expect(recovered.incarnationId).not.toBe(beforeCrash.view!.incarnationId)
-    expect(recovered.hostBootId).not.toBe(beforeCrash.view!.hostBootId)
-    expect(recovered.nativeSessionId).toBeTruthy()
-    expect(recovered.nativeSessionId).not.toBe(view.nativeSessionId)
-    providerContainerId = recovered.containerId!
-    const recoveredHostLifecyclePath = path.join(rig.supervisor.runtimeRoot,
-      recovered.incarnationId, 'host-lifecycle.jsonl')
-    const recoveredHostEvents = readBoundedTail(recoveredHostLifecyclePath, 1024 * 1024)
-      .split('\n').flatMap(line => { try { return [JSON.parse(line)] } catch { return [] } })
-    expect(recoveredHostEvents.some(row => row.event === 'host.native_identity.readiness_receipt_committed'))
-      .toBe(true)
-    model = await startInManagedContext(rig, { containerId: providerContainerId, handlerSource })
     const recoveryAccepted = await send('AWAITED_PLAN_RECOVERY')
+    recovered = await rig.runningViewForFreshSession(created.sessionId)
+    expect(recovered?.incarnationId).toBe(coldRecovery!.settled.data.incarnationId)
     rig.runtime.writeIncident('freshcodex-managed-native-crash-first-send', { userRef: created.sessionId, beforeCrash,
-      archive: archiveManifestDiagnostics, nativeExit, recoveryAccepted, recovered, coldRecovery: {
+      archive: archiveManifestDiagnostics, nativeExit, recoveryAccepted, recovered, recoveryOwner,
+      coldRecovery: coldRecovery ? {
         trigger: coldRecovery.trigger.event, outcome: coldRecovery.settled.event,
         reason: coldRecovery.settled.data.reason, incarnationId: coldRecovery.settled.data.incarnationId,
         receiptCommitted: true,
-      }, newTraffic: await model.readTraffic(), frames: wire.frames.slice(-30) })
+      } : undefined, newTraffic: await model.readTraffic(), frames: wire.frames.slice(-30) })
     // Acceptance must durably commit the new native source before returning.
     expect(recovered?.nativeSessionId).toBeTruthy()
     expect(recovered!.nativeSessionId).not.toBe(view.nativeSessionId)

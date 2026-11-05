@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
@@ -1214,6 +1214,241 @@ async fn spawned_runtime_receives_context_but_reattached_runtime_does_not() {
 }
 
 #[tokio::test]
+async fn retained_claim_returns_unchanged_before_final_create_commit() {
+    for phase in [
+        "plan-discard",
+        "planner-cancel",
+        "post-adopt-owner-loss",
+        "post-adopt-server-retention",
+    ] {
+        assert_retained_claim_lifecycle(phase).await;
+    }
+}
+
+#[tokio::test]
+async fn committed_retained_owner_enriches_new_identity_and_retains_it_for_next_restart() {
+    assert_retained_claim_lifecycle("committed-enrich-and-retention").await;
+}
+
+async fn assert_retained_claim_lifecycle(phase: &str) {
+    let (_store_dir, store) = temp_sidecar_store();
+    let survivor = SpawnedCodexAppServerRuntime::with_command_and_store(
+        fake_app_server_command(),
+        store.clone(),
+    );
+    survivor.ensure_ready(None).await.unwrap();
+    survivor
+        .note_session_id("retained-rollback-session".into())
+        .await
+        .unwrap();
+    survivor
+        .update_ownership_metadata("prior-terminal".into(), 1)
+        .await
+        .unwrap();
+    survivor
+        .prepare_retention("prior-server-shutdown".into())
+        .await
+        .unwrap();
+    let original = store.load_all().pop().expect("prior durable owner");
+    let (reconciler, _) = SidecarReconciler::boot_reconcile(store.clone());
+    let reconciler = Arc::new(reconciler);
+    let manager = CodexTerminalLaunchManager::new(Box::new({
+        let reconciler = reconciler.clone();
+        let store = store.clone();
+        move |plan| {
+            let reconciler = reconciler.clone();
+            let store = store.clone();
+            Box::pin(
+                async move { select_codex_runtime(Some(&reconciler), Some(&store), plan).await },
+            )
+        }
+    }));
+    let launch = manager
+        .plan_create_with_retry_uncancellable(
+            &CodexLaunchPlanInput {
+                resume_session_id: Some("retained-rollback-session"),
+                require_retained_sidecar: true,
+                ..Default::default()
+            },
+            1,
+            LaunchClass::Interactive,
+        )
+        .await
+        .expect("plan against owned retained process");
+    let proxy = launch.remote_ws_url.clone();
+    match phase {
+        "plan-discard" => manager.discard(launch).await,
+        "planner-cancel" => {
+            manager.shutdown().await;
+            drop(launch);
+        }
+        "committed-enrich-and-retention" => {
+            manager
+                .adopt("new-committed-terminal", launch, 2)
+                .await
+                .unwrap();
+            manager
+                .commit_ownership("new-committed-terminal")
+                .await
+                .unwrap();
+            manager
+                .note_session_id("new-committed-terminal", "new-native-thread")
+                .await;
+            manager.begin_shutdown_retention();
+            manager.shutdown().await;
+        }
+        "post-adopt-server-retention" => {
+            manager
+                .adopt("new-uncommitted-terminal", launch, 2)
+                .await
+                .unwrap();
+            manager.begin_shutdown_retention();
+            manager.shutdown().await;
+        }
+        _ => {
+            manager
+                .adopt("new-uncommitted-terminal", launch, 2)
+                .await
+                .unwrap();
+            // The real WS path adopts before its final coordinator commit.
+            // An ownership loser kills its new TUI and reaches this hook.
+            // A premature native identity event must not rewrite the prior
+            // binding while that transfer is still only borrowed.
+            manager
+                .note_session_id("new-uncommitted-terminal", "must-not-rebind-pending")
+                .await;
+            manager.notify_terminal_exit("new-uncommitted-terminal");
+            timeout(RECV_TIMEOUT, async {
+                while reconciler.unclaimed_len() != 1
+                    && proc_starttime(original.pid as i32) == Some(original.starttime)
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("settle the owned rollback");
+        }
+    }
+    let same_process = proc_starttime(original.pid as i32) == Some(original.starttime);
+    let (same_record, discoverable) = if phase == "committed-enrich-and-retention" {
+        let records = store.load_all();
+        let correct_binding = records.len() == 1
+            && records[0].pid == original.pid
+            && records[0].starttime == original.starttime
+            && records[0].session_id.as_deref() == Some("new-native-thread")
+            && records[0].terminal_id.as_deref() == Some("new-committed-terminal")
+            && matches!(records[0].state, SidecarRecordState::Retained { .. });
+        let (next_boot, _) = SidecarReconciler::boot_reconcile(store.clone());
+        (
+            correct_binding,
+            next_boot.has_verified_terminal_session("new-native-thread"),
+        )
+    } else {
+        (
+            store.load_all() == vec![original.clone()],
+            reconciler.has_verified_terminal_session("retained-rollback-session"),
+        )
+    };
+    let proxy_closed = connect_async(&proxy).await.is_err();
+    manager.shutdown().await;
+    // prepare_retention deliberately detached this test-owned native child;
+    // clean it up only after collecting the rollback evidence.
+    freshell_codex::sidecar_sweep::kill_verified_sidecar_tree(&original).await;
+    wait_pid_gone(original.pid).await;
+    assert!(
+        same_process,
+        "{phase} must preserve the existing native PID/start ticks"
+    );
+    assert!(
+        same_record,
+        "{phase} must preserve the correct durable owner binding"
+    );
+    assert!(
+        discoverable,
+        "{phase} must leave its current native identity discoverable for reconnect"
+    );
+    assert!(
+        proxy_closed,
+        "{phase} must close only the newly-created proxy"
+    );
+}
+
+#[tokio::test]
+async fn required_retained_runtime_refuses_missing_or_consumed_claim_without_new_owner() {
+    let dir = tempfile::tempdir().expect("owned runtime observations");
+    let (_store_dir, store) = temp_sidecar_store();
+    let survivor = SpawnedCodexAppServerRuntime::with_command_and_store(
+        fake_app_server_command(),
+        store.clone(),
+    );
+    survivor
+        .ensure_ready(None)
+        .await
+        .expect("start owned survivor");
+    survivor
+        .note_session_id("required-retained-session".into())
+        .await
+        .unwrap();
+    survivor
+        .update_ownership_metadata("prior-terminal".into(), 1)
+        .await
+        .unwrap();
+    let pid = survivor.child_pid().await.expect("owned survivor pid");
+    let start = proc_starttime(pid as i32).expect("owned survivor start ticks");
+    let (reconciler, _) = SidecarReconciler::boot_reconcile(store.clone());
+    let reconciler = Arc::new(reconciler);
+    let claimed = reconciler
+        .claim_for_session("required-retained-session")
+        .await;
+    assert!(claimed.is_some(), "consume this exact owned claim");
+
+    let replacement_log = dir.path().join("must-not-spawn.json");
+    let plan = plan_codex_launch(&CodexLaunchPlanInput {
+        resume_session_id: Some("required-retained-session"),
+        require_retained_sidecar: true,
+        sidecar_context: sidecar_context(&replacement_log),
+        ..Default::default()
+    })
+    .unwrap();
+    let mut outcomes = Vec::new();
+    for available in [false, true] {
+        let selected = select_codex_runtime(
+            available.then_some(&reconciler),
+            available.then_some(&store),
+            &plan,
+        )
+        .await;
+        let ready_refused = selected.ensure_ready(None).await.is_err();
+        let adoption_refused = selected
+            .update_ownership_metadata("must-not-own".into(), 2)
+            .await
+            .is_err();
+        selected.shutdown().await.unwrap();
+        outcomes.push((ready_refused, adoption_refused));
+    }
+    let same_native_process = proc_starttime(pid as i32) == Some(start);
+    let no_replacement = !replacement_log.exists();
+    survivor
+        .shutdown()
+        .await
+        .expect("clean up only owned fixture");
+    wait_pid_gone(pid).await;
+
+    assert!(
+        outcomes.iter().all(|&(ready, adopt)| ready && adopt),
+        "an absent or consumed claim must refuse both readiness and ownership"
+    );
+    assert!(
+        same_native_process,
+        "claim loss must not kill the existing native process"
+    );
+    assert!(
+        no_replacement,
+        "claim loss must not create a second provider writer"
+    );
+}
+
+#[tokio::test]
 async fn spawned_runtime_launches_the_app_server_and_relays_through_the_proxy() {
     let tmp = std::env::temp_dir().join(format!("freshell-codex-s4-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
@@ -1730,6 +1965,11 @@ async fn ensure_ready_persists_a_verified_sidecar_record() {
         record.ws_url, ready.ws_url,
         "record ws_url is the returned one"
     );
+    assert!(record
+        .cmdline
+        .windows(2)
+        .any(|args| args == ["--listen", "ws://127.0.0.1:0"]));
+    assert_ne!(ready.ws_url, "ws://127.0.0.1:0");
     assert_eq!(
         verify_sidecar_identity(record),
         IdentityVerdict::Verified,
@@ -1740,6 +1980,276 @@ async fn ensure_ready_persists_a_verified_sidecar_record() {
         .shutdown()
         .await
         .expect("shutdown cleans up the child");
+}
+
+#[tokio::test]
+async fn spawned_runtime_uses_its_own_announced_listener() {
+    struct RivalGuard(std::path::PathBuf, String);
+    impl Drop for RivalGuard {
+        fn drop(&mut self) {
+            let Ok(bytes) = std::fs::read(&self.0) else {
+                return;
+            };
+            let Ok(row) = serde_json::from_slice::<Value>(&bytes) else {
+                return;
+            };
+            let Some(pid) = row["pid"].as_u64() else {
+                return;
+            };
+            let Ok(environment) = std::fs::read(format!("/proc/{pid}/environ")) else {
+                return;
+            };
+            let needle = format!("FRESHELL_CODEX_SIDECAR_ID={}", self.1);
+            if environment
+                .split(|byte| *byte == 0)
+                .any(|entry| entry == needle.as_bytes())
+            {
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
+    }
+    let (dir, store) = temp_sidecar_store();
+    let rival = dir.path().join("rival");
+    std::fs::create_dir_all(&rival).unwrap();
+    let ready_path = rival.join("ready.json");
+    let rival_id = format!(
+        "rival-{}",
+        dir.path().file_name().unwrap().to_string_lossy()
+    );
+    let _guard = RivalGuard(ready_path.clone(), rival_id.clone());
+    let behavior_path = dir.path().join("behavior.json");
+    std::fs::write(
+        &behavior_path,
+        json!({"startupCompetingListener":{
+            "home":rival,"readyPath":ready_path,"releasePath":rival.join("release"),
+            "ownershipId":rival_id,"requestsPath":rival.join("requests.jsonl"),
+            "eventsPath":rival.join("events.jsonl"),
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let runtime = SpawnedCodexAppServerRuntime::with_command_and_store(
+        format!(
+            "{} --fixture-behavior-file {}",
+            fake_app_server_command(),
+            behavior_path.display()
+        ),
+        store.clone(),
+    );
+    let ready = runtime
+        .ensure_ready(None)
+        .await
+        .expect("own listener starts");
+    let rival_ready: Value = serde_json::from_slice(&std::fs::read(&ready_path).unwrap()).unwrap();
+    assert_ne!(
+        ready.ws_url,
+        rival_ready["url"].as_str().unwrap(),
+        "readiness must never use a competing listener"
+    );
+    let row = store.load_all().pop().unwrap();
+    assert_eq!(row.ws_url, ready.ws_url);
+    assert_eq!(verify_sidecar_identity(&row), IdentityVerdict::Verified);
+    runtime.shutdown().await.unwrap();
+    let requests: Vec<Value> = std::fs::read_to_string(rival.join("requests.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the rival only receives its intentional warmup: {requests:?}"
+    );
+    assert_eq!(requests[0]["method"], "initialize");
+}
+
+async fn receive_native_fixture_frame(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> Value {
+    loop {
+        let frame = timeout(RECV_TIMEOUT, socket.next())
+            .await
+            .expect("native frame arrives")
+            .expect("socket stays open")
+            .unwrap();
+        if let Message::Text(text) = frame {
+            return serde_json::from_str(&text).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_fixture_only_cold_resume_emits_idle_before_the_response() {
+    let runtime = SpawnedCodexAppServerRuntime::with_command_and_store(
+        fake_app_server_command(),
+        Arc::new(CodexSidecarStore::disabled()),
+    );
+    let ready = runtime.ensure_ready(None).await.unwrap();
+    let (mut requester, _) = connect_async(&ready.ws_url).await.unwrap();
+    let (mut opted_out, _) = connect_async(&ready.ws_url).await.unwrap();
+    for (socket, id, opt_outs) in [
+        (&mut requester, "requester-init", json!([])),
+        (
+            &mut opted_out,
+            "opted-out-init",
+            json!(["thread/started", "thread/status/changed"]),
+        ),
+    ] {
+        socket.send(Message::Text(json!({"id":id,"method":"initialize","params":{"capabilities":{"optOutNotificationMethods":opt_outs}}}).to_string())).await.unwrap();
+        assert_eq!(receive_native_fixture_frame(socket).await["id"], id);
+    }
+    // A new thread's Idle is in its response, not a separate notification.
+    requester
+        .send(Message::Text(
+            json!({"id":"start","method":"thread/start","params":{}}).to_string(),
+        ))
+        .await
+        .unwrap();
+    let started = receive_native_fixture_frame(&mut requester).await;
+    assert_eq!(started["id"], "start");
+    assert_eq!(started["result"]["thread"]["status"]["type"], "idle");
+    let started_id = started["result"]["thread"]["id"].as_str().unwrap();
+    let started_notification = receive_native_fixture_frame(&mut requester).await;
+    assert_eq!(started_notification["method"], "thread/started");
+    assert_eq!(started_notification["params"]["thread"]["id"], started_id);
+    requester
+        .send(Message::Text(
+            json!({"id":"start-barrier","method":"configRequirements/read","params":{}})
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        receive_native_fixture_frame(&mut requester).await["id"],
+        "start-barrier"
+    );
+
+    requester.send(Message::Text(json!({"id":"cold-resume","method":"thread/resume","params":{"threadId":"cold-native-thread"}}).to_string())).await.unwrap();
+    let cold_status = receive_native_fixture_frame(&mut requester).await;
+    assert_eq!(cold_status["method"], "thread/status/changed");
+    assert_eq!(
+        cold_status["params"],
+        json!({"threadId":"cold-native-thread","status":{"type":"idle"}})
+    );
+    assert_eq!(
+        receive_native_fixture_frame(&mut requester).await["id"],
+        "cold-resume"
+    );
+
+    // Both freshly started and just-resumed threads are now loaded. Repeating
+    // resume must not manufacture another Idle edge. RPC barriers establish
+    // absence without a sleep, including the per-connection opt-out control.
+    for (id, thread_id) in [
+        ("warm-resume", "cold-native-thread"),
+        ("started-resume", started_id),
+    ] {
+        requester
+            .send(Message::Text(
+                json!({"id":id,"method":"thread/resume","params":{"threadId":thread_id}})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(receive_native_fixture_frame(&mut requester).await["id"], id);
+    }
+    for (socket, id) in [
+        (&mut requester, "requester-barrier"),
+        (&mut opted_out, "opted-out-barrier"),
+    ] {
+        socket
+            .send(Message::Text(
+                json!({"id":id,"method":"configRequirements/read","params":{}}).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(receive_native_fixture_frame(socket).await["id"], id);
+    }
+    requester.close(None).await.unwrap();
+    opted_out.close(None).await.unwrap();
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_fixture_notification_opt_out_is_per_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let behavior = dir.path().join("behavior.json");
+    std::fs::write(&behavior, json!({"notificationsAfterMethods":{"thread/start":[{
+        "method":"thread/status/changed","params":{"threadId":"thread-new-1","status":{"type":"idle"}}
+    }]}}).to_string()).unwrap();
+    let runtime = SpawnedCodexAppServerRuntime::with_command_and_store(
+        format!(
+            "{} --fixture-behavior-file {}",
+            fake_app_server_command(),
+            behavior.display()
+        ),
+        Arc::new(CodexSidecarStore::disabled()),
+    );
+    let ready = runtime.ensure_ready(None).await.unwrap();
+    let (mut opted_out, _) = connect_async(&ready.ws_url).await.unwrap();
+    let (mut control, _) = connect_async(&ready.ws_url).await.unwrap();
+    opted_out.send(Message::Text(json!({"id":"opt-init","method":"initialize","params":{"capabilities":{"optOutNotificationMethods":["thread/started"]}}}).to_string())).await.unwrap();
+    control
+        .send(Message::Text(
+            json!({"id":"control-init","method":"initialize","params":{}}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        receive_native_fixture_frame(&mut opted_out).await["id"],
+        "opt-init"
+    );
+    assert_eq!(
+        receive_native_fixture_frame(&mut control).await["id"],
+        "control-init"
+    );
+    control
+        .send(Message::Text(
+            json!({"id":"control-start","method":"thread/start","params":{}}).to_string(),
+        ))
+        .await
+        .unwrap();
+    let response = receive_native_fixture_frame(&mut control).await;
+    let opted_notification = receive_native_fixture_frame(&mut opted_out).await;
+    let control_started = receive_native_fixture_frame(&mut control).await;
+    let control_status = receive_native_fixture_frame(&mut control).await;
+    // A same-connection RPC response is an ordering witness after the native
+    // notification batch; no timer-based negative assertion is needed.
+    opted_out
+        .send(Message::Text(
+            json!({"id":"opt-barrier","method":"configRequirements/read","params":{}}).to_string(),
+        ))
+        .await
+        .unwrap();
+    let mut opted_notifications = vec![opted_notification];
+    loop {
+        let frame = receive_native_fixture_frame(&mut opted_out).await;
+        if frame["id"] == "opt-barrier" {
+            break;
+        }
+        opted_notifications.push(frame);
+    }
+    opted_out.close(None).await.unwrap();
+    control.close(None).await.unwrap();
+    runtime.shutdown().await.unwrap();
+    assert_eq!(response["id"], "control-start", "responses remain intact");
+    assert_eq!(
+        control_started["method"], "thread/started",
+        "default client retains the notification"
+    );
+    assert_eq!(control_status["method"], "thread/status/changed");
+    assert_eq!(
+        opted_notifications.len(),
+        1,
+        "the opted-out method must not arrive before the response barrier: {opted_notifications:?}"
+    );
+    assert_eq!(
+        opted_notifications[0]["method"], "thread/status/changed",
+        "other notifications remain intact"
+    );
 }
 
 #[tokio::test]

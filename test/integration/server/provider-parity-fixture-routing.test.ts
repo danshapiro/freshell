@@ -59,15 +59,23 @@ process.exit(73);
 }
 
 describe('provider parity fixture Rust routing', () => {
-  it('keeps every Cargo selector behind the strict sandbox and hands its rows to the nested consumer', async () => {
+  it.each(['ordinary', 'sealed distribution output'])('keeps every Cargo selector behind the strict sandbox and hands its rows to the nested consumer: %s', async distribution => {
     const f = fixture()
-    await expect(runProviderParityFixture(f.root)).rejects.toThrow('failed (73)')
-    const observed = JSON.parse(fs.readFileSync(f.observed, 'utf8'))
-    expect(observed.row).toEqual({ route: 'sandbox', mode: 'runtime-suite' })
-    expect(path.relative(path.join(f.root, 'dist'), observed.directory)).not.toMatch(/^\.\./)
-    expect(fs.existsSync(observed.directory), 'the fixture settles its exact shared row directory').toBe(false)
-    expect(fs.existsSync(f.hostCargo), 'a strict selector must never execute host Cargo').toBe(false)
-    expect(fs.readFileSync(f.sandboxCalls, 'utf8').trim().split('\n')).toHaveLength(4)
+    const dist = path.join(f.root, 'dist')
+    const retained = path.join(dist, 'retained-build')
+    fs.mkdirSync(dist)
+    fs.writeFileSync(retained, 'private distribution output')
+    if (distribution === 'sealed distribution output') fs.chmodSync(dist, 0o500)
+    try {
+      await expect(runProviderParityFixture(f.root)).rejects.toThrow('failed (73)')
+      const observed = JSON.parse(fs.readFileSync(f.observed, 'utf8'))
+      expect(observed.row).toEqual({ route: 'sandbox', mode: 'runtime-suite' })
+      expect(path.relative(f.root, observed.directory)).not.toMatch(/^\.\./)
+      expect(fs.existsSync(observed.directory), 'the fixture settles its exact shared row directory').toBe(false)
+      expect(fs.existsSync(f.hostCargo), 'a strict selector must never execute host Cargo').toBe(false)
+      expect(fs.readFileSync(f.sandboxCalls, 'utf8').trim().split('\n')).toHaveLength(4)
+      expect(fs.readFileSync(retained, 'utf8')).toBe('private distribution output')
+    } finally { fs.chmodSync(dist, 0o700) }
   })
 
   it('keeps non-test artifact builds on their existing native build-and-copy route', () => {

@@ -98,6 +98,15 @@ host-agent sessions, then use a separate deliberate approved recovery and
 verify authenticated readiness against the intended supervisor before
 describing the agents as protected.
 
+For a deliberate upgrade from older protocol-1 hosts, qualify retained
+terminal processes, Codex sidecar adoption, and original-host Claude and
+OpenCode restoration with the candidate first. Qualify any separately selected
+history transfers for their intended route. See
+[Retaining processes from a legacy installation](managed-runtime-rollout.md#retaining-processes-from-a-legacy-installation).
+This does not bypass the updater's refusal or authorize a service restart.
+Record the specific interruption and recovery plan for other host-owned
+agents before requesting bootstrap approval.
+
 For reset-capable updates, retain the isolated old-schema drill, read-only
 registry preflight, and verified live-backup procedure in
 [Managed runtime rollout](managed-runtime-rollout.md#upgrade-an-existing-installation-while-preserving-stores).
