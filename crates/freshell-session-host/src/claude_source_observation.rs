@@ -514,7 +514,7 @@ fn seed_retained_ordinary_candidate(
                         std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
                     ) =>
                 {
-                    continue
+                    continue;
                 }
                 Err(_) => return Err(blocked()),
             };
@@ -1524,7 +1524,10 @@ print('provider-read-verified')
         )
         .unwrap();
         assert!(!home.join(".claude/old-settings.json").exists());
-        assert!(home.join(".claude").is_dir(),"native siblings in retained HOME keep the category parent present after stale ordinary removal");
+        assert!(
+            home.join(".claude").is_dir(),
+            "native siblings in retained HOME keep the category parent present after stale ordinary removal"
+        );
         assert!(!home.join(".claude/projects").exists());
         assert!(!home.join(".claude/.credentials.json").exists());
         for path in [&history, &auth] {

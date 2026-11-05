@@ -91,6 +91,7 @@ fn state(probe: Arc<ParkedProbe>, missing_program: &std::path::Path) -> WsState 
         permission_mode_args: None,
     };
     WsState {
+        session_index_ready: None,
         layout: Default::default(),
         terminal_meta: Default::default(),
         pane_ledger: Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),

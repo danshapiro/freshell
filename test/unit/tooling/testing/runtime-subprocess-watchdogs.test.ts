@@ -316,6 +316,8 @@ describe('runtime synchronous subprocess watchdogs', () => {
     expect(cleanup).not.toHaveBeenCalled()
     settleRetry()
     const result = await stopping
+    expect(kill).toHaveBeenCalledExactlyOnceWith('SIGKILL')
+    expect(stop).toHaveBeenCalledTimes(2)
     expect(cleanup).toHaveBeenCalledExactlyOnceWith([`web stop: ${error.message}`])
     expect(stop.mock.invocationCallOrder[1]).toBeLessThan(cleanup.mock.invocationCallOrder[0])
     expect(result.ok).toBe(false)

@@ -16,14 +16,17 @@ use freshell_runtime_protocol::{
     ControlRole, Envelope, FixtureKind, FreshAgentLaunchSpec, HostBootId, HostCommand, HostReply,
     HostResult, IncarnationId, IncidentId, LaunchResult, LaunchState, LimitApplication,
     NativeIdentityObservation, OpenCodeTransferAction, OpenCodeTransferReadinessReceipt,
-    OpenCodeTransferResult, RequestId, ResumeSpec, RuntimeError, RuntimeErrorCode, RuntimeLimits,
-    RuntimeMetrics, RuntimeOutputBatch, RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec,
-    UpdateLimitsResult, CONTROL_PROTOCOL_VERSION,
+    OpenCodeTransferResult, RecoveryProbe, RequestId, ResumeSpec, RuntimeError, RuntimeErrorCode,
+    RuntimeLimits, RuntimeMetrics, RuntimeOutputBatch, RuntimeView, SoulId, StopOutcome,
+    TerminalLaunchSpec, UpdateLimitsResult, CONTROL_PROTOCOL_VERSION,
+    HOST_CAPABILITY_NATIVE_READINESS_RECEIPT_V1,
 };
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex as StdMutex, OnceLock,
@@ -45,6 +48,9 @@ enum FreshNativeAdmission {
 }
 
 /// Private cause information retained before the public runtime error projection.
+type BoxedAdminDispatch<'a> =
+    Pin<Box<dyn Future<Output = Result<AdminResult, RuntimeError>> + Send + 'a>>;
+
 struct ClassifiedFailure {
     error: RuntimeError,
     category: &'static str,
@@ -493,213 +499,34 @@ impl Supervisor {
                     .await
                     .map(AdminResult::Recovery)
             }
-            _ => Box::pin(self.dispatch_non_recovery(envelope)).await,
+            _ => self.dispatch_non_recovery(envelope).await,
         }
     }
 
     // Keep the sizeable provider operations out of the general command
     // switch's polling frame. A request only polls its own command family.
-    async fn dispatch_non_recovery(
-        &self,
+    #[inline(never)]
+    fn dispatch_non_recovery<'a>(
+        &'a self,
         envelope: Envelope<AdminCommand>,
-    ) -> Result<AdminResult, RuntimeError> {
-        match &envelope.body {
-            AdminCommand::FreshAgentSend(_)
-            | AdminCommand::FreshAgentFork(_)
-            | AdminCommand::FreshAgentCompact(_)
-            | AdminCommand::FreshAgentConfigure(_)
-            | AdminCommand::FreshAgentRollback(_)
-            | AdminCommand::FreshAgentCapture(_)
-            | AdminCommand::FreshAgentResolve(_)
-            | AdminCommand::FreshAgentPrepareNative(_)
-            | AdminCommand::FreshAgentInterrupt(_)
-            | AdminCommand::FreshAgentReadEvents(_)
-            | AdminCommand::FreshAgentReadRetainedState(_)
-            | AdminCommand::FreshAgentReadHistory(_)
-            | AdminCommand::FreshAgentReadSnapshot(_)
-            | AdminCommand::FreshAgentModelCatalog(_)
-            | AdminCommand::FreshAgentNativeName(_)
-            | AdminCommand::FreshAgentReadChild(_) => {
-                Box::pin(async move { self.dispatch_fresh_agent(envelope).await }).await
-            }
-            AdminCommand::Health
-            | AdminCommand::ReserveProviderInputs(_)
-            | AdminCommand::NativeAuthLookup(_)
-            | AdminCommand::ObserveClaudeSources(_)
-            | AdminCommand::BindProviderPathInputs(_)
-            | AdminCommand::Launch(_)
-            | AdminCommand::OpenCodeTransfer(_)
-            | AdminCommand::Stop(_)
-            | AdminCommand::Reopen(_)
-            | AdminCommand::Inventory
-            | AdminCommand::InventorySnapshot
-            | AdminCommand::PendingViewProjections(_)
-            | AdminCommand::AcknowledgeViewProjection(_)
-            | AdminCommand::UpdateViewVisibility(_)
-            | AdminCommand::UpsertViewIntent(_)
-            | AdminCommand::UpdateLimits(_)
-            | AdminCommand::QualificationWriterClaim(_)
-            | AdminCommand::PendingNotices(_)
-            | AdminCommand::NoticeReceipt(_)
-            | AdminCommand::IncidentSummary(_)
-            | AdminCommand::PreflightLostSouls(_)
-            | AdminCommand::RestoreLostSouls(_)
-            | AdminCommand::MetricsSnapshot
-            | AdminCommand::MigrationPlan(_)
-            | AdminCommand::RepairAudit(_)
-            | AdminCommand::TerminalInput(_)
-            | AdminCommand::TerminalResize(_)
-            | AdminCommand::TerminalReadOutput(_)
-            | AdminCommand::RuntimeMetrics(_)
-            | AdminCommand::ProbeRecovery(_)
-            | AdminCommand::Recover(_) => {
-                Box::pin(async move { self.dispatch_general(envelope).await }).await
-            }
+    ) -> BoxedAdminDispatch<'a> {
+        if is_fresh_agent_admin_command(&envelope.body) {
+            let request_id = envelope.request_id;
+            let command = envelope.body;
+            self.dispatch_fresh_agent_command(request_id, command)
+        } else {
+            self.dispatch_general_boxed(envelope)
         }
     }
 
-    async fn dispatch_fresh_agent(
-        &self,
-        envelope: Envelope<AdminCommand>,
-    ) -> Result<AdminResult, RuntimeError> {
-        match envelope.body {
-            AdminCommand::FreshAgentSend(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                // Keep the owned send future out of the shared command
-                // switch's worker-stack frame, including for non-send calls.
-                let state = Box::pin(async move {
-                    self.fresh_agent_send(
-                        envelope.request_id,
-                        request.soul_id,
-                        request.text,
-                        request.settings,
-                        request.checkpoint_logical_attempt_id,
-                    )
-                    .await
-                })
-                .await?;
-                Ok(AdminResult::FreshAgentCommand { state })
-            }
-            AdminCommand::FreshAgentFork(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                let result = Box::pin(async move {
-                    self.fresh_agent_fork(
-                        envelope.request_id,
-                        request.soul_id,
-                        request.parent_session_id,
-                        request.input,
-                    )
-                    .await
-                })
-                .await?;
-                Ok(AdminResult::FreshAgentFork(result))
-            }
-            AdminCommand::FreshAgentCompact(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                let state = Box::pin(async move {
-                    self.fresh_agent_compact(
-                        envelope.request_id,
-                        request.soul_id,
-                        request.instructions,
-                        request.cwd,
-                    )
-                    .await
-                })
-                .await?;
-                Ok(AdminResult::FreshAgentCommand { state })
-            }
-            AdminCommand::FreshAgentConfigure(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                let state = self
-                    .fresh_agent_configure(envelope.request_id, request.soul_id, request.settings)
-                    .await?;
-                Ok(AdminResult::FreshAgentCommand { state })
-            }
-            AdminCommand::FreshAgentRollback(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                let state = Box::pin(async move {
-                    self.fresh_agent_rollback(envelope.request_id, request)
-                        .await
-                })
-                .await?;
-                Ok(AdminResult::FreshAgentCommand { state })
-            }
-            AdminCommand::FreshAgentCapture(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                Ok(AdminResult::FreshAgentCapture(
-                    self.fresh_agent_capture(request.soul_id, request.max_bytes)
-                        .await?,
-                ))
-            }
-            AdminCommand::FreshAgentModelCatalog(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                Ok(AdminResult::FreshAgentModelCatalog(
-                    self.fresh_agent_model_catalog(request.soul_id, request.cwd)
-                        .await?,
-                ))
-            }
-            AdminCommand::FreshAgentNativeName(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                Ok(AdminResult::FreshAgentNativeName(
-                    self.fresh_agent_native_name(request).await?,
-                ))
-            }
-            AdminCommand::FreshAgentReadSnapshot(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                Ok(AdminResult::FreshAgentSnapshot(
-                    self.fresh_agent_snapshot(request.soul_id).await?,
-                ))
-            }
-            AdminCommand::FreshAgentReadChild(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                Ok(AdminResult::FreshAgentChildSnapshot(
-                    self.fresh_agent_read_child(request.soul_id, request.child_thread_id)
-                        .await?,
-                ))
-            }
-            AdminCommand::FreshAgentResolve(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                let state = self
-                    .fresh_agent_resolve(
-                        request.soul_id,
-                        request.decision_id,
-                        request.decision,
-                        request.operation_attempt_id,
-                    )
-                    .await?;
-                Ok(AdminResult::FreshAgentCommand { state })
-            }
-            AdminCommand::FreshAgentInterrupt(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                self.fresh_agent_interrupt(request.soul_id, request.request_id)
-                    .await?;
-                Ok(AdminResult::FreshAgentInterrupted)
-            }
-            AdminCommand::FreshAgentPrepareNative(request) => {
+    #[inline(never)]
+    fn dispatch_fresh_agent_command<'a>(
+        &'a self,
+        request_id: RequestId,
+        command: AdminCommand,
+    ) -> BoxedAdminDispatch<'a> {
+        match command {
+            AdminCommand::FreshAgentPrepareNative(request) => Box::pin(async move {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
@@ -707,8 +534,141 @@ impl Supervisor {
                 Ok(AdminResult::FreshAgentCommand {
                     state: CommandState::Completed,
                 })
-            }
-            AdminCommand::FreshAgentReadHistory(request) => {
+            }),
+            command => self.dispatch_other_fresh_agent_command(request_id, command),
+        }
+    }
+
+    #[inline(never)]
+    fn dispatch_other_fresh_agent_command<'a>(
+        &'a self,
+        request_id: RequestId,
+        command: AdminCommand,
+    ) -> BoxedAdminDispatch<'a> {
+        // Match before making the async future so each command gets a
+        // separate heap-backed future.
+        match command {
+            AdminCommand::FreshAgentSend(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let state = Box::pin(self.fresh_agent_send(
+                    request_id,
+                    request.soul_id,
+                    request.text,
+                    request.settings,
+                    request.checkpoint_logical_attempt_id,
+                ))
+                .await?;
+                Ok(AdminResult::FreshAgentCommand { state })
+            }),
+            AdminCommand::FreshAgentFork(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let result = Box::pin(self.fresh_agent_fork(
+                    request_id,
+                    request.soul_id,
+                    request.parent_session_id,
+                    request.input,
+                ))
+                .await?;
+                Ok(AdminResult::FreshAgentFork(result))
+            }),
+            AdminCommand::FreshAgentCompact(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let state = Box::pin(self.fresh_agent_compact(
+                    request_id,
+                    request.soul_id,
+                    request.instructions,
+                    request.cwd,
+                ))
+                .await?;
+                Ok(AdminResult::FreshAgentCommand { state })
+            }),
+            AdminCommand::FreshAgentConfigure(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let state = Box::pin(self.fresh_agent_configure(
+                    request_id,
+                    request.soul_id,
+                    request.settings,
+                ))
+                .await?;
+                Ok(AdminResult::FreshAgentCommand { state })
+            }),
+            AdminCommand::FreshAgentRollback(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let state = Box::pin(self.fresh_agent_rollback(request_id, request)).await?;
+                Ok(AdminResult::FreshAgentCommand { state })
+            }),
+            AdminCommand::FreshAgentCapture(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::FreshAgentCapture(
+                    Box::pin(self.fresh_agent_capture(request.soul_id, request.max_bytes)).await?,
+                ))
+            }),
+            AdminCommand::FreshAgentModelCatalog(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::FreshAgentModelCatalog(
+                    Box::pin(self.fresh_agent_model_catalog(request.soul_id, request.cwd)).await?,
+                ))
+            }),
+            AdminCommand::FreshAgentNativeName(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::FreshAgentNativeName(
+                    Box::pin(self.fresh_agent_native_name(request)).await?,
+                ))
+            }),
+            AdminCommand::FreshAgentReadSnapshot(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::FreshAgentSnapshot(
+                    Box::pin(self.fresh_agent_snapshot(request.soul_id)).await?,
+                ))
+            }),
+            AdminCommand::FreshAgentReadChild(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::FreshAgentChildSnapshot(
+                    Box::pin(self.fresh_agent_read_child(request.soul_id, request.child_thread_id))
+                        .await?,
+                ))
+            }),
+            AdminCommand::FreshAgentResolve(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let state = Box::pin(self.fresh_agent_resolve(
+                    request.soul_id,
+                    request.decision_id,
+                    request.decision,
+                    request.operation_attempt_id,
+                ))
+                .await?;
+                Ok(AdminResult::FreshAgentCommand { state })
+            }),
+            AdminCommand::FreshAgentInterrupt(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Box::pin(self.fresh_agent_interrupt(request.soul_id, request.request_id)).await?;
+                Ok(AdminResult::FreshAgentInterrupted)
+            }),
+            AdminCommand::FreshAgentReadHistory(request) => Box::pin(async move {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
@@ -730,16 +690,14 @@ impl Supervisor {
                         "saved native session identity unavailable",
                     )
                 })?;
-                let mut snapshot = self
-                    .backend
-                    .read_native_history(
-                        handle,
-                        agent.provider.as_str(),
-                        native_id,
-                        &self.config.host_binary_path,
-                    )
-                    .await
-                    .map_err(map_backend)?;
+                let mut snapshot = Box::pin(self.backend.read_native_history(
+                    handle,
+                    agent.provider.as_str(),
+                    native_id,
+                    &self.config.host_binary_path,
+                ))
+                .await
+                .map_err(map_backend)?;
                 // Kilroy uses the Claude transcript contract, with its own session type.
                 let wire_provider =
                     if agent.provider == freshell_runtime_protocol::FreshProvider::Kilroy {
@@ -765,21 +723,23 @@ impl Supervisor {
                     "sessionType": agent.session_type,
                 });
                 Ok(AdminResult::FreshAgentHistory(snapshot))
-            }
-            AdminCommand::FreshAgentReadEvents(request) => {
+            }),
+            AdminCommand::FreshAgentReadEvents(request) => Box::pin(async move {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
-                let events = self
-                    .fresh_agent_read_events(
-                        request.soul_id,
-                        request.after_sequence,
-                        request.max_events,
-                    )
-                    .await?;
+                let events = Box::pin(self.fresh_agent_read_events(
+                    request.soul_id,
+                    request.after_sequence,
+                    request.max_events,
+                ))
+                .await?;
                 Ok(AdminResult::FreshAgentEvents(events))
-            }
-            AdminCommand::FreshAgentReadRetainedState(request) => {
+            }),
+            AdminCommand::FreshAgentPrepareNative(_) => Box::pin(async move {
+                unreachable!("native readiness is handled before other FreshAgent commands")
+            }),
+            AdminCommand::FreshAgentReadRetainedState(request) => Box::pin(async move {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
@@ -801,15 +761,24 @@ impl Supervisor {
                     }
                 };
                 Ok(AdminResult::FreshAgentEvents(events))
-            }
-            _ => unreachable!("only fresh-agent commands reach this dispatcher"),
+            }),
+            _ => unreachable!("non-FreshAgent command reached the FreshAgent switch"),
         }
+    }
+
+    #[inline(never)]
+    fn dispatch_general_boxed<'a>(
+        &'a self,
+        envelope: Envelope<AdminCommand>,
+    ) -> BoxedAdminDispatch<'a> {
+        Box::pin(self.dispatch_general(envelope))
     }
 
     async fn dispatch_general(
         &self,
         envelope: Envelope<AdminCommand>,
     ) -> Result<AdminResult, RuntimeError> {
+        let request_id = envelope.request_id;
         match envelope.body {
             AdminCommand::ReserveProviderInputs(request) => {
                 self.registry
@@ -1158,7 +1127,7 @@ impl Supervisor {
                 // The restore future is much larger than the other command
                 // states. Construct it inside a boxed async block so merely
                 // polling an unrelated command does not reserve its stack.
-                Box::pin(async move { self.restore_lost_souls(envelope.request_id, request).await })
+                Box::pin(async move { self.restore_lost_souls(request_id, request).await })
                     .await
                     .map(AdminResult::RestoreLostSouls)
             }
@@ -1188,7 +1157,7 @@ impl Supervisor {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
-                self.launch(envelope.request_id, *request)
+                self.launch(request_id, *request)
                     .await
                     .map(AdminResult::Launch)
             }
@@ -1201,7 +1170,7 @@ impl Supervisor {
                     .await?;
                 Ok(AdminResult::Stop { outcome, view })
             }
-            AdminCommand::Reopen(request) => Box::pin(self.reopen(envelope.request_id, request))
+            AdminCommand::Reopen(request) => Box::pin(self.reopen(request_id, request))
                 .await
                 .map(AdminResult::Reopen),
             AdminCommand::TerminalInput(request) => {
@@ -1209,7 +1178,7 @@ impl Supervisor {
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
                 let state = self
-                    .terminal_input(envelope.request_id, request.soul_id, request.data)
+                    .terminal_input(request_id, request.soul_id, request.data)
                     .await?;
                 Ok(AdminResult::TerminalInput { state })
             }
@@ -2002,6 +1971,43 @@ impl Supervisor {
                 ));
             }
         };
+        if let Some(receipt) = accepted.native_readiness_receipt.clone() {
+            let observation = accepted
+                .native_identity_observation
+                .clone()
+                .ok_or_else(|| {
+                    self.activation_failure(
+                        &prepared,
+                        state,
+                        "commit_native_readiness_receipt",
+                        RuntimeError::new(
+                            RuntimeErrorCode::RecoveryWrongIdentity,
+                            "host returned a native readiness receipt without its exact observation",
+                        ),
+                    )
+                })?;
+            fence = self
+                .registry
+                .record_native_readiness_recovery_receipt(
+                    workload.soul_id.clone(),
+                    receipt.clone(),
+                    observation.clone(),
+                    accepted.native_readiness_recovery.take(),
+                    workload.resume_spec.clone(),
+                )
+                .await
+                .map_err(map_registry)
+                .map_err(|error| {
+                    self.activation_failure(
+                        &prepared,
+                        state,
+                        "commit_native_readiness_receipt",
+                        error,
+                    )
+                })?;
+            accepted.native_session_id = Some(receipt.identity.native_session_id.clone());
+            accepted.native_identity_observation = Some(observation);
+        }
         let native_context = self
             .registry
             .recovery_context(workload.soul_id.clone())
@@ -2162,7 +2168,9 @@ impl Supervisor {
                 workload.soul_id.clone(),
                 handle.incarnation_id().clone(),
                 fence,
-                workload.resume_spec.is_none() || defer_provider_preparation_completion,
+                workload.resume_spec.is_none()
+                    || native_context.resume_spec.is_none()
+                    || defer_provider_preparation_completion,
             )
             .await
             .map_err(map_registry)
@@ -2883,7 +2891,7 @@ impl Supervisor {
         let fixture = current.fresh_agent.as_ref().is_some_and(|agent| {
             crate::registry::deterministic_fresh_agent_fixture(&current.provider, agent)
         });
-        let can_prepare = !fixture
+        let can_prepare_claude = !fixture
             && matches!(current.provider.as_str(), "claude" | "kilroy")
             && current.desired_state == freshell_runtime_protocol::DesiredState::Running
             && current.prior_handle.incarnation_id() == active.incarnation_id()
@@ -2902,7 +2910,7 @@ impl Supervisor {
                 })
             && [
                 "native-identity-observation-v1",
-                "fresh-agent-native-readiness-v1",
+                HOST_CAPABILITY_NATIVE_READINESS_RECEIPT_V1,
             ]
             .iter()
             .all(|required| {
@@ -2910,7 +2918,13 @@ impl Supervisor {
                     .iter()
                     .any(|capability| capability == required)
             });
-        let codex_prepare = admission == FreshNativeAdmission::CodexCompactReadiness
+        let readiness_needed = status.exited
+            || crate::recovery::current_native_observation(&current, &status).is_none();
+        let retained_codex_send = admission == FreshNativeAdmission::CodexSendRecovery
+            && self
+                .retained_codex_host_eligible(&current, &host, &status)
+                .await?;
+        let codex_same_root_prepare = admission == FreshNativeAdmission::CodexCompactReadiness
             && host
                 .capabilities
                 .iter()
@@ -2918,13 +2932,13 @@ impl Supervisor {
             && self
                 .retained_codex_host_eligible(&current, &host, &status)
                 .await?;
-        if (can_prepare || codex_prepare)
-            && (status.exited
-                || crate::recovery::current_native_observation(&current, &status).is_none())
-        {
+        if readiness_needed && can_prepare_claude {
             let before = current.write_fence();
-            let before_launch = current.native_identity_launch.clone();
-            let before_root = current.native_session_id.clone();
+            let expected_launch = current
+                .native_identity_launch
+                .clone()
+                .expect("Claude readiness requires a bound native launch");
+            let source_fence = before.native_readiness_fence();
             let result = self
                 .await_running_startup(
                     soul_id,
@@ -2935,6 +2949,8 @@ impl Supervisor {
                         &host,
                         HostCommand::FreshAgentPrepareNative {
                             incarnation_id: active.incarnation_id().clone(),
+                            expected_launch: Some(expected_launch),
+                            source_fence: Some(source_fence),
                         },
                     ),
                 )
@@ -2951,29 +2967,6 @@ impl Supervisor {
                     "unexpected fresh-agent native readiness reply",
                 ));
             }
-            if codex_prepare {
-                if !matches!(&result, HostResult::FreshAgentCommand { native_session_id, .. } if native_session_id == &before_root)
-                {
-                    return Err(RuntimeError::new(
-                        RuntimeErrorCode::RecoveryWrongIdentity,
-                        "same-root readiness acknowledged a different native root",
-                    ));
-                }
-                let refreshed = self
-                    .authenticate_host(active.incarnation_id(), active.runtime_dir())
-                    .await?;
-                if refreshed.host_boot_id != host.host_boot_id
-                    || !refreshed
-                        .capabilities
-                        .iter()
-                        .any(|capability| capability == "fresh-agent-codex-same-root-readiness-v1")
-                {
-                    return Err(RuntimeError::new(
-                        RuntimeErrorCode::HostAuthenticationFailed,
-                        "native readiness changed its authenticated host",
-                    ));
-                }
-            }
             status = self
                 .host_status(active.incarnation_id().clone(), active.runtime_dir(), &host)
                 .await?;
@@ -2982,46 +2975,339 @@ impl Supervisor {
                 .recovery_context(soul_id.clone())
                 .await
                 .map_err(map_registry)?;
-            if current.write_fence() != before
-                || (codex_prepare
-                    && (current.native_identity_launch != before_launch
-                        || current.native_session_id != before_root
-                        || status.native_session_id != before_root))
-            {
+            if current.write_fence() != before {
                 return Err(RuntimeError::new(
                     RuntimeErrorCode::StaleIntentRevision,
                     "fresh-agent owner or intent changed during native readiness",
                 ));
             }
-            if codex_prepare {
-                let proof = crate::recovery::current_native_observation(&current, &status)
-                    .filter(|_| {
-                        status.host_boot_id == host.host_boot_id
-                            && status.max_control_epoch <= current.control_epoch
-                            && status.worker_pid.is_some()
-                            && !status.exited
-                    })
-                    .ok_or_else(|| {
-                        RuntimeError::new(
-                            RuntimeErrorCode::RecoveryWrongIdentity,
-                            "same-root readiness did not publish current live native proof",
-                        )
-                    })?;
-                if !self
-                    .registry
-                    .validate_fresh_codex_recovery_source(
-                        soul_id.clone(),
-                        proof.clone(),
-                        status.host_boot_id.clone(),
-                        before,
+        } else if readiness_needed && codex_same_root_prepare {
+            let before = current.write_fence();
+            let before_launch = current.native_identity_launch.clone();
+            let before_root = current.native_session_id.clone();
+            let result = self
+                .await_running_startup(
+                    soul_id,
+                    "prepare_fresh_same_root_codex_readiness",
+                    self.send_authenticated_host_command(
+                        active.incarnation_id().clone(),
+                        active.runtime_dir(),
+                        &host,
+                        HostCommand::FreshAgentPrepareSameRootNative {
+                            incarnation_id: active.incarnation_id().clone(),
+                        },
+                    ),
+                )
+                .await??;
+            if !matches!(
+                &result,
+                HostResult::FreshAgentCommand {
+                    state: CommandState::Completed | CommandState::ProviderAcked,
+                    native_session_id,
+                    ..
+                } if native_session_id == &before_root
+            ) {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::RecoveryWrongIdentity,
+                    "same-root readiness acknowledged a different native root",
+                ));
+            }
+            let refreshed = self
+                .authenticate_host(active.incarnation_id(), active.runtime_dir())
+                .await?;
+            if refreshed.host_boot_id != host.host_boot_id
+                || !refreshed
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "fresh-agent-codex-same-root-readiness-v1")
+            {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::HostAuthenticationFailed,
+                    "native readiness changed its authenticated host",
+                ));
+            }
+            status = self
+                .host_status(
+                    active.incarnation_id().clone(),
+                    active.runtime_dir(),
+                    &refreshed,
+                )
+                .await?;
+            current = self
+                .registry
+                .recovery_context(soul_id.clone())
+                .await
+                .map_err(map_registry)?;
+            if current.write_fence() != before
+                || current.native_identity_launch != before_launch
+                || current.native_session_id != before_root
+                || status.native_session_id != before_root
+            {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::StaleIntentRevision,
+                    "fresh-agent owner or intent changed during same-root readiness",
+                ));
+            }
+            let proof = crate::recovery::current_native_observation(&current, &status)
+                .filter(|_| {
+                    status.host_boot_id == host.host_boot_id
+                        && status.max_control_epoch <= current.control_epoch
+                        && status.worker_pid.is_some()
+                        && !status.exited
+                })
+                .ok_or_else(|| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::RecoveryWrongIdentity,
+                        "same-root readiness did not publish current live native proof",
                     )
+                })?;
+            if !self
+                .registry
+                .validate_fresh_codex_recovery_source(
+                    soul_id.clone(),
+                    proof.clone(),
+                    status.host_boot_id.clone(),
+                    before,
+                )
+                .await
+                .map_err(map_registry)?
+            {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::OwnershipMismatch,
+                    "same-root readiness lost its current native writer",
+                ));
+            }
+        } else if readiness_needed
+            && admission != FreshNativeAdmission::CodexCompactReadiness
+            && !retained_codex_send
+            && !fixture
+            && current.provider == "codex"
+            && current.desired_state == freshell_runtime_protocol::DesiredState::Running
+            && current.prior_handle.incarnation_id() == active.incarnation_id()
+            && current
+                .native_session_id
+                .as_deref()
+                .is_some_and(|root| !root.is_empty())
+            && current
+                .native_identity_launch
+                .as_ref()
+                .is_some_and(|launch| {
+                    launch.incarnation_id == *active.incarnation_id()
+                        && launch.launch_nonce == active.launch_nonce().as_str()
+                        && launch.execution_generation > 0
+                        && launch.execution_generation == status.max_execution_generation
+                        && launch.evidence_revision == current.evidence_revision
+                        && launch
+                            .requested_native_session_id
+                            .as_deref()
+                            .is_none_or(|root| Some(root) == current.native_session_id.as_deref())
+                })
+            && [
+                "native-identity-observation-v1",
+                HOST_CAPABILITY_NATIVE_READINESS_RECEIPT_V1,
+            ]
+            .iter()
+            .all(|required| {
+                host.capabilities
+                    .iter()
+                    .any(|capability| capability == required)
+            })
+        {
+            let before_probe = current.write_fence();
+            let (probe, probed_context) = self
+                .probe_codex_native_readiness_locked(&current, &host)
+                .await?;
+            if probed_context.write_fence() != before_probe {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::StaleIntentRevision,
+                    "Codex readiness source changed before its provider check",
+                ));
+            }
+            let fresh_store_proof = matches!(
+                probe,
+                RecoveryProbe::ResumeReady { .. }
+                    | RecoveryProbe::DefinitivelyUnavailable {
+                        path: freshell_runtime_protocol::RecoveryPath::NativeResume,
+                        ..
+                    }
+            );
+            if fresh_store_proof {
+                let before = before_probe;
+                let expected_launch =
+                    probed_context
+                        .native_identity_launch
+                        .clone()
+                        .ok_or_else(|| {
+                            RuntimeError::new(
+                                RuntimeErrorCode::RecoveryBlocked,
+                                "Codex readiness has no current native launch binding",
+                            )
+                        })?;
+                let source_fence = before.native_readiness_fence();
+                let before_provider = self
+                    .registry
+                    .recovery_context(soul_id.clone())
                     .await
-                    .map_err(map_registry)?
+                    .map_err(map_registry)?;
+                if before_provider.write_fence() != before
+                    || before_provider.native_identity_launch.as_ref() != Some(&expected_launch)
+                    || before_provider.native_session_id != probed_context.native_session_id
                 {
                     return Err(RuntimeError::new(
-                        RuntimeErrorCode::OwnershipMismatch,
-                        "same-root readiness lost its current native writer",
+                        RuntimeErrorCode::StaleIntentRevision,
+                        "Codex readiness source changed before native recovery",
                     ));
+                }
+                let result = self
+                    .await_running_startup(
+                        soul_id,
+                        "prepare_fresh_native_readiness",
+                        self.send_authenticated_host_command(
+                            active.incarnation_id().clone(),
+                            active.runtime_dir(),
+                            &host,
+                            HostCommand::FreshAgentPrepareNative {
+                                incarnation_id: active.incarnation_id().clone(),
+                                expected_launch: Some(expected_launch.clone()),
+                                source_fence: Some(source_fence),
+                            },
+                        ),
+                    )
+                    .await??;
+                let (state, reported_native, identity) = match result {
+                    HostResult::FreshAgentCommand {
+                        state,
+                        native_session_id,
+                        native_identity,
+                        ..
+                    } => (state, native_session_id, native_identity),
+                    _ => {
+                        return Err(RuntimeError::new(
+                            RuntimeErrorCode::HostAuthenticationFailed,
+                            "unexpected Codex native readiness reply",
+                        ));
+                    }
+                };
+                if !matches!(state, CommandState::Completed | CommandState::ProviderAcked) {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::HostAuthenticationFailed,
+                        "Codex native readiness did not complete",
+                    ));
+                }
+                status = self
+                    .host_status(active.incarnation_id().clone(), active.runtime_dir(), &host)
+                    .await?;
+                let still_current = self
+                    .registry
+                    .recovery_context(soul_id.clone())
+                    .await
+                    .map_err(map_registry)?;
+                if still_current.write_fence() != before
+                    || still_current.native_identity_launch.as_ref() != Some(&expected_launch)
+                    || still_current.native_session_id != probed_context.native_session_id
+                {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::StaleIntentRevision,
+                        "Codex readiness source changed while the provider was recovering",
+                    ));
+                }
+                let native_observation = status.native_identity_observation.as_ref();
+                let Some(native_observation) = native_observation else {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::RecoveryWrongIdentity,
+                        "Codex readiness returned without authenticated native proof",
+                    ));
+                };
+                if status.exited
+                    || !native_observation.matches_provider("codex", true)
+                    || native_observation.incarnation_id != *active.incarnation_id()
+                    || native_observation.launch_nonce != active.launch_nonce().as_str()
+                    || status.native_session_id.as_deref()
+                        != Some(native_observation.native_session_id.as_str())
+                    || reported_native.as_deref()
+                        != Some(native_observation.native_session_id.as_str())
+                {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::RecoveryWrongIdentity,
+                        "Codex native readiness proof does not match the current host",
+                    ));
+                }
+                match identity {
+                    Some(identity) => {
+                        let previous = probed_context
+                            .native_session_id
+                            .as_deref()
+                            .expect("Codex readiness precondition requires an exact prior root");
+                        let mut expected_next = expected_launch.clone();
+                        expected_next.evidence_revision = expected_next
+                            .evidence_revision
+                            .checked_add(1)
+                            .ok_or_else(|| {
+                                RuntimeError::new(
+                                    RuntimeErrorCode::RecoveryWrongIdentity,
+                                    "Codex native identity revision is exhausted",
+                                )
+                            })?;
+                        expected_next.requested_native_session_id =
+                            Some(identity.native_session_id.clone());
+                        if identity.previous_native_session_id != previous
+                            || identity.native_session_id.is_empty()
+                            || identity.native_session_id == previous
+                            || identity.native_session_id.chars().any(char::is_control)
+                            || reported_native.as_deref()
+                                != Some(identity.native_session_id.as_str())
+                            || !native_observation.matches_launch(&expected_next)
+                            || native_observation.native_session_id != identity.native_session_id
+                        {
+                            return Err(RuntimeError::new(
+                                RuntimeErrorCode::RecoveryWrongIdentity,
+                                "Codex native recovery transition is not bound to the accepted proof",
+                            ));
+                        }
+                        self.registry
+                            .record_fresh_agent_recovery_identity_fenced(
+                                soul_id.clone(),
+                                active.incarnation_id().clone(),
+                                identity,
+                                before,
+                            )
+                            .await
+                            .map_err(map_registry)?;
+                        current = self
+                            .registry
+                            .recovery_context(soul_id.clone())
+                            .await
+                            .map_err(map_registry)?;
+                        if current.native_session_id.as_deref()
+                            != Some(native_observation.native_session_id.as_str())
+                            || current.native_identity_launch.as_ref() != Some(&expected_next)
+                            || current.fresh_agent.as_ref().is_none_or(|agent| {
+                                agent.native_session_id.as_deref()
+                                    != Some(native_observation.native_session_id.as_str())
+                            })
+                        {
+                            return Err(RuntimeError::new(
+                                RuntimeErrorCode::RecoveryWrongIdentity,
+                                "Codex native root transition was not committed consistently",
+                            ));
+                        }
+                    }
+                    None => {
+                        if reported_native.as_deref() != probed_context.native_session_id.as_deref()
+                            || !native_observation.matches_launch(&expected_launch)
+                            || native_observation.native_session_id
+                                != probed_context
+                                    .native_session_id
+                                    .as_deref()
+                                    .unwrap_or_default()
+                        {
+                            return Err(RuntimeError::new(
+                                RuntimeErrorCode::RecoveryWrongIdentity,
+                                "Codex readiness did not prove the current native root",
+                            ));
+                        }
+                        current = still_current;
+                    }
                 }
             }
         }
@@ -6015,8 +6301,26 @@ impl Supervisor {
             })
             .await
             .map_err(map_registry)?;
+        let native_readiness_recovery =
+            match (workload.fresh_agent.as_ref(), workload.resume_spec.as_ref()) {
+                (Some(agent), Some(resume))
+                    if agent.provider == freshell_runtime_protocol::FreshProvider::Codex =>
+                {
+                    self.registry
+                        .authorize_native_readiness_recovery(
+                            workload.soul_id.clone(),
+                            incarnation_id.clone(),
+                            native_identity_launch.clone(),
+                            resume.clone(),
+                        )
+                        .await
+                        .map_err(map_registry)?
+                }
+                _ => None,
+            };
         let command = HostCommand::GrantExecution {
             native_identity_launch: Some(native_identity_launch.clone()),
+            native_readiness_recovery: native_readiness_recovery.clone().map(Box::new),
             incarnation_id: incarnation_id.clone(),
             soul_id: workload.soul_id.clone(),
             host_boot_id: grant.host_boot_id.clone(),
@@ -6030,12 +6334,48 @@ impl Supervisor {
             resume_spec: workload.resume_spec.clone().map(Box::new),
             dispatch_budget_ms: None,
         };
-        match self
+        let grant_reply = match self
             .send_authenticated_host_command(incarnation_id, handle.runtime_dir(), host, command)
-            .await?
+            .await
         {
+            Ok(reply) => reply,
+            Err(original_error) if native_readiness_recovery.is_some() => {
+                // The provider transition and host receipt are durable before
+                // GrantAccepted is sent. If that reply was lost, ask Status
+                // for the exact persisted receipt instead of redispatching
+                // startup work or accepting only the observed root string.
+                match self
+                    .host_status(handle.incarnation_id().clone(), handle.runtime_dir(), host)
+                    .await
+                {
+                    Ok(status)
+                        if !status.exited
+                            && status.host_boot_id == grant.host_boot_id
+                            && status.max_execution_generation == grant.execution_generation
+                            && status.native_readiness_receipt.is_some()
+                            && status.worker_pid.is_some() =>
+                    {
+                        HostResult::GrantAccepted {
+                            host_boot_id: status.host_boot_id,
+                            worker_pid: status.worker_pid.expect("checked above"),
+                            worker_launch_count: status.worker_launch_count,
+                            fixture_evidence: status.fixture_evidence,
+                            native_session_id: status.native_session_id,
+                            native_identity_observation: status.native_identity_observation,
+                            native_readiness_receipt: status.native_readiness_receipt,
+                            opencode_transfer_receipt: status.opencode_transfer_receipt,
+                            opencode_adoption: status.opencode_adoption,
+                        }
+                    }
+                    _ => return Err(original_error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        match grant_reply {
             HostResult::GrantAccepted {
                 native_identity_observation,
+                native_readiness_receipt,
                 host_boot_id,
                 worker_pid,
                 worker_launch_count,
@@ -6047,11 +6387,15 @@ impl Supervisor {
                 let observed_root = native_identity_observation
                     .as_ref()
                     .filter(|observation| {
-                        observation.matches_launch(&native_identity_launch)
+                        native_readiness_receipt.as_ref().is_some_and(|receipt| {
+                            observation.matches_launch(&receipt.next_launch)
+                                && observation.native_session_id
+                                    == receipt.identity.native_session_id
+                        }) || (observation.matches_launch(&native_identity_launch)
                             && observation.matches_provider(
                                 &identity_context.provider,
                                 workload.fresh_agent.is_some(),
-                            )
+                            ))
                     })
                     .map(|observation| observation.native_session_id.clone());
                 // Fixture roots are presentation identity only. Ordinary
@@ -6082,7 +6426,17 @@ impl Supervisor {
                     worker_launch_count,
                     fixture_evidence,
                     native_session_id: observed_root.or(fixture_root),
-                    native_identity_observation,
+                    native_identity_observation: native_identity_observation.filter(
+                        |observation| {
+                            native_readiness_receipt.as_ref().is_some_and(|receipt| {
+                                observation.matches_launch(&receipt.next_launch)
+                                    && observation.native_session_id
+                                        == receipt.identity.native_session_id
+                            }) || observation.matches_launch(&native_identity_launch)
+                        },
+                    ),
+                    native_readiness_receipt,
+                    native_readiness_recovery,
                     opencode_transfer_receipt: validate_opencode_transfer_receipt(
                         workload
                             .terminal
@@ -6179,6 +6533,7 @@ impl Supervisor {
                 fresh_agent_recovery_source,
                 max_control_epoch,
                 native_identity_observation,
+                native_readiness_receipt,
                 max_execution_generation,
                 host_boot_id,
                 worker_pid,
@@ -6193,6 +6548,7 @@ impl Supervisor {
                 fresh_agent_recovery_source,
                 max_control_epoch,
                 native_identity_observation,
+                native_readiness_receipt,
                 max_execution_generation,
                 host_boot_id,
                 worker_pid,
@@ -6640,6 +6996,7 @@ mod tests {
                                 fixture_evidence: serde_json::json!({"fixture":"reopen"}),
                                 native_session_id: None,
                                 native_identity_observation: None,
+                                native_readiness_receipt: None,
                                 opencode_transfer_receipt: None,
                                 opencode_adoption: Default::default(),
                             })
@@ -6665,6 +7022,7 @@ mod tests {
                                 native_identity_observation: (!probe.pause_observation)
                                     .then(|| observation.clone())
                                     .flatten(),
+                                native_readiness_receipt: None,
                                 opencode_transfer_receipt: None,
                                 opencode_adoption: Default::default(),
                             })
@@ -8312,6 +8670,9 @@ pub(crate) struct AuthenticatedHost {
 }
 pub(crate) struct AcceptedGrant {
     native_identity_observation: Option<freshell_runtime_protocol::NativeIdentityObservation>,
+    native_readiness_receipt: Option<freshell_runtime_protocol::NativeReadinessReceipt>,
+    native_readiness_recovery:
+        Option<freshell_runtime_protocol::NativeReadinessRecoveryAuthorization>,
     host_boot_id: HostBootId,
     worker_pid: u32,
     worker_launch_count: u64,
@@ -8326,6 +8687,7 @@ pub(crate) struct HostStatus {
     pub(crate) max_execution_generation: u64,
     pub(crate) native_identity_observation:
         Option<freshell_runtime_protocol::NativeIdentityObservation>,
+    pub(crate) native_readiness_receipt: Option<freshell_runtime_protocol::NativeReadinessReceipt>,
     pub(crate) host_boot_id: HostBootId,
     pub(crate) worker_pid: Option<u32>,
     pub(crate) worker_launch_count: u64,
@@ -8900,10 +9262,33 @@ fn release_qualified_workload(
 /// Host commands that wait on a provider (a turn, a compaction, a settings
 /// apply, a rollback, a launch) get the long fresh-agent budget instead of
 /// the control budget.
+fn is_fresh_agent_admin_command(command: &AdminCommand) -> bool {
+    matches!(
+        command,
+        AdminCommand::FreshAgentSend(_)
+            | AdminCommand::FreshAgentFork(_)
+            | AdminCommand::FreshAgentCompact(_)
+            | AdminCommand::FreshAgentConfigure(_)
+            | AdminCommand::FreshAgentRollback(_)
+            | AdminCommand::FreshAgentCapture(_)
+            | AdminCommand::FreshAgentModelCatalog(_)
+            | AdminCommand::FreshAgentNativeName(_)
+            | AdminCommand::FreshAgentReadSnapshot(_)
+            | AdminCommand::FreshAgentReadChild(_)
+            | AdminCommand::FreshAgentResolve(_)
+            | AdminCommand::FreshAgentInterrupt(_)
+            | AdminCommand::FreshAgentPrepareNative(_)
+            | AdminCommand::FreshAgentReadHistory(_)
+            | AdminCommand::FreshAgentReadEvents(_)
+            | AdminCommand::FreshAgentReadRetainedState(_)
+    )
+}
+
 pub(crate) fn uses_fresh_agent_command_budget(command: &HostCommand) -> bool {
     matches!(
         command,
         HostCommand::FreshAgentPrepareNative { .. }
+            | HostCommand::FreshAgentPrepareSameRootNative { .. }
             | HostCommand::FreshAgentSend { .. }
             | HostCommand::FreshAgentNativeName { .. }
             | HostCommand::FreshAgentCompact { .. }
@@ -9142,6 +9527,7 @@ mod grant_identity_tests {
                                     _ => Some("raw-root".into()),
                                 },
                                 native_identity_observation: reply_observation.clone(),
+                                native_readiness_receipt: None,
                                 opencode_transfer_receipt: None,
                                 opencode_adoption: Default::default(),
                             }
@@ -9229,7 +9615,29 @@ mod grant_identity_tests {
                 _ => None,
             };
             assert_eq!(accepted.native_session_id.as_deref(), expected, "{case}");
-            assert_eq!(accepted.native_identity_observation, observation, "{case}");
+            let launch_mismatch = matches!(
+                case,
+                "wrong-nonce"
+                    | "wrong-revision"
+                    | "wrong-incarnation"
+                    | "wrong-proof-root"
+                    | "wrong-requested-root"
+                    | "fixture-stale-proof"
+            );
+            if case == "current-proof"
+                || case == "fixture-stale-proof"
+                || (case.starts_with("wrong-") && !fixture)
+            {
+                assert!(
+                    observation.is_some(),
+                    "{case}: the fake host must send its configured proof"
+                );
+            }
+            let accepted_observation = if launch_mismatch { None } else { observation };
+            assert_eq!(
+                accepted.native_identity_observation, accepted_observation,
+                "{case}"
+            );
             let context = registry.recovery_context(soul).await.unwrap();
             assert_eq!(context.never_dispatched, was_never_dispatched);
             assert_eq!(context.accepted_command_count, 0);
@@ -9690,6 +10098,7 @@ mod host_command_budget_tests {
             .unwrap();
         let command = HostCommand::GrantExecution {
             native_identity_launch: None,
+            native_readiness_recovery: None,
             incarnation_id: prepared.incarnation_id.clone(),
             soul_id: prepared.soul_id,
             host_boot_id: grant.host_boot_id,
@@ -9738,6 +10147,7 @@ mod host_command_budget_tests {
                                 fixture_evidence: serde_json::json!({}),
                                 native_session_id: None,
                                 native_identity_observation: None,
+                                native_readiness_receipt: None,
                                 opencode_adoption: Default::default(),
                                 opencode_transfer_receipt: None,
                             }
@@ -10887,6 +11297,7 @@ mod codex_pre_worker_retry_tests {
                                 fixture_evidence: serde_json::json!({}),
                                 native_session_id: Some(current.native_session_id.clone()),
                                 native_identity_observation: Some(current),
+                                native_readiness_receipt: None,
                                 opencode_transfer_receipt: None,
                                 opencode_adoption: Default::default(),
                             })
@@ -10906,6 +11317,7 @@ mod codex_pre_worker_retry_tests {
                         .as_ref()
                         .map(|value| value.native_session_id.clone()),
                     native_identity_observation: observation.clone(),
+                    native_readiness_receipt: None,
                     opencode_transfer_receipt: None,
                     opencode_adoption: Default::default(),
                 }),
@@ -11931,6 +12343,7 @@ mod opencode_transfer_restart_tests {
                                 max_execution_generation: 1,
                                 fixture_evidence: serde_json::json!({}),
                                 exited: false,
+                                native_readiness_receipt: None,
                                 opencode_transfer_receipt: None,
                                 opencode_adoption: Default::default(),
                             }
@@ -12513,6 +12926,7 @@ mod opencode_transfer_restart_tests {
                             exited: case == "provider-exit"
                                 && elapsed >= Duration::from_millis(250),
                             native_session_id: Some("ses_exact".into()),
+                            native_readiness_receipt: None,
                             opencode_transfer_receipt: None,
                             opencode_adoption: if matches!(case, "initial" | "saved") {
                                 OpenCodeAdoptionStatus::AwaitingObservation
@@ -13453,6 +13867,7 @@ mod interrupted_transaction_tests {
         HostCommand::GrantExecution {
             dispatch_budget_ms: None,
             native_identity_launch: None,
+            native_readiness_recovery: None,
             incarnation_id: incarnation,
             soul_id: soul,
             host_boot_id: boot,
@@ -13554,6 +13969,7 @@ mod interrupted_transaction_tests {
                                     worker_launch_count: 1,
                                     fixture_evidence: serde_json::json!({}),
                                     native_session_id: None,
+                                    native_readiness_receipt: None,
                                     opencode_transfer_receipt: None,
                                     opencode_adoption: OpenCodeAdoptionStatus::NotRequired,
                                 })
@@ -17017,6 +17433,7 @@ mod native_observation_ipc_tests {
                             fixture_evidence: serde_json::json!({}),
                             exited: false,
                             native_session_id: Some("ses_unqualified_status".into()),
+                            native_readiness_receipt: None,
                             opencode_transfer_receipt: None,
                             opencode_adoption: Default::default(),
                         },
@@ -17162,6 +17579,7 @@ mod native_observation_ipc_tests {
                                 fixture_evidence: serde_json::json!({}),
                                 exited: !delayed_reattach,
                                 native_session_id: Some("ses_from_status".into()),
+                                native_readiness_receipt: None,
                                 opencode_transfer_receipt: None,
                                 opencode_adoption: Default::default(),
                             }

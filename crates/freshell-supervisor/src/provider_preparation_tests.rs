@@ -287,6 +287,7 @@ impl RuntimeBackend for Backend {
                         current_generation = execution_generation;
                         HostResult::GrantAccepted {
                             native_identity_observation: observation.clone(),
+                            native_readiness_receipt: None,
                             opencode_adoption:
                                 freshell_runtime_protocol::OpenCodeAdoptionStatus::NotRequired,
                             opencode_transfer_receipt: None,
@@ -302,6 +303,7 @@ impl RuntimeBackend for Backend {
                         native_identity_observation: observation.clone(),
                         opencode_adoption:
                             freshell_runtime_protocol::OpenCodeAdoptionStatus::NotRequired,
+                        native_readiness_receipt: None,
                         opencode_transfer_receipt: None,
                         host_boot_id: boot.clone(),
                         worker_pid: if rejected { None } else { Some(1234) },

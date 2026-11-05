@@ -130,6 +130,12 @@ jobs:
         if: ${{ !cancelled() && matrix.os == 'windows-2022' }}
         run: cargo test --locked -p freshell-freshagent --test claude_sidecar_teardown
 
+      # Exercise actual Windows Codex processes and descendants, including
+      # the confirmed and unconfirmed paths before cold recovery can proceed.
+      - name: Test Codex recovery tree cleanup (Windows)
+        if: ${{ !cancelled() && matrix.os == 'windows-2022' }}
+        run: cargo test --locked -p freshell-freshagent --features test-support --test codex_windows_recovery
+
       - name: Test Claude sidecar tree guard (macOS)
         if: ${{ !cancelled() && startsWith(matrix.os, 'macos') }}
         run: cargo test --locked -p freshell-freshagent --test claude_sidecar_teardown

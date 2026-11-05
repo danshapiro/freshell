@@ -153,6 +153,7 @@ mod uncertain_launch {
                                 worker_launch_count: 1,
                                 fixture_evidence: serde_json::Value::Null,
                                 native_session_id: Some("native-exact-caller".into()),
+                                native_readiness_receipt: None,
                             }
                         }
                         HostCommand::Status { .. } => HostResult::Status {
@@ -171,6 +172,7 @@ mod uncertain_launch {
                             native_session_id: observation
                                 .as_ref()
                                 .map(|value| value.native_session_id.clone()),
+                            native_readiness_receipt: None,
                         },
                         HostCommand::ProbeRecovery {
                             resume_spec: Some(spec),

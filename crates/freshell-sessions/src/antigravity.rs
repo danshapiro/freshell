@@ -1,15 +1,21 @@
 //! Antigravity CLI session source: the `SessionSource` behind the
 //! `antigravity` provider's native history rows.
 //!
-//! // Stage-1 candidate contract: the transcript PATH
+//! REAL-BINARY record contract (corrected 2026-11-02 against real agy
+//! 1.2.11 + 1.4.12 transcripts; evidence:
+//! `.worktrees/.the-usual-logs/antigravity-transcript-validation/reports/
+//! real-binary-transcript-evidence.md`): the transcript PATH
 //! (`<antigravity_home>/brain/<conversationId>/.system_generated/logs/transcript.jsonl`)
 //! and the home resolution (`FRESHELL_ANTIGRAVITY_HOME` else
 //! `<home>/.gemini/antigravity-cli`, applied ONLY at the wiring seams —
 //! see [`crate::provider_layout::antigravity_home`]) are
-//! documented+probe-validated facts. The on-disk RECORD SCHEMA surfaced by
-//! [`crate::parse::parse_antigravity_session_content`] is fixture-validated
-//! only (the A2 named blocker) — this module adds no new schema claims, it
-//! only turns the parser's output into index rows.
+//! documented+probe-validated facts, and the on-disk RECORD SCHEMA surfaced by
+//! [`crate::parse::parse_antigravity_session_content`] is the corrected
+//! real-binary contract. Real records carry no workspace evidence, so real
+//! conversations index with cwd `None` (project "unknown") — the cwd GATE is
+//! deliberately GONE (it excluded every real conversation); the
+//! fake-contract `session_start` anchor supplies cwd for fake-driven tests
+//! when present.
 //!
 //! Own-file module (the [`crate::amplifier`] pattern): the source reuses
 //! the `pub` `SessionSource`/`FileStat`/`IndexedSession` contract and the
@@ -24,7 +30,8 @@
 //!   only accepts the [`crate::provider_layout::AntigravityLayout::qualifies`]
 //!   transcript shape, so cache churn can never surface or resurrect a row.
 //! - Absence is never silent: every `parse` that yields no row (unreadable
-//!   file, no ownership record, no usable workspace path) emits a JSONL
+//!   file, a path without the `brain/<id>` conversation directory, no
+//!   parseable records) emits a JSONL
 //!   `antigravity_parse_failed {path, error}` warn event (the server's
 //!   `logging::JsonLayer` renders it as one JSONL line) — a row dropping
 //!   out of the index between sweeps is always attributable in the logs.
@@ -76,25 +83,24 @@ impl SessionSource for AntigravitySource {
             }
         };
         let content = String::from_utf8_lossy(&bytes).into_owned();
-        let meta = match parse_antigravity_session_content(&content) {
+        let Some(conversation_id) = AntigravityLayout::conversation_id_from_path(path) else {
+            parse_failed(
+                path,
+                "transcript path does not carry a brain/<id> conversation directory",
+            );
+            return None;
+        };
+        let meta = match parse_antigravity_session_content(&content, &conversation_id) {
             Some(meta) => meta,
             None => {
-                parse_failed(
-                    path,
-                    "no ownership record: no session_start yields a conversationId",
-                );
+                parse_failed(path, "no parseable records (real binary vocabulary)");
                 return None;
             }
         };
-        // R10b cwd gate — the same discovery-time exclusion claude/codex
-        // enforce: never index a session with no resolvable workspace.
-        if meta.cwd.is_none() {
-            parse_failed(
-                path,
-                "no usable workspace path in the ownership record (cwd gate)",
-            );
-            return None;
-        }
+        // No cwd gate: the real record schema carries no workspace
+        // evidence (binary v1.4.12), so real conversations index with
+        // cwd None (project "unknown"); the fake contract's ownership
+        // anchor supplies cwd for fake-driven tests when present.
         Some(indexed_from_meta(&meta, path))
     }
 
@@ -180,7 +186,8 @@ fn stat_transcript(path: &Path) -> Option<FileStat> {
 
 /// The JSONL `antigravity_parse_failed {path, error}` warn event: absence is
 /// never silent. Emitted on EVERY `parse` that yields no row — an
-/// unreadable file, an id-less transcript, or a cwd-gated exclusion — so a
+/// unreadable file, a path without the `brain/<id>` conversation
+/// directory, or a transcript with no parseable records — so a
 /// discovered conversation dropping out of the index between sweeps is
 /// always attributable in the server's JSONL log. Bounded by the
 /// incremental cache (a cached exclusion is never re-parsed), so this
@@ -205,11 +212,14 @@ fn parse_failed(path: &Path, error: impl std::fmt::Display) {
 /// `indexed_from_meta`.
 ///
 /// Reachability note: `meta.session_id` is `Some` here by the parser's
-/// contract (it returns `None` when no ownership record yields a
-/// conversationId — pinned by `parse::antigravity`'s tests); the
-/// `unwrap_or_default` is a defensive fallback, never a reachable path.
+/// contract (it returns `None` when no recognized record parses — pinned
+/// by `parse::antigravity`'s tests); the `unwrap_or_default` is a
+/// defensive fallback, never a reachable path.
 fn indexed_from_meta(meta: &crate::meta::ParsedSessionMeta, path: &Path) -> IndexedSession {
-    // Session transcripts record the checkout as `cwd`. For a linked git
+    // Session transcripts record the checkout as `cwd` when the format
+    // carries one (the fake contract's ownership anchor). The REAL binary
+    // format carries no workspace evidence (binary v1.4.12), so real rows
+    // group under "unknown". For a linked git
     // worktree, the sidebar's project grouping follows the common
     // repository root (the same resolver `item_from_meta` uses).
     let project_path = meta
@@ -352,9 +362,12 @@ mod tests {
 
         let fresh = source.parse(&fresh_path).expect("fresh fixture parses");
         assert_eq!(fresh.provider, "antigravity");
+        // The DIRECTORY id is the row's identity (real records carry no
+        // id field — binary v1.4.12); real records carry no workspace
+        // evidence, so cwd is None and the row groups under "unknown".
         assert_eq!(fresh.session_id, FRESH_CONV);
-        assert_eq!(fresh.cwd.as_deref(), Some("/home/u/proj"));
-        assert_eq!(fresh.project_path, "/home/u/proj");
+        assert_eq!(fresh.cwd, None);
+        assert_eq!(fresh.project_path, "unknown");
         assert_eq!(fresh.title.as_deref(), Some("Fix the flaky test"));
         assert!(!fresh.title_provider_generated);
         assert_eq!(fresh.title_source, None);
@@ -363,8 +376,8 @@ mod tests {
             Some("Fix the flaky test")
         );
         assert_eq!(fresh.summary.as_deref(), Some("Fixed the test."));
-        assert_eq!(fresh.created_at, Some(1_793_304_000_000));
-        assert_eq!(fresh.last_activity_at, 1_793_304_005_500);
+        assert_eq!(fresh.created_at, Some(1_793_304_001_000));
+        assert_eq!(fresh.last_activity_at, 1_793_304_005_000);
         assert_eq!(
             fresh.token_usage,
             Some(TokenSummary {
@@ -385,12 +398,13 @@ mod tests {
         assert_eq!(fresh.legacy_session_id, None);
         assert_eq!(fresh.git_branch, None);
 
-        // The resumed conversation keeps its OWN identity and the FIRST
-        // user message (never the post-resume one), with the LAST real
-        // usage envelope.
+        // The resumed conversation keeps its OWN directory identity and
+        // the FIRST user message (never the post-restart one), with the
+        // LAST token-bearing record's usage (turn 2's — the documented
+        // per-turn reading; turn 1's 15/25 never survives).
         let resumed = source.parse(&resumed_path).expect("resumed fixture parses");
         assert_eq!(resumed.session_id, RESUMED_CONV);
-        assert_eq!(resumed.cwd.as_deref(), Some("/home/u/resumed"));
+        assert_eq!(resumed.cwd, None);
         assert_eq!(
             resumed.first_user_message.as_deref(),
             Some("First prompt before exit")
@@ -398,18 +412,18 @@ mod tests {
         assert_eq!(
             resumed.token_usage,
             Some(TokenSummary {
-                input_tokens: 15,
-                output_tokens: 25,
-                cached_tokens: 0,
-                total_tokens: 40,
+                input_tokens: 40,
+                output_tokens: 5,
+                cached_tokens: 2,
+                total_tokens: 45,
                 context_tokens: None,
                 model_context_window: None,
                 compact_threshold_tokens: None,
                 compact_percent: None,
             })
         );
-        assert_eq!(resumed.created_at, Some(1_793_307_600_000));
-        assert_eq!(resumed.last_activity_at, 1_793_309_402_500);
+        assert_eq!(resumed.created_at, Some(1_793_307_601_000));
+        assert_eq!(resumed.last_activity_at, 1_793_469_604_000);
 
         assert_eq!(source.scan().len(), 2, "scan composes the two rows");
         let _ = std::fs::remove_dir_all(&home);
@@ -455,12 +469,15 @@ mod tests {
     }
 
     #[test]
-    fn zero_record_transcript_is_excluded_but_ownership_only_row_stays() {
+    fn zero_record_transcripts_are_excluded_but_a_system_only_transcript_stays() {
         let home = unique_temp_dir("zero-turn");
         let _empty = write_transcript(&home, "conv-empty", "");
         let _garbage = write_transcript(&home, "conv-garbage", "not json\n{oops");
-        // The zero-turn fixture: ownership record only (id + cwd known),
-        // NO user message — the row STAYS with an empty first message.
+        // The zero-turn fixture: a SYSTEM_MESSAGE-only real-shaped
+        // transcript (no user record yet) — the row STAYS with an empty
+        // first message and no cwd (real records carry no workspace
+        // evidence — the fake-contract anchor supplies one only when
+        // present, and this fixture carries none).
         let _zero = write_transcript(
             &home,
             "55555555-6666-7777-8888-999999999999",
@@ -469,10 +486,11 @@ mod tests {
 
         let source = AntigravitySource::new(home.clone());
         let items = source.scan();
-        assert_eq!(items.len(), 1, "only the ownership-bearing row is indexed");
+        assert_eq!(items.len(), 1, "only the parseable transcript is indexed");
         let row = &items[0];
         assert_eq!(row.session_id, "55555555-6666-7777-8888-999999999999");
-        assert_eq!(row.cwd.as_deref(), Some("/home/u/idle"));
+        assert_eq!(row.cwd, None);
+        assert_eq!(row.project_path, "unknown");
         assert_eq!(
             row.first_user_message, None,
             "no user message yet — stays indexed"
@@ -634,23 +652,25 @@ mod tests {
         // A mid-write: a COMPLETE new turn lands, then the writer is cut
         // off mid-line. The re-parse must SUCCEED on the intact prefix
         // (the parser skips the truncated tail) — the row survives with
-        // FRESH content, not via any preserve-on-error rule.
+        // FRESH content, not via any preserve-on-error rule. The appended
+        // records are real-shaped (binary v1.4.12 vocabulary: step_index
+        // + second-granularity created_at).
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .unwrap();
         file.write_all(
-            br#"{"type":"user_message","conversationId":"11111111-2222-3333-4444-555555555555","text":"Mid-write addition","at":"2026-10-29T20:30:00.000Z"}
+            br#"{"type":"USER_INPUT","source":"USER_EXPLICIT","status":"DONE","step_index":2,"created_at":"2026-10-29T20:30:00Z","content":"Mid-write addition"}
 "#,
         )
         .unwrap();
         file.write_all(
-            br#"{"type":"assistant_message","conversationId":"11111111-2222-3333-4444-555555555555","text":"Mid-write reply.","at":"2026-10-29T20:30:01.000Z"}
+            br#"{"type":"PLANNER_RESPONSE","source":"MODEL","status":"DONE","step_index":3,"created_at":"2026-10-29T20:30:01Z","content":"Mid-write reply."}
 "#,
         )
         .unwrap();
         file.write_all(
-            br#"{"type":"turn_settled","conversationId":"11111111-2222-3333-4444-555555555"#,
+            br#"{"type":"PLANNER_RESPONSE","source":"MODEL","status":"DONE","step_index":4,"#,
         )
         .unwrap(); // truncated mid-write tail, no closing quote/brace
         drop(file);
@@ -687,10 +707,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn id_less_or_cwd_less_transcript_drops_the_row_until_the_next_successful_sweep() {
+    async fn unparseable_transcript_drops_the_row_but_a_real_shaped_one_without_cwd_stays() {
         let home = unique_temp_dir("honest-drop");
         let path_a = write_transcript(&home, FRESH_CONV, &fixture_content("fresh.sanitized.jsonl"));
-        let path_b = write_transcript(
+        write_transcript(
             &home,
             RESUMED_CONV,
             &fixture_content("resumed.sanitized.jsonl"),
@@ -698,40 +718,28 @@ mod tests {
         let index = test_index(AntigravitySource::new(home.clone()));
         assert_eq!(index.snapshot().await.len(), 2);
 
-        // A genuinely id-less rewrite (messages but no ownership record):
-        // the parse yields None and the row DOES drop — the same honest
-        // behavior class as claude/codex, never a silent stale ghost.
-        std::fs::write(
-            &path_a,
-            concat!(
-                r#"{"type":"user_message","text":"Orphan message","at":"2026-10-29T20:00:01.000Z"}"#,
-                "\n",
-            ),
-        )
-        .unwrap();
+        // A rewrite with NO parseable records (garbage only — nothing in
+        // the real binary vocabulary): the parse yields None and the row
+        // DOES drop — the same honest behavior class as claude/codex,
+        // never a silent stale ghost.
+        std::fs::write(&path_a, "totally not json garbage\n{oops\n").unwrap();
         index.mark_dirty(&[(path_a.clone(), "antigravity".to_string())]);
         assert!(
             wait_for_rows(&index, 5, |rows| rows.len() == 1).await,
-            "an id-less transcript must drop its row; snapshot len stayed {}",
+            "an unparseable transcript must drop its row; snapshot len stayed {}",
             index.snapshot().await.len()
         );
 
-        // A cwd-less ownership record (no usable workspacePaths entry)
-        // fails the R10b cwd gate the same way.
-        std::fs::write(
-            &path_b,
-            concat!(
-                r#"{"type":"session_start","conversationId":"22222222-3333-4444-5555-666666666666","workspacePaths":[],"startedAt":"2026-10-29T21:00:00.000Z"}"#,
-                "\n",
-            ),
-        )
-        .unwrap();
-        index.mark_dirty(&[(path_b.clone(), "antigravity".to_string())]);
-        assert!(
-            wait_for_rows(&index, 5, |rows| rows.is_empty()).await,
-            "a cwd-less transcript must drop its row; snapshot len stayed {}",
-            index.snapshot().await.len()
-        );
+        // The cwd gate is GONE (real records carry no workspace evidence
+        // — binary v1.4.12): a real-shaped transcript with NO ownership
+        // record indexes with cwd None and project_path "unknown".
+        let snapshot = index.snapshot().await;
+        let row = snapshot
+            .iter()
+            .find(|row| row.session_id == RESUMED_CONV)
+            .expect("the cwd-less real-shaped row stays indexed");
+        assert_eq!(row.cwd, None);
+        assert_eq!(row.project_path, "unknown");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -816,22 +824,22 @@ mod tests {
             "an unreadable transcript yields no row"
         );
 
-        // (2) Id-less content: messages with no ownership record.
-        let id_less = write_transcript(
+        // (2) No parseable records: content outside the real binary
+        // vocabulary (the old candidate record shape) parses to nothing.
+        let unparseable = write_transcript(
             &home,
-            "conv-id-less",
+            "conv-unparseable",
             r#"{"type":"user_message","text":"Hi","at":"2026-10-29T20:00:01.000Z"}"#,
         );
-        assert!(source.parse(&id_less).is_none());
+        assert!(source.parse(&unparseable).is_none());
 
-        // (3) An ownership record with no usable workspace path (the cwd
-        // gate).
-        let cwd_less = write_transcript(
-            &home,
-            "conv-cwd-less",
-            r#"{"type":"session_start","conversationId":"conv-cwd-less","workspacePaths":[],"startedAt":"2026-10-29T20:00:00.000Z"}"#,
-        );
-        assert!(source.parse(&cwd_less).is_none());
+        // (3) A path that does not carry the brain/<id> conversation
+        // directory (wrong depth): the id cannot be derived, so the row is
+        // excluded before any content parse.
+        let wrong_depth = home.join("brain/conv-wrong-depth/transcript.jsonl");
+        std::fs::create_dir_all(wrong_depth.parent().unwrap()).unwrap();
+        std::fs::write(&wrong_depth, fixture_content("fresh.sanitized.jsonl")).unwrap();
+        assert!(source.parse(&wrong_depth).is_none());
 
         // (4) A mid-write truncated tail is NOT a parse failure: the
         // intact prefix parses and the row survives.
@@ -863,8 +871,17 @@ mod tests {
             );
         }
         assert!(captured[0]["path"].contains("conv-unreadable"));
-        assert!(captured[1]["path"].contains("conv-id-less"));
-        assert!(captured[2]["path"].contains("conv-cwd-less"));
+        assert!(captured[0]["error"].contains("read failed"));
+        assert!(captured[1]["path"].contains("conv-unparseable"));
+        assert!(
+            captured[1]["error"].contains("no parseable records"),
+            "the no-parseable-records reason: {captured:?}"
+        );
+        assert!(captured[2]["path"].contains("conv-wrong-depth"));
+        assert!(
+            captured[2]["error"].contains("brain/<id> conversation directory"),
+            "the conversation-directory reason: {captured:?}"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 

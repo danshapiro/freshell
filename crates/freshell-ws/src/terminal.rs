@@ -376,6 +376,7 @@ pub async fn run(
     terminal_interest_v1: bool,
     terminal_lifetime_claim_v1: bool,
     managed_runtime_v1: bool,
+    session_index_ready_v1: bool,
 ) {
     let (ws_tx, ws_rx) = socket.split();
 
@@ -422,6 +423,7 @@ pub async fn run(
         conn_identity,
         terminal_interest_v1,
         terminal_lifetime_claim_v1,
+        session_index_ready_v1,
     )
     .instrument(span)
     .await;
@@ -446,6 +448,7 @@ async fn run_loop(
     mut conn_identity: ConnectionIdentity,
     terminal_interest_v1: bool,
     terminal_lifetime_claim_v1: bool,
+    session_index_ready_v1: bool,
 ) {
     // One independently supervised socket writer. The read/dispatch path
     // never awaits socket capacity; output is reconsidered one frame at a time.
@@ -797,6 +800,17 @@ async fn run_loop(
                 match frame {
                     // A pre-serialized server→client frame — forward it verbatim.
                     Ok(json) => {
+                        // Capability-gated frame (auto-restore-warming Task 2):
+                        // the session-index readiness broadcast goes ONLY to
+                        // connections whose hello negotiated
+                        // `sessionIndexReadyV1` — the frozen wire stays
+                        // byte-for-byte legacy. Pre-serialized frames make a
+                        // substring check the cheapest safe gate; the protocol
+                        // roundtrip test pins the serialized marker so drift
+                        // fails there, not silently here.
+                        if json.contains(SESSIONS_INDEX_READY_MARKER) && !session_index_ready_v1 {
+                            continue;
+                        }
                         if ws_tx.send(Message::Text(json.into())).await.is_err() {
                             close_reason = "send_error";
                             break;
@@ -2772,6 +2786,7 @@ async fn handle_client_text(
                     state,
                     pane_reconcile_fresh_agent_v1,
                     state.registry.managed_runtime_connection(conn_id),
+                    conn_id,
                 )
                 .await;
             }
@@ -8091,8 +8106,65 @@ pub enum RespawnError {
     Spawn(std::io::Error),
 }
 
+/// How a successful respawn's identity relates to the RECORDED session id
+/// the orchestrator holds the locator claim for — the auto-resume hub's
+/// claim disposition input (focused repair round 1, Major 1).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RespawnedIdentity {
+    /// The respawn proceeds WITH the exact recorded session id — the
+    /// gate positively passed it, failed open on it, or (unvalidated
+    /// providers and empty-id passthrough shapes) the recorded id was
+    /// merely handed through as a resume arg — the hub COMPLETES the
+    /// claimed lease against the new terminal.
+    Resumed,
+    /// The resume gate refused the recorded id (positively absent on
+    /// disk) and MINTED a replacement id at spawn time — the
+    /// fresh-id-minting providers (claude/amplifier): the new terminal
+    /// carries the minted id in every identity home. AD-3 (accepted,
+    /// scoped to the minters): the hub still completes the RECORDED
+    /// locator's claim against the new terminal — a later create
+    /// carrying the stale ref then adopts the replacement pane via
+    /// `BoundElsewhere` without door 1's notice (convergent; the only
+    /// cost is the missing notice on a rare second-order path).
+    MintedReplacement,
+    /// The gate refused the recorded id and NO replacement id exists at
+    /// spawn time (codex/opencode/antigravity): the respawn launched an
+    /// identity-less FRESH conversation. Completing the recorded
+    /// locator's claim against it would re-bind the STALE identity over
+    /// a conversation it does not name — the silent replacement the
+    /// direct create path refuses with the typed SESSION_MISSING error
+    /// (GC3). The hub must RELEASE the claim instead; the pane has NO
+    /// saved identity. Any later re-bind is then the provider's own
+    /// machinery, not Freshell's: codex/opencode re-associate through
+    /// their real session discovery, while antigravity's typed-prompt
+    /// rebind engages only on Freshell's fake-contract fixtures —
+    /// real-format antigravity sessions never re-bind per-pane (the
+    /// README's recorded limitation), so the fresh conversation is
+    /// simply the CLI's own new conversation.
+    FreshUnbound,
+}
+
+/// A successful respawn: the new terminal id, its identity disposition,
+/// and — for the FreshUnbound shape only — the gate's stale-id notice
+/// (the operator-visible text naming the refused conversation) for the
+/// hub to carry on `terminal.replaced` (focused repair round 3, Major 2:
+/// the Recovering frame broadcast inside the respawn names the stale id
+/// but is addressed to the NEW terminal id, which the pane cannot know
+/// before the replacement announcement — the replaced frame is the path
+/// the pane actually consumes).
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct RespawnOutcome {
+    pub terminal_id: String,
+    pub identity: RespawnedIdentity,
+    pub stale_session_notice: Option<String>,
+}
+
 /// Spawns a replacement agent terminal from a server-side identity.
-/// Returns the NEW terminal id. Does NOT guard/lease — the orchestrator does.
+/// Returns the NEW terminal id and its identity disposition
+/// ([`RespawnOutcome`]) — the orchestrator's claim input. Does NOT
+/// guard/lease — the orchestrator does.
 ///
 /// Mirrors `handle_create`'s CLI branch step-for-step — same call order, same
 /// error handling, same `spawn_blocking` boundaries — minus the
@@ -8107,7 +8179,7 @@ pub enum RespawnError {
 pub async fn respawn_agent_terminal(
     state: &WsState,
     req: &AgentRespawnRequest,
-) -> Result<String, RespawnError> {
+) -> Result<RespawnOutcome, RespawnError> {
     let host_os = host_os_live();
     let is_wsl = is_wsl_env_live();
     // Headless respawn: no wire `shell` field — the system shell, exactly
@@ -8164,6 +8236,29 @@ pub async fn respawn_agent_terminal(
     };
     let launch_intent = outcome.launch_intent;
     let resume_session_id = outcome.resume_session_id;
+    // Identity disposition for the orchestrator's claim (RespawnedIdentity):
+    // no stale id ⇒ the recorded session resumed; stale id + minted
+    // replacement ⇒ the AD-3 minter shape; stale id + NO replacement ⇒ the
+    // identity-less fresh conversation whose claim the hub must RELEASE.
+    let respawned_identity = if outcome.stale_session_id.is_some() {
+        if resume_session_id.is_some() {
+            RespawnedIdentity::MintedReplacement
+        } else {
+            RespawnedIdentity::FreshUnbound
+        }
+    } else {
+        RespawnedIdentity::Resumed
+    };
+    // Focused repair round 3, Major 2: carry the gate's stale-id notice on
+    // the outcome for the FreshUnbound shape ONLY — the hub relays it on
+    // `terminal.replaced` (the path the pane actually consumes; see
+    // RespawnOutcome's doc). Resumed/MintedReplacement pass no notice
+    // (their folds stay exactly as today).
+    let stale_session_notice = if respawned_identity == RespawnedIdentity::FreshUnbound {
+        outcome.notice.clone()
+    } else {
+        None
+    };
     if let Some(stale) = outcome.stale_session_id.as_deref() {
         tracing::warn!(
             mode = %req.mode,
@@ -8185,16 +8280,39 @@ pub async fn respawn_agent_terminal(
         // with the notice as reason. Reason prose is presentational-only per
         // the protocol doc; the typed fields carry no data change here.
         //
-        // Deliberate decision AD-3 (accepted, documented — no behavior
-        // change): after this gate-fired respawn, the auto-resume hub's
-        // `complete_claim` keeps the STALE locator's lease bound to the FRESH
-        // terminal (auto_resume.rs → registry.complete_session_ref_claim). A
-        // later `terminal.create` carrying the stale ref then adopts the
-        // fresh terminal via `BoundElsewhere` WITHOUT door 1's notice. This
-        // is convergent (no loop, no duplicate pane, the user reaches the
-        // fresh terminal); the only cost is a missing notice on a rare
-        // second-order path. Releasing/rebinding the lease would mean new
-        // registry API surface for no user-visible gain.
+        // Deliberate decision AD-3 (accepted, scoped to the FRESH-ID-MINTING
+        // providers — claude/amplifier): after a gate-fired respawn that
+        // MINTED a replacement id, the auto-resume hub's `complete_claim`
+        // keeps the STALE locator's lease bound to the FRESH terminal
+        // (auto_resume.rs → registry.complete_session_ref_claim). A later
+        // `terminal.create` carrying the stale ref then adopts the fresh
+        // terminal via `BoundElsewhere` WITHOUT door 1's notice. For the
+        // minters this is convergent (the fresh terminal carries the minted
+        // replacement id in every identity home — no loop, no duplicate
+        // pane, the user reaches the replacement pane); the only cost is a
+        // missing notice on a rare second-order path.
+        //
+        // The no-mint providers (codex/opencode/antigravity — the gate
+        // refuses the recorded id and NO replacement id exists at spawn
+        // time) are OUTSIDE that accepted decision: the respawn reports
+        // `RespawnedIdentity::FreshUnbound` and the hub RELEASES the stale
+        // locator's claim (`fail_claim`), NEVER completing it against the
+        // fresh terminal. Completing it would re-bind the STALE identity
+        // over an identity-less fresh conversation — the silent replacement
+        // the direct create path refuses with the typed SESSION_MISSING
+        // error (GC3). The pane comes back with NO saved identity; any
+        // later re-bind is the provider's own machinery — codex/opencode
+        // re-associate through real session discovery, while
+        // antigravity's typed-prompt rebind engages only on Freshell's
+        // fake-contract fixtures (real-format antigravity sessions never
+        // re-bind per-pane; README's binding paragraph).
+        // The Recovering frame broadcast above names the stale id, but it
+        // is addressed to the NEW terminal id — which the pane cannot know
+        // before `terminal.replaced` — and the replaced fold clears the
+        // recovery notice, so the notice the pane ACTUALLY consumes is the
+        // one carried on the replaced frame (focused repair round 3, Major
+        // 2: `RespawnOutcome::stale_session_notice` → the hub's
+        // `emit_replaced` → the frame's `staleSessionNotice`).
         let msg =
             freshell_protocol::ServerMessage::TerminalStatus(freshell_protocol::TerminalStatus {
                 recovery_summary: None,
@@ -8587,8 +8705,17 @@ pub async fn respawn_agent_terminal(
 
     // Identity record for the new terminal (provider/session_id/cwd) + the
     // durable ledger binding (fsync — blocking pool, pane_ledger.rs:363
-    // doctrine), riding the same record shape `handle_create` seeds. A
-    // respawn always has a session id, so the record is always `Some`.
+    // doctrine), riding the same record shape `handle_create` seeds. The
+    // record itself always exists, but its session id does NOT: a
+    // gate-fired fresh respawn of a no-mint provider
+    // (codex/opencode/antigravity) carries `resume_session_id == None`,
+    // so the ledger binding below is SKIPPED, and the identity upsert
+    // runs with NO session id — a session-less row: the pane has NO
+    // saved identity, and any later re-bind is the provider's own
+    // machinery (codex/opencode re-associate through real session
+    // discovery; antigravity's typed-prompt rebind is fake-contract
+    // fixtures only — real-format antigravity sessions never re-bind
+    // per-pane).
     let create_meta_record = terminal_meta_record_for_create(
         &terminal_id,
         &mode,
@@ -8647,6 +8774,31 @@ pub async fn respawn_agent_terminal(
         }
     }
 
+    // Focused repair round 5, Major: stamp the FreshUnbound replacement's
+    // identity marker — the in-memory mirror of the `terminal.replaced`
+    // frame's `fresh_unbound` disposition. A browser DISCONNECTED during
+    // the server-side auto-resume (or reloaded after it) never sees that
+    // transient frame; on reconnection its pane.reconcile attach of this
+    // identity-less terminal is the only path that can tell the pane its
+    // stale saved sessionRef was released (the reconcile derive reads this
+    // marker and carries the clearing disposition on the attach verdict).
+    // Only the FreshUnbound shape stamps (Resumed keeps a correct recorded
+    // ref; MintedReplacement carries its minted id in every identity home),
+    // which is exactly what keeps an ordinary identity-less attach — a
+    // young pane whose identity is not captured yet — from clearing a
+    // still-valid claim.
+    //
+    // Final-delta review round 2, Fix 1: the marker stores the gate's
+    // stale-id NOTICE too — the reconnect verdict must carry the same
+    // visible explanation the missed `terminal.replaced` frame carried
+    // (`staleSessionNotice`), or the pane re-attaches with its id cleared
+    // and no visible naming of the lost conversation.
+    if respawned_identity == RespawnedIdentity::FreshUnbound {
+        state
+            .identity
+            .mark_fresh_unbound_replacement(&terminal_id, stale_session_notice.as_deref());
+    }
+
     // Name reliability (Task 10): the replacement row resumes the SAME
     // durable session, so it binds that session's saved name (its title was
     // "<Mode> (auto-resumed)" with no binding at all). With no record yet the
@@ -8683,7 +8835,11 @@ pub async fn respawn_agent_terminal(
         &state.broadcast_tx,
         create_meta_record,
     );
-    Ok(terminal_id)
+    Ok(RespawnOutcome {
+        terminal_id,
+        identity: respawned_identity,
+        stale_session_notice,
+    })
 }
 
 /// Rust port of `isValidClaudeSessionId` (`shared/session-contract.ts:34,44-46`;
@@ -8878,6 +9034,25 @@ pub fn broadcast_sessions_changed(state: &WsState) {
     let _ = state.broadcast_tx.send(frame);
 }
 
+/// The serialized `type` marker of the readiness broadcast — the forward
+/// site's capability gate substring-matches it on every pre-serialized
+/// broadcast frame; the protocol roundtrip test
+/// (`sessions_index_ready_frame_roundtrips`) pins that the typed frame
+/// really serializes to this marker, so drift fails there, not silently in
+/// production.
+const SESSIONS_INDEX_READY_MARKER: &str = r#""type":"sessions.index.ready""#;
+
+/// One broadcast per boot (auto-restore-warming Task 3 wiring): the session
+/// index finished its first sweep (`SessionIndex::subscribe_ready` fired),
+/// so parked panes may now resume automatically. Capability-gated at the
+/// forward site — frozen connections never see the frame. Mirrors
+/// [`broadcast_sessions_changed`]; deliberately carries NO revision —
+/// readiness is a one-way latch, not a change series.
+pub fn broadcast_sessions_index_ready(state: &WsState) {
+    let frame = serde_json::json!({ "type": "sessions.index.ready" }).to_string();
+    let _ = state.broadcast_tx.send(frame);
+}
+
 /// Send the reference's `sendError` frame for a failed `terminal.create`
 /// (`ws-handler.ts:2606-2614`): `{ code, message, requestId }`.
 /// `pane.reconcile.request` (reconciliation design §5): the terminal sources
@@ -8896,6 +9071,7 @@ async fn handle_pane_reconcile(
     state: &WsState,
     pane_reconcile_fresh_agent_v1: bool,
     managed_runtime_v1: bool,
+    conn_id: u64,
 ) -> bool {
     if request.panes.len() > crate::reconcile::MAX_RECONCILE_PANES {
         let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
@@ -9009,17 +9185,79 @@ async fn handle_pane_reconcile(
     // design, and `snapshot().await` on a truly cold index runs the sweep
     // inline for potentially minutes — unbounded, so unusable here). The
     // honest expectation stands: a truly cold scan takes far longer than the
-    // budget, so `error{index_warming}` is EXPECTED on cold boots and the
-    // client's manual retry affordance is the recovery path. The stall is
-    // delay-only and scoped to THIS connection's select loop, bounded by the
-    // budget (default 2000ms, shrunk in tests).
-    let warming = |vs: &[freshell_protocol::PaneVerdict]| {
-        vs.iter().any(|v| {
-            matches!(v.verdict, freshell_protocol::ReconcileVerdict::Error)
-                && v.reason.as_deref() == Some("index_warming")
-        })
+    // budget, so `error{index_warming}` is EXPECTED on cold boots — and the
+    // recovery path is the client's readiness-driven driver (auto-restore-
+    // warming, kata freshell#vnpc), not a manual Retry click: a client that
+    // negotiated `sessionIndexReadyV1` learns readiness from the
+    // `ready.sessionIndexReady` handshake state or the once-per-boot
+    // `sessions.index.ready` broadcast and re-issues the reconcile for its
+    // parked panes with bounded dedup retries. The stall is delay-only and
+    // scoped to THIS connection's select loop, bounded by the budget
+    // (default 2000ms, shrunk in tests).
+    let is_index_warming = |v: &freshell_protocol::PaneVerdict| {
+        matches!(v.verdict, freshell_protocol::ReconcileVerdict::Error)
+            && v.reason.as_deref() == Some("index_warming")
     };
+    let warming = |vs: &[freshell_protocol::PaneVerdict]| vs.iter().any(&is_index_warming);
     if warming(&verdicts) {
+        // Round-3 finding 6: production-visible recovery transitions live
+        // SERVER-SIDE, where the default RUST_LOG records INFO. Once per
+        // request by construction — the deferral is single-shot, so this
+        // can never become a per-poll log (the same unchanged wait is
+        // never re-logged). Delta fix finding 2: the arm event also names
+        // the panes it is deferring (pane keys + the session identities
+        // they claim — read from the REQUEST, the authoritative claim
+        // source; a pane with no claim logs `-`), and the post-deferral
+        // resolution is recorded by exactly ONE
+        // `pane_reconcile.index_warming_resolved` event below (severity by
+        // outcome: WARN when a deferred pane ended in a failure state,
+        // INFO on clean resolution) carrying the per-pane failure causes
+        // and the deferral duration.
+        let session_claim = |key: &str| -> String {
+            request
+                .panes
+                .iter()
+                .find(|p| p.pane_key == key)
+                .map(|p| {
+                    p.session_ref
+                        .as_ref()
+                        .map(|s| format!("{}:{}", s.provider, s.session_id))
+                        // The same promotion the reconcile door applies to a
+                        // legacy claim (reconcile.rs `promoted_legacy_claim`):
+                        // a non-shell mode + resumeSessionId pair IS a session
+                        // claim. A pane with no claim of either shape logs `-`.
+                        .or_else(|| {
+                            p.resume_session_id
+                                .as_deref()
+                                .filter(|s| !s.is_empty())
+                                .and(p.mode.as_deref().filter(|m| !m.is_empty() && *m != "shell"))
+                                .map(|m| {
+                                    format!(
+                                        "{m}:{}",
+                                        p.resume_session_id.as_deref().unwrap_or_default()
+                                    )
+                                })
+                        })
+                        .unwrap_or_else(|| "-".to_string())
+                })
+                .unwrap_or_else(|| "-".to_string())
+        };
+        let deferred: Vec<(String, String)> = verdicts
+            .iter()
+            .filter(|v| is_index_warming(v))
+            .map(|v| (v.pane_key.clone(), session_claim(&v.pane_key)))
+            .collect();
+        tracing::info!(
+            event = "pane_reconcile.index_warming",
+            connection_id = conn_id,
+            reconcile_id = %request.reconcile_id,
+            pane_count = deferred.len(),
+            pane_keys = %deferred.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(","),
+            sessions = %deferred.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join(","),
+            budget_ms = state.reconcile_deferral_budget_ms,
+            "pane reconcile deferred: session index warming"
+        );
+        let deferred_started = std::time::Instant::now();
         tokio::time::sleep(std::time::Duration::from_millis(
             state.reconcile_deferral_budget_ms,
         ))
@@ -9037,6 +9275,71 @@ async fn handle_pane_reconcile(
                 .await;
             }
         };
+        // Delta fix finding 2: the request's post-deferral resolution record,
+        // fired exactly ONCE per deferred request. `warming_cleared` says
+        // whether any deferred pane still answers warming; the per-pane
+        // failure cause names every deferred pane whose re-derived verdict
+        // ended in a terminal NON-RESOLVED state (focused review round 2,
+        // finding 2): Error (still index_warming, the honest
+        // session_store_unreadable, provider_unavailable, ...), DeadSession
+        // (confirmed absence — the index published and the previously
+        // claimed identity is gone; the pane parks in the dead-sessions
+        // dialog awaiting user adjudication), or Invalid (the pane claim
+        // was rejected). Attach/Respawn/Fresh are true resolutions and
+        // stay clean, so a failed recovery is traceable to a specific pane
+        // and session from the server log alone. Severity is
+        // outcome-structured: WARN when any deferred pane ended in a
+        // failure state, INFO on clean resolution.
+        let deferred_keys: Vec<String> = deferred.iter().map(|(k, _)| k.clone()).collect();
+        let unresolved_panes: Vec<String> = verdicts
+            .iter()
+            .filter(|v| deferred_keys.contains(&v.pane_key))
+            .filter(|v| {
+                matches!(
+                    v.verdict,
+                    freshell_protocol::ReconcileVerdict::Error
+                        | freshell_protocol::ReconcileVerdict::DeadSession
+                        | freshell_protocol::ReconcileVerdict::Invalid
+                )
+            })
+            .map(|v| {
+                let cause = match v.verdict {
+                    freshell_protocol::ReconcileVerdict::DeadSession => "dead_session",
+                    freshell_protocol::ReconcileVerdict::Invalid => {
+                        v.reason.as_deref().unwrap_or("invalid")
+                    }
+                    _ => v.reason.as_deref().unwrap_or("-"),
+                };
+                format!("{}:{}", v.pane_key, cause)
+            })
+            .collect();
+        let warming_cleared = !verdicts
+            .iter()
+            .any(|v| deferred_keys.contains(&v.pane_key) && is_index_warming(v));
+        let elapsed_ms = deferred_started.elapsed().as_millis() as u64;
+        if unresolved_panes.is_empty() {
+            tracing::info!(
+                event = "pane_reconcile.index_warming_resolved",
+                connection_id = conn_id,
+                reconcile_id = %request.reconcile_id,
+                pane_count = deferred_keys.len(),
+                warming_cleared,
+                unresolved_panes = "",
+                elapsed_ms,
+                "pane reconcile warming resolved"
+            );
+        } else {
+            tracing::warn!(
+                event = "pane_reconcile.index_warming_resolved",
+                connection_id = conn_id,
+                reconcile_id = %request.reconcile_id,
+                pane_count = deferred_keys.len(),
+                warming_cleared,
+                unresolved_panes = %unresolved_panes.join(","),
+                elapsed_ms,
+                "pane reconcile warming resolved with failures"
+            );
+        }
     }
     // A `dead_session` verdict parks the pane in the client's dead-sessions
     // dialog awaiting user adjudication — the loud, user-facing end of the
@@ -12181,6 +12484,7 @@ mod terminals_changed_tests {
         let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
         let rx = broadcast_tx.subscribe();
         let state = WsState {
+            session_index_ready: None,
             pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
             layout: Default::default(),
             identity: crate::identity::TerminalIdentityRegistry::new(),
@@ -12381,6 +12685,7 @@ mod terminal_kill_stop_wedge_tests {
         let auth_token = Arc::new("s3cr3t-token-abcdef".to_string());
         let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
         let state = WsState {
+            session_index_ready: None,
             pane_ledger: Arc::new(pane_ledger),
             layout: Default::default(),
             identity: crate::identity::TerminalIdentityRegistry::new(),
@@ -12808,6 +13113,7 @@ mod terminal_meta_created_tests {
         let broadcast_tx = std::sync::Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
         let rx = broadcast_tx.subscribe();
         let state = WsState {
+            session_index_ready: None,
             pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
             layout: Default::default(),
             identity: crate::identity::TerminalIdentityRegistry::new(),
@@ -13464,6 +13770,7 @@ mod pane_reconcile_gate_tests {
         let auth_token = Arc::new("s3cr3t-token-abcdef".to_string());
         let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
         WsState {
+            session_index_ready: None,
             pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
             layout: Default::default(),
             identity: crate::identity::TerminalIdentityRegistry::new(),
@@ -15851,6 +16158,7 @@ mod host_stats_dispatch_tests {
         let auth_token = Arc::new("s3cr3t-token-abcdef".to_string());
         let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
         WsState {
+            session_index_ready: None,
             pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
             layout: Default::default(),
             identity: crate::identity::TerminalIdentityRegistry::new(),

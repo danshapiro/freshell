@@ -270,10 +270,11 @@ pub(super) async fn readiness_fixture() -> ReadinessFixture {
                     exited: !live,
                     native_session_id: live.then(|| native.clone()),
                     native_identity_observation: live.then(|| current_observation.clone()),
+                    native_readiness_receipt: None,
                     opencode_transfer_receipt: None,
                     opencode_adoption: OpenCodeAdoptionStatus::NotRequired,
                 },
-                HostCommand::FreshAgentPrepareNative { incarnation_id } => {
+                HostCommand::FreshAgentPrepareNative { incarnation_id, .. } => {
                     assert_eq!(incarnation_id, host_launch.incarnation_id);
                     assert_eq!(
                         host_registry

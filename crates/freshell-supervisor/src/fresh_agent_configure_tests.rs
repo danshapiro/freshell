@@ -7,6 +7,7 @@ use crate::backend::{
 };
 use crate::registry::{BackendCreatedRecord, LaunchPreparation, OwnedRuntimeHandle, Registry};
 use freshell_runtime_protocol::*;
+use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::net::UnixListener;
 
@@ -154,6 +155,14 @@ async fn running_fresh_provider_with_name(
         )
         .await
         .unwrap();
+    registry
+        .record_native_session(
+            soul.clone(),
+            prepared.incarnation_id.clone(),
+            initial_native_session_id.into(),
+        )
+        .await
+        .unwrap();
     let current = registry.recovery_context(soul.clone()).await.unwrap();
     let launch = registry
         .bind_native_identity_launch(NativeIdentityLaunch {
@@ -163,14 +172,6 @@ async fn running_fresh_provider_with_name(
             execution_generation: grant.execution_generation,
             requested_native_session_id: Some(initial_native_session_id.into()),
         })
-        .await
-        .unwrap();
-    registry
-        .record_native_session(
-            soul.clone(),
-            prepared.incarnation_id.clone(),
-            initial_native_session_id.into(),
-        )
         .await
         .unwrap();
     let current = registry.recovery_context(soul.clone()).await.unwrap();
@@ -214,6 +215,348 @@ async fn running_fresh_provider_with_name(
         soul,
         incarnation: prepared.incarnation_id,
         runtime_dir,
+    }
+}
+
+struct PreparedCodexReplacement {
+    fixture: RunningFreshAgent,
+    prior_incarnation: IncarnationId,
+    target_incarnation: IncarnationId,
+    attempt_id: RecoveryAttemptId,
+    prior_root: String,
+    next_root: String,
+    target_cwd: String,
+    resume_spec: ResumeSpec,
+    source_launch: NativeIdentityLaunch,
+    authorization: NativeReadinessRecoveryAuthorization,
+}
+
+async fn prepared_codex_replacement() -> PreparedCodexReplacement {
+    let fixture = running_fresh_provider_with_name(
+        FreshProvider::Codex,
+        Some("pending-before-recovery".into()),
+        "native-before-recovery",
+    )
+    .await;
+    let registry = &fixture.supervisor.registry;
+    let prior_root = "native-before-recovery".to_string();
+    let current = registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    let candidate = crate::resume_catalog::exact_resume_candidate(&current, None)
+        .unwrap()
+        .expect("Codex native identity produces an exact resume proof");
+    let resume_spec = registry
+        .store_verified_resume_spec(fixture.soul.clone(), candidate)
+        .await
+        .unwrap();
+    let current = registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    assert_eq!(current.resume_spec.as_ref(), Some(&resume_spec));
+
+    let start = registry
+        .begin_recovery_fenced(
+            fixture.soul.clone(),
+            RecoveryTrigger::ProviderExit,
+            RecoveryPath::NativeResume,
+            current.write_fence(),
+        )
+        .await
+        .unwrap();
+    let prior_incarnation = start.context.prior_handle.incarnation_id().clone();
+    let attempt_id = start.attempt_id.clone();
+    registry
+        .mark_stop_outcome(prior_incarnation.clone(), StopOutcome::VerifiedEmpty)
+        .await
+        .unwrap();
+
+    let target_cwd = fixture
+        ._root
+        .path()
+        .join("recovery-cwd")
+        .to_string_lossy()
+        .into_owned();
+    std::fs::create_dir_all(&target_cwd).unwrap();
+    let mut target_spec = start
+        .context
+        .fresh_agent
+        .clone()
+        .expect("fresh-agent recovery retains its current launch settings");
+    target_spec.cwd = target_cwd.clone();
+    target_spec.native_session_id = Some(prior_root.clone());
+    target_spec.session_ref = Some(ProviderSessionReference {
+        provider: FreshProvider::Codex.as_str().into(),
+        session_id: prior_root.clone(),
+    });
+    let replacement = registry
+        .prepare_replacement(
+            start,
+            None,
+            Some(target_spec),
+            Some(resume_spec.clone()),
+            RecoveryPath::NativeResume,
+        )
+        .await
+        .unwrap();
+    assert_eq!(replacement.prior_incarnation_id, prior_incarnation);
+    assert_eq!(replacement.attempt_id, attempt_id);
+
+    let target_incarnation = replacement.prepared.incarnation_id.clone();
+    let target_runtime_dir = fixture._root.path().join("replacement-runtime");
+    std::fs::create_dir_all(&target_runtime_dir).unwrap();
+    let target_host = target_runtime_dir.join("host");
+    std::fs::write(&target_host, b"synthetic-replacement-host").unwrap();
+    registry
+        .commit_created(
+            target_incarnation.clone(),
+            BackendCreatedRecord {
+                launch_policy: Default::default(),
+                daemon_id: DockerDaemonId::new(),
+                container_id: "d".repeat(64),
+                image_ref: format!("sha256:{}", "e".repeat(64)),
+                runtime_dir: target_runtime_dir,
+                host_binary_path: target_host,
+                immutable_config_digest: format!("sha256:{}", "f".repeat(64)),
+            },
+        )
+        .await
+        .unwrap();
+    let grant = registry
+        .commit_execution_grant(
+            target_incarnation.clone(),
+            HostBootId::new(),
+            crate::checkpoints::tests::limits(),
+        )
+        .await
+        .unwrap();
+    let target_context = registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    let source_launch = registry
+        .bind_native_identity_launch(NativeIdentityLaunch {
+            incarnation_id: target_incarnation.clone(),
+            launch_nonce: replacement.prepared.launch_nonce.as_str().into(),
+            evidence_revision: target_context.evidence_revision,
+            execution_generation: grant.execution_generation,
+            requested_native_session_id: Some(prior_root.clone()),
+        })
+        .await
+        .unwrap();
+    let authorization = registry
+        .authorize_native_readiness_recovery(
+            fixture.soul.clone(),
+            target_incarnation.clone(),
+            source_launch.clone(),
+            resume_spec.clone(),
+        )
+        .await
+        .unwrap()
+        .expect("exact prepared Codex replacement receives narrow resume authorization");
+
+    PreparedCodexReplacement {
+        fixture,
+        prior_incarnation,
+        target_incarnation,
+        attempt_id,
+        prior_root,
+        next_root: "native-after-recovery".into(),
+        target_cwd,
+        resume_spec,
+        source_launch,
+        authorization,
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TestNativeStoreSelection {
+    cwd: String,
+    provider_version: Option<String>,
+    environment: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TestNativeAbsenceCensus {
+    provider: String,
+    store: String,
+    native_id: String,
+    evidence_revision: u64,
+    provider_home: String,
+    environment_fingerprint: String,
+    selection: TestNativeStoreSelection,
+    inspected_home: String,
+    generation: String,
+    store_state: EvidenceStoreState,
+}
+
+fn native_absence_census_reference(
+    resume_spec: &ResumeSpec,
+    selection_cwd: &str,
+    store_state: EvidenceStoreState,
+) -> String {
+    let environment = resume_spec
+        .environment
+        .iter()
+        .filter(|(name, _)| {
+            matches!(
+                name.as_str(),
+                "HOME"
+                    | "CLAUDE_CONFIG_DIR"
+                    | "CODEX_HOME"
+                    | "AMPLIFIER_HOME"
+                    | "XDG_DATA_HOME"
+                    | "OPENCODE_DB"
+                    | "OPENCODE_DISABLE_CHANNEL_DB"
+            )
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    let selection = TestNativeStoreSelection {
+        cwd: selection_cwd.into(),
+        provider_version: resume_spec.provider_version.clone(),
+        environment,
+    };
+    let environment_fingerprint = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&(resume_spec.provider_home.as_str(), &selection)).unwrap()
+        )
+    );
+    let census = TestNativeAbsenceCensus {
+        provider: FreshProvider::Codex.as_str().into(),
+        store: resume_spec.provider_session.provider_store_id.clone(),
+        native_id: resume_spec.provider_session.native_session_id.clone(),
+        evidence_revision: resume_spec.evidence_revision,
+        provider_home: resume_spec.provider_home.clone(),
+        environment_fingerprint,
+        selection,
+        inspected_home: resume_spec.provider_home.clone(),
+        generation: "a".repeat(64),
+        store_state,
+    };
+    format!(
+        "nativeAbsenceCensus=v2:{}",
+        serde_json::to_string(&census).unwrap()
+    )
+}
+
+fn native_readiness_recovery_result(
+    prepared: &PreparedCodexReplacement,
+    census_cwd: &str,
+) -> (NativeReadinessReceipt, NativeIdentityObservation) {
+    native_readiness_recovery_result_with_store_state(
+        prepared,
+        census_cwd,
+        EvidenceStoreState::Missing,
+    )
+}
+
+fn native_readiness_recovery_result_with_store_state(
+    prepared: &PreparedCodexReplacement,
+    census_cwd: &str,
+    store_state: EvidenceStoreState,
+) -> (NativeReadinessReceipt, NativeIdentityObservation) {
+    let mut next_launch = prepared.source_launch.clone();
+    next_launch.evidence_revision += 1;
+    next_launch.requested_native_session_id = Some(prepared.next_root.clone());
+    let receipt = NativeReadinessReceipt {
+        source_fence: prepared.authorization.source_fence.clone(),
+        source_launch: prepared.source_launch.clone(),
+        next_launch: next_launch.clone(),
+        identity: NativeDispatchIdentity {
+            previous_native_session_id: prepared.prior_root.clone(),
+            native_session_id: prepared.next_root.clone(),
+            pending_naming_handle: None,
+        },
+        absence_evidence: Some(NativeReadinessAbsenceEvidence {
+            prior_incarnation_id: prepared.prior_incarnation.clone(),
+            provider: FreshProvider::Codex.as_str().into(),
+            provider_store_id: prepared
+                .resume_spec
+                .provider_session
+                .provider_store_id
+                .clone(),
+            native_session_id: prepared.prior_root.clone(),
+            evidence_revision: prepared.source_launch.evidence_revision,
+            store_state: EvidenceStoreState::Missing,
+            census_reference: native_absence_census_reference(
+                &prepared.resume_spec,
+                census_cwd,
+                store_state,
+            ),
+        }),
+        resume_spec_sha256: Some(prepared.authorization.resume_spec_sha256.clone()),
+    };
+    let observation = NativeIdentityObservation {
+        native_session_id: prepared.next_root.clone(),
+        incarnation_id: prepared.target_incarnation.clone(),
+        launch_nonce: next_launch.launch_nonce.clone(),
+        evidence_revision: next_launch.evidence_revision,
+        source: NativeIdentitySource::FreshProviderHandshake,
+        evidence_digest: "b".repeat(64),
+    };
+    (receipt, observation)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct NativeReadinessRegistrySnapshot {
+    native_session_id: Option<String>,
+    identity_revision: u64,
+    evidence_revision: u64,
+    resume_spec: Option<ResumeSpec>,
+    native_identity_launch: Option<NativeIdentityLaunch>,
+    fresh_agent: Option<FreshAgentLaunchSpec>,
+    prior_claims: u64,
+    next_claims: u64,
+    receipt: Option<String>,
+    observation: Option<String>,
+}
+
+async fn native_readiness_registry_snapshot(
+    prepared: &PreparedCodexReplacement,
+) -> NativeReadinessRegistrySnapshot {
+    let registry = &prepared.fixture.supervisor.registry;
+    let context = registry
+        .recovery_context(prepared.fixture.soul.clone())
+        .await
+        .unwrap();
+    let conn = rusqlite::Connection::open(registry.database_path()).unwrap();
+    let claim_count = |native_session_id: &str| {
+        conn.query_row(
+            "SELECT COUNT(*) FROM writer_claims WHERE soul_id=?1 AND provider='codex' AND provider_store_id=?2 AND native_session_id=?3 AND incarnation_id=?4",
+            rusqlite::params![
+                prepared.fixture.soul.as_str(),
+                prepared.resume_spec.provider_session.provider_store_id,
+                native_session_id,
+                prepared.target_incarnation.as_str(),
+            ],
+            |row| row.get::<_, u64>(0),
+        )
+        .unwrap()
+    };
+    let (receipt, observation): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT native_readiness_receipt,native_identity_observation FROM incarnations WHERE incarnation_id=?1",
+            rusqlite::params![prepared.target_incarnation.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    NativeReadinessRegistrySnapshot {
+        native_session_id: context.native_session_id,
+        identity_revision: context.identity_revision,
+        evidence_revision: context.evidence_revision,
+        resume_spec: context.resume_spec,
+        native_identity_launch: context.native_identity_launch,
+        fresh_agent: context.fresh_agent,
+        prior_claims: claim_count(&prepared.prior_root),
+        next_claims: claim_count(&prepared.next_root),
+        receipt,
+        observation,
     }
 }
 
@@ -291,6 +634,7 @@ async fn native_send_host(
                         exited: false,
                         native_session_id: Some(observation.native_session_id.clone()),
                         native_identity_observation: Some(observation.clone()),
+                        native_readiness_receipt: None,
                         opencode_transfer_receipt: None,
                         opencode_adoption: Default::default(),
                     }
@@ -455,6 +799,656 @@ async fn accepted_native_recovery_preserves_presentation_and_pending_name_policy
             .collect();
         assert_eq!(claims, vec!["native-recovered".to_string()]);
     }
+}
+
+#[tokio::test]
+async fn codex_readiness_reconciles_receipt_after_host_commit_reply_is_lost() {
+    let fixture = running_fresh_provider_with_name(
+        FreshProvider::Codex,
+        Some("pending-original".into()),
+        "native-original",
+    )
+    .await;
+    let source = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    let source_launch = source.native_identity_launch.clone().unwrap();
+    let expected_source_fence = source.write_fence().native_readiness_fence();
+    let child_native = "native-recovered".to_string();
+    let host_secret = b"synthetic-readiness-host-secret";
+    std::fs::write(fixture.runtime_dir.join("secret"), host_secret).unwrap();
+    let listener = UnixListener::bind(fixture.runtime_dir.join("host.sock")).unwrap();
+    let boot = HostBootId::new();
+    let incarnation = fixture.incarnation.clone();
+    let control_epoch = fixture.supervisor.registry.control_epoch();
+    let current_observation = Arc::new(StdMutex::new(None::<NativeIdentityObservation>));
+    let receipt = Arc::new(StdMutex::new(None::<NativeReadinessReceipt>));
+    let readiness_requests = Arc::new(StdMutex::new(0usize));
+    let provider_operations = Arc::new(StdMutex::new(0usize));
+    let (shutdown, mut stop) = tokio::sync::oneshot::channel();
+
+    let host = {
+        let current_observation = current_observation.clone();
+        let receipt = receipt.clone();
+        let readiness_requests = readiness_requests.clone();
+        let provider_operations = provider_operations.clone();
+        let source_launch = source_launch.clone();
+        let expected_source_fence = expected_source_fence.clone();
+        let child_native = child_native.clone();
+        let incarnation = incarnation.clone();
+        let boot = boot.clone();
+        let listener = listener;
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = tokio::select! {
+                    _ = &mut stop => break,
+                    accepted = listener.accept() => accepted.unwrap(),
+                };
+                let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
+                let result = match request.body {
+                    HostCommand::Hello {
+                        incarnation_id,
+                        challenge,
+                    } => Some(HostResult::Hello {
+                        host_boot_id: boot.clone(),
+                        proof: host_proof(host_secret, &challenge, &boot, &incarnation_id),
+                        capabilities: vec![
+                            "provider-store-probe-v1".into(),
+                            "native-identity-observation-v1".into(),
+                            HOST_CAPABILITY_NATIVE_READINESS_RECEIPT_V1.into(),
+                        ],
+                        effective_limits: crate::checkpoints::tests::limits(),
+                    }),
+                    HostCommand::Status { incarnation_id } => {
+                        assert_eq!(incarnation_id, incarnation);
+                        let observation = current_observation.lock().unwrap().clone();
+                        Some(HostResult::Status {
+                            native_session_id: observation
+                                .as_ref()
+                                .map(|observation| observation.native_session_id.clone()),
+                            native_identity_observation: observation,
+                            host_boot_id: boot.clone(),
+                            worker_pid: Some(123),
+                            worker_launch_count: 1,
+                            max_control_epoch: control_epoch,
+                            max_execution_generation: source_launch.execution_generation,
+                            fixture_evidence: serde_json::json!({}),
+                            exited: false,
+                            native_readiness_receipt: None,
+                            opencode_transfer_receipt: None,
+                            opencode_adoption: Default::default(),
+                        })
+                    }
+                    HostCommand::ProbeRecovery { resume_spec, .. } => {
+                        let resume_spec =
+                            resume_spec.expect("Codex readiness probes its exact root");
+                        Some(HostResult::RecoveryProbe(RecoveryProbe::ResumeReady {
+                            evidence_revision: resume_spec.evidence_revision,
+                            resume_spec,
+                        }))
+                    }
+                    HostCommand::FreshAgentPrepareNative {
+                        incarnation_id,
+                        expected_launch,
+                        source_fence,
+                    } => {
+                        assert_eq!(incarnation_id, incarnation);
+                        let expected_launch =
+                            expected_launch.expect("receipt requests the original launch");
+                        let source_fence =
+                            source_fence.expect("receipt requests the original fence");
+                        assert_eq!(expected_launch, source_launch);
+                        assert_eq!(source_fence, expected_source_fence);
+                        let request_number = {
+                            let mut requests = readiness_requests.lock().unwrap();
+                            *requests += 1;
+                            *requests
+                        };
+                        let mut durable = receipt.lock().unwrap();
+                        let accepted = if let Some(existing) = durable.as_ref() {
+                            assert_eq!(existing.source_launch, source_launch);
+                            assert_eq!(existing.source_fence, expected_source_fence);
+                            assert_eq!(existing.identity.native_session_id, child_native);
+                            existing.clone()
+                        } else {
+                            *provider_operations.lock().unwrap() += 1;
+                            let identity = NativeDispatchIdentity {
+                                previous_native_session_id: "native-original".into(),
+                                native_session_id: child_native.clone(),
+                                pending_naming_handle: Some("pending-original".into()),
+                            };
+                            let mut next_launch = source_launch.clone();
+                            next_launch.evidence_revision += 1;
+                            next_launch.requested_native_session_id = Some(child_native.clone());
+                            let accepted = NativeReadinessReceipt {
+                                source_fence: expected_source_fence.clone(),
+                                source_launch: source_launch.clone(),
+                                next_launch: next_launch.clone(),
+                                identity,
+                                absence_evidence: None,
+                                resume_spec_sha256: None,
+                            };
+                            assert!(accepted.is_valid());
+                            *durable = Some(accepted.clone());
+                            *current_observation.lock().unwrap() =
+                                Some(NativeIdentityObservation {
+                                    native_session_id: child_native.clone(),
+                                    incarnation_id: incarnation.clone(),
+                                    launch_nonce: next_launch.launch_nonce.clone(),
+                                    evidence_revision: next_launch.evidence_revision,
+                                    source: NativeIdentitySource::FreshProviderHandshake,
+                                    evidence_digest: "d".repeat(64),
+                                });
+                            accepted
+                        };
+                        if request_number == 1 {
+                            // Host/actor and provider acceptance are durable,
+                            // but the supervisor never receives this reply.
+                            None
+                        } else {
+                            Some(HostResult::FreshAgentCommand {
+                                state: CommandState::ProviderAcked,
+                                claude_fork: None,
+                                native_session_id: Some(child_native.clone()),
+                                native_identity: Some(accepted.identity),
+                            })
+                        }
+                    }
+                    other => panic!("unexpected Codex readiness command: {other:?}"),
+                };
+                if let Some(result) = result {
+                    write_frame(
+                        &mut socket,
+                        &HostReply {
+                            request_id: request.request_id,
+                            result: Ok(result),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+        })
+    };
+
+    let prepare = || {
+        let mut envelope = Envelope::new(
+            RequestId::new(),
+            ControlRole::Web,
+            AdminCommand::FreshAgentPrepareNative(FreshAgentInterruptRequest {
+                soul_id: fixture.soul.clone(),
+                request_id: None,
+                expected_control_epoch: Some(control_epoch),
+            }),
+        );
+        envelope.auth = Some(SECRET.into());
+        envelope
+    };
+    let first = fixture.supervisor.dispatch(prepare()).await;
+    assert!(
+        first.result.is_err(),
+        "the host committed but lost its reply"
+    );
+    let split = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    assert_eq!(split.native_session_id.as_deref(), Some("native-original"));
+    assert_eq!(
+        split.native_identity_launch.as_ref(),
+        Some(&source_launch),
+        "the first missing reply cannot partially commit registry identity"
+    );
+
+    let second = fixture.supervisor.dispatch(prepare()).await;
+    if second.result.is_err() {
+        let current = fixture
+            .supervisor
+            .registry
+            .recovery_context(fixture.soul.clone())
+            .await
+            .unwrap();
+        let active = fixture
+            .supervisor
+            .registry
+            .active_handle_for_soul(fixture.soul.clone())
+            .await
+            .unwrap();
+        let host = fixture
+            .supervisor
+            .authenticate_host(active.incarnation_id(), active.runtime_dir())
+            .await
+            .unwrap();
+        let status = fixture
+            .supervisor
+            .host_status(active.incarnation_id().clone(), active.runtime_dir(), &host)
+            .await
+            .unwrap();
+        eprintln!(
+            "reconciliation diagnostics: error={:?}; registry root={:?}, launch={:?}, evidence={}; host root={:?}, observation={:?}, exited={}, generation={}; observation_matches={}",
+            second.result,
+            current.native_session_id,
+            current.native_identity_launch,
+            current.evidence_revision,
+            status.native_session_id,
+            status.native_identity_observation,
+            status.exited,
+            status.max_execution_generation,
+            crate::recovery::current_native_observation(&current, &status).is_some(),
+        );
+    }
+    assert!(
+        matches!(
+            second.result,
+            Ok(AdminResult::FreshAgentCommand {
+                state: CommandState::Completed
+            })
+        ),
+        "second readiness reply: {:?}",
+        second.result
+    );
+    assert_eq!(*readiness_requests.lock().unwrap(), 2);
+    assert_eq!(
+        *provider_operations.lock().unwrap(),
+        1,
+        "retry must replay the durable receipt without repeating provider work"
+    );
+    let committed = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        committed.native_session_id.as_deref(),
+        Some("native-recovered")
+    );
+    let receipt_next_launch = receipt
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .next_launch
+        .clone();
+    assert_eq!(
+        committed.native_identity_launch.as_ref(),
+        Some(&receipt_next_launch)
+    );
+    let spec = committed.fresh_agent.unwrap();
+    assert_eq!(spec.session_id, source.fresh_agent.unwrap().session_id);
+    assert_eq!(spec.naming_handle.as_deref(), Some("pending-original"));
+
+    shutdown.send(()).unwrap();
+    host.await.unwrap();
+}
+
+#[tokio::test]
+async fn codex_recovery_authorization_binds_the_exact_prepared_source_attempt_and_target() {
+    let prepared = prepared_codex_replacement().await;
+    let registry = &prepared.fixture.supervisor.registry;
+    let authorization = &prepared.authorization;
+
+    assert!(authorization.is_valid_for(
+        &registry
+            .recovery_context(prepared.fixture.soul.clone())
+            .await
+            .unwrap()
+            .fresh_agent
+            .unwrap(),
+        &prepared.resume_spec,
+    ));
+    assert_eq!(
+        authorization.prior_incarnation_id,
+        prepared.prior_incarnation
+    );
+    assert_eq!(
+        authorization.source_fence.active_incarnation_id,
+        prepared.target_incarnation
+    );
+    assert_eq!(
+        authorization.source_fence.recovery_attempt_id.as_ref(),
+        Some(&prepared.attempt_id)
+    );
+    assert_eq!(
+        authorization.source_fence.evidence_revision,
+        prepared.source_launch.evidence_revision
+    );
+    assert_eq!(authorization.source_launch, prepared.source_launch);
+    assert_eq!(
+        authorization
+            .source_launch
+            .requested_native_session_id
+            .as_deref(),
+        Some(prepared.prior_root.as_str())
+    );
+    assert_eq!(
+        authorization.resume_spec_sha256,
+        resume_spec_sha256(&prepared.resume_spec)
+    );
+    assert_ne!(
+        prepared.resume_spec.cwd, prepared.target_cwd,
+        "the exact prior store proof keeps its original CWD while the replacement keeps accepted settings"
+    );
+
+    let before = native_readiness_registry_snapshot(&prepared).await;
+    let mut stale_launch = prepared.source_launch.clone();
+    stale_launch.launch_nonce.push_str("-stale");
+    assert!(registry
+        .authorize_native_readiness_recovery(
+            prepared.fixture.soul.clone(),
+            prepared.target_incarnation.clone(),
+            stale_launch,
+            prepared.resume_spec.clone(),
+        )
+        .await
+        .is_err());
+    assert_eq!(native_readiness_registry_snapshot(&prepared).await, before);
+
+    let mut wrong_resume = prepared.resume_spec.clone();
+    wrong_resume.cwd = prepared.target_cwd.clone();
+    assert!(registry
+        .authorize_native_readiness_recovery(
+            prepared.fixture.soul.clone(),
+            prepared.target_incarnation.clone(),
+            prepared.source_launch.clone(),
+            wrong_resume,
+        )
+        .await
+        .is_err());
+    assert_eq!(native_readiness_registry_snapshot(&prepared).await, before);
+
+    assert!(registry
+        .authorize_native_readiness_recovery(
+            prepared.fixture.soul.clone(),
+            IncarnationId::new(),
+            prepared.source_launch.clone(),
+            prepared.resume_spec.clone(),
+        )
+        .await
+        .is_err());
+    assert_eq!(native_readiness_registry_snapshot(&prepared).await, before);
+}
+
+#[tokio::test]
+async fn codex_recovery_receipt_commit_is_fenced_atomic_and_idempotent() {
+    let prepared = prepared_codex_replacement().await;
+    let registry = &prepared.fixture.supervisor.registry;
+    let (receipt, observation) =
+        native_readiness_recovery_result(&prepared, &prepared.resume_spec.cwd);
+    assert!(receipt.is_valid());
+    let before = native_readiness_registry_snapshot(&prepared).await;
+
+    let mut wrong_attempt = prepared.authorization.clone();
+    wrong_attempt.source_fence.recovery_attempt_id = Some(RecoveryAttemptId::new());
+    assert!(registry
+        .record_native_readiness_recovery_receipt(
+            prepared.fixture.soul.clone(),
+            receipt.clone(),
+            observation.clone(),
+            Some(wrong_attempt),
+            Some(prepared.resume_spec.clone()),
+        )
+        .await
+        .is_err());
+    assert_eq!(native_readiness_registry_snapshot(&prepared).await, before);
+
+    let mut wrong_prior = prepared.authorization.clone();
+    wrong_prior.prior_incarnation_id = IncarnationId::new();
+    assert!(registry
+        .record_native_readiness_recovery_receipt(
+            prepared.fixture.soul.clone(),
+            receipt.clone(),
+            observation.clone(),
+            Some(wrong_prior),
+            Some(prepared.resume_spec.clone()),
+        )
+        .await
+        .is_err());
+    assert_eq!(native_readiness_registry_snapshot(&prepared).await, before);
+
+    let mut wrong_launch_authority = prepared.authorization.clone();
+    wrong_launch_authority
+        .source_launch
+        .launch_nonce
+        .push_str("-stale");
+    assert!(registry
+        .record_native_readiness_recovery_receipt(
+            prepared.fixture.soul.clone(),
+            receipt.clone(),
+            observation.clone(),
+            Some(wrong_launch_authority),
+            Some(prepared.resume_spec.clone()),
+        )
+        .await
+        .is_err());
+    assert_eq!(native_readiness_registry_snapshot(&prepared).await, before);
+
+    let mut wrong_resume = prepared.resume_spec.clone();
+    wrong_resume.cwd = prepared.target_cwd.clone();
+    assert!(registry
+        .record_native_readiness_recovery_receipt(
+            prepared.fixture.soul.clone(),
+            receipt.clone(),
+            observation.clone(),
+            Some(prepared.authorization.clone()),
+            Some(wrong_resume),
+        )
+        .await
+        .is_err());
+    assert_eq!(native_readiness_registry_snapshot(&prepared).await, before);
+
+    let (wrong_census, wrong_census_observation) =
+        native_readiness_recovery_result(&prepared, &prepared.target_cwd);
+    assert!(wrong_census.is_valid());
+    assert!(registry
+        .record_native_readiness_recovery_receipt(
+            prepared.fixture.soul.clone(),
+            wrong_census,
+            wrong_census_observation,
+            Some(prepared.authorization.clone()),
+            Some(prepared.resume_spec.clone()),
+        )
+        .await
+        .is_err());
+    assert_eq!(native_readiness_registry_snapshot(&prepared).await, before);
+
+    let (unknown_census, unknown_census_observation) =
+        native_readiness_recovery_result_with_store_state(
+            &prepared,
+            &prepared.resume_spec.cwd,
+            EvidenceStoreState::Unknown,
+        );
+    assert!(registry
+        .record_native_readiness_recovery_receipt(
+            prepared.fixture.soul.clone(),
+            unknown_census,
+            unknown_census_observation,
+            Some(prepared.authorization.clone()),
+            Some(prepared.resume_spec.clone()),
+        )
+        .await
+        .is_err());
+    assert_eq!(native_readiness_registry_snapshot(&prepared).await, before);
+
+    let committed_fence = registry
+        .record_native_readiness_recovery_receipt(
+            prepared.fixture.soul.clone(),
+            receipt.clone(),
+            observation.clone(),
+            Some(prepared.authorization.clone()),
+            Some(prepared.resume_spec.clone()),
+        )
+        .await
+        .unwrap();
+    let committed = native_readiness_registry_snapshot(&prepared).await;
+    assert_eq!(
+        committed.native_session_id.as_deref(),
+        Some("native-after-recovery")
+    );
+    assert_eq!(committed.identity_revision, before.identity_revision + 1);
+    assert_eq!(committed.evidence_revision, before.evidence_revision + 1);
+    assert!(
+        committed.resume_spec.is_none(),
+        "the prior root proof is stale after mint"
+    );
+    assert_eq!(committed.prior_claims, 0);
+    assert_eq!(committed.next_claims, 1);
+    assert_eq!(
+        committed.native_identity_launch.as_ref(),
+        Some(&receipt.next_launch)
+    );
+    let updated_spec = committed.fresh_agent.as_ref().unwrap();
+    assert_eq!(updated_spec.cwd, prepared.target_cwd);
+    assert_eq!(updated_spec.session_id, "fresh-session");
+    assert_eq!(updated_spec.model.as_deref(), Some("sonnet"));
+    assert_eq!(
+        updated_spec.naming_handle.as_deref(),
+        Some("pending-before-recovery")
+    );
+    assert_eq!(
+        updated_spec.native_session_id.as_deref(),
+        Some("native-after-recovery")
+    );
+    assert_eq!(
+        updated_spec
+            .session_ref
+            .as_ref()
+            .map(|reference| reference.session_id.as_str()),
+        Some("native-after-recovery")
+    );
+    assert!(committed.receipt.is_some());
+    assert!(committed.observation.is_some());
+
+    let replay_fence = registry
+        .record_native_readiness_recovery_receipt(
+            prepared.fixture.soul.clone(),
+            receipt.clone(),
+            observation.clone(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay_fence, committed_fence);
+    let replayed = native_readiness_registry_snapshot(&prepared).await;
+    assert_eq!(replayed, committed, "exact receipt replay must be a no-op");
+
+    registry
+        .mark_running(prepared.target_incarnation.clone())
+        .await
+        .unwrap();
+    let recovered = registry
+        .recovery_context(prepared.fixture.soul.clone())
+        .await
+        .unwrap();
+    registry
+        .mark_recovery_live(
+            prepared.fixture.soul.clone(),
+            prepared.target_incarnation.clone(),
+            recovered.write_fence(),
+        )
+        .await
+        .unwrap();
+
+    let replacement_start = registry
+        .begin_recovery_fenced(
+            prepared.fixture.soul.clone(),
+            RecoveryTrigger::ManualRetry,
+            RecoveryPath::CheckpointRestore,
+            registry
+                .recovery_context(prepared.fixture.soul.clone())
+                .await
+                .unwrap()
+                .write_fence(),
+        )
+        .await
+        .unwrap();
+    registry
+        .mark_stop_outcome(
+            prepared.target_incarnation.clone(),
+            StopOutcome::VerifiedEmpty,
+        )
+        .await
+        .unwrap();
+    let replacement_spec = replacement_start
+        .context
+        .fresh_agent
+        .clone()
+        .expect("Codex replacement keeps the accepted fresh-agent settings");
+    let replacement = registry
+        .prepare_replacement(
+            replacement_start,
+            None,
+            Some(replacement_spec),
+            None,
+            RecoveryPath::CheckpointRestore,
+        )
+        .await
+        .unwrap();
+    let replacement_incarnation = replacement.prepared.incarnation_id.clone();
+    let replacement_runtime_dir = prepared
+        .fixture
+        ._root
+        .path()
+        .join("stale-replay-replacement-runtime");
+    std::fs::create_dir_all(&replacement_runtime_dir).unwrap();
+    let replacement_host = replacement_runtime_dir.join("host");
+    std::fs::write(&replacement_host, b"synthetic-newer-host").unwrap();
+    registry
+        .commit_created(
+            replacement_incarnation.clone(),
+            BackendCreatedRecord {
+                launch_policy: Default::default(),
+                daemon_id: DockerDaemonId::new(),
+                container_id: "1".repeat(64),
+                image_ref: format!("sha256:{}", "2".repeat(64)),
+                runtime_dir: replacement_runtime_dir,
+                host_binary_path: replacement_host,
+                immutable_config_digest: format!("sha256:{}", "3".repeat(64)),
+            },
+        )
+        .await
+        .unwrap();
+    registry
+        .commit_execution_grant(
+            replacement_incarnation.clone(),
+            HostBootId::new(),
+            crate::checkpoints::tests::limits(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        registry
+            .recovery_context(prepared.fixture.soul.clone())
+            .await
+            .unwrap()
+            .prior_handle
+            .incarnation_id(),
+        &replacement_incarnation,
+        "target B must be the active incarnation before stale receipt replay"
+    );
+    let replacement_state = native_readiness_registry_snapshot(&prepared).await;
+    assert!(registry
+        .record_native_readiness_recovery_receipt(
+            prepared.fixture.soul.clone(),
+            receipt,
+            observation,
+            None,
+            None,
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        native_readiness_registry_snapshot(&prepared).await,
+        replacement_state,
+        "a stale receipt replay must not return a newer target's fence or mutate its state"
+    );
 }
 
 #[tokio::test]
@@ -1351,6 +2345,82 @@ async fn admin_native_name_rejects_stale_authority_before_host_work_and_preserve
             "metadata does not change launch/recovery settings"
         );
     }
+}
+
+#[tokio::test]
+async fn native_name_lifecycle_busy_is_typed_and_fresh_retry_dispatches_once() {
+    let fixture = running_fresh_provider_with_name(FreshProvider::Codex, None, "name-native").await;
+    let view = fixture
+        .supervisor
+        .registry
+        .inventory()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|view| view.soul_id == fixture.soul)
+        .unwrap();
+    let source = FreshAgentNativeNameSource {
+        incarnation_id: view.incarnation_id.clone(),
+        host_boot_id: view.host_boot_id.clone().unwrap(),
+        execution_generation: view.execution_generation,
+        intent_revision: view.intent_revision,
+        native_session_id: "name-native".into(),
+    };
+    let (received, host) =
+        fake_host_with_boot(&fixture.runtime_dir, false, source.host_boot_id.clone());
+    let make_request = || {
+        let mut request = Envelope::new(
+            RequestId::new(),
+            ControlRole::Web,
+            AdminCommand::FreshAgentNativeName(FreshAgentNativeNameRequest {
+                soul_id: fixture.soul.clone(),
+                source: source.clone(),
+                codex_home: "/owning/codex".into(),
+                operation: FreshAgentNativeNameOperation::Read,
+                expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
+            }),
+        );
+        request.auth = Some(SECRET.into());
+        request
+    };
+
+    let lifecycle_lock = fixture.supervisor.lifecycle_lock(&fixture.soul).await;
+    let busy_guard = lifecycle_lock.lock().await;
+    let busy = fixture.supervisor.dispatch(make_request()).await;
+    let AdminResult::FreshAgentNativeName(busy_reply) = busy.result.unwrap() else {
+        panic!("native name request returned the wrong result")
+    };
+    assert_eq!(
+        busy_reply,
+        FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::LifecycleBusy),
+        "the caller can distinguish a refusal before host dispatch"
+    );
+    assert!(
+        received.lock().unwrap().is_empty(),
+        "the busy request must not queue a host/native operation"
+    );
+
+    drop(busy_guard);
+    let fresh = fixture.supervisor.dispatch(make_request()).await;
+    let AdminResult::FreshAgentNativeName(fresh_reply) = fresh.result.unwrap() else {
+        panic!("native name request returned the wrong result")
+    };
+    assert_eq!(
+        fresh_reply,
+        FreshAgentNativeNameReply::Title(Some("Native title".into()))
+    );
+    assert_eq!(
+        received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|command| matches!(command, HostCommand::FreshAgentNativeName { .. }))
+            .count(),
+        1,
+        "only the fresh request after the lock release reaches the host"
+    );
+    host.abort();
+    assert!(host.await.unwrap_err().is_cancelled());
 }
 
 #[tokio::test]

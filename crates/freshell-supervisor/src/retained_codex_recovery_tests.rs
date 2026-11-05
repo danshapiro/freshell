@@ -327,7 +327,7 @@ impl ControlledCodex {
                                     }),
                                 }
                             }
-                            HostCommand::FreshAgentPrepareNative { .. } => {
+                            HostCommand::FreshAgentPrepareSameRootNative { .. } => {
                                 prepares.fetch_add(1, Ordering::SeqCst);
                                 if prepare_refuse.load(Ordering::SeqCst) {
                                     write_frame(

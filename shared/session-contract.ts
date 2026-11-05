@@ -20,6 +20,11 @@ export const RestoreErrorReasonSchema = z.enum([
   'dead_live_handle',
   'provider_runtime_failed',
   'durable_artifact_missing',
+  // Auto-restore-warming: the session index PUBLISHED but this identity's
+  // store could not be read (locked DB, unreadable transcript/dir). Honest
+  // error — never warming; the session identity is preserved for a later
+  // reconnect-driven retry.
+  'session_store_unreadable',
 ])
 
 export type RestoreErrorReason = z.infer<typeof RestoreErrorReasonSchema>

@@ -1738,9 +1738,7 @@ async fn a_foreign_status_only_native_sync_transition_republishes_on_adoption() 
         .unwrap()
         .expect("A's series claims its first cycle");
     a.fold_native_outcome(
-        target.clone(),
-        claim.location_revision,
-        claim.series_epoch,
+        claim.clone(),
         crate::session_name_native::NativeOutcomeFold::Undelivered {
             reason: "connect refusal".to_string(),
         },

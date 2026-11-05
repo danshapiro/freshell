@@ -246,6 +246,7 @@ impl DeterministicNativeRecovery {
                             exited: false,
                             native_session_id: Some(actual_native.clone()),
                             native_identity_observation: None,
+                            native_readiness_receipt: None,
                             opencode_transfer_receipt: None,
                             opencode_adoption: Default::default(),
                         }

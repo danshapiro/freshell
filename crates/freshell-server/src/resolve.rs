@@ -2083,11 +2083,15 @@ mod tests {
             serde_json::json!([{
                 "provider": "antigravity",
                 "sessionId": AGY_CONV,
-                "cwd": "/home/u/proj",
+                // Real records carry no workspace evidence (binary v1.4.12):
+                // the row has no cwd, so the resolve match falls back to the
+                // project grouping ("unknown") — the client then asks for a
+                // working directory instead of auto-opening.
+                "cwd": "unknown",
                 "sessionType": "antigravity",
                 "title": "Fix the flaky test",
                 "firstUserMessage": "Fix the flaky test",
-                "lastActivityAt": 1_793_304_005_500i64,
+                "lastActivityAt": 1_793_304_005_000i64,
                 "matchKind": "exact",
             }]),
             "the exact conversationId must resolve through the real antigravity source"

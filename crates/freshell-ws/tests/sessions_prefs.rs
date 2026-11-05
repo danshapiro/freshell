@@ -59,6 +59,7 @@ async fn spawn_server() -> (
     let interest = freshell_ws::subagent_interest::SubagentInterestRegistry::default();
 
     let state = WsState {
+        session_index_ready: None,
         layout: Default::default(),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         terminal_meta: Default::default(),

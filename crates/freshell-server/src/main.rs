@@ -1949,7 +1949,28 @@ async fn main() -> ExitCode {
             // installing the receiver HERE — BETWEEN construction and
             // start() — orders the FIRST publish provably after the watcher
             // reports its startup arms settled.
-            index.set_startup_gate(watcher.startup_ready());
+            //
+            // Test-only deterministic cold window (auto-restore-warming
+            // Task 3): `FRESHELL_TEST_SESSION_INDEX_STARTUP_HOLD_MS` (u64
+            // millis, read ONCE here at boot; unset/unparseable/0 =
+            // disabled — never a documented user knob) composes a fixed
+            // delay onto that receiver, so an e2e server (RustServer env
+            // forwarding) can hold every first-publish entry for a known
+            // duration: a reconcile landing inside the hold answers
+            // error{index_warming}, and the readiness broadcast fires at
+            // a known time. Disabled keeps the production wiring
+            // byte-identical (the direct watcher receiver, no composed
+            // task).
+            let hold_ms: u64 = std::env::var("FRESHELL_TEST_SESSION_INDEX_STARTUP_HOLD_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let startup_gate = if hold_ms > 0 {
+                delayed_startup_gate(watcher.startup_ready(), hold_ms)
+            } else {
+                watcher.startup_ready()
+            };
+            index.set_startup_gate(startup_gate);
             watcher.start();
             watcher
         })
@@ -2223,17 +2244,30 @@ async fn main() -> ExitCode {
             // check the attach arm (`agy --conversation <id>`) resolves —
             // the index's AntigravitySource drops parse-failed transcripts,
             // so a conversation dir on disk can answer a false warm Absent
-            // while the CLI would still resume it. CHEAP single-open check,
-            // so it joins the sync warm-Absent adjudication path
-            // (amplifier/opencode class, NOT codex's gate-only walk). The
-            // home is resolved with the SAME helper the provider_roots
-            // entry above uses. No resolvable provider home => probe
-            // behaves as today for antigravity.
+            // while the CLI would still resume it. CHEAP checks per query
+            // (the population probe's two brain/ readdirs + the resolved
+            // root's single open — the amplifier/opencode class, NOT
+            // codex's gate-only walk), so it joins the sync warm-Absent
+            // adjudication path.
+            // AUTHORITY LADDER (focused repair round 3, Major 1): the
+            // binary reads only ITS OWN store root, so the gate's by-id
+            // answers are rooted in that store, resolved per the ladder —
+            // the `FRESHELL_ANTIGRAVITY_HOME` override is authoritative
+            // alone; with it unset, the single conversation-bearing
+            // candidate root is the store; with BOTH candidates
+            // populated, Freshell cannot know which root the CLI reads
+            // and DEFERS found ids to the binary (Unknown at the probe —
+            // never a wrong-root Present the CLI would silently replace
+            // with a fresh conversation, and never a false refusal for an
+            // id found nowhere). A dual-root store logs one loud
+            // startup line telling the operator to set the override. The
+            // index source and the provider_roots entry above keep the
+            // seam's single-root selection (history/search parity). No
+            // resolvable provider home => probe behaves as today for
+            // antigravity.
             let probe = match session_directory::provider_home() {
                 Some(h) => probe.with_antigravity_transcript_locator(
-                    existence::antigravity_transcript_locator(
-                        freshell_sessions::provider_layout::antigravity_home(&h),
-                    ),
+                    existence::antigravity_authority_root_locator(&h),
                 ),
                 None => probe,
             };
@@ -2262,9 +2296,12 @@ async fn main() -> ExitCode {
                 let existence = match probe.exists_for_gate(provider, session_id) {
                     SessionExistence::Present => ResumeExistence::Present,
                     SessionExistence::Absent => ResumeExistence::Absent,
-                    SessionExistence::Unknown | SessionExistence::ProviderUnavailable => {
-                        ResumeExistence::Unknown
-                    }
+                    // Kata vnpc Task 4: `Unreadable` maps beside `Unknown` —
+                    // the resume gate fails open for user creates and blocks
+                    // managed recovery (both require positive evidence).
+                    SessionExistence::Unknown
+                    | SessionExistence::ProviderUnavailable
+                    | SessionExistence::Unreadable => ResumeExistence::Unknown,
                 };
                 ResumeProbeAnswer {
                     existence,
@@ -2385,6 +2422,13 @@ async fn main() -> ExitCode {
         handshake_settings: settings_store.shared_settings_lock(),
         config_fallback: config_fallback.clone(),
         broadcast_tx: Arc::clone(&broadcast_tx),
+        // Auto-restore-warming Task 2: the session-index readiness watch —
+        // read at handshake time for the negotiated `ready.sessionIndexReady`
+        // state field; the Task 3 boot wiring awaits it to fire the
+        // one-per-boot `sessions.index.ready` broadcast. `None` (no provider
+        // home) keeps readiness permanently cold — the honest answer for a
+        // boot with no session index at all.
+        session_index_ready: session_index.as_ref().map(|index| index.subscribe_ready()),
         fresh_codex: fresh_codex_state.clone(),
         fresh_claude: fresh_claude_state.clone(),
         fresh_opencode: fresh_opencode_state.clone(),
@@ -2695,6 +2739,12 @@ async fn main() -> ExitCode {
     // requests while it's in flight.
     if let Some(index) = &session_index {
         let warm_index = Arc::clone(index);
+        // Auto-restore-warming Task 3: the one-per-boot readiness fan-out
+        // (`sessions.index.ready`, capability-gated at the forward site).
+        // Subscribing BEFORE the warm sweep spawns makes the 0→true
+        // transition impossible to miss; an already-ready index (a request
+        // raced the warm task and published first) broadcasts immediately.
+        spawn_session_index_ready_broadcast(index, &ws_state);
         // DIAG-01: log the initial warm sweep's count + duration (an
         // equivalent call to `index.warm()`'s own body -- `snapshot()` is
         // what `warm()` calls internally -- but keeping the return value
@@ -4382,6 +4432,67 @@ fn sessions_sweep_signature(
     (items.len(), max_last_activity_at, hasher.finish())
 }
 
+/// Test-only deterministic cold window (auto-restore-warming Task 3):
+/// composes the watcher's startup-ready signal with a fixed delay, so an
+/// e2e server (via `FRESHELL_TEST_SESSION_INDEX_STARTUP_HOLD_MS`, read
+/// once at boot) can hold ALL first-publish entries — both publish paths
+/// consult the installed gate (`await_startup_gate`) — for a known
+/// duration: a reconcile landing inside the hold answers
+/// error{index_warming}, and the readiness broadcast fires at a known
+/// time. Unset/0 disables the composition entirely (production wiring
+/// stays byte-identical: the direct watcher receiver). Like
+/// `await_startup_gate`, this fails OPEN: if the inner watcher's sender
+/// dies without ever signaling, the gate still opens after the hold (a
+/// crashed watcher task must never wedge session serving).
+pub(crate) fn delayed_startup_gate(
+    inner: tokio::sync::watch::Receiver<bool>,
+    hold_ms: u64,
+) -> tokio::sync::watch::Receiver<bool> {
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        let mut inner = inner;
+        // Already-true at composition (a late install) opens immediately;
+        // changed() only gates the false→true transition.
+        if !*inner.borrow() {
+            let _ = inner.changed().await; // Err = sender dropped: fail OPEN
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(hold_ms)).await;
+        let _ = tx.send(true);
+    });
+    rx
+}
+
+/// One broadcast per boot when the session index completes its first sweep
+/// (auto-restore-warming Task 3): `SessionIndex::subscribe_ready` fired,
+/// so parked panes may now resume automatically. Subscribing BEFORE the
+/// warm sweep starts makes the 0→true transition impossible to miss; a
+/// late (already-true) state broadcasts immediately. The spawned task is
+/// one-shot — it exits after the single broadcast, so later publishes
+/// (which cannot re-flip the idempotent readiness latch,
+/// `send_if_modified`) never re-fire it. The frame is capability-gated at
+/// the forward site; frozen connections never see it.
+pub(crate) fn spawn_session_index_ready_broadcast(
+    index: &freshell_sessions::directory_index::SessionIndex,
+    ws_state: &WsState,
+) {
+    let mut ready = index.subscribe_ready();
+    let state = ws_state.clone();
+    tokio::spawn(async move {
+        // Already-ready (a request raced the warm task and published
+        // first): broadcast immediately; changed() only waits out the
+        // false→true transition. The sender never drops while the index
+        // lives, and even its Err arm falls through to the broadcast.
+        if !*ready.borrow() {
+            let _ = ready.changed().await;
+        }
+        freshell_ws::terminal::broadcast_sessions_index_ready(&state);
+        tracing::info!(
+            event = "session_index_ready_broadcast",
+            "session index readiness broadcast sent"
+        );
+    });
+}
+
 /// SESSION-09: event-driven sweep that detects session-directory changes and
 /// broadcasts `sessions.changed` so the sidebar refetches its active session
 /// window WITHOUT a page reload.
@@ -4798,81 +4909,9 @@ mod sessions_sweep_tests {
         ));
 
         // A REAL WsState (the sessions_prefs.rs harness literal, rerooted
-        // in-process): the sweep broadcasts through its shared channel.
-        let auth_token = Arc::new("tok".to_string());
-        let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
-        let mut broadcast_rx = broadcast_tx.subscribe();
-        let settings_json = serde_json::json!({
-            "ai": {},
-            "codingCli": { "enabledProviders": [], "mcpServer": true, "providers": {} },
-            "editor": { "externalEditor": "auto" },
-            "extensions": { "disabled": [] },
-            "freshAgent": { "defaultPlugins": [], "enabled": false, "providers": {} },
-            "logging": { "debug": false },
-            "network": { "configured": true, "host": "127.0.0.1" },
-            "panes": { "defaultNewPane": "ask" },
-            "safety": { "autoKillIdleMinutes": 15 },
-            "sidebar": {
-                "autoGenerateTitles": true,
-                "excludeFirstChatMustStart": false,
-                "excludeFirstChatSubstrings": []
-            },
-            "terminal": { "scrollback": 10000 }
-        });
-        let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
-        let ws_state = WsState {
-            pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
-            layout: Default::default(),
-            identity: identity.clone(),
-            terminal_meta: Default::default(),
-            auth_token: Arc::clone(&auth_token),
-            server_instance_id: Arc::new("srv-test".to_string()),
-            boot_id: Arc::new("boot-test".to_string()),
-            settings: Arc::new(serde_json::from_value(settings_json.clone()).unwrap()),
-            handshake_settings: Arc::new(tokio::sync::RwLock::new(
-                serde_json::from_value(settings_json).unwrap(),
-            )),
-            broadcast_tx: Arc::clone(&broadcast_tx),
-            auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
-            auto_resume_cancels: Default::default(),
-            fresh_codex: freshell_freshagent::FreshCodexState::new(
-                Arc::clone(&auth_token),
-                Arc::clone(&broadcast_tx),
-                serde_json::json!({ "freshAgent": { "enabled": false } }),
-            ),
-            fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
-            fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
-                freshell_freshagent::FreshAgentState::new(auth_token, Arc::clone(&broadcast_tx)),
-            ),
-            registry: freshell_terminal::TerminalRegistry::new(),
-            shutdown: Arc::new(tokio::sync::Notify::new()),
-            tabs: freshell_ws::tabs::TabsRegistry::new(),
-            screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
-            subagent_interest: Default::default(),
-            host_stats: Default::default(),
-            checkpoint_send: Default::default(),
-            terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-            sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-            cli_commands: Arc::new(Vec::new()),
-            ping_interval_ms: 30_000,
-            hello_timeout_ms: 5_000,
-            allowed_origins: Arc::new(freshell_ws::origin::default_allowed_origins()),
-            ws_max_payload_bytes: 16 * 1024 * 1024,
-            term09: freshell_ws::backpressure::Term09Config::default(),
-            create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
-            spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
-            shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
-            config_fallback: None,
-            opencode_locator: None,
-            codex_locator: None,
-            activity: None,
-            session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
-            reconcile_deferral_budget_ms:
-                freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-            fresh_agent_respawn_counts: Default::default(),
-            ownership: None,
-        };
+        // in-process — shared with the readiness-broadcast tests): the
+        // sweep broadcasts through its shared channel.
+        let (ws_state, identity, mut broadcast_rx) = broadcast_test_ws_state();
 
         let mut gen_rx = index.subscribe_changes();
         spawn_sessions_sweep(
@@ -4920,6 +4959,187 @@ mod sessions_sweep_tests {
             .expect("broadcast channel open");
         let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(v["type"], serde_json::json!("sessions.changed"));
+    }
+
+    // ── Auto-restore-warming Task 3: readiness broadcast + startup hold ──────
+
+    /// A REAL `WsState` over a REAL broadcast bus (the sessions_prefs.rs
+    /// harness literal, rerooted in-process) — the broadcast-observing
+    /// tests' shared construction: returns the state, the SAME identity
+    /// registry instance folded into it (for sweep-signature drives), and
+    /// a subscriber armed BEFORE any spawn, so a test observes exactly the
+    /// frames its own drives produce.
+    fn broadcast_test_ws_state() -> (
+        WsState,
+        freshell_ws::identity::TerminalIdentityRegistry,
+        tokio::sync::broadcast::Receiver<String>,
+    ) {
+        let auth_token = Arc::new("tok".to_string());
+        let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
+        let broadcast_rx = broadcast_tx.subscribe();
+        let settings_json = serde_json::json!({
+            "ai": {},
+            "codingCli": { "enabledProviders": [], "mcpServer": true, "providers": {} },
+            "editor": { "externalEditor": "auto" },
+            "extensions": { "disabled": [] },
+            "freshAgent": { "defaultPlugins": [], "enabled": false, "providers": {} },
+            "logging": { "debug": false },
+            "network": { "configured": true, "host": "127.0.0.1" },
+            "panes": { "defaultNewPane": "ask" },
+            "safety": { "autoKillIdleMinutes": 15 },
+            "sidebar": {
+                "autoGenerateTitles": true,
+                "excludeFirstChatMustStart": false,
+                "excludeFirstChatSubstrings": []
+            },
+            "terminal": { "scrollback": 10000 }
+        });
+        let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+        let ws_state = WsState {
+            pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
+            layout: Default::default(),
+            identity: identity.clone(),
+            terminal_meta: Default::default(),
+            auth_token: Arc::clone(&auth_token),
+            server_instance_id: Arc::new("srv-test".to_string()),
+            boot_id: Arc::new("boot-test".to_string()),
+            settings: Arc::new(serde_json::from_value(settings_json.clone()).unwrap()),
+            handshake_settings: Arc::new(tokio::sync::RwLock::new(
+                serde_json::from_value(settings_json).unwrap(),
+            )),
+            broadcast_tx: Arc::clone(&broadcast_tx),
+            session_index_ready: None,
+            auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+            auto_resume_cancels: Default::default(),
+            fresh_codex: freshell_freshagent::FreshCodexState::new(
+                Arc::clone(&auth_token),
+                Arc::clone(&broadcast_tx),
+                serde_json::json!({ "freshAgent": { "enabled": false } }),
+            ),
+            fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
+            fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
+                freshell_freshagent::FreshAgentState::new(auth_token, Arc::clone(&broadcast_tx)),
+            ),
+            registry: freshell_terminal::TerminalRegistry::new(),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            tabs: freshell_ws::tabs::TabsRegistry::new(),
+            screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
+            subagent_interest: Default::default(),
+            host_stats: Default::default(),
+            checkpoint_send: Default::default(),
+            terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            cli_commands: Arc::new(Vec::new()),
+            ping_interval_ms: 30_000,
+            hello_timeout_ms: 5_000,
+            allowed_origins: Arc::new(freshell_ws::origin::default_allowed_origins()),
+            ws_max_payload_bytes: 16 * 1024 * 1024,
+            term09: freshell_ws::backpressure::Term09Config::default(),
+            create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
+            spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
+            shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
+            config_fallback: None,
+            opencode_locator: None,
+            codex_locator: None,
+            activity: None,
+            session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+            reconcile_deferral_budget_ms:
+                freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+            fresh_agent_respawn_counts: Default::default(),
+            ownership: None,
+        };
+        (ws_state, identity, broadcast_rx)
+    }
+
+    /// The hold knob composes the startup gate: while held, the first
+    /// publish is delayed by exactly the hold (all first-publish entries
+    /// await the gate — directory_index.rs `await_startup_gate`), giving
+    /// e2e a deterministic cold window instead of a machine-speed-dependent
+    /// one.
+    #[tokio::test]
+    async fn delayed_startup_gate_holds_then_releases_once() {
+        let (inner_tx, inner_rx) = tokio::sync::watch::channel(false);
+        let start = std::time::Instant::now();
+        let mut gate = delayed_startup_gate(inner_rx, 300);
+        inner_tx.send(true).expect("alive");
+        assert!(!*gate.borrow(), "hold must keep the gate closed");
+        gate.changed().await.expect("gate sender alive");
+        assert!(*gate.borrow());
+        assert!(start.elapsed() >= std::time::Duration::from_millis(300));
+    }
+
+    /// hold_ms == 0: the gate resolves as soon as the inner watcher is
+    /// ready. Production wiring stays byte-identical when the knob is
+    /// unset/0 (main only composes the delay for hold_ms > 0); this pins
+    /// the composed-with-0 shape as a fast passthrough — strictly faster
+    /// than the 300ms hold the sibling test pins.
+    #[tokio::test]
+    async fn delayed_startup_gate_disabled_passes_through() {
+        let (inner_tx, inner_rx) = tokio::sync::watch::channel(false);
+        let start = std::time::Instant::now();
+        let mut gate = delayed_startup_gate(inner_rx, 0);
+        inner_tx.send(true).expect("alive");
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.changed())
+            .await
+            .expect("a disabled (0ms) hold must not wedge the gate")
+            .expect("gate sender alive");
+        assert!(*gate.borrow());
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(300),
+            "hold_ms == 0 must be a passthrough, not a fixed delay (took {:?})",
+            start.elapsed()
+        );
+    }
+
+    /// The Task 3 boot wiring's one-per-boot fan-out: the first publish
+    /// (here a real cold sweep over a seeded tempdir corpus) flips
+    /// readiness, and the broadcast fires exactly once for it. A second
+    /// publish — `request_refresh`, the real trigger a degraded-path
+    /// Retry uses — must NOT re-broadcast: the one-shot spawn task has
+    /// exited and the readiness flip itself is idempotent
+    /// (`send_if_modified`, pinned in directory_index).
+    #[tokio::test]
+    async fn readiness_broadcast_fires_exactly_once_on_first_publish() {
+        let claude_home = unique_temp_dir("ready-broadcast").join(".claude");
+        write_claude_session(
+            &claude_home,
+            "66666666-6666-4666-8666-666666666666",
+            "/tmp/ready-broadcast/one",
+            "2025-06-01T00:00:00.000Z",
+        );
+        let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(ClaudeSource::new(claude_home.clone())) as Arc<dyn SessionSource>],
+            std::time::Duration::from_millis(0),
+            None,
+        ));
+        let (ws_state, _identity, mut rx) = broadcast_test_ws_state();
+        spawn_session_index_ready_broadcast(&index, &ws_state);
+
+        // First publish: the cold inline sweep → readiness flip → the
+        // subscribed one-shot task broadcasts.
+        let _ = index.snapshot().await;
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("broadcast arrives")
+            .expect("channel alive");
+        assert!(frame.contains(r#""type":"sessions.index.ready""#));
+
+        // Exactly once: a second publish must not re-broadcast. The
+        // idle-wait confirms that refresh COMPLETED its publish before
+        // the silence window — a bare `snapshot().await` would return the
+        // stale cached copy immediately (stale-while-revalidate) and
+        // prove nothing.
+        index.request_refresh();
+        index.wait_for_refresh_idle_for_test().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+                .await
+                .is_err(),
+            "a second publish must not re-broadcast readiness"
+        );
+
+        std::fs::remove_dir_all(claude_home.parent().unwrap()).ok();
     }
 }
 

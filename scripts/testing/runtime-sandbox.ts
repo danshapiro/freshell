@@ -2734,6 +2734,7 @@ export class RuntimeHarness {
 
   private readonly trackedContainers = new Set<string>()
   private readonly trackedSupervisorContainers = new Set<string>()
+  private supervisorPtraceForDiagnostics = false
   private readonly trackedForeignContainers = new Set<string>()
   private readonly trackedVolumes = new Set<string>()
   private readonly unsettledDockerRequests = new Set<string>()
@@ -3739,6 +3740,13 @@ export class RuntimeHarness {
     return path.join(this.testRoot, 'scenarios', sanitizeName(scenarioId))
   }
 
+  enableSupervisorPtraceForDiagnostics(): void {
+    if (this.brokerStarted || this.trackedSupervisorContainers.size > 0) {
+      throw new Error('supervisor ptrace diagnostics must be enabled before the owned runtime starts')
+    }
+    this.supervisorPtraceForDiagnostics = true
+  }
+
   async startSupervisor(options: {
     scenarioId: string
     volumeName?: string
@@ -3803,6 +3811,7 @@ export class RuntimeHarness {
       '-v', `${this.buildDir}:${this.buildDir}:ro`,
       '-v', `${volumeName}:/var/lib/freshell-supervisor:rw`,
     ]
+    if (this.supervisorPtraceForDiagnostics) args.push('--cap-add', 'SYS_PTRACE')
     if (this.phase >= 2) {
       if (this.providerFixtureHome !== undefined) {
         // The supervisor resolves provider configuration-file references in
@@ -4360,6 +4369,14 @@ export class RuntimeHarness {
       throw new Error(`refusing to exec non-owned container ${containerId}`)
     }
     return execFileSync('docker', ['exec', containerId, ...command], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: SYNC_PROBE_TIMEOUT_MS, killSignal: 'SIGKILL' })
+  }
+
+  startOwnedContainerDetachedExact(containerId: string, command: string[]): void {
+    if (!this.broker.receiptIds().has(containerId) && !this.trackedContainers.has(containerId)) {
+      throw new Error('refusing to start a detached process in non-owned container ' + containerId)
+    }
+    const result = dockerResult(['exec', '-d', containerId, ...command])
+    if (result.status !== 0) throw new Error('detached process could not start in the exact owned container')
   }
 
   execOwnedContainerAsExact(containerId: string, user: string, command: string[]): string {

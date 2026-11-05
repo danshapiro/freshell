@@ -35,6 +35,113 @@ use freshell_ws::WsState;
 
 const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
 
+// ── capturing tracing layer (dev-only test facility, duplicated from
+// safe08_restore_diagnostics.rs / diag01_lifecycle_events.rs's convention;
+// thread-local default subscriber, safe under parallel `cargo test`) ──────
+
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
+use tracing::field::{Field, Visit};
+use tracing::{Event, Subscriber};
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::Layer;
+
+#[derive(Debug, Clone, Default)]
+struct CapturedEvent {
+    message: String,
+    /// `"DEBUG" | "INFO" | "WARN" | "ERROR"` — pinned by the
+    /// auto-restore-warming delta fix (finding 2): the recovery transition
+    /// events carry structured severity (the failure-resolution arm is
+    /// WARN, the clean-resolution arm INFO).
+    level: String,
+    fields: BTreeMap<String, String>,
+}
+
+#[derive(Default)]
+struct FieldVisitor {
+    message: String,
+    fields: BTreeMap<String, String>,
+}
+
+impl Visit for FieldVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        let rendered = format!("{value:?}");
+        if field.name() == "message" {
+            self.message = rendered;
+        } else {
+            self.fields.insert(field.name().to_string(), rendered);
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_string();
+        } else {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+}
+
+struct CaptureLayer {
+    events: Arc<Mutex<Vec<CapturedEvent>>>,
+}
+
+impl<S: Subscriber> Layer<S> for CaptureLayer {
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        let mut visitor = FieldVisitor::default();
+        event.record(&mut visitor);
+        self.events
+            .lock()
+            .expect("capture lock")
+            .push(CapturedEvent {
+                message: visitor.message,
+                level: event.metadata().level().to_string(),
+                fields: visitor.fields,
+            });
+    }
+}
+
+fn capture() -> (
+    Arc<Mutex<Vec<CapturedEvent>>>,
+    tracing::subscriber::DefaultGuard,
+) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let layer = CaptureLayer {
+        events: Arc::clone(&events),
+    };
+    let subscriber = tracing_subscriber::registry().with(layer);
+    let guard = tracing::subscriber::set_default(subscriber);
+    (events, guard)
+}
+
+/// All captured events carrying `event = <name>`, in emission order.
+fn events_by_name(events: &Arc<Mutex<Vec<CapturedEvent>>>, name: &str) -> Vec<CapturedEvent> {
+    events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| e.fields.get("event").map(String::as_str) == Some(name))
+        .cloned()
+        .collect()
+}
+
 fn test_settings_value() -> serde_json::Value {
     serde_json::json!({
         "ai": {},
@@ -96,6 +203,42 @@ impl freshell_ws::existence::SessionExistenceProbe for FlippingProbe {
     }
 }
 
+/// FlippingProbe with `ever_observed` pinned TRUE: an identity the disk HAS
+/// observed (the dead_session gate, §5.3 row 4). Used to script a
+/// warming -> confirmed-absence re-derivation (Unknown, then Absent for an
+/// ever-observed identity -> dead_session).
+struct ObservedFlippingProbe {
+    answers: std::sync::Mutex<std::collections::VecDeque<freshell_ws::existence::SessionExistence>>,
+    last: std::sync::Mutex<freshell_ws::existence::SessionExistence>,
+}
+
+impl ObservedFlippingProbe {
+    fn new(answers: Vec<freshell_ws::existence::SessionExistence>) -> Self {
+        let last = *answers.last().expect("at least one scripted answer");
+        Self {
+            answers: std::sync::Mutex::new(answers.into_iter().collect()),
+            last: std::sync::Mutex::new(last),
+        }
+    }
+}
+
+impl freshell_ws::existence::SessionExistenceProbe for ObservedFlippingProbe {
+    fn exists(
+        &self,
+        _provider: &str,
+        _session_id: &str,
+    ) -> freshell_ws::existence::SessionExistence {
+        match self.answers.lock().unwrap().pop_front() {
+            Some(answer) => answer,
+            None => *self.last.lock().unwrap(),
+        }
+    }
+
+    fn ever_observed(&self, _provider: &str, _session_id: &str) -> bool {
+        true
+    }
+}
+
 /// Real axum server on an ephemeral loopback port. Returns handles to the
 /// SHARED registry + identity registry so tests can seed generations
 /// deterministically (the §9.1 headless convention).
@@ -127,6 +270,7 @@ async fn spawn_server_with_probe(
     let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
 
     let mut state = WsState {
+        session_index_ready: None,
         layout: Default::default(),
         terminal_meta: Default::default(),
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
@@ -690,9 +834,17 @@ async fn frozen_client_create_path_is_deduped_same_as_negotiating_clients() {
 
 /// warming-never-completes (council red test): a probe pinned to Unknown
 /// forever must yield error{index_warming} after ONE bounded deferral —
-/// never a hang, never a fake fresh/dead_session.
+/// never a hang, never a fake fresh/dead_session. The server-side
+/// `pane_reconcile.index_warming` transition log fires exactly ONCE for
+/// such a request (when the deferral arms — never per poll; the deferral
+/// is single-shot by construction), carrying the DEFERRING panes' keys
+/// and session claims, and the post-deferral resolution is recorded by
+/// exactly ONE `pane_reconcile.index_warming_resolved` event at WARN with
+/// the per-pane failure cause (auto-restore-warming delta fix, finding 2:
+/// pane/session identifiers, duration, and final failure cause).
 #[tokio::test]
 async fn warming_never_completes_yields_error_index_warming() {
+    let (events, _guard) = capture();
     // Server with deferral budget shrunk for tests (50ms) and the default
     // NoIndexProbe (always Unknown for known providers).
     let server = spawn_server_with(|state| state.reconcile_deferral_budget_ms = 50).await;
@@ -713,12 +865,81 @@ async fn warming_never_completes_yields_error_index_warming() {
         v.get("retryAfterMs").is_none(),
         "retry is deleted from the wire"
     );
+    let warming_events = events_by_name(&events, "pane_reconcile.index_warming");
+    assert_eq!(
+        warming_events.len(),
+        1,
+        "the deferral arm logs exactly once per request — the post-deferral record is the resolution event below: {warming_events:?}"
+    );
+    let arm = &warming_events[0];
+    assert_eq!(
+        arm.message,
+        "pane reconcile deferred: session index warming"
+    );
+    assert_eq!(
+        arm.fields.get("reconcile_id").map(String::as_str),
+        Some("rec-warming")
+    );
+    assert_eq!(arm.fields.get("pane_count").map(String::as_str), Some("1"));
+    assert_eq!(arm.fields.get("budget_ms").map(String::as_str), Some("50"));
+    assert!(
+        arm.fields.contains_key("connection_id"),
+        "the event must identify the connection: {arm:?}"
+    );
+    // Delta fix finding 2: the arm event names the panes it is deferring
+    // and the session identities they claim.
+    assert_eq!(
+        arm.fields.get("pane_keys").map(String::as_str),
+        Some("pk-warm"),
+        "the deferred pane's key is logged: {arm:?}"
+    );
+    assert_eq!(
+        arm.fields.get("sessions").map(String::as_str),
+        Some("claude:sess-1"),
+        "the deferred pane's session claim is logged: {arm:?}"
+    );
+    // The post-deferral resolution: ONE event, WARN (the request's deferred
+    // panes ended in a failure state), with the per-pane failure cause and
+    // the deferral duration.
+    let resolution_events = events_by_name(&events, "pane_reconcile.index_warming_resolved");
+    assert_eq!(
+        resolution_events.len(),
+        1,
+        "exactly one resolution event per deferred request: {resolution_events:?}"
+    );
+    let resolved = &resolution_events[0];
+    assert_eq!(resolved.level, "WARN", "still-warming is a failure record");
+    assert_eq!(
+        resolved.fields.get("reconcile_id").map(String::as_str),
+        Some("rec-warming")
+    );
+    assert_eq!(
+        resolved.fields.get("warming_cleared").map(String::as_str),
+        Some("false"),
+        "the re-derivation still answered warming: {resolved:?}"
+    );
+    assert_eq!(
+        resolved.fields.get("unresolved_panes").map(String::as_str),
+        Some("pk-warm:index_warming"),
+        "the per-pane failure cause is logged: {resolved:?}"
+    );
+    assert!(
+        resolved
+            .fields
+            .get("elapsed_ms")
+            .and_then(|s| s.parse::<u64>().ok())
+            .expect("elapsed_ms is a number")
+            >= 50,
+        "the deferral duration is recorded: {resolved:?}"
+    );
 }
 
 /// A known provider with no home on this machine is NOT warming — it gets
-/// the honest provider_unavailable label, immediately (no 2s deferral).
+/// the honest provider_unavailable label, immediately (no 2s deferral, and
+/// no `pane_reconcile.index_warming` event: the deferral never arms).
 #[tokio::test]
 async fn provider_unavailable_is_immediate_and_honest() {
+    let (events, _guard) = capture();
     // A single scripted answer repeats forever — "always ProviderUnavailable".
     let probe = FlippingProbe::new(vec![
         freshell_ws::existence::SessionExistence::ProviderUnavailable,
@@ -741,12 +962,53 @@ async fn provider_unavailable_is_immediate_and_honest() {
     let v = &result["verdicts"][0];
     assert_eq!(v["verdict"], "error");
     assert_eq!(v["reason"], "provider_unavailable");
+    assert!(
+        events_by_name(&events, "pane_reconcile.index_warming").is_empty(),
+        "the warming event must never fire for a non-warming reason"
+    );
+}
+
+/// Kata vnpc Task 4: an unreadable store is NOT warming either — the request
+/// returns error{reason: "session_store_unreadable"} immediately (no 2s
+/// deferral, no `pane_reconcile.index_warming` event), mirroring
+/// `provider_unavailable_is_immediate_and_honest`.
+#[tokio::test]
+async fn unreadable_store_is_immediate_and_honest_never_deferred() {
+    let (events, _guard) = capture();
+    // A single scripted answer repeats forever — "always Unreadable".
+    let probe = FlippingProbe::new(vec![freshell_ws::existence::SessionExistence::Unreadable]);
+    // Deliberately LARGE budget: proves no deferral happens for this reason.
+    let server = spawn_server_with_probe(std::sync::Arc::new(probe), |state| {
+        state.reconcile_deferral_budget_ms = 30_000
+    })
+    .await;
+    let (mut ws, _ready) = connect(&server.url, true).await;
+    let started = std::time::Instant::now();
+    ws.send(reconcile_request_with_session_ref("claude", "sess-locked"))
+        .await
+        .expect("send request");
+    let result = next_frame_of_type(&mut ws, "pane.reconcile.result").await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "session_store_unreadable must never trigger the warming deferral"
+    );
+    let v = &result["verdicts"][0];
+    assert_eq!(v["verdict"], "error");
+    assert_eq!(v["reason"], "session_store_unreadable");
+    assert!(
+        events_by_name(&events, "pane_reconcile.index_warming").is_empty(),
+        "the warming event must never fire for an unreadable store"
+    );
 }
 
 /// The deferral is real: index warms during the wait -> the SECOND derivation
-/// answers with the warm verdict, not error.
+/// answers with the warm verdict, not error. The transition logs fire
+/// exactly ONCE each for the request — the deferral arm, then the
+/// resolution event at INFO (warming cleared, no unresolved pane) — never
+/// per poll.
 #[tokio::test]
 async fn warming_resolves_during_deferral_rederives() {
+    let (events, _guard) = capture();
     // Fake probe: first call Unknown, subsequent calls Absent (never observed
     // -> per existing rules the verdict for a never-observed identity is
     // fresh{identity_never_observed}).
@@ -764,6 +1026,201 @@ async fn warming_resolves_during_deferral_rederives() {
         .expect("send request");
     let result = next_frame_of_type(&mut ws, "pane.reconcile.result").await;
     assert_ne!(result["verdicts"][0]["verdict"], "error");
+    let warming_events = events_by_name(&events, "pane_reconcile.index_warming");
+    assert_eq!(
+        warming_events.len(),
+        1,
+        "a deferred request that resolves during the deferral logs the transition exactly once: {warming_events:?}"
+    );
+    let event = &warming_events[0];
+    assert_eq!(
+        event.message,
+        "pane reconcile deferred: session index warming"
+    );
+    assert_eq!(
+        event.fields.get("reconcile_id").map(String::as_str),
+        Some("rec-warming")
+    );
+    assert_eq!(
+        event.fields.get("pane_count").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        event.fields.get("budget_ms").map(String::as_str),
+        Some("50")
+    );
+    assert!(
+        event.fields.contains_key("connection_id"),
+        "the event must identify the connection: {event:?}"
+    );
+    assert_eq!(
+        event.fields.get("pane_keys").map(String::as_str),
+        Some("pk-warm"),
+        "the deferred pane's key is logged: {event:?}"
+    );
+    assert_eq!(
+        event.fields.get("sessions").map(String::as_str),
+        Some("claude:sess-2"),
+        "the deferred pane's session claim is logged: {event:?}"
+    );
+    // Delta fix finding 2: the resolution transition is recorded once, at
+    // INFO (the deferred pane resolved cleanly — no failure cause).
+    let resolution_events = events_by_name(&events, "pane_reconcile.index_warming_resolved");
+    assert_eq!(
+        resolution_events.len(),
+        1,
+        "exactly one resolution event per deferred request: {resolution_events:?}"
+    );
+    let resolved = &resolution_events[0];
+    assert_eq!(resolved.level, "INFO", "clean resolution is not a failure");
+    assert_eq!(
+        resolved.fields.get("reconcile_id").map(String::as_str),
+        Some("rec-warming")
+    );
+    assert_eq!(
+        resolved.fields.get("warming_cleared").map(String::as_str),
+        Some("true"),
+        "the re-derivation resolved the deferred pane: {resolved:?}"
+    );
+    assert_eq!(
+        resolved.fields.get("unresolved_panes").map(String::as_str),
+        Some(""),
+        "no pane resolved-to-error, so no failure causes: {resolved:?}"
+    );
+    assert!(
+        resolved.fields.contains_key("elapsed_ms"),
+        "the deferral duration is recorded: {resolved:?}"
+    );
+}
+
+/// Delta fix finding 2: a deferred pane that re-derives to a NON-warming
+/// error verdict (e.g. the honest session_store_unreadable once the index
+/// published but the store cannot be read) is a failure transition — the
+/// resolution event logs at WARN with the per-pane failure cause.
+#[tokio::test]
+async fn warming_resolves_to_error_verdict_logs_the_per_pane_failure_cause() {
+    let (events, _guard) = capture();
+    // First call Unknown (parks behind the deferral), then Unreadable (the
+    // index published but this identity's store could not be read).
+    let probe = FlippingProbe::new(vec![
+        freshell_ws::existence::SessionExistence::Unknown,
+        freshell_ws::existence::SessionExistence::Unreadable,
+    ]);
+    let server = spawn_server_with_probe(std::sync::Arc::new(probe), |state| {
+        state.reconcile_deferral_budget_ms = 50
+    })
+    .await;
+    let (mut ws, _ready) = connect(&server.url, true).await;
+    ws.send(reconcile_request_with_session_ref(
+        "claude",
+        "sess-locked-2",
+    ))
+    .await
+    .expect("send request");
+    let result = next_frame_of_type(&mut ws, "pane.reconcile.result").await;
+    assert_eq!(result["verdicts"][0]["verdict"], "error");
+    assert_eq!(result["verdicts"][0]["reason"], "session_store_unreadable");
+    assert_eq!(
+        events_by_name(&events, "pane_reconcile.index_warming").len(),
+        1,
+        "the deferral arm logged once"
+    );
+    let resolution_events = events_by_name(&events, "pane_reconcile.index_warming_resolved");
+    assert_eq!(
+        resolution_events.len(),
+        1,
+        "exactly one resolution event: {resolution_events:?}"
+    );
+    let resolved = &resolution_events[0];
+    assert_eq!(
+        resolved.level, "WARN",
+        "an error verdict is a failure record"
+    );
+    assert_eq!(
+        resolved.fields.get("unresolved_panes").map(String::as_str),
+        Some("pk-warm:session_store_unreadable"),
+        "the per-pane failure cause names the honest verdict reason: {resolved:?}"
+    );
+    assert_eq!(
+        resolved.fields.get("warming_cleared").map(String::as_str),
+        Some("true"),
+        "no pane still answers warming — the failure is the unreadable store, not a wait: {resolved:?}"
+    );
+}
+
+/// Focused review round 2, finding 2 (delta fix): a deferred pane whose
+/// post-deferral re-derivation CONFIRMS ABSENCE (an ever-observed identity
+/// the now-published index says is gone -> dead_session) is a failure
+/// transition of the recovery, not a clean resolution: exactly ONE
+/// `pane_reconcile.index_warming_resolved` event at WARN with the per-pane
+/// `dead_session` cause, the request identifier, and the deferral duration.
+/// True resolutions (attach/respawn/fresh) stay INFO — pinned by
+/// `warming_resolves_during_deferral_rederives` (fresh) staying green
+/// beside this classification.
+#[tokio::test]
+async fn warming_resolves_to_dead_session_logs_the_failure_cause() {
+    let (events, _guard) = capture();
+    // First answer Unknown (parks behind the deferral); then Absent for an
+    // identity the disk HAS observed — confirmed absence, §5.3 row 4.
+    let probe = ObservedFlippingProbe::new(vec![
+        freshell_ws::existence::SessionExistence::Unknown,
+        freshell_ws::existence::SessionExistence::Absent,
+    ]);
+    let server = spawn_server_with_probe(std::sync::Arc::new(probe), |state| {
+        state.reconcile_deferral_budget_ms = 50
+    })
+    .await;
+    let (mut ws, _ready) = connect(&server.url, true).await;
+    ws.send(reconcile_request_with_session_ref("claude", "sess-gone"))
+        .await
+        .expect("send request");
+    let result = next_frame_of_type(&mut ws, "pane.reconcile.result").await;
+    assert_eq!(
+        result["verdicts"][0]["verdict"], "dead_session",
+        "the ever-observed identity is confirmed absent: {}",
+        result["verdicts"][0]
+    );
+    assert_eq!(result["verdicts"][0]["reason"], "session_not_on_disk");
+    assert_eq!(
+        events_by_name(&events, "pane_reconcile.index_warming").len(),
+        1,
+        "the deferral arm logged once"
+    );
+    let resolution_events = events_by_name(&events, "pane_reconcile.index_warming_resolved");
+    assert_eq!(
+        resolution_events.len(),
+        1,
+        "exactly one resolution event per deferred request: {resolution_events:?}"
+    );
+    let resolved = &resolution_events[0];
+    assert_eq!(
+        resolved.level, "WARN",
+        "confirmed absence is a failure record, never a clean resolution: {resolved:?}"
+    );
+    assert_eq!(
+        resolved.fields.get("reconcile_id").map(String::as_str),
+        Some("rec-warming"),
+        "the resolution event keeps the request identifier: {resolved:?}"
+    );
+    assert_eq!(
+        resolved.fields.get("unresolved_panes").map(String::as_str),
+        Some("pk-warm:dead_session"),
+        "the per-pane failure cause names the dead_session classification: {resolved:?}"
+    );
+    assert_eq!(
+        resolved.fields.get("warming_cleared").map(String::as_str),
+        Some("true"),
+        "the index published — the failure is the confirmed absence, not a wait: {resolved:?}"
+    );
+    assert!(
+        resolved
+            .fields
+            .get("elapsed_ms")
+            .and_then(|s| s.parse::<u64>().ok())
+            .expect("elapsed_ms is a number")
+            >= 50,
+        "the deferral duration is recorded: {resolved:?}"
+    );
 }
 
 // --- waveC integration pin: idle-reap (#539) x reconcile verdicts (C2) ---------

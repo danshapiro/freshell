@@ -98,7 +98,9 @@ pub enum FreshAgentNativeNameOperation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FreshAgentNativeNameError {
-    /// The lifecycle guard refused before any host or provider operation.
+    /// The per-soul lifecycle fence refused before any host, provider, or
+    /// native operation was dispatched. Only clients that opt in receive this
+    /// typed refusal; they may retry from a fresh observation.
     LifecycleBusy,
     Unavailable {
         message: String,

@@ -92,7 +92,7 @@ pub(crate) async fn context_with_native_identity(
             .commit_execution_grant(prepared.incarnation_id.clone(), HostBootId::new(), limits())
             .await
             .unwrap();
-        if provider == "opencode" {
+        if matches!(provider, "codex" | "opencode") {
             // These callers start with a valid observed runtime. Resume and
             // checkpoint evidence remain absent until each test supplies it.
             // The dispatched-false branch deliberately models unobserved
@@ -120,7 +120,11 @@ pub(crate) async fn context_with_native_identity(
                         incarnation_id: launch.incarnation_id,
                         launch_nonce: launch.launch_nonce,
                         evidence_revision: launch.evidence_revision,
-                        source: NativeIdentitySource::OpencodeTui,
+                        source: if provider == "codex" {
+                            NativeIdentitySource::CodexAppServer
+                        } else {
+                            NativeIdentitySource::OpencodeTui
+                        },
                         evidence_digest: format!(
                             "{:x}",
                             Sha256::digest(b"synthetic checkpoint fixture native admission")
@@ -358,4 +362,52 @@ async fn inspected_shared_store_absence_remains_definitive() {
             ..
         }
     ));
+}
+
+#[tokio::test]
+async fn codex_rollout_only_absence_covers_checkpoint_restore_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, mut ctx) = context(temp.path(), "codex", true).await;
+    let home = tempfile::tempdir().unwrap();
+    let mut resume = spec("codex");
+    resume.provider_session.provider_store_id = ctx.provider_store_id.clone();
+    resume.provider_session.native_session_id = ctx.native_session_id.clone().unwrap();
+    resume.provider_home = home.path().display().to_string();
+    resume
+        .environment
+        .insert("HOME".into(), resume.provider_home.clone());
+    resume.evidence_revision = ctx.evidence_revision;
+    ctx.resume_spec = Some(resume.clone());
+
+    let store = freshell_agent_runtime::probe_provider_store(home.path(), &resume);
+    let freshell_agent_runtime::ProviderStoreProbe::DefinitivelyUnavailable {
+        reason,
+        evidence,
+        store_state,
+        negative_paths,
+    } = store
+    else {
+        panic!("absent exact Codex rollout should be inspectable: {store:?}");
+    };
+    let probe = RecoveryProbe::DefinitivelyUnavailable {
+        path: RecoveryPath::NativeResume,
+        reason,
+        evidence,
+        store_state,
+        negative_paths,
+    };
+
+    let refined = crate::recovery::after_native_probe(&ctx, probe);
+    assert!(
+        matches!(
+            &refined,
+            RecoveryProbe::DefinitivelyUnavailable {
+                path: RecoveryPath::NativeResume,
+                negative_paths,
+                ..
+            } if negative_paths.iter().any(|row| row.path == RecoveryPath::NativeResume)
+                && negative_paths.iter().any(|row| row.path == RecoveryPath::CheckpointRestore)
+        ),
+        "expected the complete Codex rollout census to cover both exact paths, got {refined:?}"
+    );
 }

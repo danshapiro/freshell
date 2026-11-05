@@ -10,6 +10,7 @@ import managedRuntimeReducer from '@/store/managedRuntimeSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer, { applyReconcileAttach, clearDeadTerminals } from '@/store/panesSlice'
 import { isFreshAgentReconcileActive, setFreshAgentReconcileActive } from '@/lib/pane-reconcile'
+import { ReadyMessageSchema } from '@/lib/ready-message-schema'
 import tabRegistryReducer from '@/store/tabRegistrySlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
 import extensionsReducer from '@/store/extensionsSlice'
@@ -254,6 +255,7 @@ function createStore() {
         lastError: undefined,
         platform: null,
         availableClis: {},
+        sessionIndexReady: false,
       },
       sessions: {
         projects: [],
@@ -310,13 +312,14 @@ function createStore() {
   })
 }
 
-function readyFrame(options: { capabilities?: Record<string, unknown> } = {}) {
+function readyFrame(options: { capabilities?: Record<string, unknown>; sessionIndexReady?: boolean } = {}) {
   return {
     type: 'ready',
     timestamp: new Date().toISOString(),
     serverInstanceId: 'srv-1',
     bootId: 'boot-1',
     ...(options.capabilities ? { capabilities: options.capabilities } : {}),
+    ...(options.sessionIndexReady !== undefined ? { sessionIndexReady: options.sessionIndexReady } : {}),
   }
 }
 
@@ -748,5 +751,94 @@ describe('App pane.reconcile adoption', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+})
+
+describe('session index readiness wiring (auto-restore-warming Task 5)', () => {
+  beforeEach(() => {
+    cleanup()
+    vi.resetAllMocks()
+    stubAudio()
+    sentFrames.length = 0
+    dispatchedTypes.length = 0
+    seededPane = null
+    seededFreshAgentPane = null
+    setFreshAgentReconcileActive(false)
+    messageHandlers = new Set()
+    disconnectHandler = null
+    wsMocks.isReady = false
+    wsMocks.serverInstanceId = undefined
+    wsMocks.onReconnect.mockReturnValue(() => {})
+    wsMocks.onDisconnect.mockImplementation((cb: () => void) => {
+      disconnectHandler = cb
+      return () => { disconnectHandler = null }
+    })
+    wsMocks.onMessage.mockImplementation((cb: (msg: any) => void) => {
+      messageHandlers.add(cb)
+      return () => messageHandlers.delete(cb)
+    })
+    wsMocks.send.mockImplementation((frame: unknown) => {
+      sentFrames.push(frame)
+    })
+
+    fetchSidebarSessionsSnapshot.mockResolvedValue([])
+    getTerminalDirectoryPage.mockResolvedValue({ items: [], revision: 1, nextCursor: null })
+    searchTerminalView.mockResolvedValue({ matches: [] })
+    apiGet.mockImplementation((url: string) => {
+      if (url === '/api/bootstrap') {
+        return Promise.resolve({
+          settings: defaultServerSettings,
+          platform: { platform: 'linux' },
+          shell: { authenticated: true, ready: true },
+        })
+      }
+      return Promise.resolve({})
+    })
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  it('parses ready.sessionIndexReady additively and degrades malformed values to undefined', () => {
+    // Parser boundary (the ready frame's zod schema, folded into this suite
+    // because it has no dedicated test file): a present boolean passes
+    // through; absence (old servers, non-negotiating clients) is undefined;
+    // a malformed value degrades to undefined without failing the WHOLE
+    // ready frame (the loose-record doctrine — a failed frame would
+    // silently disable restart detection).
+    const valid = { type: 'ready', timestamp: 'now', bootId: 'boot-1', serverInstanceId: 'srv-1' }
+    expect(ReadyMessageSchema.parse({ ...valid, sessionIndexReady: true }).sessionIndexReady).toBe(true)
+    expect(ReadyMessageSchema.parse({ ...valid, sessionIndexReady: false }).sessionIndexReady).toBe(false)
+    expect(ReadyMessageSchema.parse(valid).sessionIndexReady).toBeUndefined()
+    const degraded = ReadyMessageSchema.parse({ ...valid, sessionIndexReady: 'warming-up' })
+    expect(degraded.sessionIndexReady).toBeUndefined()
+    expect(degraded.bootId).toBe('boot-1')
+  })
+
+  it('dispatches sessionIndexReady from the ready frame state', async () => {
+    const store = await bootApp()
+    expect(store.getState().connection.sessionIndexReady).toBe(false)
+    act(() => {
+      emitServerFrame(readyFrame({ capabilities: { sessionIndexReadyV1: true }, sessionIndexReady: true }))
+    })
+    expect(store.getState().connection.sessionIndexReady).toBe(true)
+    // A later ready carrying sessionIndexReady: false resets it — a server
+    // restart re-folds the new boot's readiness from the handshake.
+    act(() => {
+      emitServerFrame(readyFrame({ capabilities: { sessionIndexReadyV1: true }, sessionIndexReady: false }))
+    })
+    expect(store.getState().connection.sessionIndexReady).toBe(false)
+  })
+
+  it('dispatches readiness true on the sessions.index.ready broadcast', async () => {
+    const store = await bootApp()
+    expect(store.getState().connection.sessionIndexReady).toBe(false)
+    act(() => {
+      emitServerFrame({ type: 'sessions.index.ready' })
+    })
+    expect(store.getState().connection.sessionIndexReady).toBe(true)
   })
 })

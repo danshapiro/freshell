@@ -576,8 +576,9 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
     // managed claim stays off until the named blocker chain clears: the
     // qualification spec, QUALIFIABLE_TERMINAL_PROVIDERS, the runtime image
     // pin, the ProviderPreparation/secret/bootstrap arms, and any managed
-    // doorway. The identity/state values record the Stage-1 candidate
-    // contract honestly (terminal locator + the documented transcript path);
+    // doorway. The identity/state values record the real-binary-validated
+    // store contract honestly (terminal locator + the documented transcript
+    // path, validated against real agy 1.4.12 transcripts 2026-11-02);
     // neither is a managed-recovery claim.
     ProviderCapability {
         provider: "antigravity",
@@ -588,8 +589,8 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
         recovery_paths: &[],
         managed_modes: &["antigravity"],
         execution_boundary: "legacy-extension",
-        identity_capture: "terminal locator (candidate contract; managed identity unimplemented)",
-        state_store: "$HOME/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl (candidate)",
+        identity_capture: "terminal locator (store real-binary-validated 2026-11-02; managed identity unimplemented)",
+        state_store: "$HOME/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl (real-binary-validated 2026-11-02)",
         resume_command: None,
         zero_turn_policy: "no-continuity-claim",
         checkpoint_policy: "none",
@@ -1079,8 +1080,10 @@ pub fn probe_provider_store(provider_home: &Path, spec: &ResumeSpec) -> Provider
         );
         evidence.push(reference.clone());
         for row in negative_paths.iter_mut().filter(|row| {
-            row.path == RecoveryPath::NativeResume
-                && row.verdict == RecoveryEvidenceVerdict::DefinitiveNegative
+            row.verdict == RecoveryEvidenceVerdict::DefinitiveNegative
+                && (row.path == RecoveryPath::NativeResume
+                    || (spec.provider_session.provider == "codex"
+                        && row.path == RecoveryPath::CheckpointRestore))
         }) {
             row.evidence_refs.push(reference.clone());
         }
@@ -1312,6 +1315,7 @@ fn probe_selected_provider_identity(
                 .join("projects"),
             expected,
             provider,
+            &[RecoveryPath::NativeResume],
         ),
         "codex" => probe_bounded_tree(
             &selection
@@ -1322,6 +1326,7 @@ fn probe_selected_provider_identity(
                 .join("sessions"),
             expected,
             provider,
+            &[RecoveryPath::NativeResume, RecoveryPath::CheckpointRestore],
         ),
         "amplifier" => probe_amplifier(provider_home, expected),
         "opencode" => probe_opencode(provider_home, expected, selection),
@@ -2154,7 +2159,12 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
     }
 }
 
-fn probe_bounded_tree(root: &Path, expected: &str, provider: &str) -> ProviderStoreProbe {
+fn probe_bounded_tree(
+    root: &Path,
+    expected: &str,
+    provider: &str,
+    absence_paths: &[RecoveryPath],
+) -> ProviderStoreProbe {
     if let Err(probe) = inspect_native_path(Path::new(""), root) {
         return probe;
     }
@@ -2191,7 +2201,7 @@ fn probe_bounded_tree(root: &Path, expected: &str, provider: &str) -> ProviderSt
                     "selected provider native store is absent".into(),
                     vec![root.display().to_string()],
                     EvidenceStoreState::Missing,
-                    &[RecoveryPath::NativeResume],
+                    absence_paths,
                 );
             }
             Err(_) => {
@@ -2332,7 +2342,7 @@ fn probe_bounded_tree(root: &Path, expected: &str, provider: &str) -> ProviderSt
             "selected provider native store has no matching owner".into(),
             vec![root.display().to_string()],
             EvidenceStoreState::PresentReadable,
-            &[RecoveryPath::NativeResume],
+            absence_paths,
         ),
         1 => ProviderStoreProbe::Ready { evidence: matches },
         _ => blocked(
@@ -3707,6 +3717,60 @@ mod tests {
     }
 
     #[test]
+    fn native_probe_codex_complete_rollout_absence_covers_rollout_only_checkpoint_path() {
+        for root_is_present in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let root = home.path().join(".codex/sessions");
+            if root_is_present {
+                fs::create_dir_all(&root).unwrap();
+                fs::write(
+                    root.join("other-session.jsonl"),
+                    format!(
+                        "{}\n",
+                        serde_json::json!({"type":"session_meta","payload":{"id":"other-session","cwd":"/work"}})
+                    ),
+                )
+                .unwrap();
+            }
+            let expected = "11111111-2222-3333-4444-555555555555";
+            let spec = resume_spec_for_test("codex", expected, home.path());
+
+            let probe = probe_provider_store(home.path(), &spec);
+            let ProviderStoreProbe::DefinitivelyUnavailable {
+                negative_paths,
+                store_state,
+                ..
+            } = probe
+            else {
+                panic!("complete Codex inspection should prove exact rollout absence: {probe:?}");
+            };
+            assert_eq!(
+                negative_paths
+                    .iter()
+                    .map(|row| row.path)
+                    .collect::<Vec<_>>(),
+                [RecoveryPath::NativeResume, RecoveryPath::CheckpointRestore]
+            );
+            assert!(negative_paths.iter().all(|row| {
+                row.verdict == RecoveryEvidenceVerdict::DefinitiveNegative
+                    && row.store_state == store_state
+                    && row
+                        .evidence_refs
+                        .iter()
+                        .any(|reference| reference.starts_with(NATIVE_CENSUS_PREFIX))
+            }));
+            assert_eq!(
+                store_state,
+                if root_is_present {
+                    EvidenceStoreState::PresentReadable
+                } else {
+                    EvidenceStoreState::Missing
+                }
+            );
+        }
+    }
+
+    #[test]
     fn native_probe_codex_requires_native_owner_even_when_filename_and_text_match() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join(".codex/sessions");
@@ -4606,11 +4670,11 @@ mod tests {
         assert_eq!(row.execution_boundary, "legacy-extension");
         assert_eq!(
             row.identity_capture,
-            "terminal locator (candidate contract; managed identity unimplemented)"
+            "terminal locator (store real-binary-validated 2026-11-02; managed identity unimplemented)"
         );
         assert_eq!(
             row.state_store,
-            "$HOME/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl (candidate)"
+            "$HOME/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl (real-binary-validated 2026-11-02)"
         );
         assert_eq!(row.resume_command, None);
         assert_eq!(row.zero_turn_policy, "no-continuity-claim");

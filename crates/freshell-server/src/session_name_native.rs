@@ -17,6 +17,9 @@
 //! counters. Only a current-revision readback within that allowance can
 //! establish the target as synchronized; an old acknowledgement alone
 //! cannot. Exhaustion is final for the revision.
+//! A supervisor lifecycle-lock refusal happens before provider dispatch and
+//! uses a separate persisted, bounded backoff budget, so brief contention
+//! does not consume a provider cycle or read.
 //!
 //! A pre-write read that answers `None` reports an EXISTING target holding
 //! no title yet — divergence, and exactly the state the writeback exists to
@@ -90,7 +93,9 @@ const CAPABILITY_REPROBE_DELAY: Duration = Duration::from_secs(2);
 // same phase/receipt, with at most three seconds of paced waiting PER PHASE
 // (nine per cycle). Exhaustion uses the existing finite cycle/backoff budget;
 // each adapter retains its own request deadline and cleanup ownership.
+#[cfg(any(feature = "managed-runtime-v1", test))]
 const LIFECYCLE_RETRY_ATTEMPTS: usize = 16;
+#[cfg(any(feature = "managed-runtime-v1", test))]
 const LIFECYCLE_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 /// The bounded window a FAILED on-demand route discovery backs the series
@@ -110,19 +115,24 @@ const DISCOVERY_RETRY_WINDOW: Duration = Duration::from_secs(30);
 // ---------------------------------------------------------------------------
 
 /// One classified native call outcome. `Confirmed` carries the response
-/// value; `Undelivered` is a known-no-effect failure (the request provably
+/// value; `LifecycleBusy` means the supervisor refused before provider/native
+/// dispatch; `Undelivered` is a known-no-effect failure (the request provably
 /// never took effect — a connect refusal or a definitive rejection);
 /// `Ambiguous` is a possibly-applied failure (timeout, mid-flight drop,
 /// post-send error); `Unsupported` is a diagnosed capability failure
 /// (unsupported/archived/ephemeral/missing). Native error classification is
 /// preserved here — never reduced to a generic timeout.
 /// `LifecycleBusy` proves that no host/native operation was dispatched. Its
-/// bounded phase retries share one charge and receipt; terminal contention
-/// consumes the finite cycle while retaining real reads and write ACKs.
+/// bounded phase retries reuse the same claim and receipt; persistent
+/// contention then releases only the exact pre-dispatch reservation into the
+/// durable lifecycle backoff, preserving any real read or acknowledged write.
 #[derive(Clone, Debug, PartialEq)]
 pub enum NativeCallResult<T> {
     Confirmed(T),
-    /// The managed lifecycle lock refused before any host/native dispatch.
+    /// The supervisor's per-soul lifecycle fence was busy. No provider work
+    /// was dispatched, so the same claim may be retried before a durable
+    /// deferral releases it for a fresh claim.
+    #[cfg(any(feature = "managed-runtime-v1", test))]
     LifecycleBusy,
     Undelivered(String),
     Ambiguous(String),
@@ -134,6 +144,8 @@ pub enum NativeCallResult<T> {
 /// it into the operation's own `NativeCallResult<T>`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum NativeClassified {
+    #[cfg(feature = "managed-runtime-v1")]
+    LifecycleBusy,
     Undelivered(String),
     Ambiguous(String),
     Unsupported(String),
@@ -142,6 +154,8 @@ pub enum NativeClassified {
 impl NativeClassified {
     pub(crate) fn into_call<T>(self) -> NativeCallResult<T> {
         match self {
+            #[cfg(feature = "managed-runtime-v1")]
+            Self::LifecycleBusy => NativeCallResult::LifecycleBusy,
             Self::Undelivered(reason) => NativeCallResult::Undelivered(reason),
             Self::Ambiguous(reason) => NativeCallResult::Ambiguous(reason),
             Self::Unsupported(reason) => NativeCallResult::Unsupported(reason),
@@ -191,9 +205,30 @@ pub struct NativeNameReadback {
 pub type NativeFuture<T> =
     Pin<Box<dyn std::future::Future<Output = NativeCallResult<T>> + Send + 'static>>;
 
-/// The owned boxed `Send` future the capability probe resolves to (a plain
-/// bool — a probe is not an operation and classifies nothing).
-pub type NativeProbeFuture = Pin<Box<dyn std::future::Future<Output = bool> + Send + 'static>>;
+/// Capability probes distinguish an absent route from a lifecycle lock
+/// refusal: genuine absence remains a pending pause, while typed contention
+/// uses the bounded durable lifecycle-deferral budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeProbeResult {
+    Available,
+    Unavailable,
+    #[cfg(any(feature = "managed-runtime-v1", test))]
+    LifecycleBusy,
+}
+
+impl From<bool> for NativeProbeResult {
+    fn from(available: bool) -> Self {
+        if available {
+            Self::Available
+        } else {
+            Self::Unavailable
+        }
+    }
+}
+
+/// The owned boxed `Send` future the capability probe resolves to.
+pub type NativeProbeFuture =
+    Pin<Box<dyn std::future::Future<Output = NativeProbeResult> + Send + 'static>>;
 
 /// The provider-adapter seam. `read` returns the current native title at the
 /// target; `write` sets the attempted title. Both preserve the provider's
@@ -202,9 +237,11 @@ pub type NativeProbeFuture = Pin<Box<dyn std::future::Future<Output = bool> + Se
 /// probes it before claiming a cycle so an initially absent route or
 /// capability (no live provider connection, no wired adapter, an unspawnable
 /// helper) pauses the series as `pending` without consuming any allowance,
-/// and a refusal rotates the series out of the selector for a bounded
-/// re-probe window; a `true` answer is not a health guarantee, the attempt
-/// itself still classifies its own outcome.
+/// and an unavailable result rotates the series out of the selector for a
+/// bounded re-probe window; an available result is not a health guarantee, the attempt
+/// itself still classifies its own outcome. A supervisor lifecycle-lock
+/// refusal is returned distinctly so the worker can apply its bounded
+/// contention policy instead of treating it as absent capability.
 pub trait NativeNameBackend: Send + Sync {
     fn read(&self, target: NativeNameTarget) -> NativeFuture<NativeNameReadback>;
     fn write(&self, attempt: NativeNameAttempt) -> NativeFuture<()>;
@@ -225,6 +262,11 @@ pub struct NativeWorkItem {
     pub desired_name: String,
     pub desired_source: NameSource,
     pub cycles_consumed: u32,
+    /// Current arming identity, carried so a stale probe cannot touch a
+    /// successor series.
+    pub series_epoch: NameRevision,
+    /// Lifecycle-refusal count when this due snapshot was selected.
+    pub lifecycle_busy_deferrals: u32,
     /// Delta-review round 3, finding 4: the series' next-due time, carried so
     /// the selector orders due work "then earliest nextDue/reference key" as
     /// the plan and the worker's own doc comment state. `None` is an unarmed
@@ -249,6 +291,14 @@ pub struct NativeCycleClaim {
     pub source: NameSource,
     pub receipt_id: String,
     pub cycle: u32,
+    /// This claim must only read the provider because its preceding write was
+    /// already acknowledged and is awaiting a current-location readback.
+    pub confirmation_only: bool,
+    /// The acknowledged write receipt being confirmed by a read-only claim.
+    pub confirmation_receipt_id: Option<String>,
+    /// Whether claiming this attempt incremented the finite cycle counter.
+    /// The final read-only confirmation claim may be allowed at the cycle cap.
+    pub cycle_charged: bool,
 }
 
 impl NativeCycleClaim {
@@ -273,6 +323,24 @@ impl NativeCycleClaim {
     }
 }
 
+/// Result of releasing a native cycle after a pre-dispatch lifecycle refusal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "managed-runtime-v1", test))]
+pub(crate) enum NativeLifecycleDeferralResult {
+    /// The exact current claim was released and a bounded retry was scheduled.
+    Deferred {
+        deferral_count: u32,
+        retry_in_ms: i64,
+    },
+    /// The fast retry window was exhausted and a durable cooldown was scheduled.
+    CooldownScheduled {
+        deferral_count: u32,
+        retry_in_ms: i64,
+    },
+    /// The claim's revision/epoch/receipt/location no longer names current work.
+    Stale,
+}
+
 /// One classified outcome folded back into the durable series.
 #[derive(Clone, Debug, PartialEq)]
 pub enum NativeOutcomeFold {
@@ -287,6 +355,9 @@ pub enum NativeOutcomeFold {
     WriteAcknowledged { receipt: String },
     /// A known-no-effect failure.
     Undelivered { reason: String },
+    /// A read failed ambiguously. Reads cannot apply a provider mutation, so
+    /// this must not set the possibly-applied write marker.
+    ReadFailure { reason: String },
     /// A possibly-applied failure — the receipt stays provenance, and a later
     /// matching readback records `observedCurrent` without ever establishing
     /// `synced` for this revision.
@@ -302,6 +373,7 @@ enum NativeLifecyclePhase {
     ConfirmationRead,
 }
 
+#[cfg(any(feature = "managed-runtime-v1", test))]
 async fn native_call_with_lifecycle_retry<T>(
     names: &Arc<SessionNames>,
     claim: &NativeCycleClaim,
@@ -345,6 +417,24 @@ async fn native_call_with_lifecycle_retry<T>(
         tokio::time::sleep(delay).await;
     }
     unreachable!("the finite retry loop returns on its final attempt")
+}
+
+#[cfg(not(any(feature = "managed-runtime-v1", test)))]
+async fn native_call_with_lifecycle_retry<T>(
+    names: &Arc<SessionNames>,
+    claim: &NativeCycleClaim,
+    _phase: NativeLifecyclePhase,
+    call: impl FnOnce() -> NativeFuture<T>,
+) -> Option<NativeCallResult<T>> {
+    match names.native_claim_is_current(claim.clone()).await {
+        Ok(true) => Some(call().await),
+        Ok(false) => None,
+        Err(error) => {
+            tracing::warn!(op = "native_claim_is_current", revision = claim.desired_revision,
+                class = %error.code(), "session_names.operation_failed: {error}");
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -616,32 +706,47 @@ async fn run(
                 // allowance, the rotation below moves it out of the selector
                 // for a bounded window so lower-priority armed series keep
                 // receiving slots, and it re-probes once that window expires.
-                if !native
+                let route_probe = native
                     .route_available(NativeNameTarget {
                         name_ref: item.target.clone(),
                         location: item.location.clone(),
                         location_revision: item.location_revision,
                     })
-                    .await
-                {
-                    tracing::debug!(
-                        target: "freshell_server::session_name_native",
-                        op = "route_available",
-                        name_ref = %freshell_freshagent::naming::name_ref_debug_key(&item.target),
-                        revision = item.desired_revision,
-                        class = "capability_absent",
-                        "session_names.native_route_unavailable: capability paused before claiming a cycle"
-                    );
-                    probe_backoff.insert(
-                        (
-                            freshell_freshagent::naming::name_ref_debug_key(&item.target),
-                            item.desired_revision,
-                        ),
-                        tokio::time::Instant::now() + CAPABILITY_REPROBE_DELAY,
-                    );
-                    drop(guard);
-                    tokio::time::sleep(WORKER_POLL_INTERVAL).await;
-                    continue;
+                    .await;
+                match route_probe {
+                    NativeProbeResult::Unavailable => {
+                        tracing::debug!(
+                            target: "freshell_server::session_name_native",
+                            op = "route_available",
+                            name_ref = %freshell_freshagent::naming::name_ref_debug_key(&item.target),
+                            revision = item.desired_revision,
+                            class = "capability_absent",
+                            "session_names.native_route_unavailable: capability paused before claiming a cycle"
+                        );
+                        probe_backoff.insert(
+                            (
+                                freshell_freshagent::naming::name_ref_debug_key(&item.target),
+                                item.desired_revision,
+                            ),
+                            tokio::time::Instant::now() + CAPABILITY_REPROBE_DELAY,
+                        );
+                        drop(guard);
+                        tokio::time::sleep(WORKER_POLL_INTERVAL).await;
+                        continue;
+                    }
+                    #[cfg(any(feature = "managed-runtime-v1", test))]
+                    NativeProbeResult::LifecycleBusy => {
+                        // A typed probe refusal proves no provider operation
+                        // was admitted. Record it in one exact-item
+                        // transaction; claim+refund as separate writes could
+                        // leave a phantom cycle if the process stops between
+                        // them.
+                        defer_lifecycle_busy_item(&names, &item, "probe").await;
+                        drop(guard);
+                        tokio::time::sleep(WORKER_POLL_INTERVAL).await;
+                        continue;
+                    }
+                    NativeProbeResult::Available => {}
                 }
                 // Recover any interrupted generation start while holding the
                 // guard (only a guard-holder dispatches, so an InFlight series
@@ -651,7 +756,7 @@ async fn run(
                 // (the provider calls and any owned-helper cleanup) and
                 // released right after the fold — external ambiguity never
                 // retains it.
-                run_cycle(&names, native.as_ref(), &item.target).await;
+                run_cycle_for_item(&names, native.as_ref(), &item).await;
                 drop(guard);
             }
             WorkSelection::Generation(item) => {
@@ -788,33 +893,55 @@ fn select_next(
 /// outcome into the durable series. A late/ambiguous acknowledgement can
 /// never synchronize a newer revision or a relocated target (the fold guards
 /// enforce that against the current document).
+#[cfg(test)]
 async fn run_cycle(
     names: &Arc<SessionNames>,
     native: &dyn NativeNameBackend,
     target: &SessionNameRef,
 ) {
+    run_cycle_with_item(names, native, target, None).await;
+}
+
+async fn run_cycle_for_item(
+    names: &Arc<SessionNames>,
+    native: &dyn NativeNameBackend,
+    item: &NativeWorkItem,
+) {
+    run_cycle_with_item(names, native, &item.target, Some(item)).await;
+}
+
+async fn run_cycle_with_item(
+    names: &Arc<SessionNames>,
+    native: &dyn NativeNameBackend,
+    target: &SessionNameRef,
+    work_item: Option<&NativeWorkItem>,
+) {
     let receipt = Uuid::new_v4().to_string();
-    let Some(claim) = names
-        .claim_native_cycle(target.clone(), receipt)
-        .await
-        .unwrap_or_else(|error| {
-            tracing::warn!(
-                target: "freshell_server::session_name_native",
-                op = "claim_native_cycle",
-                name_ref = %freshell_freshagent::naming::name_ref_debug_key(target),
-                revision = error.log_revision(),
-                class = %error.code(),
-                "session_names.operation_failed: {error}"
-            );
-            None
-        })
-    else {
+    let claim_result = match work_item {
+        Some(item) => {
+            names
+                .claim_native_cycle_for_item(item.clone(), receipt)
+                .await
+        }
+        None => names.claim_native_cycle(target.clone(), receipt).await,
+    };
+    let Some(claim) = claim_result.unwrap_or_else(|error| {
+        tracing::warn!(
+            target: "freshell_server::session_name_native",
+            op = if work_item.is_some() {
+                "claim_native_cycle_for_item"
+            } else {
+                "claim_native_cycle"
+            },
+            name_ref = %freshell_freshagent::naming::name_ref_debug_key(target),
+            revision = error.log_revision(),
+            class = %error.code(),
+            "session_names.operation_failed: {error}"
+        );
+        None
+    }) else {
         return;
     };
-    let claim_target = claim.target.clone();
-    let location_revision = claim.location_revision;
-    let series_epoch = claim.series_epoch;
-
     // 1. One current-target read before any retry/reconciliation. Matching
     //    titles synchronize immediately (the native already holds the exact
     //    desired value); a readback of `None` reports an EXISTING target
@@ -829,9 +956,7 @@ async fn run_cycle(
         // and stops repair.
         let _ = names
             .fold_native_outcome(
-                claim_target.clone(),
-                location_revision,
-                series_epoch,
+                claim.clone(),
                 NativeOutcomeFold::Undelivered {
                     reason: "native read allowance exhausted".to_string(),
                 },
@@ -849,41 +974,21 @@ async fn run_cycle(
     };
     let observed = match outcome {
         NativeCallResult::Confirmed(readback) => readback.title,
+        #[cfg(any(feature = "managed-runtime-v1", test))]
         NativeCallResult::LifecycleBusy => {
-            fold_lifecycle_contention(names, &claim).await;
+            defer_lifecycle_busy(names, &claim, "read", claim.cycle_charged, true).await;
             return;
         }
         NativeCallResult::Undelivered(reason) => {
-            fold(
-                names,
-                &claim_target,
-                location_revision,
-                series_epoch,
-                NativeOutcomeFold::Undelivered { reason },
-            )
-            .await;
+            fold(names, &claim, NativeOutcomeFold::Undelivered { reason }).await;
             return;
         }
         NativeCallResult::Ambiguous(reason) => {
-            fold(
-                names,
-                &claim_target,
-                location_revision,
-                series_epoch,
-                NativeOutcomeFold::Ambiguous { reason },
-            )
-            .await;
+            fold(names, &claim, NativeOutcomeFold::ReadFailure { reason }).await;
             return;
         }
         NativeCallResult::Unsupported(reason) => {
-            fold(
-                names,
-                &claim_target,
-                location_revision,
-                series_epoch,
-                NativeOutcomeFold::Unsupported { reason },
-            )
-            .await;
+            fold(names, &claim, NativeOutcomeFold::Unsupported { reason }).await;
             return;
         }
     };
@@ -892,15 +997,58 @@ async fn run_cycle(
         // current-revision readback synchronizes this exact revision.
         fold(
             names,
-            &claim_target,
-            location_revision,
-            series_epoch,
+            &claim,
             NativeOutcomeFold::Read {
                 observed,
-                receipt: Some(claim.receipt_id.clone()),
+                receipt: Some(
+                    claim
+                        .confirmation_receipt_id
+                        .clone()
+                        .unwrap_or_else(|| claim.receipt_id.clone()),
+                ),
             },
         )
         .await;
+        return;
+    }
+    if claim.confirmation_only {
+        // An acknowledged provider write is never repeated while its receipt
+        // is awaiting confirmation. A divergent read only schedules another
+        // read-only claim within the remaining finite policy.
+        fold(
+            names,
+            &claim,
+            NativeOutcomeFold::Read {
+                observed,
+                receipt: claim.confirmation_receipt_id.clone(),
+            },
+        )
+        .await;
+        return;
+    }
+    let claim_current = names
+        .native_claim_is_current(claim.clone())
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                target: "freshell_server::session_name_native",
+                op = "native_claim_is_current",
+                name_ref = %freshell_freshagent::naming::name_ref_debug_key(&claim.target),
+                revision = error.log_revision(),
+                class = %error.code(),
+                "session_names.operation_failed: {error}"
+            );
+            false
+        });
+    if !claim_current {
+        tracing::debug!(
+            target: "freshell_server::session_name_native",
+            op = "write_claim_stale",
+            name_ref = %freshell_freshagent::naming::name_ref_debug_key(&claim.target),
+            revision = claim.desired_revision,
+            class = "stale_claim",
+            "session_names.native_write_not_dispatched: the native claim changed during pre-read"
+        );
         return;
     }
     // Divergent title (including `None` — an existing target with no title
@@ -917,53 +1065,31 @@ async fn run_cycle(
         return;
     };
     match outcome {
-        NativeCallResult::LifecycleBusy => {
-            fold_lifecycle_contention(names, &claim).await;
-            return;
-        }
         NativeCallResult::Confirmed(()) => {
             fold(
                 names,
-                &claim_target,
-                location_revision,
-                series_epoch,
+                &claim,
                 NativeOutcomeFold::WriteAcknowledged {
                     receipt: claim.receipt_id.clone(),
                 },
             )
             .await;
         }
+        #[cfg(any(feature = "managed-runtime-v1", test))]
+        NativeCallResult::LifecycleBusy => {
+            defer_lifecycle_busy(names, &claim, "write", claim.cycle_charged, false).await;
+            return;
+        }
         NativeCallResult::Undelivered(reason) => {
-            fold(
-                names,
-                &claim_target,
-                location_revision,
-                series_epoch,
-                NativeOutcomeFold::Undelivered { reason },
-            )
-            .await;
+            fold(names, &claim, NativeOutcomeFold::Undelivered { reason }).await;
             return;
         }
         NativeCallResult::Ambiguous(reason) => {
-            fold(
-                names,
-                &claim_target,
-                location_revision,
-                series_epoch,
-                NativeOutcomeFold::Ambiguous { reason },
-            )
-            .await;
+            fold(names, &claim, NativeOutcomeFold::Ambiguous { reason }).await;
             return;
         }
         NativeCallResult::Unsupported(reason) => {
-            fold(
-                names,
-                &claim_target,
-                location_revision,
-                series_epoch,
-                NativeOutcomeFold::Unsupported { reason },
-            )
-            .await;
+            fold(names, &claim, NativeOutcomeFold::Unsupported { reason }).await;
             return;
         }
     }
@@ -977,9 +1103,7 @@ async fn run_cycle(
     {
         let _ = names
             .fold_native_outcome(
-                claim_target.clone(),
-                location_revision,
-                series_epoch,
+                claim.clone(),
                 NativeOutcomeFold::Undelivered {
                     reason: "native read allowance exhausted before the confirming readback"
                         .to_string(),
@@ -999,15 +1123,10 @@ async fn run_cycle(
         return;
     };
     match outcome {
-        NativeCallResult::LifecycleBusy => {
-            fold_lifecycle_contention(names, &claim).await;
-        }
         NativeCallResult::Confirmed(readback) => {
             fold(
                 names,
-                &claim_target,
-                location_revision,
-                series_epoch,
+                &claim,
                 NativeOutcomeFold::Read {
                     observed: readback.title,
                     receipt: Some(claim.receipt_id.clone()),
@@ -1015,71 +1134,167 @@ async fn run_cycle(
             )
             .await;
         }
+        #[cfg(any(feature = "managed-runtime-v1", test))]
+        NativeCallResult::LifecycleBusy => {
+            // The acknowledged write has already happened. Keep its cycle
+            // charge and retry only the fenced confirmation read.
+            defer_lifecycle_busy(names, &claim, "confirm_read", false, true).await;
+        }
         NativeCallResult::Undelivered(reason) => {
-            fold(
-                names,
-                &claim_target,
-                location_revision,
-                series_epoch,
-                NativeOutcomeFold::Undelivered { reason },
-            )
-            .await;
+            fold(names, &claim, NativeOutcomeFold::Undelivered { reason }).await;
         }
         NativeCallResult::Ambiguous(reason) => {
-            fold(
-                names,
-                &claim_target,
-                location_revision,
-                series_epoch,
-                NativeOutcomeFold::Ambiguous { reason },
-            )
-            .await;
+            fold(names, &claim, NativeOutcomeFold::ReadFailure { reason }).await;
         }
         NativeCallResult::Unsupported(reason) => {
-            fold(
-                names,
-                &claim_target,
-                location_revision,
-                series_epoch,
-                NativeOutcomeFold::Unsupported { reason },
-            )
-            .await;
+            fold(names, &claim, NativeOutcomeFold::Unsupported { reason }).await;
         }
     }
 }
 
-async fn fold_lifecycle_contention(names: &Arc<SessionNames>, claim: &NativeCycleClaim) {
-    fold(
-        names,
-        &claim.target,
-        claim.location_revision,
-        claim.series_epoch,
-        NativeOutcomeFold::Undelivered {
-            reason: "native naming lifecycle contention exhausted".into(),
-        },
-    )
-    .await;
-}
-
-async fn fold(
-    names: &Arc<SessionNames>,
-    target: &SessionNameRef,
-    location_revision: NameRevision,
-    series_epoch: NameRevision,
-    outcome: NativeOutcomeFold,
-) {
-    if let Err(error) = names
-        .fold_native_outcome(target.clone(), location_revision, series_epoch, outcome)
-        .await
-    {
+async fn fold(names: &Arc<SessionNames>, claim: &NativeCycleClaim, outcome: NativeOutcomeFold) {
+    if let Err(error) = names.fold_native_outcome(claim.clone(), outcome).await {
         tracing::warn!(
             target: "freshell_server::session_name_native",
             op = "fold_native_outcome",
-            name_ref = %freshell_freshagent::naming::name_ref_debug_key(target),
+            name_ref = %freshell_freshagent::naming::name_ref_debug_key(&claim.target),
             revision = error.log_revision(),
             class = %error.code(),
             "session_names.operation_failed: {error}"
         );
+    }
+}
+
+#[cfg(any(feature = "managed-runtime-v1", test))]
+async fn defer_lifecycle_busy(
+    names: &Arc<SessionNames>,
+    claim: &NativeCycleClaim,
+    operation: &'static str,
+    refund_cycle: bool,
+    refund_read: bool,
+) {
+    let name_ref = freshell_freshagent::naming::name_ref_debug_key(&claim.target);
+    match names
+        .defer_native_lifecycle_busy(claim.clone(), refund_cycle, refund_read)
+        .await
+    {
+        Ok(NativeLifecycleDeferralResult::Deferred {
+            deferral_count,
+            retry_in_ms,
+        }) => tracing::info!(
+            target: "freshell_server::session_name_native",
+            op = "defer_native_lifecycle_busy",
+            name_ref = %name_ref,
+            revision = claim.desired_revision,
+            series_epoch = claim.series_epoch,
+            location_revision = claim.location_revision,
+            cycle = claim.cycle,
+            operation,
+            deferral_count,
+            retry_in_ms,
+            refunded_cycle = refund_cycle && claim.cycle_charged,
+            refunded_read = refund_read,
+            "session_names.native_cycle_deferred"
+        ),
+        Ok(NativeLifecycleDeferralResult::CooldownScheduled {
+            deferral_count,
+            retry_in_ms,
+        }) => tracing::warn!(
+            target: "freshell_server::session_name_native",
+            op = "defer_native_lifecycle_busy",
+            name_ref = %name_ref,
+            revision = claim.desired_revision,
+            series_epoch = claim.series_epoch,
+            location_revision = claim.location_revision,
+            cycle = claim.cycle,
+            operation,
+            deferral_count,
+            retry_in_ms,
+            "session_names.native_cycle_cooldown_scheduled"
+        ),
+        Ok(NativeLifecycleDeferralResult::Stale) => tracing::debug!(
+            target: "freshell_server::session_name_native",
+            op = "defer_native_lifecycle_busy",
+            name_ref = %name_ref,
+            revision = claim.desired_revision,
+            series_epoch = claim.series_epoch,
+            location_revision = claim.location_revision,
+            cycle = claim.cycle,
+            operation,
+            "session_names.native_cycle_deferral_stale"
+        ),
+        Err(error) => tracing::warn!(
+            target: "freshell_server::session_name_native",
+            op = "defer_native_lifecycle_busy",
+            name_ref = %name_ref,
+            revision = error.log_revision(),
+            class = %error.code(),
+            operation,
+            "session_names.operation_failed: {error}"
+        ),
+    }
+}
+
+#[cfg(any(feature = "managed-runtime-v1", test))]
+async fn defer_lifecycle_busy_item(
+    names: &Arc<SessionNames>,
+    item: &NativeWorkItem,
+    operation: &'static str,
+) {
+    let name_ref = freshell_freshagent::naming::name_ref_debug_key(&item.target);
+    match names
+        .defer_native_lifecycle_busy_for_item(item.clone())
+        .await
+    {
+        Ok(NativeLifecycleDeferralResult::Deferred {
+            deferral_count,
+            retry_in_ms,
+        }) => tracing::info!(
+            target: "freshell_server::session_name_native",
+            op = "defer_native_lifecycle_busy_for_item",
+            name_ref = %name_ref,
+            revision = item.desired_revision,
+            series_epoch = item.series_epoch,
+            location_revision = item.location_revision,
+            operation,
+            deferral_count,
+            retry_in_ms,
+            "session_names.native_cycle_deferred"
+        ),
+        Ok(NativeLifecycleDeferralResult::CooldownScheduled {
+            deferral_count,
+            retry_in_ms,
+        }) => tracing::warn!(
+            target: "freshell_server::session_name_native",
+            op = "defer_native_lifecycle_busy_for_item",
+            name_ref = %name_ref,
+            revision = item.desired_revision,
+            series_epoch = item.series_epoch,
+            location_revision = item.location_revision,
+            operation,
+            deferral_count,
+            retry_in_ms,
+            "session_names.native_cycle_cooldown_scheduled"
+        ),
+        Ok(NativeLifecycleDeferralResult::Stale) => tracing::debug!(
+            target: "freshell_server::session_name_native",
+            op = "defer_native_lifecycle_busy_for_item",
+            name_ref = %name_ref,
+            revision = item.desired_revision,
+            series_epoch = item.series_epoch,
+            location_revision = item.location_revision,
+            operation,
+            "session_names.native_cycle_deferral_stale"
+        ),
+        Err(error) => tracing::warn!(
+            target: "freshell_server::session_name_native",
+            op = "defer_native_lifecycle_busy_for_item",
+            name_ref = %name_ref,
+            revision = error.log_revision(),
+            class = %error.code(),
+            operation,
+            "session_names.operation_failed: {error}"
+        ),
     }
 }
 
@@ -1326,6 +1541,7 @@ impl NativeNameBackend for ClaudeNativeNameAdapter {
                     NativeCallResult::Confirmed(NativeNameReadback { title })
                 }
                 NativeCallResult::Undelivered(reason) => NativeCallResult::Undelivered(reason),
+                #[cfg(any(feature = "managed-runtime-v1", test))]
                 NativeCallResult::LifecycleBusy => NativeCallResult::LifecycleBusy,
                 NativeCallResult::Ambiguous(reason) => NativeCallResult::Ambiguous(reason),
                 NativeCallResult::Unsupported(reason) => NativeCallResult::Unsupported(reason),
@@ -1355,8 +1571,9 @@ impl NativeNameBackend for ClaudeNativeNameAdapter {
         Box::pin(async move {
             match adapter.exchange(attempt.target.location, request).await {
                 NativeCallResult::Confirmed(_) => NativeCallResult::Confirmed(()),
-                NativeCallResult::Undelivered(reason) => NativeCallResult::Undelivered(reason),
+                #[cfg(any(feature = "managed-runtime-v1", test))]
                 NativeCallResult::LifecycleBusy => NativeCallResult::LifecycleBusy,
+                NativeCallResult::Undelivered(reason) => NativeCallResult::Undelivered(reason),
                 NativeCallResult::Ambiguous(reason) => NativeCallResult::Ambiguous(reason),
                 NativeCallResult::Unsupported(reason) => NativeCallResult::Unsupported(reason),
             }
@@ -1369,7 +1586,7 @@ impl NativeNameBackend for ClaudeNativeNameAdapter {
         // the bind, and the staged helper must exist for any attempt.
         let session_ok = !session_id_of(&target.name_ref).is_empty();
         let helper_exists = self.helper_path.exists();
-        Box::pin(async move { session_ok && helper_exists })
+        Box::pin(async move { (session_ok && helper_exists).into() })
     }
 }
 
@@ -1586,11 +1803,11 @@ impl NativeNameBackend for CodexNativeNameAdapter {
         let hosted = self.hosted.clone();
         Box::pin(async move {
             if codex_root_matched_thread(&resolver, &target).await.is_ok() {
-                return true;
+                return NativeProbeResult::Available;
             }
             match hosted {
                 Some(hosted) => hosted.route_available(target).await,
-                None => false,
+                None => NativeProbeResult::Unavailable,
             }
         })
     }
@@ -1768,7 +1985,7 @@ impl NativeNameBackend for OpencodeNativeNameAdapter {
         // lazy creation un-pauses armed series within one re-probe window.
         let resolvable = !Self::session_id_of_target(&target.name_ref, &target.location).is_empty();
         let shared = Arc::clone(&self.shared);
-        Box::pin(async move { resolvable && shared.lock().await.is_some() })
+        Box::pin(async move { (resolvable && shared.lock().await.is_some()).into() })
     }
 }
 
@@ -1843,7 +2060,7 @@ impl NativeNameBackend for NativeNameDispatch {
             Some(backend) => backend.route_available(target),
             // No adapter wired (a degraded boot): the capability is absent —
             // the series pauses as pending, never a burned cycle.
-            None => Box::pin(async move { false }),
+            None => Box::pin(async move { NativeProbeResult::Unavailable }),
         }
     }
 }

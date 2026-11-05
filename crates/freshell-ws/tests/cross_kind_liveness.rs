@@ -482,6 +482,7 @@ async fn build_ws_state_with_probe_and_env(
     let registry = registry.with_ownership(Arc::clone(&ownership));
 
     let state = WsState {
+        session_index_ready: None,
         layout: Default::default(),
         terminal_meta: Default::default(),
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
