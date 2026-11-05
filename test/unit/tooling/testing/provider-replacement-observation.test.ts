@@ -110,6 +110,12 @@ describe('provider replacement observation', () => {
     expect(() => selectProviderReplacement([pending], before, [scheduled, cancelled])).toThrow('CAPABILITY_PENDING')
   })
 
+  it('does not let an old incarnation retry authorize a blocked replacement incarnation', () => {
+    const blockedReplacement = { ...pending, incarnationId: 'new' }
+    expect(() => selectProviderReplacement([blockedReplacement], before, [scheduled]))
+      .toThrow('CAPABILITY_PENDING')
+  })
+
   it('keeps one absolute deadline when authorized preparation never completes', async () => {
     vi.useFakeTimers()
     const read = vi.fn().mockResolvedValue({ rows: [pending], events: [scheduled] })

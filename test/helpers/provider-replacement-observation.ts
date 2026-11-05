@@ -85,7 +85,8 @@ export function selectProviderReplacement<T extends ReplacementView>(
   const blocked = matching.find(row => row.recoveryState === 'blocked')
   if (blocked) {
     const retryActive = preparationRetryIsActive(events, before)
-    if (blocked.recoveryReason !== 'CAPABILITY_PENDING' || !retryActive) {
+    if (blocked.recoveryReason !== 'CAPABILITY_PENDING'
+      || blocked.incarnationId !== before.incarnationId || !retryActive) {
       const retryState = retryActive ? 'active' : 'absent_or_invalid'
       const retryEvents = events.filter(event => event.event.startsWith('supervisor.recovery_retry.')
         && event.data.soulId === before.soulId).map(event => ({
