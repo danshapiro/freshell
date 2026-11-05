@@ -1787,7 +1787,7 @@ impl FreshAgentTransport for HostedTransport {
             }
             ProviderState::Codex(state) => {
                 use freshell_freshagent::codex::CodexSendOutcome;
-                return match state.handle_send(send).await {
+                return match state.handle_send_same_root(send).await {
                     CodexSendOutcome::Accepted {
                         session_id: native,
                         submitted_turn_id,
@@ -5693,6 +5693,18 @@ await import(parameters.source)
             .allow_and_wait(state, &original, false, deadline)
             .await;
         let before_requests = std::fs::read(&log).unwrap();
+        let saved_epoch = host.control_fence.lock().unwrap().max_control_epoch;
+        host.control_fence.lock().unwrap().max_control_epoch = saved_epoch.saturating_add(1);
+        assert!(
+            native_host_command(&host, prepare()).await.is_err(),
+            "stale same-root readiness must be refused before provider work"
+        );
+        assert_eq!(
+            std::fs::read(&log).unwrap(),
+            before_requests,
+            "a stale control fence must not launch or resume a native process"
+        );
+        host.control_fence.lock().unwrap().max_control_epoch = saved_epoch;
         let saved_launch = host
             .persisted
             .lock()
@@ -6050,6 +6062,55 @@ await import(parameters.source)
                     .remove("threadResumeThreadId");
             }
             std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR", behavior.to_string());
+            let persisted = host.persisted.lock().await.clone();
+            let launch = persisted
+                .native_identity_launch
+                .clone()
+                .expect("the retained host owns the exact source launch");
+            let mut source_fence = crate::tests::native_readiness_fence_for_test(&launch);
+            source_fence.control_epoch = persisted.max_control_epoch;
+            let readiness = native_host_command(
+                &host,
+                freshell_runtime_protocol::HostCommand::FreshAgentPrepareNative {
+                    incarnation_id: host.incarnation_id.clone(),
+                    expected_launch: Some(launch.clone()),
+                    source_fence: Some(source_fence),
+                },
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{mode}: exact-store readiness failed before the later SEND: {error:?}; requests={}",
+                    std::fs::read_to_string(&log).unwrap()
+                )
+            });
+            let freshell_runtime_protocol::HostResult::FreshAgentCommand {
+                native_session_id: Some(ready_root),
+                native_identity,
+                ..
+            } = readiness
+            else {
+                panic!("{mode}: readiness did not return the committed provider root")
+            };
+            assert_eq!(
+                ready_root,
+                if mode == "missing" {
+                    replacement.as_str()
+                } else {
+                    original.as_str()
+                },
+                "{mode}: exact-store readiness selects the authorized root before SEND"
+            );
+            if mode == "missing" {
+                let identity = native_identity.expect("missing history mints under its receipt");
+                assert_eq!(identity.previous_native_session_id, original);
+                assert_eq!(identity.native_session_id, replacement);
+            } else {
+                assert!(
+                    native_identity.is_none(),
+                    "{mode}: same-root readiness mints nothing"
+                );
+            }
             native_mint_input(
                 &actor,
                 Some(&host),
@@ -6278,8 +6339,8 @@ await import(parameters.source)
     }
 
     #[tokio::test]
-    async fn authenticated_native_crash_compact_second_exit_refuses_without_mint_then_send_recovers(
-    ) {
+    async fn authenticated_native_crash_compact_second_exit_refuses_without_mint_then_send_refuses()
+    {
         let logs = tempfile::tempdir().unwrap();
         let first_gate = NativeExitGate::new(logs.path());
         let second_dir = logs.path().join("second");
@@ -6394,27 +6455,42 @@ await import(parameters.source)
         behavior["overrides"] = json!({"thread/resume":{"error":{"code":-32600,"message":format!("no rollout found for thread id {original}")}}});
         behavior["threadStartThreadId"] = json!(replacement);
         std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR", behavior.to_string());
-        native_mint_input(
+        let refused = native_mint_input(
             &actor,
             Some(&host),
             "send-after-second-native-exit",
             "explicit recovery SEND",
         )
-        .await
-        .unwrap();
+        .await;
+        assert!(
+            refused.is_err(),
+            "hosted SEND must not create a replacement Codex root without supervisor readiness"
+        );
         assert_eq!(
             actor.profile().await.native_session_id.as_deref(),
-            Some(replacement.as_str())
+            Some(original.as_str())
         );
-        native_mint_input(
-            &actor,
-            Some(&host),
-            "second-send-after-second-native-exit",
-            "second explicit SEND",
-        )
-        .await
-        .unwrap();
-        assert_eq!(actor.snapshot().await.unwrap()["threadId"], replacement);
+        assert_eq!(actor.profile().await, before);
+        assert!(!fixture.transport.native_identity.lock().unwrap().pending);
+        let rows = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["method"] == "thread/start")
+                .count(),
+            1,
+            "a failed hosted SEND must not mint an uncommitted replacement root"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["method"] == "turn/start")
+                .count(),
+            1,
+            "a refused hosted SEND must not dispatch user input"
+        );
         native_host_command(
             &host,
             freshell_runtime_protocol::HostCommand::Stop {
@@ -6778,6 +6854,38 @@ await import(parameters.source)
             .is_err());
             host.control_fence.lock().unwrap().stopped = false;
             assert_eq!(std::fs::read(&log).unwrap(), before);
+        }
+        if let Some(host) = &host {
+            let launch = host
+                .persisted
+                .lock()
+                .await
+                .native_identity_launch
+                .clone()
+                .expect("the retained host owns the exact source launch");
+            let prepared = native_host_command(
+                host,
+                freshell_runtime_protocol::HostCommand::FreshAgentPrepareNative {
+                    incarnation_id: host.incarnation_id.clone(),
+                    expected_launch: Some(launch.clone()),
+                    source_fence: Some(crate::tests::native_readiness_fence_for_test(&launch)),
+                },
+            )
+            .await
+            .expect("receipt-backed readiness must finish before hosted SEND");
+            let freshell_runtime_protocol::HostResult::FreshAgentCommand {
+                native_identity: Some(identity),
+                ..
+            } = prepared
+            else {
+                panic!("native readiness must return its durable root transition")
+            };
+            assert_eq!(identity.previous_native_session_id, original);
+            assert_ne!(identity.native_session_id, original);
+            assert_eq!(
+                actor.profile().await.native_session_id.as_deref(),
+                Some(identity.native_session_id.as_str())
+            );
         }
         let recovery = native_mint_input(
             &actor,

@@ -2078,7 +2078,6 @@ async fn native_name_lifecycle_contention_is_undispatched_and_fresh_retry_succee
             operation: FreshAgentNativeNameOperation::Write {
                 title: "Manual title".into(),
             },
-            accepts_lifecycle_busy: true,
             expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
         }),
     );

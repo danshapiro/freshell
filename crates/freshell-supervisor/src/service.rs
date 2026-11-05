@@ -43,7 +43,8 @@ use tokio::{
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FreshNativeAdmission {
     Live,
-    CodexSendRecovery,
+    CodexLiveReadiness,
+    CodexReadiness,
     CodexCompactReadiness,
 }
 
@@ -2706,7 +2707,7 @@ impl Supervisor {
             ));
         }
         let host = self
-            .authenticate_fresh_host(&soul_id, &active, FreshNativeAdmission::CodexSendRecovery)
+            .authenticate_fresh_host(&soul_id, &active, FreshNativeAdmission::CodexReadiness)
             .await?;
         let (disposition, incarnation_id) = self
             .registry
@@ -2862,12 +2863,29 @@ impl Supervisor {
         }
     }
 
-    async fn authenticate_current_fresh_host(
+    pub(crate) async fn authenticate_current_fresh_host(
         &self,
         soul_id: &SoulId,
         active: &crate::registry::OwnedRuntimeHandle,
     ) -> Result<AuthenticatedHost, RuntimeError> {
-        self.authenticate_fresh_host(soul_id, active, FreshNativeAdmission::Live)
+        let admission = if active
+            .fresh_agent()
+            .is_some_and(|agent| agent.provider.as_str() == "codex")
+        {
+            FreshNativeAdmission::CodexLiveReadiness
+        } else {
+            FreshNativeAdmission::Live
+        };
+        self.authenticate_fresh_host(soul_id, active, admission)
+            .await
+    }
+
+    pub(crate) async fn authenticate_current_codex_recovery_host(
+        &self,
+        soul_id: &SoulId,
+        active: &crate::registry::OwnedRuntimeHandle,
+    ) -> Result<AuthenticatedHost, RuntimeError> {
+        self.authenticate_fresh_host(soul_id, active, FreshNativeAdmission::CodexReadiness)
             .await
     }
 
@@ -2931,11 +2949,23 @@ impl Supervisor {
             .capabilities
             .iter()
             .any(|capability| capability == "fresh-agent-codex-same-root-readiness-v1");
-        let codex_same_root_prepare = admission == FreshNativeAdmission::CodexCompactReadiness
-            && supports_codex_same_root_readiness
+        let retained_codex = matches!(
+            admission,
+            FreshNativeAdmission::CodexReadiness | FreshNativeAdmission::CodexCompactReadiness
+        ) && status.exited
             && self
                 .retained_codex_host_eligible(&current, &host, &status)
                 .await?;
+        let codex_readiness_admitted = match admission {
+            FreshNativeAdmission::CodexReadiness | FreshNativeAdmission::CodexCompactReadiness => {
+                !status.exited || retained_codex
+            }
+            FreshNativeAdmission::CodexLiveReadiness => !status.exited,
+            FreshNativeAdmission::Live => false,
+        };
+        let codex_same_root_prepare = admission == FreshNativeAdmission::CodexCompactReadiness
+            && supports_codex_same_root_readiness
+            && retained_codex;
         if readiness_needed && can_prepare_claude {
             let before = current.write_fence();
             let expected_launch = current
@@ -3082,8 +3112,11 @@ impl Supervisor {
                 ));
             }
         } else if readiness_needed
-            && admission == FreshNativeAdmission::CodexCompactReadiness
-            && !supports_codex_same_root_readiness
+            && codex_readiness_admitted
+            && (admission == FreshNativeAdmission::CodexReadiness
+                || admission == FreshNativeAdmission::CodexLiveReadiness
+                || (admission == FreshNativeAdmission::CodexCompactReadiness
+                    && !supports_codex_same_root_readiness))
             && !fixture
             && current.provider == "codex"
             && current.desired_state == freshell_runtime_protocol::DesiredState::Running
@@ -3117,9 +3150,9 @@ impl Supervisor {
                     .any(|capability| capability == required)
             })
         {
-            // This compatibility path is only for Compact on older hosts
-            // without the dedicated same-root check. SEND and permission
-            // resolution require retained or current live identity proof.
+            // This exact-store path serves Codex readiness when live proof is
+            // incomplete or a validated retained SEND is being recovered. It
+            // commits any resulting root transition before the operation runs.
             let before_probe = current.write_fence();
             let (probe, probed_context) = self
                 .probe_codex_native_readiness_locked(&current, &host)
@@ -3318,15 +3351,10 @@ impl Supervisor {
                 }
             }
         }
-        let retained_codex = admission == FreshNativeAdmission::CodexSendRecovery
-            && self
-                .retained_codex_host_eligible(&current, &host, &status)
-                .await?;
         if current.desired_state != freshell_runtime_protocol::DesiredState::Running
             || current.prior_handle.incarnation_id() != active.incarnation_id()
-            || (status.exited && !retained_codex)
+            || status.exited
             || (!fixture
-                && !retained_codex
                 && (!host
                     .capabilities
                     .iter()
@@ -3344,7 +3372,6 @@ impl Supervisor {
                     "provider":current.provider,
                     "desiredState":current.desired_state,
                     "statusExited":status.exited,
-                    "retainedCodex":retained_codex,
                     "fixture":fixture,
                     "hasCurrentNativeObservation":
                         crate::recovery::current_native_observation(&current, &status).is_some(),
@@ -3358,15 +3385,6 @@ impl Supervisor {
                 RuntimeErrorCode::RecoveryBlocked,
                 "fresh-agent input requires the current committed native identity",
             ));
-        }
-        if retained_codex {
-            append_event(
-                &self.config.lifecycle_log,
-                "fresh_agent.retained_codex_recovery_admitted",
-                serde_json::json!({"severity":"info","soulId":soul_id,
-                    "incarnationId":active.incarnation_id(),"hostBootId":host.host_boot_id,
-                    "nativeSessionId":current.native_session_id}),
-            );
         }
         Ok(host)
     }
