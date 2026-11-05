@@ -7633,19 +7633,20 @@ async fn opencode_map_hit_success_preserves_durable_owner(attach: bool) {
                 requester,
             )
             .await;
-        let replies = std::mem::take(
+        let requester_replies = std::mem::take(
             &mut *captured
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
         assert!(
-            replies.iter().any(|frame| match frame {
-                freshell_protocol::ServerMessage::FreshAgentEvent(event) => {
-                    event.event["type"] == "freshAgent.session.snapshot" && event.session_id == id
-                }
-                _ => false,
-            }),
-            "successful attach should return its legacy snapshot to the requester: {replies:?}"
+            matches!(
+                requester_replies.as_slice(),
+                [freshell_protocol::ServerMessage::FreshAgentEvent(event)]
+                    if event.event["type"] == "freshAgent.session.snapshot"
+                        && event.session_id == id
+            ),
+            "successful attach should return exactly one legacy snapshot to its requester: \
+             {requester_replies:?}"
         );
     } else {
         h.ws_state
@@ -7653,17 +7654,44 @@ async fn opencode_map_hit_success_preserves_durable_owner(attach: bool) {
             .handle_create(create("adopt-existing"), None)
             .await;
     }
-    let replies: Vec<Value> = std::iter::from_fn(|| replies.try_recv().ok())
+    let broadcast_frames: Vec<Value> = std::iter::from_fn(|| replies.try_recv().ok())
         .map(|raw| serde_json::from_str(&raw).unwrap())
         .collect();
-    assert!(
-        replies.iter().any(|frame| if attach {
-            frame["event"]["type"] == "freshAgent.session.snapshot" && frame["sessionId"] == id
-        } else {
-            frame["type"] == "freshAgent.created" && frame["requestId"] == "adopt-existing"
-        }),
-        "successful adoption must answer the request: {replies:?}"
-    );
+    if attach {
+        assert!(
+            broadcast_frames.iter().any(|frame| {
+                frame["type"] == "session.runtimeOwner"
+                    && frame["provider"] == "opencode"
+                    && frame["sessionId"] == id
+                    && frame["ownerKind"] == "fresh-agent"
+                    && frame["transition"] == "handoff-committed"
+            }),
+            "successful adoption should publish its committed shared owner: {broadcast_frames:?}"
+        );
+        assert!(
+            broadcast_frames.iter().any(|frame| {
+                frame["type"] == "freshAgent.event"
+                    && frame["event"]["type"] == "freshAgent.session.metadata"
+                    && frame["sessionId"] == id
+            }),
+            "successful attach should publish shared session metadata: {broadcast_frames:?}"
+        );
+        assert!(
+            broadcast_frames.iter().all(|frame| {
+                !(frame["type"] == "freshAgent.event"
+                    && frame["event"]["type"] == "freshAgent.session.snapshot"
+                    && frame["sessionId"] == id)
+            }),
+            "the synthetic attach snapshot is requester-scoped, not shared: {broadcast_frames:?}"
+        );
+    } else {
+        assert!(
+            broadcast_frames.iter().any(|frame| {
+                frame["type"] == "freshAgent.created" && frame["requestId"] == "adopt-existing"
+            }),
+            "successful create adoption should publish its request result: {broadcast_frames:?}"
+        );
+    }
     // A mistaken guard Drop starts asynchronous repair after the successful handler.
     tokio::time::sleep(Duration::from_millis(150)).await;
     let live = registry.observe("opencode", id);
