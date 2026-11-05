@@ -16379,6 +16379,8 @@ describe('dead-session notice line (no-modal contract)', () => {
     installPerfAuditBridge(null)
     restoreMocks.consumeTerminalRestoreRequestId.mockReset()
     restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(false)
+    restoreMocks.consumeRecoveredLiveTerminalTarget.mockReset()
+    restoreMocks.consumeRecoveredLiveTerminalTarget.mockReturnValue(undefined)
     terminalThemeMocks.getTerminalTheme.mockReset()
     terminalThemeMocks.getTerminalTheme.mockReturnValue({})
   })
