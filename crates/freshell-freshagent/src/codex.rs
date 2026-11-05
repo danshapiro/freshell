@@ -112,6 +112,138 @@ pub enum CodexCreateOutcome {
 /// create callers continue to receive the legacy generic create failure.
 pub const NATIVE_READINESS_RESUME_NOT_FOUND: &str = "CODEX_NATIVE_READINESS_RESUME_NOT_FOUND";
 
+/// A provider child and, on Windows, the job which owns its process tree.
+/// The job must outlive startup and remain with the child until teardown.
+struct CodexChild {
+    child: tokio::process::Child,
+    #[cfg(windows)]
+    guard: Option<Arc<crate::codex_windows_guard::CodexWindowsGuard>>,
+}
+
+impl From<tokio::process::Child> for CodexChild {
+    fn from(child: tokio::process::Child) -> Self {
+        Self {
+            child,
+            #[cfg(windows)]
+            guard: None,
+        }
+    }
+}
+
+impl std::ops::Deref for CodexChild {
+    type Target = tokio::process::Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for CodexChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
+impl Drop for CodexChild {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if let Some(guard) = &self.guard {
+            if let Err(error) = guard.terminate() {
+                tracing::warn!(target: "freshell_freshagent::codex", %error,
+                    "freshagent.codex.windows_job_drop_terminate_failed");
+            }
+        }
+    }
+}
+
+/// Holds a Windows resume's exact process authority across every awaited
+/// startup step. If the caller is cancelled, a later attempt must confirm
+/// that same tree before starting another writer.
+struct ResumeAttemptFence {
+    #[cfg(windows)]
+    state: FreshCodexState,
+    #[cfg(windows)]
+    session_id: String,
+    #[cfg(windows)]
+    recorded: Option<crate::session_lease::CondemnedRuntimeIdentity>,
+    #[cfg(windows)]
+    guard: Option<Arc<crate::codex_windows_guard::CodexWindowsGuard>>,
+}
+
+impl ResumeAttemptFence {
+    fn new(state: &FreshCodexState, session_id: &str) -> Self {
+        #[cfg(not(windows))]
+        let _ = (state, session_id);
+        Self {
+            #[cfg(windows)]
+            state: state.clone(),
+            #[cfg(windows)]
+            session_id: session_id.to_string(),
+            #[cfg(windows)]
+            recorded: None,
+            #[cfg(windows)]
+            guard: None,
+        }
+    }
+
+    fn arm(&mut self, ownership_id: &str, child: &CodexChild) {
+        #[cfg(windows)]
+        {
+            self.state.retain_windows_guard(ownership_id, child);
+            self.guard = child.guard.clone();
+            self.recorded = Some(crate::session_lease::record_condemned_runtime_identity(
+                child.id().unwrap_or(0),
+                CODEX_SIDECAR_OWNERSHIP_ENV,
+                ownership_id,
+            ));
+        }
+        #[cfg(not(windows))]
+        let _ = (ownership_id, child);
+    }
+
+    fn disarm(&mut self) {
+        #[cfg(windows)]
+        {
+            self.recorded = None;
+            self.guard = None;
+        }
+    }
+}
+
+impl Drop for ResumeAttemptFence {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if let Some(recorded) = self.recorded.take() {
+            if let Some(guard) = self.guard.take() {
+                self.state
+                    .windows_sidecar_guards
+                    .lock()
+                    .expect("windows codex guards lock")
+                    .entry(recorded.ownership_id.clone())
+                    .or_insert(guard);
+            }
+            retain_codex_condemned_prior_if_current(
+                &self.state.condemned_priors,
+                &self.session_id,
+                recorded.clone(),
+            );
+            if let Some(guard) = self
+                .state
+                .windows_sidecar_guards
+                .lock()
+                .expect("windows codex guards lock")
+                .get(&recorded.ownership_id)
+                .cloned()
+            {
+                if let Err(error) = guard.terminate() {
+                    tracing::warn!(target: "freshell_freshagent::codex", %error,
+                        "freshagent.codex.cancelled_resume_terminate_failed");
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CodexSendOutcome {
     Accepted {
@@ -848,6 +980,17 @@ pub struct FreshCodexState {
     hosted_naming_events: bool,
     naming_rollout_probe: Arc<std::sync::OnceLock<CodexNamingRolloutProbe>>,
     sidecar_cleanup_probe: Arc<std::sync::OnceLock<CodexSidecarCleanupProbe>>,
+    #[cfg(windows)]
+    windows_sidecar_guards:
+        Arc<StdMutex<HashMap<String, Arc<crate::codex_windows_guard::CodexWindowsGuard>>>>,
+    #[cfg(all(windows, feature = "test-support"))]
+    windows_test_spawn_count: Arc<AtomicU64>,
+    #[cfg(all(windows, feature = "test-support"))]
+    windows_test_attach_gate:
+        Arc<StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
+    #[cfg(all(windows, feature = "test-support"))]
+    windows_test_recovery_gate:
+        Arc<StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
     #[cfg(any(test, feature = "test-support"))]
     sidecar_capture_observer: Arc<std::sync::OnceLock<CodexSidecarCaptureObserver>>,
     /// Unified agent names: thread id → the pre-durable naming handle
@@ -1326,6 +1469,14 @@ impl FreshCodexState {
             hosted_naming_events: false,
             naming_rollout_probe: Arc::new(std::sync::OnceLock::new()),
             sidecar_cleanup_probe: Arc::new(std::sync::OnceLock::new()),
+            #[cfg(windows)]
+            windows_sidecar_guards: Arc::new(StdMutex::new(HashMap::new())),
+            #[cfg(all(windows, feature = "test-support"))]
+            windows_test_spawn_count: Arc::new(AtomicU64::new(0)),
+            #[cfg(all(windows, feature = "test-support"))]
+            windows_test_attach_gate: Arc::new(StdMutex::new(None)),
+            #[cfg(all(windows, feature = "test-support"))]
+            windows_test_recovery_gate: Arc::new(StdMutex::new(None)),
             #[cfg(any(test, feature = "test-support"))]
             sidecar_capture_observer: Arc::new(std::sync::OnceLock::new()),
             naming_handles: Arc::new(TokioMutex::new(HashMap::new())),
@@ -1351,6 +1502,149 @@ impl FreshCodexState {
 
     pub fn set_sidecar_cleanup_probe(&self, probe: CodexSidecarCleanupProbe) {
         let _ = self.sidecar_cleanup_probe.set(probe);
+    }
+
+    /// Integration-test seam: check the exact already-open process handle,
+    /// never a bare PID, against this state's retained Codex jobs.
+    #[cfg(all(windows, feature = "test-support"))]
+    pub fn windows_test_handle_is_owned(&self, handle: usize) -> bool {
+        self.windows_sidecar_guards
+            .lock()
+            .expect("windows codex guards lock")
+            .values()
+            .any(|guard| guard.contains_process_handle(handle))
+    }
+
+    /// Number of actual successful app-server process spawns in this state.
+    #[cfg(all(windows, feature = "test-support"))]
+    pub fn windows_test_spawn_count(&self) -> u64 {
+        self.windows_test_spawn_count.load(Ordering::SeqCst)
+    }
+
+    /// Observe the real notification drain before starting a recovery race.
+    #[cfg(all(windows, feature = "test-support"))]
+    pub async fn windows_test_notification_drain_pending(&self, session_id: &str) -> bool {
+        self.notification_drain_pending(session_id).await
+    }
+
+    /// Pause one attach just before its lease claim to exercise ownership races.
+    #[cfg(all(windows, feature = "test-support"))]
+    pub fn windows_test_pause_next_attach_before_lease(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let pair = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        *self
+            .windows_test_attach_gate
+            .lock()
+            .expect("windows attach test gate lock") = Some(pair.clone());
+        pair
+    }
+
+    /// Pause one crash-recovery attempt before its lease claim.
+    #[cfg(all(windows, feature = "test-support"))]
+    pub fn windows_test_pause_next_recovery_before_lease(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let pair = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        *self
+            .windows_test_recovery_gate
+            .lock()
+            .expect("windows recovery test gate lock") = Some(pair.clone());
+        pair
+    }
+
+    /// Exercise the real handoff stop path from a native integration test.
+    #[cfg(all(windows, feature = "test-support"))]
+    pub async fn windows_test_kill_for_handoff(&self, session_id: &str) -> bool {
+        matches!(
+            self.kill_for_handoff(session_id, "native-windows-test")
+                .await,
+            crate::session_handoff::StopResult::Reaped
+                | crate::session_handoff::StopResult::AlreadyGone
+        )
+    }
+
+    fn effective_sidecar_cleanup_probe(&self) -> Option<CodexSidecarCleanupProbe> {
+        if let Some(probe) = self.sidecar_cleanup_probe.get() {
+            return Some(probe.clone());
+        }
+        #[cfg(windows)]
+        {
+            let guards = Arc::clone(&self.windows_sidecar_guards);
+            Some(Arc::new(move |recorded| {
+                let guard = guards
+                    .lock()
+                    .expect("windows codex guards lock")
+                    .get(&recorded.ownership_id)
+                    .cloned();
+                Box::pin(async move {
+                    Ok(match guard {
+                        Some(guard) => guard.terminate_and_confirm().await,
+                        None => false,
+                    })
+                })
+            }))
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+
+    fn retain_windows_guard(&self, ownership_id: &str, child: &CodexChild) {
+        #[cfg(windows)]
+        if let Some(guard) = &child.guard {
+            self.windows_sidecar_guards
+                .lock()
+                .expect("windows codex guards lock")
+                .insert(ownership_id.to_string(), Arc::clone(guard));
+        }
+        #[cfg(not(windows))]
+        let _ = (ownership_id, child);
+    }
+
+    fn forget_windows_guard(&self, ownership_id: &str) {
+        #[cfg(windows)]
+        self.windows_sidecar_guards
+            .lock()
+            .expect("windows codex guards lock")
+            .remove(ownership_id);
+        #[cfg(not(windows))]
+        let _ = ownership_id;
+    }
+
+    /// Retain the exact job when a failed resume cannot yet prove that all
+    /// writers have exited; a later request can re-check the same job.
+    #[cfg(windows)]
+    async fn stop_windows_resume_attempt(
+        &self,
+        session_id: &str,
+        ownership_id: &str,
+        child: &mut CodexChild,
+    ) -> bool {
+        let recorded = crate::session_lease::record_condemned_runtime_identity(
+            child.id().unwrap_or(0),
+            CODEX_SIDECAR_OWNERSHIP_ENV,
+            ownership_id,
+        );
+        self.retain_windows_guard(ownership_id, child);
+        if !confirm_codex_tree_dead(&recorded, self.effective_sidecar_cleanup_probe()).await {
+            self.condemned_priors
+                .lock()
+                .expect("condemned priors lock")
+                .insert(session_id.to_string(), recorded);
+            let _ = child.start_kill();
+            return false;
+        }
+        let _ = child.wait().await;
+        self.forget_windows_guard(ownership_id);
+        true
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1731,8 +2025,7 @@ impl FreshCodexState {
             .cloned();
         if let Some(condemned) = condemned {
             let confirmed =
-                confirm_codex_tree_dead(&condemned, self.sidecar_cleanup_probe.get().cloned())
-                    .await;
+                confirm_codex_tree_dead(&condemned, self.effective_sidecar_cleanup_probe()).await;
             if confirmed {
                 let ownership = self
                     .ownership_watch()
@@ -1744,6 +2037,7 @@ impl FreshCodexState {
                     session_id,
                     &condemned.ownership_id,
                     true,
+                    Some(self),
                 );
             }
             return confirmed;
@@ -3701,6 +3995,24 @@ impl FreshCodexState {
             &resume_session_id,
             None,
         );
+        #[cfg(windows)]
+        {
+            let has_condemned_prior = self
+                .condemned_priors
+                .lock()
+                .expect("condemned priors lock")
+                .contains_key(&resume_session_id);
+            if has_condemned_prior && !self.confirm_fenced_prior_dead(&resume_session_id).await {
+                if let Some(mut guard) = lease_guard.take() {
+                    guard.fail();
+                }
+                return self.fail_create(
+                    &request_id,
+                    "CODEX_APP_SERVER_START_FAILED",
+                    "the previous Codex process tree is not yet confirmed stopped",
+                );
+            }
+        }
         if self.is_known_dead_thread(&resume_session_id).await {
             if let Some(mut g) = lease_guard.take() {
                 g.fail();
@@ -3742,8 +4054,9 @@ impl FreshCodexState {
                 );
             }
         };
+        let mut resume_fence = ResumeAttemptFence::new(self, &resume_session_id);
         let (client, notifs, ownership_id, child) = match self
-            .spawn_sidecar_notifying(cwd.as_deref(), Some(&on_spawned))
+            .spawn_sidecar_notifying(cwd.as_deref(), Some(&on_spawned), Some(&mut resume_fence))
             .await
         {
             Ok(parts) => parts,
@@ -3810,7 +4123,30 @@ impl FreshCodexState {
                             );
                         }
                     }
-                    #[cfg(not(unix))]
+                    #[cfg(windows)]
+                    {
+                        if !self
+                            .stop_windows_resume_attempt(
+                                &resume_session_id,
+                                &ownership_id,
+                                &mut child,
+                            )
+                            .await
+                        {
+                            if let Some(mut g) = lease_guard.take() {
+                                g.fail();
+                            }
+                            let failure_code = if classify_native_readiness_not_found {
+                                "CODEX_APP_SERVER_START_FAILED"
+                            } else {
+                                "FRESH_AGENT_CREATE_FAILED"
+                            };
+                            return self.fail_create(&request_id, failure_code,
+                                "the exact Codex resume target was absent, but its app-server process tree could not be confirmed stopped");
+                        }
+                        resume_fence.disarm();
+                    }
+                    #[cfg(not(any(unix, windows)))]
                     {
                         // This platform has no process-group guard in this
                         // spawn path, so a stopped leader does not prove that
@@ -3837,6 +4173,25 @@ impl FreshCodexState {
                         );
                     }
                 } else {
+                    #[cfg(windows)]
+                    {
+                        if !self
+                            .stop_windows_resume_attempt(
+                                &resume_session_id,
+                                &ownership_id,
+                                &mut child,
+                            )
+                            .await
+                        {
+                            if let Some(mut guard) = lease_guard.take() {
+                                guard.fail();
+                            }
+                            return self.fail_create(&request_id, "CODEX_APP_SERVER_START_FAILED",
+                                "the Codex resume failed and its process tree could not be confirmed stopped");
+                        }
+                        resume_fence.disarm();
+                    }
+                    #[cfg(not(windows))]
                     let _ = child.start_kill();
                 }
                 reap_owned_codex_sidecars(&ownership_id);
@@ -3966,32 +4321,37 @@ impl FreshCodexState {
         // cancellation + settle registered at the handler top cover this
         // handler's whole unwind — the delta-r2 late registration here is
         // superseded.
-        self.finish_create(
-            request_id,
-            thread_id.clone(),
-            client,
-            notifs,
-            ownership_id,
-            child,
-            model,
-            effort,
-            cwd,
-            sandbox,
-            permission_mode,
-            collaboration_mode,
-            started.effective_settings.clone(),
-            lease_guard,
-            history_mode,
-            own_ticket,
-            provenance,
-            // This lane committed the claim above: its lease-revoke arm in
-            // `finish_create` must roll the commit back, and the
-            // post-registration re-check (round 5, Finding 1) compares
-            // against the claim-start snapshot.
-            Some((thread_id.as_str(), claim_dead_state)),
-            naming_handle,
-        )
-        .await
+        let outcome = self
+            .finish_create(
+                request_id,
+                thread_id.clone(),
+                client,
+                notifs,
+                ownership_id,
+                child,
+                model,
+                effort,
+                cwd,
+                sandbox,
+                permission_mode,
+                collaboration_mode,
+                started.effective_settings.clone(),
+                lease_guard,
+                history_mode,
+                own_ticket,
+                provenance,
+                // This lane committed the claim above: its lease-revoke arm in
+                // `finish_create` must roll the commit back, and the
+                // post-registration re-check (round 5, Finding 1) compares
+                // against the claim-start snapshot.
+                Some((thread_id.as_str(), claim_dead_state)),
+                naming_handle,
+            )
+            .await;
+        if matches!(outcome, CodexCreateOutcome::Created { .. }) {
+            resume_fence.disarm();
+        }
+        outcome
     }
 
     /// Shared tail of `handle_create` and `handle_create_resume`: register the session
@@ -4008,7 +4368,7 @@ impl FreshCodexState {
         client: Arc<CodexAppServerClient>,
         notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
         ownership_id: String,
-        child: tokio::process::Child,
+        child: CodexChild,
         model: String,
         effort: Option<String>,
         cwd: Option<String>,
@@ -6846,7 +7206,7 @@ impl FreshCodexState {
             }
         };
         let child_parts = match self
-            .spawn_sidecar_notifying(eff_cwd.as_deref(), Some(&fork_on_spawned))
+            .spawn_sidecar_notifying(eff_cwd.as_deref(), Some(&fork_on_spawned), None)
             .await
         {
             Ok(parts) => parts,
@@ -8608,6 +8968,18 @@ impl FreshCodexState {
         // Task 13 (D8): the exited->respawn arm SPAWNS -- claim the per-sessionRef
         // lease first (the per-thread lock above covers in-process races; the lease
         // serializes against CREATE-path holders for the same durable id).
+        #[cfg(all(windows, feature = "test-support"))]
+        {
+            let gate = self
+                .windows_test_recovery_gate
+                .lock()
+                .expect("windows recovery test gate lock")
+                .take();
+            if let Some((reached, release)) = gate {
+                reached.notify_one();
+                release.notified().await;
+            }
+        }
         let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
         for round in 0..2u8 {
             match self.leases.claim(
@@ -8658,6 +9030,21 @@ impl FreshCodexState {
                         "fresh_agent_lease_expired_kill_unconfirmed: holding closed");
                     return Err(EnsureAliveError::Reserved);
                 }
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            let has_condemned_prior = self
+                .condemned_priors
+                .lock()
+                .expect("condemned priors lock")
+                .contains_key(session_id);
+            if has_condemned_prior && !self.confirm_fenced_prior_dead(session_id).await {
+                if let Some(mut guard) = lease_guard.take() {
+                    guard.fail();
+                }
+                return Err(EnsureAliveError::Reserved);
             }
         }
 
@@ -8732,8 +9119,13 @@ impl FreshCodexState {
                 );
             }
         };
+        let mut resume_fence = ResumeAttemptFence::new(self, session_id);
         let (client, notifs, ownership_id, child) = match self
-            .spawn_sidecar_notifying(cwd.as_deref(), Some(&attach_on_spawned))
+            .spawn_sidecar_notifying(
+                cwd.as_deref(),
+                Some(&attach_on_spawned),
+                Some(&mut resume_fence),
+            )
             .await
         {
             Ok(parts) => parts,
@@ -8815,8 +9207,8 @@ impl FreshCodexState {
                     CODEX_SIDECAR_OWNERSHIP_ENV,
                     &ownership_id,
                 );
-                if !confirm_codex_tree_dead(&recorded, self.sidecar_cleanup_probe.get().cloned())
-                    .await
+                self.retain_windows_guard(&ownership_id, &dead_child);
+                if !confirm_codex_tree_dead(&recorded, self.effective_sidecar_cleanup_probe()).await
                 {
                     // No user input was dispatched. Retain exact cleanup
                     // evidence and claims until the owned tree is confirmed.
@@ -8828,7 +9220,7 @@ impl FreshCodexState {
                         recorded,
                         ownership_id.clone(),
                         session_id.to_string(),
-                        self.sidecar_cleanup_probe.get().cloned(),
+                        self.effective_sidecar_cleanup_probe(),
                     );
                     let state = self.clone();
                     let key = session_id.to_string();
@@ -8837,6 +9229,7 @@ impl FreshCodexState {
                             let _ = dead_child.wait().await;
                             crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                             state.clear_condemned_prior_if_matching(&key, &ownership_id);
+                            state.forget_windows_guard(&ownership_id);
                             if let Some(mut guard) = lease_guard {
                                 guard.fail();
                             }
@@ -8858,6 +9251,8 @@ impl FreshCodexState {
                 }
                 let _ = dead_child.wait().await;
                 crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
+                self.forget_windows_guard(&ownership_id);
+                resume_fence.disarm();
                 // FIX (CODEX-FIRST triage Finding 2): remember this id as genuinely gone so
                 // a later attach/create against it fails fast instead of repeating this same
                 // spawn-resume-fail cycle.
@@ -9143,6 +9538,7 @@ impl FreshCodexState {
         // session_id is unchanged, conversation memory survives.
         tracing::info!(provider = PROVIDER, session_id = %session_id, "freshagent.crash_recovery.resumed_same_thread");
 
+        resume_fence.disarm();
         Ok(EnsureAliveOutcome::Recovered)
     }
 
@@ -9598,11 +9994,11 @@ impl FreshCodexState {
             Arc<CodexAppServerClient>,
             tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
             String,
-            tokio::process::Child,
+            CodexChild,
         ),
         String,
     > {
-        self.spawn_sidecar_notifying(cwd, None).await
+        self.spawn_sidecar_notifying(cwd, None, None).await
     }
 
     /// b8ke focused episode-2 round-2 F4: [`Self::spawn_sidecar`] with an
@@ -9620,12 +10016,13 @@ impl FreshCodexState {
         &self,
         cwd: Option<&str>,
         on_spawned: Option<&(dyn Fn(u32) + Send + Sync)>,
+        mut resume_fence: Option<&mut ResumeAttemptFence>,
     ) -> Result<
         (
             Arc<CodexAppServerClient>,
             tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
             String,
-            tokio::process::Child,
+            CodexChild,
         ),
         String,
     > {
@@ -9676,9 +10073,42 @@ impl FreshCodexState {
         if self.sidecar_launch_context.provider_exec_profile {
             freshell_codex::managed_launch::check_command(cmd.as_std())?;
         }
+        #[cfg(windows)]
+        let guard = {
+            let guard = crate::codex_windows_guard::CodexWindowsGuard::new()
+                .map_err(|error| format!("cannot create Codex process-tree guard: {error}"))?;
+            cmd.creation_flags(freshell_platform::process_job::CREATE_SUSPENDED);
+            guard
+        };
+        #[allow(unused_mut)] // Windows must kill a still-suspended child on setup failure.
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("codex app-server spawn failed ({codex_cmd}): {e}"))?;
+        #[cfg(all(windows, feature = "test-support"))]
+        self.windows_test_spawn_count.fetch_add(1, Ordering::SeqCst);
+        #[cfg(windows)]
+        {
+            let Some(pid) = child.id() else {
+                let _ = child.start_kill();
+                return Err("suspended Codex app-server has no process ID".into());
+            };
+            if let Err(error) = guard.assign(pid) {
+                let _ = child.start_kill();
+                return Err(format!("cannot assign Codex process-tree guard: {error}"));
+            }
+            if let Err(error) = freshell_platform::process_job::resume_suspended_process(pid) {
+                let _ = child.start_kill();
+                return Err(format!("cannot resume guarded Codex app-server: {error}"));
+            }
+        }
+        let mut child = CodexChild {
+            child,
+            #[cfg(windows)]
+            guard: Some(guard),
+        };
+        if let Some(fence) = &mut resume_fence {
+            fence.arm(&ownership_id, &child);
+        }
         // Drain child output so verbose app-server logs cannot back-pressure it.
         // Retain only a bounded stderr tail in memory, classify it to a fixed
         // category on startup failure, and never expose the provider's text.
@@ -10922,6 +11352,17 @@ impl FreshCodexState {
         if let Some(resumed) = self.live_resumed_session(thread_id).await {
             return Ok(resumed);
         }
+        #[cfg(windows)]
+        {
+            let has_condemned_prior = self
+                .condemned_priors
+                .lock()
+                .expect("condemned priors lock")
+                .contains_key(thread_id);
+            if has_condemned_prior && !self.confirm_fenced_prior_dead(thread_id).await {
+                return Err(ResumeSessionError::Reserved);
+            }
+        }
         if self.is_known_dead_thread(thread_id).await {
             return Err(ResumeSessionError::NotFound);
         }
@@ -10942,6 +11383,17 @@ impl FreshCodexState {
         }
         if let Some(resumed) = self.live_resumed_session(thread_id).await {
             return Ok(resumed);
+        }
+        #[cfg(windows)]
+        {
+            let has_condemned_prior = self
+                .condemned_priors
+                .lock()
+                .expect("condemned priors lock")
+                .contains_key(thread_id);
+            if has_condemned_prior && !self.confirm_fenced_prior_dead(thread_id).await {
+                return Err(ResumeSessionError::Reserved);
+            }
         }
         // FIX (review item 1): also re-check the dead-thread cache here, not just before
         // acquiring the lock above. Without this, a concurrent waiter that contended the
@@ -11001,6 +11453,18 @@ impl FreshCodexState {
         // Task 13 (D8): this arm SPAWNS -- claim the per-sessionRef lease first. The
         // per-thread lock above covers in-process attach-vs-attach; the lease
         // serializes against CREATE-path holders for the same durable id.
+        #[cfg(all(windows, feature = "test-support"))]
+        {
+            let gate = self
+                .windows_test_attach_gate
+                .lock()
+                .expect("windows attach test gate lock")
+                .take();
+            if let Some((reached, release)) = gate {
+                reached.notify_one();
+                release.notified().await;
+            }
+        }
         let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
         for round in 0..2u8 {
             match self.leases.claim(
@@ -11045,6 +11509,24 @@ impl FreshCodexState {
                         "fresh_agent_lease_expired_kill_unconfirmed: holding closed");
                     return Err(ResumeSessionError::Reserved);
                 }
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            // A concurrent create can condemn its prior while this attach
+            // waits to acquire the lease. Recheck under our acquired lease,
+            // after that attempt's cancellation fence has been recorded.
+            let has_condemned_prior = self
+                .condemned_priors
+                .lock()
+                .expect("condemned priors lock")
+                .contains_key(thread_id);
+            if has_condemned_prior && !self.confirm_fenced_prior_dead(thread_id).await {
+                if let Some(mut guard) = lease_guard.take() {
+                    guard.fail();
+                }
+                return Err(ResumeSessionError::Reserved);
             }
         }
 
@@ -11099,8 +11581,9 @@ impl FreshCodexState {
                 );
             }
         };
+        let mut resume_fence = ResumeAttemptFence::new(self, thread_id);
         let (client, notifs, ownership_id, child) = match self
-            .spawn_sidecar_notifying(cwd, Some(&ws_attach_on_spawned))
+            .spawn_sidecar_notifying(cwd, Some(&ws_attach_on_spawned), Some(&mut resume_fence))
             .await
         {
             Ok(parts) => parts,
@@ -11182,6 +11665,20 @@ impl FreshCodexState {
             Err(err) => {
                 client.close().await;
                 let mut child = child;
+                #[cfg(windows)]
+                {
+                    if !self
+                        .stop_windows_resume_attempt(thread_id, &ownership_id, &mut child)
+                        .await
+                    {
+                        if let Some(mut guard) = lease_guard.take() {
+                            guard.fail();
+                        }
+                        return Err(ResumeSessionError::Reserved);
+                    }
+                    resume_fence.disarm();
+                }
+                #[cfg(not(windows))]
                 let _ = child.start_kill();
                 reap_owned_codex_sidecars(&ownership_id);
                 crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
@@ -11497,6 +11994,7 @@ impl FreshCodexState {
             }
         };
 
+        resume_fence.disarm();
         Ok(ResumedCodexSession {
             client,
             active_turn,
@@ -11523,7 +12021,7 @@ impl FreshCodexState {
         client: Arc<CodexAppServerClient>,
         notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
         ownership_id: String,
-        child: tokio::process::Child,
+        child: CodexChild,
         model: String,
         effort: Option<String>,
         cwd: Option<String>,
@@ -12739,7 +13237,7 @@ fn codex_tree_death_escalation(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'static>> {
     Box::pin(async move {
         if (!recorded.capture_complete && cleanup_probe.is_none())
-            || (recorded.start_time.is_none() && cleanup_probe.is_some())
+            || (recorded.start_time.is_none() && cleanup_probe.is_some() && !cfg!(windows))
         {
             tracing::error!(target: "freshell_freshagent::codex",
                 session_id = %thread_id,
@@ -12804,6 +13302,7 @@ fn cleanup_confirmed_codex_teardown(
     thread_id: &str,
     ownership_id: &str,
     force_release: bool,
+    state: Option<&FreshCodexState>,
 ) {
     crate::codex_sidecar_tracking::scrub_sidecar_record(ownership_id);
     // The complete writer tree is confirmed dead, so clear both a completed
@@ -12825,29 +13324,37 @@ fn cleanup_confirmed_codex_teardown(
     if let Some(ownership) = ownership {
         ownership.release_confirmed(thread_id, "freshcodex/watcher-confirmed-teardown");
     }
+    if let Some(state) = state {
+        state.forget_windows_guard(ownership_id);
+    }
 }
 
-fn wrap_codex_confirmation_with_cleanup(
-    confirmation: std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'static>>,
+struct CodexConfirmationCleanup {
     ownership_id: String,
     thread_id: String,
     leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
     ownership: Option<crate::ownership_lane::OwnershipWatch>,
-    condemned_priors: Arc<
-        StdMutex<HashMap<String, crate::session_lease::CondemnedRuntimeIdentity>>,
-    >,
+    condemned_priors:
+        Arc<StdMutex<HashMap<String, crate::session_lease::CondemnedRuntimeIdentity>>>,
     force_release: bool,
+    state: Option<FreshCodexState>,
+}
+
+fn wrap_codex_confirmation_with_cleanup(
+    confirmation: std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'static>>,
+    cleanup: CodexConfirmationCleanup,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'static>> {
     Box::pin(async move {
         let confirmed = confirmation.await;
         if confirmed {
             cleanup_confirmed_codex_teardown(
-                &leases,
-                ownership.as_ref(),
-                &condemned_priors,
-                &thread_id,
-                &ownership_id,
-                force_release,
+                &cleanup.leases,
+                cleanup.ownership.as_ref(),
+                &cleanup.condemned_priors,
+                &cleanup.thread_id,
+                &cleanup.ownership_id,
+                cleanup.force_release,
+                cleanup.state.as_ref(),
             );
         }
         confirmed
@@ -13012,7 +13519,7 @@ async fn wait_for_codex_handoff(receiver: Option<oneshot::Receiver<()>>) {
 
 #[allow(clippy::too_many_arguments)]
 fn spawn_exit_watcher_tracking_turns(
-    mut child: tokio::process::Child,
+    child: impl Into<CodexChild>,
     ownership_id: String,
     thread_id: String,
     broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
@@ -13051,6 +13558,10 @@ fn spawn_exit_watcher_tracking_turns(
     tokio::task::JoinHandle<crate::session_handoff::StopResult>,
     Option<crate::session_lease::CondemnedRuntimeIdentity>,
 ) {
+    let mut child = child.into();
+    if let Some(state) = &retained_state {
+        state.retain_windows_guard(&ownership_id, &child);
+    }
     if let (Some(turns), Some(state)) = (&turn_state, &retained_state) {
         turns
             .lock()
@@ -13085,7 +13596,7 @@ fn spawn_exit_watcher_tracking_turns(
     let ownership = ownership.map(|watch| watch.for_runtime(&thread_id, child.id()));
     let cleanup_probe = retained_state
         .as_ref()
-        .and_then(|state| state.sidecar_cleanup_probe.get().cloned());
+        .and_then(|state| state.effective_sidecar_cleanup_probe());
     let sidecar_identity = recorded.clone();
     let watcher = tokio::spawn(async move {
         // `biased` + the REQUESTED-kill arm listed FIRST: a `freshAgent.kill` signals
@@ -13148,10 +13659,11 @@ fn spawn_exit_watcher_tracking_turns(
                         &thread_id,
                         &ownership_id,
                         true,
+                        retained_state.as_ref(),
                     );
                     tracing::info!(provider = PROVIDER, session_id = %thread_id, "freshagent.sidecar.reaped");
                     crate::session_handoff::StopResult::Reaped
-                } else if !cfg!(target_os = "linux") && wait_result.is_ok() {
+                } else if !cfg!(target_os = "linux") && !cfg!(windows) && wait_result.is_ok() {
                     tracing::warn!(provider = PROVIDER, session_id = %thread_id,
                         "freshagent.sidecar.platform_limited: direct child exited but descendant tree is unverified");
                     // A natural exit has no lifecycle caller waiting to
@@ -13193,12 +13705,15 @@ fn spawn_exit_watcher_tracking_turns(
                     crate::session_handoff::StopResult::NotConfirmed {
                         confirmation: wrap_codex_confirmation_with_cleanup(
                             confirmation,
-                            ownership_id.clone(),
-                            thread_id.clone(),
-                            Arc::clone(&leases),
-                            ownership.clone(),
-                            Arc::clone(&condemned_priors),
-                            true,
+                            CodexConfirmationCleanup {
+                                ownership_id: ownership_id.clone(),
+                                thread_id: thread_id.clone(),
+                                leases: Arc::clone(&leases),
+                                ownership: ownership.clone(),
+                                condemned_priors: Arc::clone(&condemned_priors),
+                                force_release: true,
+                                state: retained_state.clone(),
+                            },
                         ),
                     }
                 };
@@ -13252,7 +13767,7 @@ fn spawn_exit_watcher_tracking_turns(
                         }
                     },
                     async {
-                        let confirmed = if cfg!(target_os = "linux") {
+                        let confirmed = if cfg!(target_os = "linux") || cfg!(windows) {
                             match recorded.as_ref() {
                                 Some(recorded) => confirm_codex_tree_dead(recorded, cleanup_probe.clone()).await,
                                 None => false,
@@ -13265,7 +13780,7 @@ fn spawn_exit_watcher_tracking_turns(
                         // until one of those retries actually reaches it.
                         // This task only confirms death; the ownership
                         // release remains deferred until after the drain.
-                        let escalation = if !confirmed && cfg!(target_os = "linux") {
+                        let escalation = if !confirmed && (cfg!(target_os = "linux") || cfg!(windows)) {
                             recorded.clone().map(|recorded| tokio::spawn(codex_tree_death_escalation(
                                 recorded, ownership_id.clone(), thread_id.clone(), cleanup_probe.clone(),
                             )))
@@ -13308,12 +13823,12 @@ fn spawn_exit_watcher_tracking_turns(
                     if requested_during_drain {
                         cleanup_confirmed_codex_teardown(
                             &leases, ownership.as_ref(), &condemned_priors,
-                            &thread_id, &ownership_id, true,
+                            &thread_id, &ownership_id, true, retained_state.as_ref(),
                         );
                     }
                     tracing::info!(provider = PROVIDER, session_id = %thread_id, "freshagent.sidecar.reaped");
                     crate::session_handoff::StopResult::Reaped
-                } else if !cfg!(target_os = "linux") && wait_result.is_ok() {
+                } else if !cfg!(target_os = "linux") && !cfg!(windows) && wait_result.is_ok() {
                     tracing::warn!(provider = PROVIDER, session_id = %thread_id,
                         "freshagent.sidecar.platform_limited: direct child exited but descendant tree is unverified");
                     if requested_during_drain {
@@ -13357,12 +13872,15 @@ fn spawn_exit_watcher_tracking_turns(
                     let confirmation = with_codex_turn_exit_confirmation(confirmation, turn_state.clone());
                     let confirmation = wrap_codex_confirmation_with_cleanup(
                         confirmation,
-                        ownership_id.clone(),
-                        thread_id.clone(),
-                        Arc::clone(&leases),
-                        ownership.clone(),
-                        Arc::clone(&condemned_priors),
-                        requested_during_drain,
+                        CodexConfirmationCleanup {
+                            ownership_id: ownership_id.clone(),
+                            thread_id: thread_id.clone(),
+                            leases: Arc::clone(&leases),
+                            ownership: ownership.clone(),
+                            condemned_priors: Arc::clone(&condemned_priors),
+                            force_release: requested_during_drain,
+                            state: retained_state.clone(),
+                        },
                     );
                     crate::session_handoff::StopResult::NotConfirmed { confirmation }
                 };
@@ -13402,7 +13920,7 @@ fn spawn_exit_watcher_tracking_turns(
                         if confirmed {
                             cleanup_confirmed_codex_teardown(
                                 &leases, ownership.as_ref(), &condemned_priors,
-                                &thread_id, &ownership_id, false,
+                                &thread_id, &ownership_id, false, retained_state.as_ref(),
                             );
                         }
                         return detach_unexpected_codex_stop(stop_result);
@@ -13464,7 +13982,7 @@ fn spawn_exit_watcher_tracking_turns(
                     // old source's final events have been published.
                     cleanup_confirmed_codex_teardown(
                         &leases, ownership.as_ref(), &condemned_priors,
-                        &thread_id, &ownership_id, false,
+                        &thread_id, &ownership_id, false, retained_state.as_ref(),
                     );
                 }
                 detach_unexpected_codex_stop(stop_result)
@@ -16837,7 +17355,7 @@ pub(crate) mod tests {
                 Arc::new(temporary_client),
                 temporary_notifs,
                 "codex-handoff-uncommitted".into(),
-                spawn_sleeper(),
+                spawn_sleeper().into(),
                 String::new(),
                 None,
                 None,
@@ -20126,12 +20644,15 @@ pub(crate) mod tests {
         assert!(
             wrap_codex_confirmation_with_cleanup(
                 confirmation,
-                ownership_id.to_string(),
-                session_id.to_string(),
-                Arc::clone(&leases),
-                None,
-                Arc::clone(&condemned_priors),
-                true,
+                CodexConfirmationCleanup {
+                    ownership_id: ownership_id.to_string(),
+                    thread_id: session_id.to_string(),
+                    leases: Arc::clone(&leases),
+                    ownership: None,
+                    condemned_priors: Arc::clone(&condemned_priors),
+                    force_release: true,
+                    state: None,
+                },
             )
             .await
         );
@@ -37855,7 +38376,9 @@ mod provider_exec_tests {
                     env!("CARGO_MANIFEST_DIR")
                 ),
             );
-            let mut result = state.spawn_sidecar_notifying(None, Some(&on_spawned)).await;
+            let mut result = state
+                .spawn_sidecar_notifying(None, Some(&on_spawned), None)
+                .await;
             let cleanup = if let Ok((_, _, _, child)) = &mut result {
                 Some((child.kill().await, child.wait().await))
             } else {
