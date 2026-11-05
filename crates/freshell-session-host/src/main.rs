@@ -1169,7 +1169,7 @@ async fn dispatch_with_effects(
                         ));
                     };
                     if source_fence.active_incarnation_id != incarnation_id
-                        || source_fence.evidence_revision != expected_launch.evidence_revision
+                        || source_fence.evidence_revision < expected_launch.evidence_revision
                     {
                         return Err(RuntimeError::new(
                             RuntimeErrorCode::StaleIntentRevision,
@@ -12772,7 +12772,7 @@ mod tests {
             control_epoch: 0,
             intent_revision: 7,
             identity_revision: 3,
-            evidence_revision: launch.evidence_revision,
+            evidence_revision: launch.evidence_revision + 1,
             native_import_revision: 2,
             recovery_attempt_id: None,
             active_incarnation_id: state.incarnation_id.clone(),

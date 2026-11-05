@@ -2194,7 +2194,7 @@ impl FreshAgentHostActor {
         }
         if source_fence.is_some_and(|fence| {
             fence.active_incarnation_id != expected_launch.incarnation_id
-                || fence.evidence_revision != expected_launch.evidence_revision
+                || fence.evidence_revision < expected_launch.evidence_revision
         }) {
             return Err(ActorError::NativeIdentityMismatch);
         }

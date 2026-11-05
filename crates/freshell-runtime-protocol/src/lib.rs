@@ -4000,7 +4000,10 @@ impl NativeReadinessReceipt {
         expected_next.requested_native_session_id = Some(self.identity.native_session_id.clone());
 
         self.source_fence.active_incarnation_id == self.source_launch.incarnation_id
-            && self.source_fence.evidence_revision == self.source_launch.evidence_revision
+            // Registry evidence also advances when resume metadata is
+            // captured. That does not rewrite the provider launch proof, so
+            // the write fence may be newer than the exact launch it protects.
+            && self.source_fence.evidence_revision >= self.source_launch.evidence_revision
             && !self.source_launch.launch_nonce.is_empty()
             && !previous.is_empty()
             && !previous.chars().any(char::is_control)
