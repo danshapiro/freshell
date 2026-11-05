@@ -1009,6 +1009,40 @@ tool_timeout_sec = 120
       name: await readName(), nativeContext: await inspectNativeContext(), trafficCursor: (await model.readTraffic()).length }
     expect(beforeCrash.name).toEqual(canonicalName)
     rig.runtime.writeIncident('freshcodex-managed-native-before-crash', beforeCrash)
+    // The supervisor's evidence lifecycle stream is this crash case's event
+    // authority. Capture its pre-kill high-water mark so the post-crash
+    // assertions can hold the observer to the whole crash-to-recovery
+    // window, not merely the tail after some later event. The stream
+    // records no native-exit observation for this soul earlier than the
+    // classification event itself, so this pre-kill position is the honest
+    // crash boundary in stream coordinates.
+    const supervisorLifecyclePath = path.join(path.dirname(rig.supervisor.runtimeRoot), 'evidence', 'lifecycle.jsonl')
+    let supervisorLifecycleCursor = 0
+    const readNewSupervisorLifecycle = (): any[] => {
+      if (!fs.existsSync(supervisorLifecyclePath)) return []
+      try {
+        const bytes = fs.statSync(supervisorLifecyclePath).size
+        if (bytes < supervisorLifecycleCursor) supervisorLifecycleCursor = 0
+        const stream = fs.openSync(supervisorLifecyclePath, 'r')
+        try {
+          const chunk = Buffer.alloc(bytes - supervisorLifecycleCursor)
+          fs.readSync(stream, chunk, 0, chunk.length, supervisorLifecycleCursor)
+          supervisorLifecycleCursor = bytes
+          return chunk.toString('utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+        } finally { fs.closeSync(stream) }
+      } catch { return [] }
+    }
+    let classifiedExit: any
+    const readAllSupervisorLifecycle = (): any[] => {
+      if (!fs.existsSync(supervisorLifecyclePath)) return []
+      try {
+        const contents = fs.readFileSync(supervisorLifecyclePath, 'utf8').trim()
+        if (!contents) return []
+        return contents.split('\n').filter(Boolean).map(line => JSON.parse(line))
+      } catch { return [] }
+    }
+    const preCrashLifecycleHighWater = readAllSupervisorLifecycle()
+      .reduce((max: number, row: any) => Math.max(max, Number(row.sequence) || 0), 0)
     // Kill only this receipt-owned, inspected release native PID. Archive its
     // REAL native-generated history after exit, keeping every original byte.
     // The host stays live; no internal exited flag or Started event is forged.
@@ -1047,31 +1081,6 @@ tool_timeout_sec = 120
     // send-admitted, so the send itself drives the recovery. The wait is
     // event-conditioned on the supervisor's lifecycle event stream for THIS
     // soul, never a fixed sleep.
-    const supervisorLifecyclePath = path.join(path.dirname(rig.supervisor.runtimeRoot), 'evidence', 'lifecycle.jsonl')
-    let supervisorLifecycleCursor = 0
-    const readNewSupervisorLifecycle = (): any[] => {
-      if (!fs.existsSync(supervisorLifecyclePath)) return []
-      try {
-        const bytes = fs.statSync(supervisorLifecyclePath).size
-        if (bytes < supervisorLifecycleCursor) supervisorLifecycleCursor = 0
-        const stream = fs.openSync(supervisorLifecyclePath, 'r')
-        try {
-          const chunk = Buffer.alloc(bytes - supervisorLifecycleCursor)
-          fs.readSync(stream, chunk, 0, chunk.length, supervisorLifecycleCursor)
-          supervisorLifecycleCursor = bytes
-          return chunk.toString('utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
-        } finally { fs.closeSync(stream) }
-      } catch { return [] }
-    }
-    let classifiedExit: any
-    const readAllSupervisorLifecycle = (): any[] => {
-      if (!fs.existsSync(supervisorLifecyclePath)) return []
-      try {
-        const contents = fs.readFileSync(supervisorLifecyclePath, 'utf8').trim()
-        if (!contents) return []
-        return contents.split('\n').filter(Boolean).map(line => JSON.parse(line))
-      } catch { return [] }
-    }
     const classification = await waitFor('supervisor send-recoverable classification of the native exit for this soul', async () => {
       if (!classifiedExit) {
         classifiedExit = readNewSupervisorLifecycle().find((row: any) => row.event === 'supervisor.runtime_observer.native_exit_send_recoverable'
@@ -1081,17 +1090,27 @@ tool_timeout_sec = 120
           && row.data?.nativeSessionId === view.nativeSessionId)
       }
       if (!classifiedExit) return undefined
-      const row = (await rig.inventory()).find((row: any) => row.freshAgentSessionId === created.sessionId)
+      const row = (await rig.inventory()).find((row: any) => row.freshAgentSessionId === created.sessionId
+        && row.incarnationId === classifiedExit.data.incarnationId)
       return row && row.recoveryState === 'live' && !row.recoveryReason ? { event: classifiedExit, row } : undefined
     }, 150_000)
-    // The classification admits the send: no recovery was scheduled for
-    // this soul after the classification event. Scan the FULL lifecycle
-    // stream (not just the cursor advance after the wait settled) so a
-    // recovery_scheduled row sharing the classification event's read
-    // batch cannot escape the assertion.
+    // The certified row must be the classification's OWN incarnation. The
+    // inventory retains historical incarnations under the same public
+    // session ID, and a first-match row can be an older stopped incarnation
+    // still reporting recoveryState live; the classification event names
+    // its incarnation, and only that running incarnation is the live
+    // post-crash owner the no-replacement path certifies.
+    expect(classification.row.incarnationId).toBe(classification.event.data.incarnationId)
+    expect(classification.row.launchState).toBe('running')
+    // The classification admits the send: no whole-host recovery was
+    // scheduled for this soul ANYWHERE after the crash. Scan the FULL
+    // lifecycle stream from the pre-kill high-water mark — not merely rows
+    // after the classification event — so a recovery_scheduled in the
+    // crash-to-classification interval (or one sharing the classification
+    // event's read batch) cannot escape the assertion.
     expect(readAllSupervisorLifecycle().some((row: any) => row.event === 'supervisor.runtime_observer.recovery_scheduled'
       && row.data?.soulId === beforeCrash.view!.soulId
-      && Number(row.sequence) > Number(classification.event.sequence))).toBe(false)
+      && Number(row.sequence) > preCrashLifecycleHighWater)).toBe(false)
     const recoveryAccepted = await send('AWAITED_PLAN_RECOVERY')
     const recovered = await rig.runningViewForFreshSession(created.sessionId)
     rig.runtime.writeIncident('freshcodex-managed-native-crash-first-send', { userRef: created.sessionId, beforeCrash,
