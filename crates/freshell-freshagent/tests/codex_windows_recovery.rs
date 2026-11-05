@@ -368,6 +368,21 @@ async fn assert_attach_fenced(
 
 async fn assert_retry_fenced(state: &FreshCodexState, cwd: &Path, root_pid: &Path, root_id: u32) {
     let spawn_count = state.windows_test_spawn_count();
+    let replay_outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        state.handle_create_for_native_readiness(request(cwd), None),
+    )
+    .await
+    .expect("a replayed request returns");
+    assert!(
+        matches!(replay_outcome, CodexCreateOutcome::Failed { .. }),
+        "a replay must not report the unconfirmed prior as live: {replay_outcome:?}"
+    );
+    assert_eq!(
+        state.windows_test_spawn_count(),
+        spawn_count,
+        "replaying the original request must not launch a provider"
+    );
     let mut retry = request(cwd);
     retry.request_id = "windows-recovery-retry".into();
     let retry_outcome = tokio::time::timeout(
@@ -394,26 +409,29 @@ async fn assert_retry_fenced(state: &FreshCodexState, cwd: &Path, root_pid: &Pat
 
 fn install_switchable_unconfirmed_probe(
     state: &FreshCodexState,
-) -> (Arc<AtomicBool>, Arc<AtomicUsize>) {
+) -> (Arc<AtomicBool>, Arc<AtomicUsize>, Arc<AtomicBool>) {
     let armed = Arc::new(AtomicBool::new(false));
     let attempts = Arc::new(AtomicUsize::new(0));
+    let confirmed = Arc::new(AtomicBool::new(false));
     state.set_sidecar_cleanup_probe(Arc::new({
         let armed = armed.clone();
         let attempts = attempts.clone();
+        let confirmed = confirmed.clone();
         move |_| {
             let armed = armed.clone();
             let attempts = attempts.clone();
+            let confirmed = confirmed.clone();
             Box::pin(async move {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 if armed.load(Ordering::SeqCst) {
-                    Ok(false)
+                    Ok(confirmed.load(Ordering::SeqCst))
                 } else {
                     Err("test probe used before it was armed".to_string())
                 }
             })
         }
     }));
-    (armed, attempts)
+    (armed, attempts, confirmed)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -449,12 +467,13 @@ async fn run_unexpected_exit(unconfirmed: bool, helper_churn: HelperChurn) {
         Arc::new(tx),
         json!({"freshAgent":{"enabled":true}}),
     );
-    let (probe_armed, probes) = if unconfirmed {
+    let (probe_armed, probes, _) = if unconfirmed {
         install_switchable_unconfirmed_probe(&state)
     } else {
         (
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicBool::new(false)),
         )
     };
     let outcome = state
@@ -475,6 +494,27 @@ async fn run_unexpected_exit(unconfirmed: bool, helper_churn: HelperChurn) {
     let child = TestProcess::open(&state, child_id);
     assert_eq!(read_pid(&child_ready).await, child_id);
     assert!(!root.exited() && !child.exited());
+    let replay = state
+        .handle_create_for_native_readiness(request(dir.path()), None)
+        .await;
+    assert!(
+        matches!(replay, CodexCreateOutcome::Created { .. }),
+        "a healthy cached request must still replay: {replay:?}"
+    );
+    let mut healthy_adoption = request(dir.path());
+    healthy_adoption.request_id = "windows-healthy-adoption".into();
+    let adopted = state
+        .handle_create_for_native_readiness(healthy_adoption, None)
+        .await;
+    assert!(
+        matches!(adopted, CodexCreateOutcome::Created { .. }),
+        "a healthy live session must remain adoptable: {adopted:?}"
+    );
+    assert_eq!(
+        state.windows_test_spawn_count(),
+        1,
+        "adopting the live session must not start a new provider"
+    );
     if helper_churn == HelperChurn::Synchronized {
         let mut helpers = Vec::new();
         let mut helper_ids = std::collections::HashSet::new();
@@ -622,7 +662,7 @@ async fn run_unexpected_exit(unconfirmed: bool, helper_churn: HelperChurn) {
     state.shutdown().await;
 }
 
-async fn run_handoff(unconfirmed: bool) {
+async fn run_handoff(unconfirmed: bool, confirm_after: bool) {
     let _lock = ENV.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let root_pid = dir.path().join("app-server.pid");
@@ -641,12 +681,13 @@ async fn run_handoff(unconfirmed: bool) {
         Arc::new(tx),
         json!({"freshAgent":{"enabled":true}}),
     );
-    let (probe_armed, probes) = if unconfirmed {
+    let (probe_armed, probes, probe_confirmed) = if unconfirmed {
         install_switchable_unconfirmed_probe(&state)
     } else {
         (
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicBool::new(false)),
         )
     };
     let outcome = state
@@ -663,6 +704,7 @@ async fn run_handoff(unconfirmed: bool) {
     assert_eq!(read_pid(&child_ready).await, child_id);
     assert!(!root.exited() && !child.exited());
     assert_eq!(state.windows_test_spawn_count(), 1);
+    let escalation_gate = confirm_after.then(|| state.windows_test_pause_next_escalation());
     if unconfirmed {
         assert_eq!(probes.load(Ordering::SeqCst), 0);
         probe_armed.store(true, Ordering::SeqCst);
@@ -684,6 +726,60 @@ async fn run_handoff(unconfirmed: bool) {
         );
         assert_retry_fenced(&state, dir.path(), &root_pid, root_id).await;
         assert_attach_fenced(&state, &mut rx, dir.path(), &root_pid, root_id).await;
+        if confirm_after {
+            let (reached, release) = escalation_gate.expect("escalation gate installed");
+            tokio::time::timeout(Duration::from_secs(30), reached.notified())
+                .await
+                .expect("detached cleanup is paused");
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !root.exited() || !child.exited() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the verified prior processes stop before confirmation");
+            probe_confirmed.store(true, Ordering::SeqCst);
+            let mut stale = request(dir.path());
+            stale.request_id = "windows-stale-binding".into();
+            let outcome = state.handle_create_for_native_readiness(stale, None).await;
+            assert!(
+                matches!(outcome, CodexCreateOutcome::Failed { ref code, .. } if code == "SESSION_RESERVED"),
+                "a confirmed prior must not make a stale binding look live: {outcome:?}"
+            );
+            assert_eq!(state.windows_test_spawn_count(), 1);
+            for _ in 0..2 {
+                let replay = state
+                    .handle_create_for_native_readiness(request(dir.path()), None)
+                    .await;
+                assert!(
+                    matches!(replay, CodexCreateOutcome::Failed { ref code, .. } if code == "SESSION_RESERVED"),
+                    "a cached request cannot report a stopped prior as live: {replay:?}"
+                );
+                assert_eq!(state.windows_test_spawn_count(), 1);
+            }
+            let mut retry = request(dir.path());
+            retry.request_id = "windows-after-confirmation".into();
+            let outcome = state.handle_create_for_native_readiness(retry, None).await;
+            assert!(
+                matches!(outcome, CodexCreateOutcome::Created { .. }),
+                "a new attempt must resume after the stale binding is cleared: {outcome:?}"
+            );
+            assert_eq!(state.windows_test_spawn_count(), 2);
+            let replacement_id = read_changed_pid(&root_pid, root_id).await;
+            let replacement = TestProcess::open(&state, replacement_id);
+            let replacement_child_id = read_changed_pid(&child_pid, child_id).await;
+            let replacement_child = TestProcess::open(&state, replacement_child_id);
+            replacement.terminate();
+            replacement_child.terminate();
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !replacement.exited() || !replacement_child.exited() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the replacement processes stop");
+            release.notify_one();
+        }
     } else {
         assert!(reaped, "handoff must confirm the owned tree stopped");
         assert!(
@@ -722,7 +818,7 @@ async fn attach_rechecks_the_fence_after_a_competing_resume_is_cancelled() {
         Arc::new(tx),
         json!({"freshAgent":{"enabled":true}}),
     );
-    let (probe_armed, probes) = install_switchable_unconfirmed_probe(&state);
+    let (probe_armed, probes, _) = install_switchable_unconfirmed_probe(&state);
     let (reached, release) = state.windows_test_pause_next_attach_before_lease();
     let attach = serde_json::from_value(json!({
         "sessionId": THREAD,
@@ -839,7 +935,7 @@ async fn crash_recovery_rechecks_the_fence_after_a_competing_resume_is_cancelled
     .await
     .expect("the original process tree and notification drain settle");
 
-    let (probe_armed, probes) = install_switchable_unconfirmed_probe(&state);
+    let (probe_armed, probes, _) = install_switchable_unconfirmed_probe(&state);
     let competing_behavior = json!({
         "spawnNativeChild": true,
         "sidecarPidFile": root_pid,
@@ -956,12 +1052,17 @@ async fn recovery_succeeds_after_immediately_exiting_helper_churn() {
 
 #[tokio::test]
 async fn handoff_confirms_the_old_tree_before_proceeding() {
-    run_handoff(false).await;
+    run_handoff(false, false).await;
 }
 
 #[tokio::test]
 async fn handoff_with_unconfirmed_cleanup_keeps_recovery_fenced() {
-    run_handoff(true).await;
+    run_handoff(true, false).await;
+}
+
+#[tokio::test]
+async fn confirmed_prior_does_not_adopt_a_stale_binding() {
+    run_handoff(true, true).await;
 }
 
 #[tokio::test]

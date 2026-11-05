@@ -991,6 +991,9 @@ pub struct FreshCodexState {
     #[cfg(all(windows, feature = "test-support"))]
     windows_test_recovery_gate:
         Arc<StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
+    #[cfg(all(windows, feature = "test-support"))]
+    windows_test_escalation_gate:
+        Arc<StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
     #[cfg(any(test, feature = "test-support"))]
     sidecar_capture_observer: Arc<std::sync::OnceLock<CodexSidecarCaptureObserver>>,
     /// Unified agent names: thread id → the pre-durable naming handle
@@ -1477,6 +1480,8 @@ impl FreshCodexState {
             windows_test_attach_gate: Arc::new(StdMutex::new(None)),
             #[cfg(all(windows, feature = "test-support"))]
             windows_test_recovery_gate: Arc::new(StdMutex::new(None)),
+            #[cfg(all(windows, feature = "test-support"))]
+            windows_test_escalation_gate: Arc::new(StdMutex::new(None)),
             #[cfg(any(test, feature = "test-support"))]
             sidecar_capture_observer: Arc::new(std::sync::OnceLock::new()),
             naming_handles: Arc::new(TokioMutex::new(HashMap::new())),
@@ -1559,6 +1564,22 @@ impl FreshCodexState {
         pair
     }
 
+    /// Pause one detached confirmation retry before it probes the old tree.
+    #[cfg(all(windows, feature = "test-support"))]
+    pub fn windows_test_pause_next_escalation(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let pair = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        *self
+            .windows_test_escalation_gate
+            .lock()
+            .expect("windows escalation test gate lock") = Some(pair.clone());
+        pair
+    }
+
     /// Exercise the real handoff stop path from a native integration test.
     #[cfg(all(windows, feature = "test-support"))]
     pub async fn windows_test_kill_for_handoff(&self, session_id: &str) -> bool {
@@ -1617,6 +1638,24 @@ impl FreshCodexState {
             .remove(ownership_id);
         #[cfg(not(windows))]
         let _ = ownership_id;
+    }
+
+    #[cfg(windows)]
+    async fn windows_prior_blocks_create(&self, thread_id: &str) -> bool {
+        let has_condemned_prior = self
+            .condemned_priors
+            .lock()
+            .expect("condemned priors lock")
+            .contains_key(thread_id);
+        if !has_condemned_prior {
+            return false;
+        }
+        if !self.confirm_fenced_prior_dead(thread_id).await {
+            return true;
+        }
+        // A confirmed old tree clears its stale binding, but it does not
+        // establish a new live runtime. The caller must re-drive the create.
+        !self.has_live_session(thread_id).await
     }
 
     /// Retain the exact job when a failed resume cannot yet prove that all
@@ -3338,39 +3377,54 @@ impl FreshCodexState {
         // attempt below (including the `handle_create_resume` sub-call), so concurrent
         // duplicate `create`s for this requestId serialize instead of each spawning
         // their own sidecar.
-        let _dedup_guard = match self.create_dedup.acquire_or_replay(&request_id).await {
-            FreshAgentCreateOutcome::Replay(cached) => {
-                // Unified agent names: the replay re-answers with the SAME
-                // naming projection the original create acknowledged (the
-                // handle was stashed against this thread at admission).
-                let projection = self.created_projection_for(&cached.session_id).await;
-                let name_ref = projection.as_ref().map(|(r, _)| r.clone());
-                let session_name = projection.map(|(_, record)| record);
-                self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
-                    provider: PROVIDER.to_string(),
-                    request_id,
-                    runtime_provider: PROVIDER.to_string(),
-                    session_id: cached.session_id.clone(),
-                    session_type: SESSION_TYPE.to_string(),
-                    session_ref: Some(SessionLocator {
+        let _dedup_guard =
+            match self.create_dedup.acquire_or_replay(&request_id).await {
+                FreshAgentCreateOutcome::Replay(cached) => {
+                    #[cfg(windows)]
+                    if self.windows_prior_blocks_create(&cached.session_id).await
+                        || !self.has_live_session(&cached.session_id).await
+                    {
+                        return self.fail_create(&request_id, "SESSION_RESERVED",
+                        "the previous Codex process tree has not been replaced; retry the session");
+                    }
+                    // Unified agent names: the replay re-answers with the SAME
+                    // naming projection the original create acknowledged (the
+                    // handle was stashed against this thread at admission).
+                    let projection = self.created_projection_for(&cached.session_id).await;
+                    let name_ref = projection.as_ref().map(|(r, _)| r.clone());
+                    let session_name = projection.map(|(_, record)| record);
+                    #[cfg(windows)]
+                    if self.windows_prior_blocks_create(&cached.session_id).await
+                        || !self.has_live_session(&cached.session_id).await
+                    {
+                        return self.fail_create(&request_id, "SESSION_RESERVED",
+                        "the previous Codex process tree has not been replaced; retry the session");
+                    }
+                    self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
                         provider: PROVIDER.to_string(),
+                        request_id,
+                        runtime_provider: PROVIDER.to_string(),
                         session_id: cached.session_id.clone(),
-                    }),
-                    name_ref: name_ref.clone(),
-                    session_name,
-                }));
-                return CodexCreateOutcome::Created {
-                    session_id: cached.session_id.clone(),
-                    session_ref: Some(SessionLocator {
-                        provider: PROVIDER.into(),
-                        session_id: cached.session_id,
-                    }),
-                    cleanup_ownership_id: None,
-                    name_ref,
-                };
-            }
-            FreshAgentCreateOutcome::Proceed(guard) => guard,
-        };
+                        session_type: SESSION_TYPE.to_string(),
+                        session_ref: Some(SessionLocator {
+                            provider: PROVIDER.to_string(),
+                            session_id: cached.session_id.clone(),
+                        }),
+                        name_ref: name_ref.clone(),
+                        session_name,
+                    }));
+                    return CodexCreateOutcome::Created {
+                        session_id: cached.session_id.clone(),
+                        session_ref: Some(SessionLocator {
+                            provider: PROVIDER.into(),
+                            session_id: cached.session_id,
+                        }),
+                        cleanup_ownership_id: None,
+                        name_ref,
+                    };
+                }
+                FreshAgentCreateOutcome::Proceed(guard) => guard,
+            };
 
         // Unified agent names (Task 8 acceptance): the pending RECORD for the
         // frame's handle exists from REQUEST RECEIPT — the pane content and
@@ -4956,6 +5010,14 @@ impl FreshCodexState {
         thread_id: &str,
         provenance: Option<crate::BindProvenance>,
     ) -> CodexCreateOutcome {
+        #[cfg(windows)]
+        if self.windows_prior_blocks_create(thread_id).await {
+            return self.fail_create(
+                request_id,
+                "SESSION_RESERVED",
+                "the previous Codex process tree has not been replaced; retry the session",
+            );
+        }
         if self.notification_drain_pending(thread_id).await {
             return self.fail_create(
                 request_id,
@@ -5032,6 +5094,14 @@ impl FreshCodexState {
         };
         let name_ref = projection.as_ref().map(|(r, _)| r.clone());
         let session_name = projection.map(|(_, record)| record);
+        #[cfg(windows)]
+        if self.windows_prior_blocks_create(thread_id).await {
+            return self.fail_create(
+                request_id,
+                "SESSION_RESERVED",
+                "the previous Codex process tree has not been replaced; retry the session",
+            );
+        }
         self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
             provider: PROVIDER.to_string(),
             request_id: request_id.to_string(),
@@ -13781,9 +13851,24 @@ fn spawn_exit_watcher_tracking_turns(
                         // This task only confirms death; the ownership
                         // release remains deferred until after the drain.
                         let escalation = if !confirmed && (cfg!(target_os = "linux") || cfg!(windows)) {
-                            recorded.clone().map(|recorded| tokio::spawn(codex_tree_death_escalation(
-                                recorded, ownership_id.clone(), thread_id.clone(), cleanup_probe.clone(),
-                            )))
+                            recorded.clone().map(|recorded| {
+                                let confirmation = codex_tree_death_escalation(
+                                    recorded, ownership_id.clone(), thread_id.clone(), cleanup_probe.clone(),
+                                );
+                                #[cfg(all(windows, feature = "test-support"))]
+                                let gate = retained_state.as_ref().and_then(|state| {
+                                    state.windows_test_escalation_gate.lock()
+                                        .expect("windows escalation test gate lock").take()
+                                });
+                                tokio::spawn(async move {
+                                    #[cfg(all(windows, feature = "test-support"))]
+                                    if let Some((reached, release)) = gate {
+                                        reached.notify_one();
+                                        release.notified().await;
+                                    }
+                                    confirmation.await
+                                })
+                            })
                         } else {
                             None
                         };
