@@ -471,10 +471,7 @@ impl FreshClaudeState {
         // The pane may have closed the parent while the child booted (about a
         // second, decision 4): then nothing would ever show or close the
         // child, so it is torn down instead of handed out.
-        if self
-            .refuse_fork_of_closed_parent(&parent, &child, false)
-            .await
-        {
+        if self.refuse_fork_of_closed_parent(&parent, &child).await {
             refuse("FORK_REFUSED", FORK_PARENT_CLOSED_MESSAGE);
             return;
         }
@@ -500,7 +497,7 @@ impl FreshClaudeState {
                 session_id = %parent.durable, child = %child, error = %error,
                 "the fork child's binding could not be written; the child is torn down"
             );
-            self.unwind_fork_child(&child, false).await;
+            self.unwind_fork_child(&child).await;
             refuse("INTERNAL_ERROR", FORK_LEDGER_WRITE_MESSAGE);
             return;
         }
@@ -508,10 +505,7 @@ impl FreshClaudeState {
         // Again once the row is written: from here to the answer nothing
         // awaits, so a close of the parent lands either before this check or
         // after the pane was answered.
-        if self
-            .refuse_fork_of_closed_parent(&parent, &child, true)
-            .await
-        {
+        if self.refuse_fork_of_closed_parent(&parent, &child).await {
             refuse("FORK_REFUSED", FORK_PARENT_CLOSED_MESSAGE);
             return;
         }
@@ -527,7 +521,7 @@ impl FreshClaudeState {
                 outcome = ?outcome,
                 "the coordinator moved on while the fork child registered; the child is torn down"
             );
-            self.unwind_fork_child(&child, true).await;
+            self.unwind_fork_child(&child).await;
             refuse(
                 "INTERNAL_ERROR",
                 "session ownership changed during fork; the new conversation was torn down",
@@ -615,12 +609,7 @@ impl FreshClaudeState {
 
     /// When the pane closed the fork's parent, tear the child down (retiring
     /// its binding row once written) and say so; the caller refuses the fork.
-    async fn refuse_fork_of_closed_parent(
-        &self,
-        parent: &ForkParent,
-        child: &str,
-        row_written: bool,
-    ) -> bool {
+    async fn refuse_fork_of_closed_parent(&self, parent: &ForkParent, child: &str) -> bool {
         if !self.fork_parent_closed(&parent.live_key).await {
             return false;
         }
@@ -628,31 +617,28 @@ impl FreshClaudeState {
             event = "freshagent.claude.fork_parent_closed",
             session_id = %parent.durable,
             child = %child,
-            row_written,
             "the pane closed the parent while its fork booted the child; the child is torn down"
         );
-        self.unwind_fork_child(child, row_written).await;
+        self.unwind_fork_child(child).await;
         true
     }
 
     /// Tear down a fork child that registered but cannot be handed to the
-    /// pane; the parent is untouched. Once the child's binding row was written
-    /// (`row_written`), it is retired so nothing offers to restore a
-    /// conversation no pane ever showed.
-    async fn unwind_fork_child(&self, child: &str, row_written: bool) {
+    /// pane; the parent is untouched. `establish_runtime` has already written
+    /// the child's binding before returning, so every unwind retires that row
+    /// before it can offer a conversation no pane ever showed.
+    async fn unwind_fork_child(&self, child: &str) {
         if let Some(session) = self.sessions.lock().await.remove(child) {
             let _teardown: LoggedTeardown = self.teardown_removed_session_logged(session).await;
         }
 
         self.leases.clear_binding(PROVIDER, child);
-        if row_written {
-            if let Some(sink) = self.identity_sink() {
-                if let Err(error) = sink.retire_closed(PROVIDER, child).await {
-                    tracing::warn!(target: "freshell_freshagent::claude",
-                        event = "freshagent.claude.fork_child_retire_failed",
-                        child = %child, error = ?error,
-                        "the torn-down fork child's binding row could not be retired");
-                }
+        if let Some(sink) = self.identity_sink() {
+            if let Err(error) = sink.retire_closed(PROVIDER, child).await {
+                tracing::warn!(target: "freshell_freshagent::claude",
+                    event = "freshagent.claude.fork_child_retire_failed",
+                    child = %child, error = ?error,
+                    "the torn-down fork child's binding row could not be retired");
             }
         }
     }

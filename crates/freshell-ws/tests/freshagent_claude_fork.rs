@@ -577,11 +577,12 @@ async fn closing_the_pane_while_the_child_boots_leaves_no_child_behind() {
         "the child is torn down"
     );
     child_runtime.wait_until_exited("the child's runtime").await;
+    let child_binding = ledger(&rig).load_binding("claude", &child);
     assert!(
-        ledger(&rig)
-            .load_binding("claude", &child)
+        child_binding
+            .as_ref()
             .is_none_or(|row| row.state != freshell_ws::pane_ledger::RowState::Bound),
-        "nothing offers the child for restore"
+        "nothing offers the child for restore: {child_binding:?}"
     );
 }
 
