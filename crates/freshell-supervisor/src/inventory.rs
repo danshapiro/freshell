@@ -44,6 +44,43 @@ pub struct StartupReconcileReport {
 }
 
 impl Supervisor {
+    fn record_retained_codex_observation(
+        &self,
+        soul_id: &SoulId,
+        source: Option<freshell_runtime_protocol::NativeIdentityObservation>,
+        trigger: Option<RecoveryTrigger>,
+    ) {
+        let retained = source.is_some();
+        let changed = {
+            let mut observations = self
+                .retained_codex_observations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match source {
+                Some(source) if observations.get(soul_id) != Some(&source) => {
+                    observations.insert(soul_id.clone(), source.clone());
+                    Some(source)
+                }
+                Some(_) => None,
+                None => observations.remove(soul_id),
+            }
+        };
+        if let Some(source) = changed {
+            append_event(
+                &self.config.lifecycle_log,
+                "supervisor.runtime_observer.retained_codex_actor",
+                serde_json::json!({
+                    "severity": "info", "soulId": soul_id,
+                    "incarnationId": source.incarnation_id,
+                    "nativeSessionId": source.native_session_id,
+                    "evidenceRevision": source.evidence_revision,
+                    "retained": retained, "recoveryTrigger": trigger,
+                    "reason": if retained { "native_exit_owned_by_retained_actor" } else { "retention_ended" },
+                }),
+            );
+        }
+    }
+
     /// Reconcile every desired-running soul before the control socket becomes
     /// reachable. Individual blocked souls are successful scan results—their
     /// typed recovery state belongs in inventory. Infrastructure errors and
@@ -285,6 +322,7 @@ impl Supervisor {
                     && (view.recovery_state != RecoveryState::Live
                         || view.launch_state != LaunchState::Running))
             {
+                self.record_retained_codex_observation(&view.soul_id, None, None);
                 continue;
             }
             let retry_due = due.contains_key(&view.soul_id);
@@ -313,7 +351,26 @@ impl Supervisor {
                     .active_handle_for_soul(view.soul_id.clone())
                     .await
                     .map_err(map_registry)?;
-                let trigger = match supervisor.backend.inspect(&handle).await {
+                let inspection = supervisor.backend.inspect(&handle).await;
+                let lifecycle = supervisor.lifecycle_lock(&view.soul_id).await;
+                // Host Status and its classification share SEND/Compact's
+                // ACK/commit lock; backend inspection must not delay controls.
+                let Ok(lifecycle_guard) = lifecycle.try_lock() else {
+                    return Ok(());
+                };
+                let current = supervisor.registry.recovery_context(view.soul_id.clone())
+                    .await.map_err(map_registry)?;
+                if current.desired_state != DesiredState::Running
+                    || current.intent_revision != view.intent_revision
+                    || current.recovery_state != RecoveryState::Live
+                    || current.prior_handle.incarnation_id() != &view.incarnation_id
+                    || current.prior_handle.incarnation_id() != handle.incarnation_id()
+                    || current.prior_handle.launch_nonce() != handle.launch_nonce()
+                {
+                    return Ok(());
+                }
+                let mut retained_source = None;
+                let trigger = match inspection {
                     Ok(inspection)
                         if matches!(
                             inspection.state,
@@ -337,7 +394,16 @@ impl Supervisor {
                                 )
                                 .await
                             {
-                                Ok(status) if status.exited => Some(RecoveryTrigger::ProviderExit),
+                                Ok(status) if status.exited => {
+                                    let current = supervisor.registry.recovery_context(view.soul_id.clone())
+                                        .await.map_err(map_registry)?;
+                                    if supervisor.retained_codex_host_eligible(&current, &host, &status).await? {
+                                        retained_source = status.fresh_agent_recovery_source.clone();
+                                        None
+                                    } else {
+                                        Some(RecoveryTrigger::ProviderExit)
+                                    }
+                                },
                                 Ok(_) => {
                                     if view.provider.as_deref() != Some("shell")
                                         && !matches!(
@@ -350,7 +416,7 @@ impl Supervisor {
                                         // Publish initial native proof even when nobody reads
                                         // output. The existing probe refreshes ownership under
                                         // the lifecycle lock and reuses the capture retry gate.
-                                        supervisor.probe_recovery(view.soul_id.clone()).await?;
+                                        supervisor.probe_recovery_locked(view.soul_id.clone()).await?;
                                     }
                                     None
                                 }
@@ -383,6 +449,8 @@ impl Supervisor {
                         Some(RecoveryTrigger::HostUnreachable)
                     }
                 };
+                supervisor.record_retained_codex_observation(&view.soul_id, retained_source, trigger);
+                drop(lifecycle_guard);
                 if let Some(trigger) = trigger {
                     append_event(
                         &supervisor.config.lifecycle_log,
@@ -626,7 +694,7 @@ mod tests {
                             }
                             HostCommand::Status { incarnation_id } => {
                                 assert_eq!(incarnation_id, launch.incarnation_id);
-                                Ok(HostResult::Status {
+                                Ok(HostResult::Status { fresh_agent_recovery_source: None,
                                     host_boot_id: boot.clone(), worker_pid: Some(42), worker_launch_count: 1,
                                     max_control_epoch: registry.control_epoch(), max_execution_generation: 1,
                                     fixture_evidence: serde_json::json!({}), exited: false,

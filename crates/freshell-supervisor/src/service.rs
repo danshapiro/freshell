@@ -15,10 +15,11 @@ use freshell_runtime_protocol::{
     host_proof, read_frame, write_frame, AdminCommand, AdminReply, AdminResult, CommandState,
     ControlRole, Envelope, FixtureKind, FreshAgentLaunchSpec, HostBootId, HostCommand, HostReply,
     HostResult, IncarnationId, IncidentId, LaunchResult, LaunchState, LimitApplication,
-    OpenCodeTransferAction, OpenCodeTransferReadinessReceipt, OpenCodeTransferResult,
-    RecoveryProbe, RequestId, ResumeSpec, RuntimeError, RuntimeErrorCode, RuntimeLimits,
-    RuntimeMetrics, RuntimeOutputBatch, RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec,
-    UpdateLimitsResult, CONTROL_PROTOCOL_VERSION, HOST_CAPABILITY_NATIVE_READINESS_RECEIPT_V1,
+    NativeIdentityObservation, OpenCodeTransferAction, OpenCodeTransferReadinessReceipt,
+    OpenCodeTransferResult, RecoveryProbe, RequestId, ResumeSpec, RuntimeError, RuntimeErrorCode,
+    RuntimeLimits, RuntimeMetrics, RuntimeOutputBatch, RuntimeView, SoulId, StopOutcome,
+    TerminalLaunchSpec, UpdateLimitsResult, CONTROL_PROTOCOL_VERSION,
+    HOST_CAPABILITY_NATIVE_READINESS_RECEIPT_V1,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -38,6 +39,13 @@ use tokio::{
     sync::Mutex,
     time::{sleep, Duration, Instant},
 };
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FreshNativeAdmission {
+    Live,
+    CodexSendRecovery,
+    CodexCompactReadiness,
+}
 
 /// Private cause information retained before the public runtime error projection.
 type BoxedAdminDispatch<'a> =
@@ -249,6 +257,9 @@ pub struct Supervisor {
     pub(crate) recovery_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     /// Bounds repeated provider-store probes for an unchanged live identity.
     pub(crate) live_resume_evidence_attempts: Arc<Mutex<HashMap<LiveResumeEvidenceKey, Instant>>>,
+    /// Observer-only log deduplication; never used as recovery authority.
+    pub(crate) retained_codex_observations:
+        Arc<StdMutex<HashMap<SoulId, NativeIdentityObservation>>>,
     auth_lookup_authorities: Arc<StdMutex<HashMap<String, AuthLookupAuthority>>>,
     provider_path_inputs: Arc<StdMutex<ProviderPathInputBindings>>,
     /// Reply budgets for supervisor→session-host commands, read once.
@@ -311,6 +322,7 @@ impl Supervisor {
             opencode_transfer_lifecycle_lock: Arc::new(Mutex::new(())),
             recovery_locks: Arc::new(Mutex::new(HashMap::new())),
             live_resume_evidence_attempts: Arc::new(Mutex::new(HashMap::new())),
+            retained_codex_observations: Arc::new(StdMutex::new(HashMap::new())),
             auth_lookup_authorities: Arc::new(StdMutex::new(HashMap::new())),
             provider_path_inputs: Arc::new(StdMutex::new(HashMap::new())),
             host_command_budgets: HostCommandBudgets::from_env(),
@@ -2694,7 +2706,7 @@ impl Supervisor {
             ));
         }
         let host = self
-            .authenticate_current_fresh_host(&soul_id, &active)
+            .authenticate_fresh_host(&soul_id, &active, FreshNativeAdmission::CodexSendRecovery)
             .await?;
         let (disposition, incarnation_id) = self
             .registry
@@ -2855,6 +2867,16 @@ impl Supervisor {
         soul_id: &SoulId,
         active: &crate::registry::OwnedRuntimeHandle,
     ) -> Result<AuthenticatedHost, RuntimeError> {
+        self.authenticate_fresh_host(soul_id, active, FreshNativeAdmission::Live)
+            .await
+    }
+
+    async fn authenticate_fresh_host(
+        &self,
+        soul_id: &SoulId,
+        active: &crate::registry::OwnedRuntimeHandle,
+        admission: FreshNativeAdmission,
+    ) -> Result<AuthenticatedHost, RuntimeError> {
         let host = self
             .authenticate_host(active.incarnation_id(), active.runtime_dir())
             .await?;
@@ -2866,6 +2888,13 @@ impl Supervisor {
             .recovery_context(soul_id.clone())
             .await
             .map_err(map_registry)?;
+        let active_provider = active.fresh_agent().map(|agent| agent.provider.as_str());
+        if active_provider != Some(current.provider.as_str()) {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::OwnershipMismatch,
+                "active fresh-agent provider does not match the registry owner",
+            ));
+        }
         let fixture = current.fresh_agent.as_ref().is_some_and(|agent| {
             crate::registry::deterministic_fresh_agent_fixture(&current.provider, agent)
         });
@@ -2898,6 +2927,15 @@ impl Supervisor {
             });
         let readiness_needed = status.exited
             || crate::recovery::current_native_observation(&current, &status).is_none();
+        let supports_codex_same_root_readiness = host
+            .capabilities
+            .iter()
+            .any(|capability| capability == "fresh-agent-codex-same-root-readiness-v1");
+        let codex_same_root_prepare = admission == FreshNativeAdmission::CodexCompactReadiness
+            && supports_codex_same_root_readiness
+            && self
+                .retained_codex_host_eligible(&current, &host, &status)
+                .await?;
         if readiness_needed && can_prepare_claude {
             let before = current.write_fence();
             let expected_launch = current
@@ -2947,7 +2985,105 @@ impl Supervisor {
                     "fresh-agent owner or intent changed during native readiness",
                 ));
             }
+        } else if readiness_needed && codex_same_root_prepare {
+            let before = current.write_fence();
+            let before_launch = current.native_identity_launch.clone();
+            let before_root = current.native_session_id.clone();
+            let result = self
+                .await_running_startup(
+                    soul_id,
+                    "prepare_fresh_same_root_codex_readiness",
+                    self.send_authenticated_host_command(
+                        active.incarnation_id().clone(),
+                        active.runtime_dir(),
+                        &host,
+                        HostCommand::FreshAgentPrepareSameRootNative {
+                            incarnation_id: active.incarnation_id().clone(),
+                        },
+                    ),
+                )
+                .await??;
+            if !matches!(
+                &result,
+                HostResult::FreshAgentCommand {
+                    state: CommandState::Completed | CommandState::ProviderAcked,
+                    native_session_id,
+                    ..
+                } if native_session_id == &before_root
+            ) {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::RecoveryWrongIdentity,
+                    "same-root readiness acknowledged a different native root",
+                ));
+            }
+            let refreshed = self
+                .authenticate_host(active.incarnation_id(), active.runtime_dir())
+                .await?;
+            if refreshed.host_boot_id != host.host_boot_id
+                || !refreshed
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "fresh-agent-codex-same-root-readiness-v1")
+            {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::HostAuthenticationFailed,
+                    "native readiness changed its authenticated host",
+                ));
+            }
+            status = self
+                .host_status(
+                    active.incarnation_id().clone(),
+                    active.runtime_dir(),
+                    &refreshed,
+                )
+                .await?;
+            current = self
+                .registry
+                .recovery_context(soul_id.clone())
+                .await
+                .map_err(map_registry)?;
+            if current.write_fence() != before
+                || current.native_identity_launch != before_launch
+                || current.native_session_id != before_root
+                || status.native_session_id != before_root
+            {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::StaleIntentRevision,
+                    "fresh-agent owner or intent changed during same-root readiness",
+                ));
+            }
+            let proof = crate::recovery::current_native_observation(&current, &status)
+                .filter(|_| {
+                    status.host_boot_id == host.host_boot_id
+                        && status.max_control_epoch <= current.control_epoch
+                        && status.worker_pid.is_some()
+                        && !status.exited
+                })
+                .ok_or_else(|| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::RecoveryWrongIdentity,
+                        "same-root readiness did not publish current live native proof",
+                    )
+                })?;
+            if !self
+                .registry
+                .validate_fresh_codex_recovery_source(
+                    soul_id.clone(),
+                    proof.clone(),
+                    status.host_boot_id.clone(),
+                    before,
+                )
+                .await
+                .map_err(map_registry)?
+            {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::OwnershipMismatch,
+                    "same-root readiness lost its current native writer",
+                ));
+            }
         } else if readiness_needed
+            && admission == FreshNativeAdmission::CodexCompactReadiness
+            && !supports_codex_same_root_readiness
             && !fixture
             && current.provider == "codex"
             && current.desired_state == freshell_runtime_protocol::DesiredState::Running
@@ -2981,6 +3117,9 @@ impl Supervisor {
                     .any(|capability| capability == required)
             })
         {
+            // This compatibility path is only for Compact on older hosts
+            // without the dedicated same-root check. SEND and permission
+            // resolution require retained or current live identity proof.
             let before_probe = current.write_fence();
             let (probe, probed_context) = self
                 .probe_codex_native_readiness_locked(&current, &host)
@@ -3179,10 +3318,15 @@ impl Supervisor {
                 }
             }
         }
+        let retained_codex = admission == FreshNativeAdmission::CodexSendRecovery
+            && self
+                .retained_codex_host_eligible(&current, &host, &status)
+                .await?;
         if current.desired_state != freshell_runtime_protocol::DesiredState::Running
             || current.prior_handle.incarnation_id() != active.incarnation_id()
-            || status.exited
+            || (status.exited && !retained_codex)
             || (!fixture
+                && !retained_codex
                 && (!host
                     .capabilities
                     .iter()
@@ -3192,12 +3336,37 @@ impl Supervisor {
             append_event(
                 &self.config.lifecycle_log,
                 "fresh_agent.input_native_identity_unsettled",
-                serde_json::json!({"severity":"warn","soulId":soul_id,"incarnationId":active.incarnation_id()}),
+                serde_json::json!({
+                    "severity":"warn",
+                    "soulId":soul_id,
+                    "incarnationId":active.incarnation_id(),
+                    "currentIncarnationId":current.prior_handle.incarnation_id(),
+                    "provider":current.provider,
+                    "desiredState":current.desired_state,
+                    "statusExited":status.exited,
+                    "retainedCodex":retained_codex,
+                    "fixture":fixture,
+                    "hasCurrentNativeObservation":
+                        crate::recovery::current_native_observation(&current, &status).is_some(),
+                    "statusHostBootId":status.host_boot_id,
+                    "authenticatedHostBootId":host.host_boot_id,
+                    "statusControlEpoch":status.max_control_epoch,
+                    "currentControlEpoch":current.control_epoch,
+                }),
             );
             return Err(RuntimeError::new(
                 RuntimeErrorCode::RecoveryBlocked,
                 "fresh-agent input requires the current committed native identity",
             ));
+        }
+        if retained_codex {
+            append_event(
+                &self.config.lifecycle_log,
+                "fresh_agent.retained_codex_recovery_admitted",
+                serde_json::json!({"severity":"info","soulId":soul_id,
+                    "incarnationId":active.incarnation_id(),"hostBootId":host.host_boot_id,
+                    "nativeSessionId":current.native_session_id}),
+            );
         }
         Ok(host)
     }
@@ -3357,7 +3526,11 @@ impl Supervisor {
             ));
         }
         let host = self
-            .authenticate_current_fresh_host(&soul_id, &handle)
+            .authenticate_fresh_host(
+                &soul_id,
+                &handle,
+                FreshNativeAdmission::CodexCompactReadiness,
+            )
             .await?;
         let context = self
             .registry
@@ -6316,18 +6489,19 @@ impl Supervisor {
     ) -> crate::recovery::NativeIdentityWait {
         use crate::recovery::NativeIdentityWait;
         let opencode_readiness = workload.opencode_tui_readiness_required(&context.provider);
-        let result = self
-            .wait_for_native_identity_with_reopen_authority(
-                &workload.soul_id,
-                incarnation_id,
-                intent_revision,
-                crate::recovery::native_identity_wait_timeout(opencode_readiness),
-                false,
-                context.recovery_attempt_id.as_ref().filter(|_| {
-                    context.desired_state == freshell_runtime_protocol::DesiredState::Stopped
-                }),
-            )
-            .await;
+        // Keep the nested identity wait off the activation poll frame. Ordinary
+        // observer recovery must fit the normal Tokio worker stack as well.
+        let result = Box::pin(self.wait_for_native_identity_with_reopen_authority(
+            &workload.soul_id,
+            incarnation_id,
+            intent_revision,
+            crate::recovery::native_identity_wait_timeout(opencode_readiness),
+            false,
+            context.recovery_attempt_id.as_ref().filter(|_| {
+                context.desired_state == freshell_runtime_protocol::DesiredState::Stopped
+            }),
+        ))
+        .await;
         let (outcome, adoption_pending, elapsed_ms) = match &result {
             NativeIdentityWait::Observed { elapsed_ms, .. } => ("observed", false, elapsed_ms),
             NativeIdentityWait::ProviderExited { elapsed_ms } => {
@@ -6377,6 +6551,8 @@ impl Supervisor {
             .await?
         {
             HostResult::Status {
+                fresh_agent_recovery_source,
+                max_control_epoch,
                 native_identity_observation,
                 native_readiness_receipt,
                 max_execution_generation,
@@ -6390,6 +6566,8 @@ impl Supervisor {
                 opencode_transfer_receipt,
                 ..
             } => Ok(HostStatus {
+                fresh_agent_recovery_source,
+                max_control_epoch,
                 native_identity_observation,
                 native_readiness_receipt,
                 max_execution_generation,
@@ -6847,6 +7025,7 @@ mod tests {
                         HostCommand::Status { .. } => {
                             let probe = probe.lock().unwrap();
                             Ok(HostResult::Status {
+                                fresh_agent_recovery_source: None,
                                 host_boot_id: boot.clone(),
                                 worker_pid: Some(42),
                                 worker_launch_count: 1,
@@ -8506,7 +8685,7 @@ fn ensure_host_actor_state_dir(
 #[derive(Clone)]
 pub(crate) struct AuthenticatedHost {
     pub(crate) capabilities: Vec<String>,
-    host_boot_id: HostBootId,
+    pub(crate) host_boot_id: HostBootId,
     secret: Vec<u8>,
     effective_limits: RuntimeLimits,
 }
@@ -8523,6 +8702,9 @@ pub(crate) struct AcceptedGrant {
     opencode_transfer_receipt: Option<OpenCodeTransferReadinessReceipt>,
 }
 pub(crate) struct HostStatus {
+    pub(crate) fresh_agent_recovery_source:
+        Option<freshell_runtime_protocol::NativeIdentityObservation>,
+    pub(crate) max_control_epoch: u64,
     pub(crate) max_execution_generation: u64,
     pub(crate) native_identity_observation:
         Option<freshell_runtime_protocol::NativeIdentityObservation>,
@@ -9127,6 +9309,7 @@ pub(crate) fn uses_fresh_agent_command_budget(command: &HostCommand) -> bool {
     matches!(
         command,
         HostCommand::FreshAgentPrepareNative { .. }
+            | HostCommand::FreshAgentPrepareSameRootNative { .. }
             | HostCommand::FreshAgentSend { .. }
             | HostCommand::FreshAgentNativeName { .. }
             | HostCommand::FreshAgentCompact { .. }
@@ -11143,6 +11326,7 @@ mod codex_pre_worker_retry_tests {
                     }
                 }
                 HostCommand::Status { .. } => Ok(HostResult::Status {
+                    fresh_agent_recovery_source: None,
                     host_boot_id: boot.clone(),
                     worker_pid: Some(42),
                     worker_launch_count: 1,
@@ -12168,6 +12352,7 @@ mod opencode_transfer_restart_tests {
                         HostCommand::Status { .. } => {
                             let observation = current_proof.lock().unwrap().clone();
                             HostResult::Status {
+                                fresh_agent_recovery_source: None,
                                 native_session_id: observation
                                     .as_ref()
                                     .map(|proof| proof.native_session_id.clone()),
@@ -12751,6 +12936,7 @@ mod opencode_transfer_restart_tests {
                             continue;
                         }
                         HostCommand::Status { .. } => HostResult::Status {
+                            fresh_agent_recovery_source: None,
                             native_identity_observation: observed,
                             host_boot_id: boot.clone(),
                             worker_pid: Some(123),
@@ -17128,6 +17314,7 @@ mod native_observation_ipc_tests {
                             effective_limits: requested_limits,
                         },
                         HostCommand::Status { .. } => HostResult::Status {
+                            fresh_agent_recovery_source: None,
                             native_identity_observation: None,
                             host_boot_id: boot.clone(),
                             worker_pid: Some(123),
@@ -17273,6 +17460,7 @@ mod native_observation_ipc_tests {
                         HostCommand::Status { incarnation_id } if step == 1 => {
                             assert_eq!(incarnation_id, expected_incarnation);
                             HostResult::Status {
+                                fresh_agent_recovery_source: None,
                                 native_identity_observation: None,
                                 host_boot_id: boot.clone(),
                                 worker_pid: Some(123),
@@ -17660,6 +17848,10 @@ mod control_connection_tests {
 #[cfg(test)]
 #[path = "native_clear_service_tests.rs"]
 mod native_clear_service_tests;
+
+#[cfg(test)]
+#[path = "retained_codex_recovery_tests.rs"]
+mod retained_codex_recovery_tests;
 
 #[cfg(test)]
 #[path = "fresh_agent_blocked_send_tests.rs"]

@@ -1067,6 +1067,60 @@ tool_timeout_sec = 120
         })
       return { supervisorEvents, hostEvents, storeProbeSelections }
     }
+    const coldRecoveryWaitDiagnostics = () => {
+      const expectedSoulId = beforeCrash.view!.soulId
+      const lifecycleRows = readSupervisorLifecycle()
+      const recoveryEvents = lifecycleRows.filter(row =>
+        ['supervisor.runtime_observer.recovery_scheduled', 'supervisor.recovery_retry.settled',
+          'supervisor.recovery_retry.exhausted'].includes(row.event)
+        && row.data?.soulId === expectedSoulId)
+      const triggers = recoveryEvents
+        .filter(row => row.event === 'supervisor.runtime_observer.recovery_scheduled'
+          && ['host_unreachable', 'provider_exit'].includes(row.data?.trigger))
+        .map(row => ({
+          sequence: row.sequence,
+          afterBaseline: Number.isSafeInteger(row.sequence)
+            && row.sequence > supervisorSequenceBeforeHostPause,
+          soulId: row.data?.soulId,
+          trigger: row.data?.trigger,
+        }))
+      const settlements = recoveryEvents
+        .filter(row => ['supervisor.recovery_retry.settled', 'supervisor.recovery_retry.exhausted']
+          .includes(row.event))
+        .map(row => {
+          const incarnationId = typeof row.data?.incarnationId === 'string'
+            ? row.data.incarnationId : undefined
+          const hostPath = incarnationId
+            ? path.join(rig.supervisor.runtimeRoot, incarnationId, 'host-lifecycle.jsonl')
+            : undefined
+          let readinessReceipt = false
+          if (hostPath) {
+            try {
+              readinessReceipt = readBoundedTail(hostPath, 1024 * 1024).split('\n').some(line => {
+                try { return JSON.parse(line).event === 'host.native_identity.readiness_receipt_committed' }
+                catch { return false }
+              })
+            } catch { /* Preserve the failed observation in the returned diagnostics. */ }
+          }
+          return {
+            sequence: row.sequence,
+            event: row.event,
+            soulId: row.data?.soulId,
+            reason: row.data?.reason,
+            incarnationId,
+            hostPathExists: hostPath ? fs.existsSync(hostPath) : false,
+            readinessReceipt,
+          }
+        })
+      return {
+        expectedSoulId,
+        sequenceBeforeHostPause: supervisorSequenceBeforeHostPause,
+        latestSequence: lifecycleRows.reduce((latest, row) => Number.isSafeInteger(row.sequence)
+          ? Math.max(latest, row.sequence) : latest, 0),
+        triggers,
+        settlements,
+      }
+    }
     finalObservation = async () => {
       let final: unknown
       try { final = await snapshot() } catch (error) { final = { error: String(error) } }
@@ -1792,7 +1846,7 @@ tool_timeout_sec = 120
         const trigger = rows.find(row => row.sequence > supervisorSequenceBeforeHostPause
           && row.event === 'supervisor.runtime_observer.recovery_scheduled'
           && row.data?.soulId === beforeCrash.view!.soulId
-          && row.data?.trigger === 'host_unreachable')
+          && row.data?.trigger === 'provider_exit')
         if (!trigger) return undefined
         const settlements = rows.filter(row => row.sequence > trigger.sequence
           && row.data?.soulId === beforeCrash.view!.soulId
@@ -1815,13 +1869,13 @@ tool_timeout_sec = 120
         return undefined
       }, 150_000)
     } catch (error) {
-      const diagnostic = coldRecoveryDiagnostics()
+      const diagnostic = { ...coldRecoveryDiagnostics(), wait: coldRecoveryWaitDiagnostics() }
       try { rig.runtime.writeIncident('freshcodex-managed-native-cold-recovery-failed', diagnostic) } catch { /* Preserve the recovery failure. */ }
       throw new Error(`cold Codex host recovery did not settle: ${error instanceof Error ? error.message : String(error)}; ${JSON.stringify(diagnostic)}`)
     }
     const coldRecoveryDiagnostic = coldRecoveryDiagnostics()
     rig.runtime.writeIncident('freshcodex-managed-native-cold-recovery-settlement', coldRecoveryDiagnostic)
-    expect(coldRecovery.trigger.data.trigger).toBe('host_unreachable')
+    expect(coldRecovery.trigger.data.trigger).toBe('provider_exit')
     expect(coldRecovery.settled.event).toBe('supervisor.recovery_retry.settled')
     expect(coldRecovery.settled.data.reason).toBe('recovered')
     expect(coldRecovery.settled.data.incarnationId).not.toBe(beforeCrash.view!.incarnationId)

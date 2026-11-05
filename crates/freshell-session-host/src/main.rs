@@ -106,6 +106,12 @@ impl From<&PersistedHostState> for HostControlFence {
 }
 
 impl HostControlFence {
+    fn is_current_running(&self, epoch: u64, generation: u64) -> bool {
+        !self.stopped
+            && self.max_control_epoch == epoch
+            && self.max_execution_generation == generation
+    }
+
     fn validate_generation(&self, epoch: u64, generation: u64) -> Result<(), RuntimeError> {
         if epoch < self.max_control_epoch || generation < self.max_execution_generation {
             return Err(RuntimeError::new(
@@ -882,6 +888,8 @@ async fn dispatch_with_effects(
                     "provider-store-probe-v1".into(),
                     "opencode-adoption-observation-v1".into(),
                     "native-identity-observation-v1".into(),
+                    "fresh-agent-codex-recovery-source-v1".into(),
+                    "fresh-agent-codex-same-root-readiness-v1".into(),
                     HOST_CAPABILITY_NATIVE_READINESS_RECEIPT_V1.into(),
                     "grant-v1".into(),
                     "stop-v1".into(),
@@ -968,10 +976,12 @@ async fn dispatch_with_effects(
                 HostCommand::Status { incarnation_id } => {
                     ensure_incarnation(&incarnation_id, state)?;
                     let persisted = state.persisted.lock().await.clone();
-                    let mut evidence = persisted.fixture_evidence;
+                    let mut evidence = persisted.fixture_evidence.clone();
+                    let fresh_agent = state.fresh_agent.lock().await.clone();
                     let mut exited = false;
                     let mut native_session_id = None;
                     let mut native_identity_observation = None;
+                    let mut fresh_agent_recovery_source = None;
                     let mut opencode_adoption = OpenCodeAdoptionStatus::NotRequired;
                     if let Some(pty) = state.pty.lock().await.as_ref() {
                         exited = pty.exited();
@@ -990,8 +1000,12 @@ async fn dispatch_with_effects(
                             "exitCode":pty.exit_code(),
                             "nativeSessionId":native_session_id,
                         });
-                    } else if let Some(agent) = state.fresh_agent.lock().await.as_ref() {
+                    } else if let Some(agent) = fresh_agent.as_ref() {
                         exited = !agent.is_live().await;
+                        if exited {
+                            fresh_agent_recovery_source =
+                                retained_codex_recovery_source(state, &persisted, agent).await;
+                        }
                         if let Some(launch) = persisted.native_identity_launch.as_ref() {
                             native_identity_observation =
                                 fresh_native_observation(launch, agent).await;
@@ -1048,6 +1062,7 @@ async fn dispatch_with_effects(
                         ));
                     }
                     Ok(HostResult::Status {
+                        fresh_agent_recovery_source,
                         native_identity_observation,
                         native_readiness_receipt: persisted.native_readiness_receipt.clone(),
                         host_boot_id: state.host_boot_id.clone(),
@@ -1111,6 +1126,32 @@ async fn dispatch_with_effects(
                             expected_stream_epoch.as_deref(),
                         )?;
                     Ok(HostResult::TerminalOutput(batch))
+                }
+                HostCommand::FreshAgentPrepareSameRootNative { incarnation_id } => {
+                    let _native_command = state.fresh_native_command.lock().await;
+                    ensure_incarnation(&incarnation_id, state)?;
+                    Box::pin(prepare_same_root_codex_native(state)).await?;
+                    let persisted = state.persisted.lock().await.clone();
+                    let observation = current_native_observation(state, &persisted)
+                        .await
+                        .ok_or_else(|| {
+                            RuntimeError::new(
+                                RuntimeErrorCode::RecoveryWrongIdentity,
+                                "same-root readiness returned without current provider proof",
+                            )
+                        })?;
+                    let actor = state
+                        .fresh_agent
+                        .lock()
+                        .await
+                        .clone()
+                        .ok_or_else(unsupported_fresh_agent)?;
+                    Ok(HostResult::FreshAgentCommand {
+                        state: freshell_runtime_protocol::CommandState::ProviderAcked,
+                        claude_fork: actor.claude_fork_recipe().await,
+                        native_identity: None,
+                        native_session_id: Some(observation.native_session_id),
+                    })
                 }
                 HostCommand::FreshAgentPrepareNative {
                     incarnation_id,
@@ -1233,13 +1274,19 @@ async fn dispatch_with_effects(
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
                     let _native_command = state.fresh_native_command.lock().await;
-                    ensure_current_fresh_native_observation(state).await?;
                     let actor = state
                         .fresh_agent
                         .lock()
                         .await
                         .clone()
                         .ok_or_else(unsupported_fresh_agent)?;
+                    let persisted = state.persisted.lock().await.clone();
+                    if retained_codex_recovery_source(state, &persisted, &actor)
+                        .await
+                        .is_none()
+                    {
+                        ensure_current_fresh_native_observation(state).await?;
+                    }
                     let before = actor.profile().await;
                     let command_state = actor
                         .dispatch_with_checkpoint_identity(
@@ -1250,6 +1297,12 @@ async fn dispatch_with_effects(
                         )
                         .await
                         .map_err(map_actor_error)?;
+                    commit_fresh_native_transition(
+                        state,
+                        &actor,
+                        before.native_session_id.as_deref(),
+                    )
+                    .await?;
                     let after = actor.profile().await;
                     let native_session_id = after.native_session_id.clone();
                     let native_identity =
@@ -1311,24 +1364,44 @@ async fn dispatch_with_effects(
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
                     let _native_command = state.fresh_native_command.lock().await;
-                    ensure_current_fresh_native_observation(state).await?;
+                    let codex_same_root =
+                        state.persisted.lock().await.provider.as_deref() == Some("codex");
+                    let retained_root = if codex_same_root {
+                        // Compact may resume only the retained Codex root. A
+                        // missing current proof goes through the strict
+                        // same-root helper; it must never use cold-host
+                        // receipt recovery or mint a replacement root.
+                        Box::pin(prepare_same_root_codex_native(state)).await?;
+                        let persisted = state.persisted.lock().await.clone();
+                        Some(
+                            current_native_observation(state, &persisted)
+                                .await
+                                .ok_or_else(|| {
+                                    RuntimeError::new(
+                                        RuntimeErrorCode::RecoveryWrongIdentity,
+                                        "Codex Compact requires current retained native proof",
+                                    )
+                                })?
+                                .native_session_id,
+                        )
+                    } else {
+                        ensure_current_fresh_native_observation(state).await?;
+                        None
+                    };
                     let actor = state
                         .fresh_agent
                         .lock()
                         .await
                         .clone()
                         .ok_or_else(unsupported_fresh_agent)?;
-                    let prior_native = actor.profile().await.native_session_id;
-                    let command_state = actor
-                        .semantic_operation(
-                            request_id,
-                            freshell_agent_runtime::host_actor::FreshAgentOperation::Compact {
-                                instructions,
-                                cwd,
-                            },
-                        )
-                        .await
-                        .map_err(map_actor_error)?;
+                    let (prior_native, command_state) = compact_fresh_agent_actor(
+                        &actor,
+                        retained_root.as_deref(),
+                        request_id,
+                        instructions,
+                        cwd,
+                    )
+                    .await?;
                     commit_fresh_native_transition(state, &actor, prior_native.as_deref()).await?;
                     Ok(HostResult::FreshAgentCommand {
                         native_identity: None,
@@ -1719,6 +1792,39 @@ fn map_actor_error(error: freshell_agent_runtime::host_actor::ActorError) -> Run
     // Provider error strings may contain request bodies, environment values,
     // or credentials. Keep the control payload typed and deliberately opaque.
     RuntimeError::new(code, "hosted fresh-agent command failed")
+}
+
+async fn compact_fresh_agent_actor(
+    actor: &Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>,
+    retained_root: Option<&str>,
+    request_id: freshell_runtime_protocol::RequestId,
+    instructions: Option<String>,
+    cwd: Option<String>,
+) -> Result<(Option<String>, freshell_runtime_protocol::CommandState), RuntimeError> {
+    let prior_native = actor.profile().await.native_session_id;
+    if retained_root.is_some_and(|root| prior_native.as_deref() != Some(root)) {
+        return Err(RuntimeError::new(
+            RuntimeErrorCode::RecoveryWrongIdentity,
+            "Codex Compact requires the retained native root before dispatch",
+        ));
+    }
+    let command_state = actor
+        .semantic_operation(
+            request_id,
+            freshell_agent_runtime::host_actor::FreshAgentOperation::Compact { instructions, cwd },
+        )
+        .await
+        .map_err(map_actor_error)?;
+    let after = actor.profile().await;
+    if retained_root.is_some_and(|root| {
+        prior_native.as_deref() != Some(root) || after.native_session_id.as_deref() != Some(root)
+    }) {
+        return Err(RuntimeError::new(
+            RuntimeErrorCode::RecoveryWrongIdentity,
+            "Codex Compact changed its retained native root",
+        ));
+    }
+    Ok((prior_native, command_state))
 }
 
 fn map_fresh_agent_open_error(
@@ -3147,6 +3253,56 @@ async fn fresh_native_observation(
     providers::native_identity::bind_provider_observation(launch, &native, source, &evidence)
 }
 
+async fn retained_codex_recovery_source(
+    state: &HostState,
+    persisted: &PersistedHostState,
+    actor: &Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>,
+) -> Option<freshell_runtime_protocol::NativeIdentityObservation> {
+    let current_control = || {
+        state.control_fence.lock().unwrap().is_current_running(
+            persisted.max_control_epoch,
+            persisted.max_execution_generation,
+        )
+    };
+    if persisted.provider.as_deref() != Some("codex")
+        || persisted.host_boot_id.as_ref() != Some(&state.host_boot_id)
+        || persisted.worker_pid.is_none()
+        || !current_control()
+        || !state
+            .fresh_agent
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, actor))
+    {
+        return None;
+    }
+    let launch = persisted.native_identity_launch.as_ref()?;
+    if launch.incarnation_id != state.incarnation_id
+        || launch.execution_generation != persisted.max_execution_generation
+    {
+        return None;
+    }
+    let evidence = actor.retained_codex_native_identity_evidence().await?;
+    let native = evidence["nativeSessionId"].as_str()?;
+    if serde_json::from_value::<freshell_runtime_protocol::NativeIdentityLaunch>(
+        evidence["launch"].clone(),
+    )
+    .ok()
+    .as_ref()
+        != Some(launch)
+        || !current_control()
+    {
+        return None;
+    }
+    providers::native_identity::bind_provider_observation(
+        launch,
+        native,
+        freshell_runtime_protocol::NativeIdentitySource::FreshProviderHandshake,
+        &evidence,
+    )
+}
+
 async fn commit_fresh_native_transition(
     state: &HostState,
     actor: &Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>,
@@ -3227,6 +3383,80 @@ async fn commit_fresh_native_transition(
         serde_json::json!({"severity":"info","incarnationId":state.incarnation_id,
         "executionGeneration":persisted.max_execution_generation,
         "evidenceRevision":persisted.native_identity_launch.as_ref().map(|launch|launch.evidence_revision)})).ok();
+    Ok(())
+}
+
+async fn prepare_same_root_codex_native(state: &HostState) -> Result<(), RuntimeError> {
+    let before = state.persisted.lock().await.clone();
+    if before.provider.as_deref() != Some("codex")
+        || current_native_observation(state, &before).await.is_some()
+    {
+        return Ok(());
+    }
+    let refuse = || {
+        RuntimeError::new(
+            RuntimeErrorCode::RecoveryWrongIdentity,
+            "same-root native readiness requires the current retained Codex source",
+        )
+    };
+    let actor = state.fresh_agent.lock().await.clone().ok_or_else(refuse)?;
+    let source = retained_codex_recovery_source(state, &before, &actor)
+        .await
+        .ok_or_else(refuse)?;
+    actor
+        .prepare_same_root_native_readiness()
+        .await
+        .map_err(map_actor_error)?;
+    let current = state.persisted.lock().await.clone();
+    let revoked = if current.native_identity_launch != before.native_identity_launch {
+        Some("launch_changed")
+    } else if current.max_execution_generation != before.max_execution_generation {
+        Some("execution_generation_changed")
+    } else if current.max_control_epoch != before.max_control_epoch {
+        Some("control_epoch_changed")
+    } else if current.host_boot_id != before.host_boot_id {
+        Some("host_boot_changed")
+    } else if !state
+        .control_fence
+        .lock()
+        .unwrap()
+        .is_current_running(current.max_control_epoch, current.max_execution_generation)
+    {
+        Some("control_revoked")
+    } else if !state
+        .fresh_agent
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|attached| Arc::ptr_eq(attached, &actor))
+    {
+        Some("actor_replaced")
+    } else if current_native_observation(state, &current)
+        .await
+        .is_none_or(|proof| proof.native_session_id != source.native_session_id)
+    {
+        Some("native_proof_changed")
+    } else {
+        None
+    };
+    if let Some(reason) = revoked {
+        // A changed launch/control fence revokes this preparation. It may
+        // have registered after the earlier owner was stopped or replaced.
+        append_event_with_secret(
+            &state.state_dir,
+            &state.secret,
+            "host.fresh_agent.same_root_preparation_revoked",
+            serde_json::json!({"severity":"warn", "incarnationId":state.incarnation_id,
+                "controlEpoch":current.max_control_epoch,
+                "executionGeneration":current.max_execution_generation, "reason":reason}),
+        )
+        .ok();
+        actor.stop().await.map_err(map_actor_error)?;
+        return Err(RuntimeError::new(
+            RuntimeErrorCode::RecoveryWrongIdentity,
+            format!("same-root native preparation was revoked: {reason}"),
+        ));
+    }
     Ok(())
 }
 
@@ -11881,6 +12111,49 @@ mod tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    struct UnobservedCodexTransport(AtomicUsize);
+
+    #[async_trait]
+    impl FreshAgentTransport for UnobservedCodexTransport {
+        async fn start(&self, _: &FreshAgentProfile) -> Result<TransportStart, String> {
+            Ok(TransportStart {
+                native_session_id: None,
+            })
+        }
+        async fn is_live(&self) -> bool {
+            false
+        }
+        async fn dispatch(
+            &self,
+            request: &RequestId,
+            _: &str,
+            _: &FreshAgentProfile,
+        ) -> Result<DispatchAck, DispatchFailure> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(DispatchAck {
+                provider_ack_id: Some(request.to_string()),
+                native_identity: None,
+            })
+        }
+        async fn resolve_permission(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+        ) -> Result<(), DispatchFailure> {
+            Ok(())
+        }
+        async fn interrupt(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn stop(self: Arc<Self>) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn take_event_stream(&self) -> Option<tokio::sync::mpsc::Receiver<AgentEvent>> {
+            None
+        }
+    }
+
     struct CodexReadinessFixtureTransport {
         launch: std::sync::Mutex<freshell_runtime_protocol::NativeIdentityLaunch>,
         native_session_id: std::sync::Mutex<String>,
@@ -11978,6 +12251,103 @@ mod tests {
         fn take_event_stream(&self) -> Option<tokio::sync::mpsc::Receiver<AgentEvent>> {
             None
         }
+    }
+
+    #[tokio::test]
+    async fn authenticated_native_crash_send_requires_prior_observed_actor_source() {
+        let owned = tempfile::tempdir().unwrap();
+        let mut state = test_host_state();
+        let empty_created = state.state_dir.clone();
+        assert!(std::fs::read_dir(&empty_created).unwrap().next().is_none());
+        std::fs::remove_dir(empty_created).unwrap();
+        Arc::get_mut(&mut state).unwrap().state_dir = owned.path().into();
+        let binding = freshell_runtime_protocol::NativeIdentityLaunch {
+            incarnation_id: state.incarnation_id.clone(),
+            launch_nonce: "unobserved-native-launch".into(),
+            evidence_revision: 7,
+            execution_generation: 1,
+            requested_native_session_id: Some("saved-native-only".into()),
+        };
+        {
+            let mut persisted = state.persisted.lock().await;
+            persisted.native_identity_launch = Some(binding);
+            persisted.host_boot_id = Some(state.host_boot_id.clone());
+            persisted.provider = Some("codex".into());
+            persisted.worker_pid = Some(std::process::id());
+            persisted.worker_launch_count = 1;
+            persisted.max_control_epoch = 1;
+            persisted.max_execution_generation = 1;
+            *state.control_fence.lock().unwrap() = HostControlFence::from(&*persisted);
+        }
+        let transport = Arc::new(UnobservedCodexTransport(AtomicUsize::new(0)));
+        let profile: FreshAgentProfile = serde_json::from_value(serde_json::json!({
+            "provider":"codex", "runtimeVariant":"codex-app-server-v1", "cwd":owned.path(), "providerStoreId":"unobserved-store"
+        })).unwrap();
+        let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+            owned.path().join("actor"),
+            profile,
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+        *state.fresh_agent.lock().await = Some(actor.clone());
+        for command in [
+            HostCommand::FreshAgentPrepareSameRootNative {
+                incarnation_id: state.incarnation_id.clone(),
+            },
+            HostCommand::FreshAgentCompact {
+                incarnation_id: state.incarnation_id.clone(),
+                request_id: RequestId::new(),
+                instructions: None,
+                cwd: None,
+            },
+        ] {
+            assert!(
+                dispatch(authenticated_host_envelope(&state, command), &state)
+                    .await
+                    .is_err()
+            );
+        }
+        let result = dispatch(
+            authenticated_host_envelope(
+                &state,
+                HostCommand::FreshAgentSend {
+                    incarnation_id: state.incarnation_id.clone(),
+                    request_id: RequestId::new(),
+                    text: "forbidden unobserved input".into(),
+                    settings: None,
+                    checkpoint_logical_attempt_id: None,
+                },
+            ),
+            &state,
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err().code,
+            RuntimeErrorCode::RecoveryWrongIdentity
+        );
+        assert_eq!(transport.0.load(Ordering::SeqCst), 0);
+        let status = dispatch(
+            authenticated_host_envelope(
+                &state,
+                HostCommand::Status {
+                    incarnation_id: state.incarnation_id.clone(),
+                },
+            ),
+            &state,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            status,
+            HostResult::Status {
+                fresh_agent_recovery_source: None,
+                native_identity_observation: None,
+                exited: true,
+                ..
+            }
+        ));
+        actor.stop().await.unwrap();
     }
 
     struct RpcFixtureTransport {
@@ -12150,6 +12520,72 @@ mod tests {
                 serde_json::json!(value["launch"]["evidenceRevision"].as_u64().unwrap() + 1);
             value["launch"]["requestedNativeSessionId"] = serde_json::json!("fixture-native-child");
         }
+    }
+
+    #[tokio::test]
+    async fn compact_refuses_a_mismatched_actor_root_before_provider_dispatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let incarnation_id = freshell_runtime_protocol::IncarnationId::new();
+        let launch = freshell_runtime_protocol::NativeIdentityLaunch {
+            incarnation_id,
+            launch_nonce: "compact-root-fence".into(),
+            evidence_revision: 7,
+            execution_generation: 1,
+            requested_native_session_id: Some("fixture-native-thread".into()),
+        };
+        let transport = Arc::new(RpcFixtureTransport {
+            native_evidence: std::sync::Mutex::new(Some(serde_json::json!({
+                "launch": launch,
+                "nativeSessionId": "fixture-native-thread"
+            }))),
+            dispatches: AtomicUsize::new(0),
+            checkpoint_attempts: std::sync::Mutex::new(Vec::new()),
+            decisions: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            captures: AtomicUsize::new(0),
+            stops: AtomicUsize::new(0),
+        });
+        let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+            directory.path().join("compact-root-fence-agent"),
+            FreshAgentProfile {
+                naming_handle: None,
+                collaboration_mode: None,
+                provider: FreshProvider::Codex,
+                runtime_variant: "codex-app-server".into(),
+                cwd: "/workspace".into(),
+                model: None,
+                effort: None,
+                permission_mode: None,
+                sandbox: None,
+                provider_store_id: "codex-store".into(),
+                native_session_id: Some("fixture-native-thread".into()),
+                plugins: None,
+                model_selection: None,
+                session_ref: None,
+                provider_launch_context: None,
+                provider_secret_references: Vec::new(),
+            },
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+
+        let error = super::compact_fresh_agent_actor(
+            &actor,
+            Some("retained-native-root"),
+            RequestId::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.code,
+            freshell_runtime_protocol::RuntimeErrorCode::RecoveryWrongIdentity
+        );
+        assert_eq!(transport.operations.load(Ordering::SeqCst), 0);
+        actor.stop().await.unwrap();
     }
 
     #[tokio::test]

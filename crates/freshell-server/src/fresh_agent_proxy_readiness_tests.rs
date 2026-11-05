@@ -253,13 +253,11 @@ pub(super) async fn readiness_fixture() -> ReadinessFixture {
                 } => HostResult::Hello {
                     host_boot_id: boot.clone(),
                     proof: host_proof(host_secret, &challenge, &boot, &incarnation_id),
-                    capabilities: vec![
-                        "native-identity-observation-v1".into(),
-                        "fresh-agent-native-readiness-v1".into(),
-                    ],
+                    capabilities: vec!["native-identity-observation-v1".into()],
                     effective_limits: limits,
                 },
                 HostCommand::Status { .. } => HostResult::Status {
+                    fresh_agent_recovery_source: None,
                     host_boot_id: boot.clone(),
                     worker_pid: live.then_some(123),
                     worker_launch_count: 1,

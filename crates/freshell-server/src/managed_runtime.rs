@@ -2119,6 +2119,7 @@ mod tests {
                                 }
                             }
                             HostCommand::Status { .. } => HostResult::Status {
+                                fresh_agent_recovery_source: None,
                                 host_boot_id: boot.clone(),
                                 worker_pid: Some(42),
                                 worker_launch_count: 1,

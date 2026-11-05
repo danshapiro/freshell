@@ -398,6 +398,11 @@ pub trait FreshAgentTransport: Send + Sync {
     ) -> Result<Option<NativeDispatchIdentity>, String> {
         Ok(None)
     }
+    /// Explicit Compact readiness may resume only the retained native root.
+    /// Implementations that do not support this stricter path refuse it.
+    async fn prepare_same_root_native_readiness(&self) -> Result<(), String> {
+        Err("same-root native readiness is unsupported".into())
+    }
     async fn start(&self, profile: &FreshAgentProfile) -> Result<TransportStart, String>;
     /// The replacement-only first phase: try the exact prior Codex root using
     /// the immutable ResumeSpec CWD. A typed missing-root result is returned
@@ -2356,6 +2361,35 @@ impl FreshAgentHostActor {
         result
     }
 
+    pub async fn prepare_same_root_native_readiness(&self) -> Result<(), ActorError> {
+        let _dispatch = self.dispatch_lock.lock().await;
+        let profile = self.profile().await;
+        if self.stopped.load(Ordering::SeqCst)
+            || self.native_identity_transition.load(Ordering::SeqCst)
+            || profile.provider != FreshProvider::Codex
+            || profile.native_session_id.is_none()
+            || *self.observed_native_session_id.lock().await != profile.native_session_id
+        {
+            return Err(ActorError::NativeIdentityMismatch);
+        }
+        let result = self.transport.prepare_same_root_native_readiness().await;
+        if self.stopped.load(Ordering::SeqCst) {
+            // Stop revokes authority immediately. Its first shutdown can run
+            // before a held native resume registers; reap that late runtime too.
+            Arc::clone(&self.transport)
+                .stop()
+                .await
+                .map_err(ActorError::Transport)?;
+            return Err(ActorError::NativeIdentityMismatch);
+        }
+        result.map_err(ActorError::Transport)?;
+        if self.profile().await != profile || self.native_identity_transition.load(Ordering::SeqCst)
+        {
+            return Err(ActorError::NativeIdentityMismatch);
+        }
+        Ok(())
+    }
+
     async fn prepare_claude_effect(
         &self,
         state: &mut PersistedActorState,
@@ -2406,6 +2440,30 @@ impl FreshAgentHostActor {
     pub async fn observed_native_identity_evidence(&self) -> Option<Value> {
         self.observed_native_session_id().await?;
         self.transport.native_identity_evidence().await
+    }
+
+    /// The established Codex actor can attempt guarded recovery after its
+    /// native exits. This is retained producer evidence, never live proof or
+    /// authority derived from a saved resume profile.
+    pub async fn retained_codex_native_identity_evidence(&self) -> Option<Value> {
+        let _dispatch = self.dispatch_lock.try_lock().ok()?;
+        if self.stopped.load(Ordering::SeqCst)
+            || self.native_identity_transition.load(Ordering::SeqCst)
+        {
+            return None;
+        }
+        let state = self.state.lock().await;
+        if state.profile.provider != FreshProvider::Codex {
+            return None;
+        }
+        let observed = self.observed_native_session_id.lock().await.clone()?;
+        if state.profile.native_session_id.as_ref() != Some(&observed) {
+            return None;
+        }
+        let evidence = self.transport.native_identity_evidence().await?;
+        (evidence["nativeSessionId"].as_str() == Some(observed.as_str())
+            && !self.stopped.load(Ordering::SeqCst))
+        .then_some(evidence)
     }
 
     pub async fn observe_native_identity(

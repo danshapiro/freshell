@@ -1066,6 +1066,13 @@ wss.on('connection', (socket) => {
           await new Promise((resolve) => setTimeout(resolve, 25))
         }
       }
+      if (method === 'thread/resume' && behavior.waitForThreadResumeReleasePath) {
+        const deadline = Date.now() + 120_000
+        while (!fs.existsSync(behavior.waitForThreadResumeReleasePath)) {
+          if (Date.now() > deadline) throw new Error('Timed out waiting for test thread/resume release')
+          await new Promise((resolve) => setTimeout(resolve, 10))
+        }
+      }
       await writeBytes(process.stdout, floodStdoutBytes)
       await writeBytes(process.stderr, floodStderrBytes)
       const result = method === 'thread/read' && behavior.threadReadResults?.[message.params?.threadId]

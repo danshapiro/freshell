@@ -1050,6 +1050,28 @@ impl HostedTransport {
 
 #[async_trait]
 impl FreshAgentTransport for HostedTransport {
+    async fn prepare_same_root_native_readiness(&self) -> Result<(), String> {
+        let ProviderState::Codex(state) = &self.state else {
+            return Err("same-root native readiness requires Codex".into());
+        };
+        let root = {
+            let identity = self.native_identity.lock().expect("native identity lock");
+            if identity.pending || identity.evidence.is_none() {
+                return Err("same-root native identity is unsettled".into());
+            }
+            identity
+                .root
+                .clone()
+                .ok_or("same-root native identity is unobserved")?
+        };
+        state.prepare_same_root_native_session(&root).await?;
+        if self.current_native_id().await? != root || !state.has_live_session(&root).await {
+            return Err("same-root native readiness lost its original runtime".into());
+        }
+        self.remember_native_runtime(&root).await;
+        Ok(())
+    }
+
     async fn probe_native_store(
         &self,
         resume_spec: &ResumeSpec,
@@ -2402,7 +2424,17 @@ impl FreshAgentTransport for HostedTransport {
                 };
                 match &self.state {
                     ProviderState::Claude(state) => state.handle_compact(message).await,
-                    ProviderState::Codex(state) => state.handle_compact(message).await,
+                    ProviderState::Codex(state) => {
+                        if !state.has_live_session(&message.session_id).await {
+                            return Err(OperationFailure {
+                                kind: OperationFailureKind::Rejected,
+                                message: "current Codex runtime exited before Compact dispatch"
+                                    .into(),
+                                acceptance_ambiguous: false,
+                            });
+                        }
+                        state.handle_compact_current_native(message).await
+                    }
                     ProviderState::Opencode { runtime, .. } => {
                         runtime.handle_compact(message).await
                     }
@@ -5386,7 +5418,7 @@ await import(parameters.source)
     #[tokio::test]
     async fn task010_native_mint_ack_updates_actor_before_snapshot_and_second_send() {
         for pending in [false, true] {
-            assert_native_mint_ack(pending).await;
+            Box::pin(assert_native_mint_ack(pending, false)).await;
         }
     }
 
@@ -5498,7 +5530,964 @@ await import(parameters.source)
         actor.stop().await.unwrap();
     }
 
-    async fn assert_native_mint_ack(pending: bool) {
+    async fn native_host(fixture: &NativeCodexFixture) -> Arc<crate::HostState> {
+        let state_dir = fixture.dir.path().join("host");
+        std::fs::create_dir(&state_dir).unwrap();
+        let host = Arc::new(crate::HostState {
+            incarnation_id: freshell_runtime_protocol::IncarnationId::new(),
+            host_boot_id: freshell_runtime_protocol::HostBootId::new(),
+            state_dir,
+            secret: b"owned-native-crash-host-secret".to_vec(),
+            requested_limits: freshell_runtime_protocol::RuntimeLimits {
+                cpu_milli: 500,
+                memory_bytes: 128 * 1024 * 1024,
+                swap_bytes: 0,
+                pids_max: 64,
+            },
+            control_fence: std::sync::Mutex::new(crate::HostControlFence::default()),
+            persisted: Mutex::new(crate::PersistedHostState::default()),
+            child: Mutex::new(None),
+            pty: Mutex::new(None),
+            fresh_agent: Mutex::new(None),
+            fresh_agent_starting: Mutex::new(None),
+            fresh_native_command: Mutex::new(()),
+            provider_config_paths: crate::ProviderConfigPaths::default(),
+            opencode_transfer_mount: std::path::PathBuf::from(crate::OPENCODE_TRANSFER_MOUNT),
+            bootstrap_root: fixture.dir.path().join("bootstrap"),
+        });
+        let launch = freshell_runtime_protocol::NativeIdentityLaunch {
+            incarnation_id: host.incarnation_id.clone(),
+            launch_nonce: "current-native-crash-launch".into(),
+            evidence_revision: 7,
+            execution_generation: 1,
+            requested_native_session_id: None,
+        };
+        {
+            let mut identity = fixture.transport.native_identity.lock().unwrap();
+            identity.launch = Some(launch.clone());
+            identity.producer_launch = Some(launch.clone());
+        }
+        let mut persisted = host.persisted.lock().await;
+        persisted.native_identity_launch = Some(launch);
+        persisted.host_boot_id = Some(host.host_boot_id.clone());
+        persisted.max_control_epoch = 1;
+        persisted.max_execution_generation = 1;
+        persisted.provider = Some("codex".into());
+        persisted.worker_pid = Some(std::process::id());
+        persisted.worker_launch_count = 1;
+        *host.control_fence.lock().unwrap() = crate::HostControlFence::from(&*persisted);
+        drop(persisted);
+        host
+    }
+
+    fn native_actor_start_failed(
+        fixture: &NativeCodexFixture,
+        error: freshell_agent_runtime::host_actor::ActorError,
+    ) -> ! {
+        panic!(
+            "{}",
+            json!({
+                "event":"freshcodex.test.actor_start_failed", "severity":"error",
+                "error":format!("{error:?}"),
+                "fixtureDirectory":fixture.dir.path(),
+                "commandPath":std::env::var_os("CODEX_CMD"),
+                "codexHome":std::env::var_os("CODEX_HOME"),
+                "startupErrors":std::fs::read_to_string(fixture.dir.path().join("native-startup-errors.jsonl")).ok(),
+                "boots":std::fs::read_to_string(fixture.dir.path().join("native-boots.jsonl")).ok(),
+            })
+        );
+    }
+
+    async fn native_host_command(
+        host: &Arc<crate::HostState>,
+        command: freshell_runtime_protocol::HostCommand,
+    ) -> Result<freshell_runtime_protocol::HostResult, freshell_runtime_protocol::RuntimeError>
+    {
+        crate::dispatch(
+            crate::tests::authenticated_host_envelope(host, command),
+            host,
+        )
+        .await
+    }
+
+    async fn exit_native_compact_fixture(
+        fixture: &NativeCodexFixture,
+        cleanup: &mut NativeCodexCleanupReadiness,
+        gate: &NativeExitGate,
+        original: &str,
+    ) -> (tokio::time::Instant, Value) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let boot = native_boots(fixture)[0].clone();
+        cleanup
+            .observe_original(original, &boot, true, deadline)
+            .await;
+        gate.armed(&boot, deadline).await;
+        gate.release();
+        wait_for_native_exit(fixture, &boot, deadline)
+            .await
+            .unwrap();
+        (deadline, boot)
+    }
+
+    #[tokio::test]
+    async fn authenticated_native_crash_compact_prepares_original_root_without_send() {
+        for clear_effort in [false, true] {
+            assert_compact_original_root(clear_effort).await;
+        }
+    }
+
+    async fn assert_compact_original_root(clear_effort: bool) {
+        let logs = tempfile::tempdir().unwrap();
+        let gate = NativeExitGate::new(logs.path());
+        let log = logs.path().join("compact-requests.jsonl");
+        let original = uuid::Uuid::new_v4().to_string();
+        let fixture = native_codex_fixture(json!({"threadStartThreadId":original,"recordTurns":true,
+            "appendRequestLogPath":log,"exitProcessAfterMethodsOnce":["turn/start"],
+            "exitProcessAfterMethodsOnceMarkerPath":logs.path().join("first-exit"),"processExitGate":gate.behavior()})).await;
+        let mut cleanup = NativeCodexCleanupReadiness::withheld(&fixture, false);
+        let host = native_host(&fixture).await;
+        let mut profile = fixture.profile.clone();
+        profile.effort = Some("xhigh".into());
+        profile.collaboration_mode = Some("plan".into());
+        profile.sandbox = Some("read-only".into());
+        let actor = FreshAgentHostActor::open(
+            fixture.dir.path().join("compact-actor"),
+            profile,
+            fixture.transport.clone(),
+        )
+        .await
+        .unwrap_or_else(|error| native_actor_start_failed(&fixture, error));
+        *host.fresh_agent.lock().await = Some(actor.clone());
+        if clear_effort {
+            actor
+                .configure(
+                    RequestId::parse("clear-native-effort").unwrap(),
+                    serde_json::from_value(json!({"effort":null})).unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        actor
+            .dispatch(
+                RequestId::parse("seed-history").unwrap(),
+                "saved history".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        let before = actor.profile().await;
+        let launch = host.persisted.lock().await.native_identity_launch.clone();
+        let (deadline, _boot) =
+            exit_native_compact_fixture(&fixture, &mut cleanup, &gate, &original).await;
+        let ProviderState::Codex(state) = &fixture.transport.state else {
+            unreachable!()
+        };
+        let prepare = || freshell_runtime_protocol::HostCommand::FreshAgentPrepareSameRootNative {
+            incarnation_id: host.incarnation_id.clone(),
+        };
+        assert!(
+            native_host_command(&host, prepare()).await.is_err(),
+            "unconfirmed original cleanup refuses preparation"
+        );
+        cleanup
+            .allow_and_wait(state, &original, false, deadline)
+            .await;
+        let before_requests = std::fs::read(&log).unwrap();
+        let saved_launch = host
+            .persisted
+            .lock()
+            .await
+            .native_identity_launch
+            .clone()
+            .unwrap();
+        for case in [
+            "nonce",
+            "revision",
+            "generation",
+            "incarnation",
+            "root",
+            "boot",
+            "pending",
+            "stopped",
+        ] {
+            let mut wrong = saved_launch.clone();
+            match case {
+                "nonce" => wrong.launch_nonce = "stale-launch".into(),
+                "revision" => wrong.evidence_revision += 1,
+                "generation" => wrong.execution_generation += 1,
+                "incarnation" => {
+                    wrong.incarnation_id = freshell_runtime_protocol::IncarnationId::new()
+                }
+                "root" => wrong.requested_native_session_id = Some("foreign-root".into()),
+                "boot" => {
+                    host.persisted.lock().await.host_boot_id =
+                        Some(freshell_runtime_protocol::HostBootId::new())
+                }
+                "pending" => fixture.transport.native_identity.lock().unwrap().pending = true,
+                "stopped" => host.control_fence.lock().unwrap().stopped = true,
+                _ => unreachable!(),
+            }
+            host.persisted.lock().await.native_identity_launch = Some(wrong);
+            assert!(
+                native_host_command(&host, prepare()).await.is_err(),
+                "{case} cannot prepare"
+            );
+            assert_eq!(
+                std::fs::read(&log).unwrap(),
+                before_requests,
+                "{case} causes zero native side effects"
+            );
+            host.persisted.lock().await.native_identity_launch = Some(saved_launch.clone());
+            host.persisted.lock().await.host_boot_id = Some(host.host_boot_id.clone());
+            fixture.transport.native_identity.lock().unwrap().pending = false;
+            host.control_fence.lock().unwrap().stopped = false;
+        }
+        for command in [
+            freshell_runtime_protocol::HostCommand::FreshAgentFork {
+                incarnation_id: host.incarnation_id.clone(),
+                request_id: RequestId::new(),
+                parent_session_id: original.clone(),
+                input: None,
+            },
+            freshell_runtime_protocol::HostCommand::FreshAgentRollback {
+                incarnation_id: host.incarnation_id.clone(),
+                request_id: RequestId::new(),
+                direction: FreshAgentRollbackDirection::Undo,
+                mode: FreshAgentRollbackMode::Step,
+                turn_id: None,
+                cwd: None,
+            },
+            freshell_runtime_protocol::HostCommand::FreshAgentResolve {
+                incarnation_id: host.incarnation_id.clone(),
+                operation_attempt_id: None,
+                decision_id: "unobserved-control".into(),
+                decision: json!({"behavior":"allow"}),
+            },
+        ] {
+            assert!(native_host_command(&host, command).await.is_err());
+        }
+        assert_eq!(
+            std::fs::read(&log).unwrap(),
+            before_requests,
+            "other native controls never prepare"
+        );
+        native_host_command(&host, prepare()).await.expect(
+            "intact history preparation must recover the original native root without SEND",
+        );
+        let status = native_host_command(
+            &host,
+            freshell_runtime_protocol::HostCommand::Status {
+                incarnation_id: host.incarnation_id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let freshell_runtime_protocol::HostResult::Status {
+            exited,
+            native_session_id,
+            native_identity_observation,
+            ..
+        } = status
+        else {
+            panic!("Status")
+        };
+        assert!(!exited);
+        assert_eq!(native_session_id.as_deref(), Some(original.as_str()));
+        assert!(native_identity_observation
+            .unwrap()
+            .matches_launch(launch.as_ref().unwrap()));
+        for request in ["first-compact", "second-compact"] {
+            let mut frames = fixture.transport.provider_frames.subscribe();
+            native_host_command(
+                &host,
+                freshell_runtime_protocol::HostCommand::FreshAgentCompact {
+                    incarnation_id: host.incarnation_id.clone(),
+                    request_id: RequestId::parse(request).unwrap(),
+                    instructions: None,
+                    cwd: None,
+                },
+            )
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let frame: Value = serde_json::from_str(&frames.recv().await.unwrap()).unwrap();
+                    if frame["sessionId"] == original
+                        && frame["event"]["type"] == "freshAgent.turn.complete"
+                    {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        }
+        assert_eq!(actor.profile().await, before);
+        assert_eq!(host.persisted.lock().await.native_identity_launch, launch);
+        let rows = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|row| serde_json::from_str::<Value>(row).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["method"] == "thread/start")
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["method"] == "turn/start")
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["method"] == "thread/resume")
+                .count(),
+            1
+        );
+        let compacts = rows
+            .iter()
+            .filter(|row| row["method"] == "thread/compact/start")
+            .collect::<Vec<_>>();
+        assert_eq!(compacts.len(), 2);
+        assert!(compacts
+            .iter()
+            .all(|row| row["params"]["threadId"] == original));
+        let resume = rows
+            .iter()
+            .position(|row| row["method"] == "thread/resume")
+            .unwrap();
+        assert!(
+            resume
+                < rows
+                    .iter()
+                    .position(|row| row["method"] == "thread/compact/start")
+                    .unwrap()
+        );
+        native_mint_input(&actor, Some(&host), "after-compact", "next same-root input")
+            .await
+            .unwrap();
+        assert_eq!(actor.snapshot().await.unwrap()["threadId"], original);
+        native_host_command(
+            &host,
+            freshell_runtime_protocol::HostCommand::Stop {
+                incarnation_id: host.incarnation_id.clone(),
+                control_epoch: 2,
+                execution_generation: 2,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_native_crash_compact_failure_preserves_source_and_later_send() {
+        for mode in ["missing", "transient", "wrong-id"] {
+            eprintln!("compact preparation failure mode={mode}");
+            let logs = tempfile::tempdir().unwrap();
+            let gate = NativeExitGate::new(logs.path());
+            let log = logs.path().join("preparation-requests.jsonl");
+            let original = uuid::Uuid::new_v4().to_string();
+            let replacement = uuid::Uuid::new_v4().to_string();
+            let mut behavior = json!({"threadStartThreadId":original,"recordTurns":true,"appendRequestLogPath":log,
+                "exitProcessAfterMethodsOnce":["turn/start"],"exitProcessAfterMethodsOnceMarkerPath":logs.path().join("first-exit"),"processExitGate":gate.behavior()});
+            let fixture = native_codex_fixture(behavior.clone()).await;
+            let mut cleanup = NativeCodexCleanupReadiness::withheld(&fixture, false);
+            let host = native_host(&fixture).await;
+            let actor = FreshAgentHostActor::open(
+                fixture.dir.path().join("preparation-actor"),
+                fixture.profile.clone(),
+                fixture.transport.clone(),
+            )
+            .await
+            .unwrap_or_else(|error| native_actor_start_failed(&fixture, error));
+            *host.fresh_agent.lock().await = Some(actor.clone());
+            actor
+                .dispatch(
+                    RequestId::parse("seed-preparation-history").unwrap(),
+                    "saved history".into(),
+                    None,
+                )
+                .await
+                .unwrap();
+            let before = actor.profile().await;
+            let (deadline, boot) =
+                exit_native_compact_fixture(&fixture, &mut cleanup, &gate, &original).await;
+            let ProviderState::Codex(state) = &fixture.transport.state else {
+                unreachable!()
+            };
+            cleanup
+                .allow_and_wait(state, &original, false, deadline)
+                .await;
+            match mode {
+                "missing" => {
+                    behavior["overrides"] = json!({"thread/resume":{"error":{"code":-32600,"message":format!("no rollout found for thread id {original}")}}})
+                }
+                "transient" => {
+                    behavior["overrides"] = json!({"thread/resume":{"error":{"code":-32000,"message":"temporarily unavailable"}}})
+                }
+                "wrong-id" => behavior["threadResumeThreadId"] = json!("foreign-native-root"),
+                _ => unreachable!(),
+            }
+            std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR", behavior.to_string());
+            let prepare =
+                || freshell_runtime_protocol::HostCommand::FreshAgentPrepareSameRootNative {
+                    incarnation_id: host.incarnation_id.clone(),
+                };
+            if mode == "missing" {
+                cleanup
+                    .available
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            assert!(
+                native_host_command(&host, prepare()).await.is_err(),
+                "{mode} preparation must refuse"
+            );
+            if mode == "missing" {
+                assert!(
+                    state
+                        .leases()
+                        .peek_kill_handle("codex", &original)
+                        .is_some(),
+                    "unknown failed-resume cleanup holds its exact claim"
+                );
+                assert!(
+                    cleanup
+                        .callbacks
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|entry| entry["ownershipId"] != boot["ownershipId"]),
+                    "failed resume must use its own exact cleanup record"
+                );
+                cleanup
+                    .available
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let _ = state.confirm_fenced_prior_dead(&original).await;
+                        if state
+                            .leases()
+                            .peek_kill_handle("codex", &original)
+                            .is_none()
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(
+                    native_host_command(&host, prepare()).await.is_err(),
+                    "qualified missing-history refusal after confirmed cleanup"
+                );
+                let cached = std::fs::read(&log).unwrap();
+                assert!(
+                    native_host_command(&host, prepare()).await.is_err(),
+                    "known-dead history refuses without mint"
+                );
+                assert_eq!(
+                    std::fs::read(&log).unwrap(),
+                    cached,
+                    "known-dead branch issues no native RPC"
+                );
+            }
+            assert_eq!(
+                actor.profile().await,
+                before,
+                "{mode} preserves actor profile"
+            );
+            assert!(
+                !fixture.transport.native_identity.lock().unwrap().pending,
+                "{mode} leaves settled evidence"
+            );
+            let retained = crate::retained_codex_recovery_source(
+                &host,
+                &host.persisted.lock().await.clone(),
+                &actor,
+            )
+            .await
+            .expect("failed preparation retains later SEND authority");
+            assert_eq!(retained.native_session_id, original);
+            assert!(host
+                .fresh_agent
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|attached| Arc::ptr_eq(attached, &actor)));
+            let rows = std::fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .map(|row| serde_json::from_str::<Value>(row).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row["method"] == "thread/start")
+                    .count(),
+                1,
+                "{mode} never mints"
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row["method"] == "turn/start")
+                    .count(),
+                1,
+                "{mode} never sends input"
+            );
+            assert!(!rows
+                .iter()
+                .any(|row| row["method"] == "thread/compact/start"));
+            if mode == "missing" {
+                behavior["threadStartThreadId"] = json!(replacement);
+            } else {
+                behavior.as_object_mut().unwrap().remove("overrides");
+                behavior
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("threadResumeThreadId");
+            }
+            std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR", behavior.to_string());
+            native_mint_input(
+                &actor,
+                Some(&host),
+                "explicit-after-preparation-refusal",
+                "explicit later SEND",
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{mode}: later SEND failed: {error}; requests={}",
+                    std::fs::read_to_string(&log).unwrap()
+                )
+            });
+            let recovered = actor.profile().await;
+            assert_eq!(
+                recovered.native_session_id.as_deref(),
+                Some(if mode == "missing" {
+                    replacement.as_str()
+                } else {
+                    original.as_str()
+                })
+            );
+            assert_eq!(recovered.effort, before.effort);
+            assert_eq!(recovered.model, before.model);
+            assert_eq!(recovered.permission_mode, before.permission_mode);
+            assert_eq!(recovered.sandbox, before.sandbox);
+            native_mint_input(
+                &actor,
+                Some(&host),
+                "second-after-preparation-refusal",
+                "second explicit SEND",
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                actor.snapshot().await.unwrap()["threadId"],
+                recovered.native_session_id.unwrap()
+            );
+            native_host_command(
+                &host,
+                freshell_runtime_protocol::HostCommand::Stop {
+                    incarnation_id: host.incarnation_id.clone(),
+                    control_epoch: 2,
+                    execution_generation: 2,
+                },
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_native_crash_compact_held_preparation_respects_stop_and_launch() {
+        for case in ["stop", "launch", "control", "membership"] {
+            let logs = tempfile::tempdir().unwrap();
+            let gate = NativeExitGate::new(logs.path());
+            let log = logs.path().join("held-requests.jsonl");
+            let release = logs.path().join("resume-release");
+            let original = uuid::Uuid::new_v4().to_string();
+            let mut behavior = json!({"threadStartThreadId":original,"recordTurns":true,"appendRequestLogPath":log,
+                "exitProcessAfterMethodsOnce":["turn/start"],"exitProcessAfterMethodsOnceMarkerPath":logs.path().join("first-exit"),"processExitGate":gate.behavior()});
+            let fixture = native_codex_fixture(behavior.clone()).await;
+            let mut cleanup = NativeCodexCleanupReadiness::withheld(&fixture, false);
+            let host = native_host(&fixture).await;
+            let actor = FreshAgentHostActor::open(
+                fixture.dir.path().join("held-actor"),
+                fixture.profile.clone(),
+                fixture.transport.clone(),
+            )
+            .await
+            .unwrap_or_else(|error| native_actor_start_failed(&fixture, error));
+            *host.fresh_agent.lock().await = Some(actor.clone());
+            actor
+                .dispatch(
+                    RequestId::parse("seed-held-history").unwrap(),
+                    "saved history".into(),
+                    None,
+                )
+                .await
+                .unwrap();
+            let before = actor.profile().await;
+            let (deadline, _boot) =
+                exit_native_compact_fixture(&fixture, &mut cleanup, &gate, &original).await;
+            let ProviderState::Codex(state) = &fixture.transport.state else {
+                unreachable!()
+            };
+            cleanup
+                .allow_and_wait(state, &original, false, deadline)
+                .await;
+            behavior["waitForThreadResumeReleasePath"] = json!(release);
+            std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR", behavior.to_string());
+            let preparation = {
+                let host = host.clone();
+                tokio::spawn(async move {
+                    native_host_command(
+                        &host,
+                        freshell_runtime_protocol::HostCommand::FreshAgentPrepareSameRootNative {
+                            incarnation_id: host.incarnation_id.clone(),
+                        },
+                    )
+                    .await
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if std::fs::read_to_string(&log).unwrap().lines().any(|line| {
+                        serde_json::from_str::<Value>(line).unwrap()["method"] == "thread/resume"
+                    }) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let status = native_host_command(
+                &host,
+                freshell_runtime_protocol::HostCommand::Status {
+                    incarnation_id: host.incarnation_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                status,
+                freshell_runtime_protocol::HostResult::Status {
+                    exited: true,
+                    native_identity_observation: None,
+                    fresh_agent_recovery_source: None,
+                    ..
+                }
+            ));
+            if case == "stop" {
+                native_host_command(
+                    &host,
+                    freshell_runtime_protocol::HostCommand::Stop {
+                        incarnation_id: host.incarnation_id.clone(),
+                        control_epoch: 2,
+                        execution_generation: 2,
+                    },
+                )
+                .await
+                .unwrap();
+            } else if case == "control" {
+                host.control_fence.lock().unwrap().stopped = true;
+            } else if case == "membership" {
+                host.fresh_agent.lock().await.take();
+            } else {
+                host.persisted
+                    .lock()
+                    .await
+                    .native_identity_launch
+                    .as_mut()
+                    .unwrap()
+                    .launch_nonce = "changed-during-readiness".into();
+            }
+            std::fs::write(&release, b"release").unwrap();
+            let error = preparation.await.unwrap().unwrap_err();
+            assert_eq!(actor.profile().await, before);
+            assert!(
+                actor.observed_native_session_id().await.is_none(),
+                "revoked {case} cannot supply current actor proof"
+            );
+            assert!(
+                !fixture.transport.is_live().await,
+                "revoked {case} must reap a late resumed runtime"
+            );
+            assert!(native_boots(&fixture)
+                .iter()
+                .all(|boot| !native_boot_is_live(boot)));
+            let rows = std::fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .map(|row| serde_json::from_str::<Value>(row).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row["method"] == "thread/start")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row["method"] == "turn/start")
+                    .count(),
+                1
+            );
+            assert!(!rows
+                .iter()
+                .any(|row| row["method"] == "thread/compact/start"));
+            if case != "stop" {
+                assert_eq!(
+                    error.code,
+                    freshell_runtime_protocol::RuntimeErrorCode::RecoveryWrongIdentity
+                );
+                assert!(
+                    error.message.contains("preparation was revoked"),
+                    "{case}: {error:?}"
+                );
+                let events =
+                    std::fs::read_to_string(host.state_dir.join("host-lifecycle.jsonl")).unwrap();
+                let event = events
+                    .lines()
+                    .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                    .find(|event| {
+                        event["event"] == "host.fresh_agent.same_root_preparation_revoked"
+                    })
+                    .expect(
+                        "revoked completed preparation must explain why the runtime was stopped",
+                    );
+                assert_eq!(event["data"]["severity"], "warn");
+                assert_eq!(
+                    event["data"]["reason"],
+                    match case {
+                        "launch" => "launch_changed",
+                        "control" => "control_revoked",
+                        "membership" => "actor_replaced",
+                        _ => unreachable!(),
+                    }
+                );
+            }
+            if case != "stop" {
+                actor.stop().await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_native_crash_compact_second_exit_refuses_without_mint_then_send_recovers(
+    ) {
+        let logs = tempfile::tempdir().unwrap();
+        let first_gate = NativeExitGate::new(logs.path());
+        let second_dir = logs.path().join("second");
+        std::fs::create_dir(&second_dir).unwrap();
+        let second_gate = NativeExitGate::new(&second_dir);
+        let log = logs.path().join("second-exit-requests.jsonl");
+        let original = uuid::Uuid::new_v4().to_string();
+        let replacement = uuid::Uuid::new_v4().to_string();
+        let mut behavior = json!({"threadStartThreadId":original,"recordTurns":true,"appendRequestLogPath":log,
+            "exitProcessAfterMethodsOnce":["turn/start"],"exitProcessAfterMethodsOnceMarkerPath":logs.path().join("first-exit"),"processExitGate":first_gate.behavior()});
+        let fixture = native_codex_fixture(behavior.clone()).await;
+        let mut cleanup = NativeCodexCleanupReadiness::withheld(&fixture, false);
+        let host = native_host(&fixture).await;
+        let actor = FreshAgentHostActor::open(
+            fixture.dir.path().join("second-exit-actor"),
+            fixture.profile.clone(),
+            fixture.transport.clone(),
+        )
+        .await
+        .unwrap();
+        *host.fresh_agent.lock().await = Some(actor.clone());
+        actor
+            .dispatch(
+                RequestId::parse("seed-second-exit-history").unwrap(),
+                "saved history".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        let before = actor.profile().await;
+        let (deadline, _) =
+            exit_native_compact_fixture(&fixture, &mut cleanup, &first_gate, &original).await;
+        let ProviderState::Codex(state) = &fixture.transport.state else {
+            unreachable!()
+        };
+        cleanup
+            .allow_and_wait(state, &original, false, deadline)
+            .await;
+        behavior["exitProcessAfterMethodsOnce"] = json!(["thread/resume"]);
+        behavior["exitProcessAfterMethodsOnceMarkerPath"] = json!(logs.path().join("second-exit"));
+        behavior["processExitGate"] = second_gate.behavior();
+        std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR", behavior.to_string());
+        native_host_command(
+            &host,
+            freshell_runtime_protocol::HostCommand::FreshAgentPrepareSameRootNative {
+                incarnation_id: host.incarnation_id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let status = native_host_command(
+            &host,
+            freshell_runtime_protocol::HostCommand::Status {
+                incarnation_id: host.incarnation_id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            status,
+            freshell_runtime_protocol::HostResult::Status {
+                exited: false,
+                native_identity_observation: Some(_),
+                ..
+            }
+        ));
+        let second_boot = native_boots(&fixture)[1].clone();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        second_gate.armed(&second_boot, deadline).await;
+        second_gate.release();
+        wait_for_native_exit(&fixture, &second_boot, deadline)
+            .await
+            .unwrap();
+        // The earlier host admission was valid. Exercise its actual next actor
+        // and hosted transport dispatch after the native exited again.
+        assert!(actor.semantic_operation(RequestId::parse("compact-after-second-exit").unwrap(),FreshAgentOperation::Compact{instructions:None,cwd:None}).await.is_err(),"hosted Compact must refuse source loss after readiness rather than acknowledge or mint");
+        assert_eq!(actor.profile().await, before);
+        assert!(!fixture.transport.native_identity.lock().unwrap().pending);
+        assert!(crate::retained_codex_recovery_source(
+            &host,
+            &host.persisted.lock().await.clone(),
+            &actor
+        )
+        .await
+        .is_some());
+        let rows = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["method"] == "thread/start")
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["method"] == "thread/resume")
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["method"] == "turn/start")
+                .count(),
+            1
+        );
+        assert!(!rows
+            .iter()
+            .any(|row| row["method"] == "thread/compact/start"));
+        behavior["overrides"] = json!({"thread/resume":{"error":{"code":-32600,"message":format!("no rollout found for thread id {original}")}}});
+        behavior["threadStartThreadId"] = json!(replacement);
+        std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR", behavior.to_string());
+        native_mint_input(
+            &actor,
+            Some(&host),
+            "send-after-second-native-exit",
+            "explicit recovery SEND",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            actor.profile().await.native_session_id.as_deref(),
+            Some(replacement.as_str())
+        );
+        native_mint_input(
+            &actor,
+            Some(&host),
+            "second-send-after-second-native-exit",
+            "second explicit SEND",
+        )
+        .await
+        .unwrap();
+        assert_eq!(actor.snapshot().await.unwrap()["threadId"], replacement);
+        native_host_command(
+            &host,
+            freshell_runtime_protocol::HostCommand::Stop {
+                incarnation_id: host.incarnation_id.clone(),
+                control_epoch: 2,
+                execution_generation: 2,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(native_boots(&fixture)
+            .iter()
+            .all(|boot| !native_boot_is_live(boot)));
+    }
+
+    #[tokio::test]
+    async fn authenticated_native_crash_send_commits_host_binding_before_status_and_second_send() {
+        // The real recovery scenario nests the actual hosted dispatcher. Keep
+        // its large future off the default libtest entry/runtime stack.
+        for pending in [false, true] {
+            Box::pin(assert_native_mint_ack(pending, true)).await;
+        }
+    }
+
+    async fn native_mint_input(
+        actor: &Arc<FreshAgentHostActor>,
+        host: Option<&Arc<crate::HostState>>,
+        request: &str,
+        text: &str,
+    ) -> Result<freshell_runtime_protocol::CommandState, String> {
+        let request_id = RequestId::parse(request).unwrap();
+        if let Some(host) = host {
+            let previous = actor.profile().await.native_session_id.unwrap();
+            let result = crate::dispatch(
+                crate::tests::authenticated_host_envelope(
+                    host,
+                    freshell_runtime_protocol::HostCommand::FreshAgentSend {
+                        incarnation_id: host.incarnation_id.clone(),
+                        request_id,
+                        text: text.into(),
+                        settings: None,
+                        checkpoint_logical_attempt_id: None,
+                    },
+                ),
+                host,
+            )
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+            let freshell_runtime_protocol::HostResult::FreshAgentCommand {
+                state,
+                native_identity,
+                ..
+            } = result
+            else {
+                panic!("actual host SEND response")
+            };
+            let identity =
+                native_identity.expect("native SEND returns its typed dispatch identity");
+            assert_eq!(identity.previous_native_session_id, previous);
+            assert_eq!(
+                identity.native_session_id,
+                actor.profile().await.native_session_id.unwrap()
+            );
+            Ok(state)
+        } else {
+            actor
+                .dispatch(request_id, text.into(), None)
+                .await
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    async fn assert_native_mint_ack(pending: bool, authenticated: bool) {
         eprintln!(
             "{}",
             json!({"event":"freshcodex.test.native_mint_ack_case",
@@ -5533,6 +6522,11 @@ await import(parameters.source)
             "FAKE_CODEX_APP_SERVER_BEHAVIOR",
             qualified_behavior(&original_id).to_string(),
         );
+        let host = if authenticated {
+            Some(native_host(&fixture).await)
+        } else {
+            None
+        };
         let mut profile = fixture.profile.clone();
         profile.naming_handle = pending.then(|| "pending-initial-recovery".into());
         profile.effort = Some("xhigh".into());
@@ -5545,6 +6539,14 @@ await import(parameters.source)
         )
         .await
         .unwrap();
+        if let Some(host) = &host {
+            *host.fresh_agent.lock().await = Some(actor.clone());
+            assert!(
+                crate::current_native_observation(host, &host.persisted.lock().await.clone())
+                    .await
+                    .is_some()
+            );
+        }
         let original = actor.profile().await.native_session_id.unwrap();
         assert_eq!(original, original_id);
         if !pending {
@@ -5646,6 +6648,16 @@ await import(parameters.source)
             "the owned native executable must actually exit; pending={pending}"
         );
 
+        if let Some(host) = &host {
+            assert!(native_mint_input(
+                &actor,
+                Some(host),
+                "authenticated-before-cleanup-proof",
+                "unconfirmed cleanup must not reach native work"
+            )
+            .await
+            .is_err());
+        }
         let refused = tokio::time::timeout_at(
             deadline,
             actor.dispatch(
@@ -5705,13 +6717,75 @@ await import(parameters.source)
             "FAKE_CODEX_APP_SERVER_BEHAVIOR",
             qualified_behavior(&replacement_id).to_string(),
         );
-        let recovery = actor
-            .dispatch(
-                RequestId::parse("recover-native").unwrap(),
-                "recover native input".into(),
-                None,
+        if let Some(host) = &host {
+            let before = std::fs::read(&log).unwrap();
+            let original_launch = host
+                .persisted
+                .lock()
+                .await
+                .native_identity_launch
+                .clone()
+                .unwrap();
+            for case in ["nonce", "revision", "generation", "incarnation", "root"] {
+                let mut wrong = original_launch.clone();
+                match case {
+                    "nonce" => wrong.launch_nonce = "stale-native-launch".into(),
+                    "revision" => wrong.evidence_revision += 1,
+                    "generation" => wrong.execution_generation += 1,
+                    "incarnation" => {
+                        wrong.incarnation_id = freshell_runtime_protocol::IncarnationId::new()
+                    }
+                    "root" => wrong.requested_native_session_id = Some("foreign-native".into()),
+                    _ => unreachable!(),
+                }
+                host.persisted.lock().await.native_identity_launch = Some(wrong);
+                assert!(
+                    native_mint_input(
+                        &actor,
+                        Some(host),
+                        &format!("wrong-{case}"),
+                        "forbidden native input"
+                    )
+                    .await
+                    .is_err(),
+                    "{case}"
+                );
+                assert_eq!(
+                    std::fs::read(&log).unwrap(),
+                    before,
+                    "{case} never reaches native recovery"
+                );
+            }
+            host.persisted.lock().await.native_identity_launch = Some(original_launch);
+            fixture.transport.native_identity.lock().unwrap().pending = true;
+            assert!(native_mint_input(
+                &actor,
+                Some(host),
+                "pending-native-transition",
+                "forbidden native input"
             )
-            .await;
+            .await
+            .is_err());
+            fixture.transport.native_identity.lock().unwrap().pending = false;
+            host.control_fence.lock().unwrap().stopped = true;
+            assert!(native_mint_input(
+                &actor,
+                Some(host),
+                "stopped-native-control",
+                "forbidden native input"
+            )
+            .await
+            .is_err());
+            host.control_fence.lock().unwrap().stopped = false;
+            assert_eq!(std::fs::read(&log).unwrap(), before);
+        }
+        let recovery = native_mint_input(
+            &actor,
+            host.as_ref(),
+            "recover-native",
+            "recover native input",
+        )
+        .await;
         eprintln!(
             "{}",
             json!({"event":"freshcodex.test.recovery_after_proof",
@@ -5725,6 +6799,39 @@ await import(parameters.source)
             native, original,
             "the typed successful mint-new result must update durable actor identity before dispatch returns"
         );
+        if let Some(host) = &host {
+            let result = crate::dispatch(
+                crate::tests::authenticated_host_envelope(
+                    host,
+                    freshell_runtime_protocol::HostCommand::Status {
+                        incarnation_id: host.incarnation_id.clone(),
+                    },
+                ),
+                host,
+            )
+            .await
+            .unwrap();
+            let freshell_runtime_protocol::HostResult::Status {
+                native_session_id,
+                native_identity_observation,
+                ..
+            } = result
+            else {
+                panic!("actual Status response")
+            };
+            assert_eq!(
+                native_session_id.as_deref(),
+                Some(native.as_str()),
+                "accepted host SEND must publish the new current native source"
+            );
+            let observation =
+                native_identity_observation.expect("accepted native source has current host proof");
+            let persisted: crate::PersistedHostState = serde_json::from_slice(
+                &std::fs::read(host.state_dir.join("host-state.json")).unwrap(),
+            )
+            .unwrap();
+            assert!(observation.matches_launch(persisted.native_identity_launch.as_ref().unwrap()));
+        }
         assert_eq!(recovered.naming_handle, profile.naming_handle);
         assert_eq!(recovered.model, profile.model);
         assert_eq!(recovered.effort, profile.effort);
@@ -5746,14 +6853,14 @@ await import(parameters.source)
         assert_eq!(proof["providerEvidence"]["requestId"], "recover-native");
         let snapshot = actor.snapshot().await.unwrap();
         assert_eq!(snapshot["threadId"], native);
-        actor
-            .dispatch(
-                RequestId::parse("second-current-native").unwrap(),
-                "second current native input".into(),
-                None,
-            )
-            .await
-            .unwrap();
+        native_mint_input(
+            &actor,
+            host.as_ref(),
+            "second-current-native",
+            "second current native input",
+        )
+        .await
+        .unwrap();
         assert_eq!(
             actor.profile().await.native_session_id.as_deref(),
             Some(native.as_str())
@@ -5780,7 +6887,33 @@ await import(parameters.source)
             Ok(snapshot) => snapshot,
             Err(_) => actor.snapshot().await.unwrap(),
         };
-        actor.stop().await.unwrap();
+        if let Some(host) = &host {
+            crate::dispatch(
+                crate::tests::authenticated_host_envelope(
+                    host,
+                    freshell_runtime_protocol::HostCommand::Stop {
+                        incarnation_id: host.incarnation_id.clone(),
+                        control_epoch: 1,
+                        execution_generation: 1,
+                    },
+                ),
+                host,
+            )
+            .await
+            .unwrap();
+            let before = std::fs::read(&log).unwrap();
+            assert!(native_mint_input(
+                &actor,
+                Some(host),
+                "after-explicit-stop",
+                "forbidden native input"
+            )
+            .await
+            .is_err());
+            assert_eq!(std::fs::read(&log).unwrap(), before);
+        } else {
+            actor.stop().await.unwrap();
+        }
         assert_eq!(
             naming_snapshot["status"], "idle",
             "recovered native turn must actually settle"
