@@ -13860,14 +13860,17 @@ fn spawn_exit_watcher_tracking_turns(
                                     state.windows_test_escalation_gate.lock()
                                         .expect("windows escalation test gate lock").take()
                                 });
-                                tokio::spawn(async move {
-                                    #[cfg(all(windows, feature = "test-support"))]
+                                #[cfg(all(windows, feature = "test-support"))]
+                                let task = tokio::spawn(async move {
                                     if let Some((reached, release)) = gate {
                                         reached.notify_one();
                                         release.notified().await;
                                     }
                                     confirmation.await
-                                })
+                                });
+                                #[cfg(not(all(windows, feature = "test-support")))]
+                                let task = tokio::spawn(confirmation);
+                                task
                             })
                         } else {
                             None
