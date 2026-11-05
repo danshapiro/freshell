@@ -3786,6 +3786,9 @@ impl Supervisor {
                     FreshAgentNativeNameError::LifecycleBusy,
                 ));
             };
+            self.registry
+                .assert_epoch(request.expected_control_epoch)
+                .map_err(map_registry)?;
             let handle = self
                 .registry
                 .active_handle_for_soul(request.soul_id.clone())
@@ -3871,6 +3874,24 @@ impl Supervisor {
                         "soulId":request.soul_id,
                         "requestedHostBootId":request.source.host_boot_id,
                         "currentHostBootId":host.host_boot_id,
+                    }),
+                );
+                return Ok(unavailable());
+            }
+            // Stop persists intent before taking this mutex; authentication
+            // also yields. Recheck the epoch and full source immediately
+            // before dispatch, even when initial admission was current.
+            self.registry
+                .assert_epoch(request.expected_control_epoch)
+                .map_err(map_registry)?;
+            if !matches_source(&find_view(&self.registry, handle.incarnation_id()).await?) {
+                append_event(
+                    &self.config.lifecycle_log,
+                    "freshagent.native_name_refused",
+                    serde_json::json!({
+                        "severity":"warning", "reason":"source_changed_during_authentication",
+                        "soulId":request.soul_id,
+                        "nativeSessionId":request.source.native_session_id,
                     }),
                 );
                 return Ok(unavailable());

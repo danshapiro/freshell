@@ -2316,49 +2316,40 @@ fn host_configure_gets_the_fresh_agent_command_budget() {
 #[tokio::test]
 async fn native_name_transient_lifecycle_admission_preserves_the_current_request() {
     let fixture = running_fresh_provider_with_name(FreshProvider::Codex, None, "name-native").await;
-    let view = fixture
-        .supervisor
-        .registry
-        .inventory()
-        .await
-        .unwrap()
-        .remove(0);
+    let request = native_name_request(&fixture).await;
     let (received, host) = fake_host_with_boot(
         &fixture.runtime_dir,
         false,
-        view.host_boot_id.clone().unwrap(),
+        request.source.host_boot_id.clone(),
     );
     let lifecycle = fixture.supervisor.lifecycle_lock(&fixture.soul).await;
     let held = lifecycle.lock().await;
-    let mut operation = Box::pin(fixture.supervisor.fresh_agent_native_name(
-        FreshAgentNativeNameRequest {
-            soul_id: fixture.soul.clone(),
-            source: FreshAgentNativeNameSource {
-                incarnation_id: view.incarnation_id,
-                host_boot_id: view.host_boot_id.unwrap(),
-                execution_generation: view.execution_generation,
-                intent_revision: view.intent_revision,
-                native_session_id: "name-native".into(),
-            },
-            codex_home: "/owning/codex".into(),
-            operation: FreshAgentNativeNameOperation::Write {
-                title: "Manual title".into(),
-            },
-            expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
-            deadline_unix_ms: None,
-        },
-    ));
-    let pending = std::future::poll_fn(|cx| {
-        std::task::Poll::Ready(std::future::Future::poll(operation.as_mut(), cx).is_pending())
+    let mut operation = Box::pin(fixture.supervisor.fresh_agent_native_name(request));
+    let first_poll = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(operation.as_mut(), cx))
     })
     .await;
-    assert!(pending, "transient lifecycle contention must queue the same current request, not spend a native attempt on a false source refusal");
+    let std::task::Poll::Ready(reply) = first_poll else {
+        panic!("lifecycle contention must refuse immediately rather than queue native work");
+    };
+    assert_eq!(
+        reply.unwrap(),
+        FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::LifecycleBusy)
+    );
     assert!(
         received.lock().unwrap().is_empty(),
-        "waiting admission performs no host/native work"
+        "refused admission performs no host/native work"
     );
+    drop(operation);
     drop(held);
-    let reply = operation.await.unwrap();
+    // Only a new request with freshly observed authority may use the released
+    // lock. The refused future must never resume or spend a native attempt.
+    let fresh = native_name_request(&fixture).await;
+    let reply = fixture
+        .supervisor
+        .fresh_agent_native_name(fresh)
+        .await
+        .unwrap();
     host.abort();
     let _ = host.await;
     assert_eq!(reply, FreshAgentNativeNameReply::Renamed);
@@ -2768,80 +2759,79 @@ async fn native_name_queued_stop_cancellation_and_deadline_never_dispatch_late()
         let fixture =
             running_fresh_provider_with_name(FreshProvider::Codex, None, "name-native").await;
         let mut request = native_name_request(&fixture).await;
+        if case == "deadline" {
+            request.deadline_unix_ms = Some(super::now_millis() + 5_000);
+        }
         let (received, host) = fake_host_with_boot(
             &fixture.runtime_dir,
             false,
             request.source.host_boot_id.clone(),
         );
-        if case == "deadline" {
-            request.deadline_unix_ms = Some(super::now_millis() + 5_000);
-        }
-        if case == "epoch" {
-            request.expected_control_epoch = Some(fixture.supervisor.registry.control_epoch() + 1);
-        }
         let lifecycle = fixture.supervisor.lifecycle_lock(&fixture.soul).await;
         let held = lifecycle.lock().await;
-        let mut operation = Box::pin(fixture.supervisor.fresh_agent_native_name(request));
-        assert!(
-            std::future::poll_fn(|cx| std::task::Poll::Ready(
-                std::future::Future::poll(operation.as_mut(), cx).is_pending()
-            ))
-            .await
+        let mut operation = Box::pin(fixture.supervisor.fresh_agent_native_name(request.clone()));
+        let first_poll = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(operation.as_mut(), cx))
+        })
+        .await;
+        let std::task::Poll::Ready(reply) = first_poll else {
+            panic!("{case}: lifecycle contention must not leave a queued request");
+        };
+        assert_eq!(
+            reply.unwrap(),
+            FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::LifecycleBusy)
         );
-        if case == "stop" {
-            fixture
-                .supervisor
-                .registry
-                .begin_stop_expected(fixture.soul.clone(), None)
-                .await
-                .unwrap();
-        }
+        assert!(
+            received.lock().unwrap().is_empty(),
+            "{case}: typed refusal must precede every host/native operation"
+        );
+        drop(operation);
         match case {
-            "cancel" => drop(operation),
+            "stop" => {
+                fixture
+                    .supervisor
+                    .registry
+                    .begin_stop_expected(fixture.soul.clone(), None)
+                    .await
+                    .unwrap();
+            }
             "deadline" => {
+                // Even after the refused request's old deadline and lock
+                // release, no detached queue entry may survive its caller.
                 tokio::time::pause();
                 tokio::time::advance(std::time::Duration::from_millis(5_001)).await;
-                let reply = operation.await.unwrap();
                 tokio::time::resume();
-                assert!(matches!(
-                    reply,
-                    FreshAgentNativeNameReply::Failed(
-                        FreshAgentNativeNameError::Timeout { .. }
-                            | FreshAgentNativeNameError::LifecycleBusy
-                    )
-                ));
             }
-            _ => {
-                drop(held);
-                let reply = operation.await;
-                if case == "epoch" {
-                    assert_eq!(reply.unwrap_err().code, RuntimeErrorCode::StaleControlEpoch);
-                } else {
-                    assert!(
-                        reply.is_err()
-                            || matches!(
-                                reply.unwrap(),
-                                FreshAgentNativeNameReply::Failed(
-                                    FreshAgentNativeNameError::Unavailable { .. }
-                                )
-                            )
-                    );
-                }
-                tokio::task::yield_now().await;
-                assert!(
-                    received.lock().unwrap().is_empty(),
-                    "{case}: superseded queued work never authenticates or dispatches"
-                );
-                host.abort();
-                let _ = host.await;
-                continue;
+            "epoch" => {
+                request.expected_control_epoch =
+                    Some(fixture.supervisor.registry.control_epoch() + 1)
             }
+            "cancel" => {}
+            _ => unreachable!(),
         }
         drop(held);
+        if matches!(case, "stop" | "epoch") {
+            // A fresh attempt must reject the stopped source or stale epoch
+            // before authenticating, rather than revive the old refusal.
+            let reply = fixture.supervisor.fresh_agent_native_name(request).await;
+            if case == "epoch" {
+                assert_eq!(reply.unwrap_err().code, RuntimeErrorCode::StaleControlEpoch);
+            } else {
+                assert!(
+                    reply.is_err()
+                        || matches!(
+                            reply.unwrap(),
+                            FreshAgentNativeNameReply::Failed(
+                                FreshAgentNativeNameError::Unavailable { .. }
+                            )
+                        )
+                );
+            }
+        }
         tokio::task::yield_now().await;
         assert!(
             received.lock().unwrap().is_empty(),
-            "{case}: cancelled queue entry must not survive its caller"
+            "{case}: refused or cancelled work must never authenticate or dispatch after release"
         );
         host.abort();
         let _ = host.await;
@@ -2850,7 +2840,7 @@ async fn native_name_queued_stop_cancellation_and_deadline_never_dispatch_late()
 
 #[tokio::test]
 async fn native_name_rechecks_stop_and_deadline_after_delayed_authentication() {
-    for case in ["stop", "deadline"] {
+    for case in ["stop", "deadline", "cancel"] {
         let fixture =
             running_fresh_provider_with_name(FreshProvider::Codex, None, "name-native").await;
         let mut request = native_name_request(&fixture).await;
@@ -2887,7 +2877,7 @@ async fn native_name_rechecks_stop_and_deadline_after_delayed_authentication() {
                 operation.await.unwrap(),
                 FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Unavailable { .. })
             ));
-        } else {
+        } else if case == "deadline" {
             tokio::time::pause();
             tokio::time::advance(std::time::Duration::from_millis(5_001)).await;
             let reply = operation.await.unwrap();
@@ -2896,6 +2886,16 @@ async fn native_name_rechecks_stop_and_deadline_after_delayed_authentication() {
                 reply,
                 FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Timeout { .. })
             ));
+            gate.notify_one();
+        } else {
+            // Cancellation is exercised while real host authentication is
+            // pending; immediate Busy refusals have no queued future to abort.
+            drop(operation);
+            let lifecycle = fixture.supervisor.lifecycle_lock(&fixture.soul).await;
+            assert!(
+                lifecycle.try_lock().is_ok(),
+                "caller cancellation must release lifecycle admission"
+            );
             gate.notify_one();
         }
         tokio::task::yield_now().await;
