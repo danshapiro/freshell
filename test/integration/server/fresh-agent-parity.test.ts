@@ -9,6 +9,16 @@ import { pathToFileURL } from 'node:url'
 import WebSocket from 'ws'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
+import { configureStore } from '@reduxjs/toolkit'
+import { FreshAgentSnapshotSchema } from '../../../shared/fresh-agent-contract.js'
+import { handleFreshAgentMessage } from '../../../src/lib/fresh-agent-ws.js'
+import { streamBatcherFor } from '../../../src/lib/fresh-agent-stream-batcher.js'
+import { mergeFreshAgentTranscriptProjection, readTranscriptProjection } from '../../../src/lib/fresh-agent-transcript-projection.js'
+import freshAgentReducer, { sessionCreated } from '../../../src/store/freshAgentSlice.js'
+import freshAgentLiveReducer, { transcriptProjectionSnapshotReceived } from '../../../src/store/freshAgentLiveSlice.js'
+import panesReducer, { initLayout } from '../../../src/store/panesSlice.js'
+import turnCompletionReducer from '../../../src/store/turnCompletionSlice.js'
+import type { AppDispatch } from '../../../src/store/store.js'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 import { ManagedRuntimeBrowserRig } from '../../e2e-browser/helpers/managed-runtime.js'
 import { ensureMcpServerBuilt, McpStdioClient } from '../../e2e-browser/helpers/mcp-stdio-client.js'
@@ -232,6 +242,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
       plugins: [fixturePlugin], namingHandle, tabId: `tab-${requestId}`,
     }
     const owner = authorizeFreshRequest(row.provider, requestId)
+    const createFrameCursor = wire.frames.length
     wire.send(createRequest)
     const created = await wire.wait(frame => frame.requestId === requestId
       && (frame.type === 'freshAgent.created' || frame.type === 'freshAgent.create.failed'))
@@ -353,14 +364,49 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
       }
     }
 
+    if (row.provider === 'codex') {
+      expect(created.sessionId).not.toBe(recorded.nativeSessionId)
+      expect(created.sessionRef).toEqual({ provider: 'codex', sessionId: recorded.nativeSessionId })
+      expect(view.nativeSessionId).toBe(recorded.nativeSessionId)
+    }
     const sendId = `send-${randomUUID()}`
+    const sendFrameCursor = wire.frames.length
     wire.send({ type: 'freshAgent.send', provider: row.provider, sessionType: row.sessionType,
       sessionId: created.sessionId, requestId: sendId, text: 'fixture prompt' })
-    const materialized = await wire.wait(frame => frame.type === 'freshAgent.session.materialized'
-      && frame.provider === row.provider && frame.previousSessionId === created.sessionId)
-    expect(materialized.sessionId).toBe(recorded.nativeSessionId)
-    await wire.wait(frame => frame.type === 'freshAgent.turn.complete'
-      && frame.provider === row.provider && frame.sessionId === materialized.sessionId)
+    if (row.provider === 'codex') {
+      const shortHash = (value: string) => createHash('sha256').update(value).digest('hex').slice(0, 24)
+      const turnId = `turn-${shortHash(sendId)}-1`
+      const assistantMessageId = `assistant-${shortHash(turnId)}-1`
+      const delivered = await waitFor('the Codex fixture assistant and its completion', () => {
+        const frames = wire.frames.slice(sendFrameCursor)
+        const assistant = frames.findIndex(frame => frame.type === 'freshAgent.event'
+          && frame.provider === 'codex' && frame.sessionId === created.sessionId
+          && frame.event?.type === 'fixture.provider_native.assistant_message'
+          && frame.event.turnId === turnId && frame.event.assistantMessageId === assistantMessageId)
+        if (assistant < 0) return undefined
+        const complete = frames.findIndex((frame, index) => index > assistant
+          && frame.type === 'freshAgent.event' && frame.provider === 'codex'
+          && frame.sessionId === created.sessionId && frame.event?.type === 'freshAgent.turn.complete')
+        return complete < 0 ? undefined : { frames, complete }
+      })
+      const completion = delivered.frames[delivered.complete]
+      expect(completion.sessionType).toBe('freshcodex')
+      expect(completion.event.sessionId).toBe(created.sessionId)
+      expect(Number.isFinite(completion.event.at)).toBe(true)
+      expect(completion.event.outcome).toBe('completed')
+      expect(delivered.frames.slice(0, delivered.complete + 1).filter(frame =>
+        frame.type === 'freshAgent.event' && frame.provider === 'codex'
+          && frame.sessionId === created.sessionId && frame.event?.type === 'freshAgent.turn.complete')).toHaveLength(1)
+      expect(wire.frames.slice(createFrameCursor, sendFrameCursor + delivered.complete + 1).filter(frame =>
+        frame.type === 'freshAgent.session.materialized' && frame.provider === 'codex'
+          && frame.previousSessionId === created.sessionId)).toHaveLength(0)
+    } else {
+      const materialized = await wire.wait(frame => frame.type === 'freshAgent.session.materialized'
+        && frame.provider === row.provider && frame.previousSessionId === created.sessionId)
+      expect(materialized.sessionId).toBe(recorded.nativeSessionId)
+      await wire.wait(frame => frame.type === 'freshAgent.turn.complete'
+        && frame.provider === row.provider && frame.sessionId === materialized.sessionId)
+    }
 
     const resumeId = `resume-${randomUUID()}`
     wire.send({ type: 'freshAgent.create', requestId: resumeId,
@@ -370,6 +416,21 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
       && (frame.type === 'freshAgent.created' || frame.type === 'freshAgent.create.failed'))
     expect(resumed.type, JSON.stringify(resumed)).toBe('freshAgent.created')
     expect(resumed.sessionRef?.sessionId).toBe(recorded.nativeSessionId)
+    if (row.provider === 'codex') {
+      expect(resumed.sessionId).toBe(recorded.nativeSessionId)
+      expect(resumed.sessionRef).toEqual({ provider: 'codex', sessionId: recorded.nativeSessionId })
+      const resumedView = await waitFor('the original Codex soul after exact native resume', async () =>
+        (await rig.runningViewForFreshSession(resumed.sessionId)) ?? undefined)
+      expect(resumedView.soulId).toBe(view.soulId)
+      expect(resumedView.nativeSessionId).toBe(recorded.nativeSessionId)
+      const response = await fetch(`${rig.info.baseUrl}/api/fresh-agent/threads/freshcodex/codex/${encodeURIComponent(resumed.sessionId)}`, {
+        headers: { 'x-auth-token': rig.info.token },
+      })
+      expect(response.ok).toBe(true)
+      const snapshot = await response.json()
+      expect(snapshot.threadId).toBe(recorded.nativeSessionId)
+      expect(JSON.stringify(snapshot.turns)).toContain('deterministic fixture completion')
+    }
     let rejectedCreate: { requestType: string; responseType: string } | undefined
     await withMissingGrant(onecli.grants[row.provider], async () => {
       const badRequestId = `bad-grant-${randomUUID()}`
@@ -1042,6 +1103,48 @@ tool_timeout_sec = 120
     fixtureWork.throwIfAborted()
     expect(beforeCrash.name).toEqual(canonicalName)
     writeBodyIncident('freshcodex-managed-native-before-crash', beforeCrash)
+    const recoveryFrameCursor = wire.frames.length
+    // Start with the real pre-crash snapshot of A, as an already hydrated pane.
+    // Recovery itself must come only from frames actually received on this wire.
+    const clientStore = configureStore({ reducer: {
+      freshAgent: freshAgentReducer, freshAgentLive: freshAgentLiveReducer,
+      panes: panesReducer, turnCompletion: turnCompletionReducer,
+    } })
+    const clientLocator = { provider: 'codex', sessionType: 'freshcodex', sessionId: created.sessionId } as const
+    const clientKey = `freshcodex:codex:${created.sessionId}`
+    const clientTabId = `recovery-tab-${requestId}`
+    const clientPaneId = `recovery-pane-${requestId}`
+    clientStore.dispatch(initLayout({ tabId: clientTabId, paneId: clientPaneId, content: {
+      kind: 'fresh-agent', ...clientLocator, createRequestId: requestId, status: 'idle',
+      sessionRef: { provider: 'codex', sessionId: view.nativeSessionId! },
+    } }))
+    clientStore.dispatch(sessionCreated({ ...clientLocator, requestId }))
+    clientStore.dispatch(transcriptProjectionSnapshotReceived({ ...clientLocator,
+      snapshot: FreshAgentSnapshotSchema.parse(beforeCrash.snapshot) }))
+    expect(clientStore.getState().freshAgentLive.bySession[clientKey]?.projection).toBeDefined()
+    // Match the existing four-reducer handler tests. These handlers use only
+    // these slices for the captured frames; no application singleton is started.
+    const clientDispatch = clientStore.dispatch as AppDispatch
+    let clientCursor = recoveryFrameCursor
+    const receiveCapturedRecoveryFrames = () => {
+      fixtureWork.throwIfAborted()
+      const through = wire.frames.length
+      for (const frame of wire.frames.slice(clientCursor, through)) {
+        handleFreshAgentMessage(clientDispatch, frame)
+      }
+      streamBatcherFor(clientDispatch).flush()
+      clientCursor = through
+    }
+    const originalClientPane = () => {
+      const layout = clientStore.getState().panes.layouts[clientTabId]
+      if (layout?.type !== 'leaf') throw new Error('expected the original recovery pane')
+      return layout.content
+    }
+    const capturedClientTurns = (key: string) => {
+      const live = clientStore.getState().freshAgentLive.bySession[key]
+      return live?.retainedSnapshot ? mergeFreshAgentTranscriptProjection(live.retainedSnapshot, live.projection)
+        : live?.projection?.turns ?? []
+    }
     // Kill only this receipt-owned, inspected release native PID. Archive its
     // REAL native-generated history after exit, keeping every original byte.
     // The host stays live; no internal exited flag or Started event is forged.
@@ -1084,23 +1187,235 @@ tool_timeout_sec = 120
     expect(recovered!.nativeSessionId).not.toBe(view.nativeSessionId)
     expect(recovered!.freshAgentSessionId).toBe(created.sessionId)
     const recoveredId = recovered!.nativeSessionId!
+    const replacementAnnouncement = await step(() => managedWaitFor('replacement B announced at original presentation', () =>
+      wire.frames.slice(recoveryFrameCursor).find(frame => frame.type === 'freshAgent.session.materialized'
+        && frame.provider === 'codex' && frame.sessionType === 'freshcodex'
+        && frame.previousSessionId === created.sessionId && frame.sessionId === created.sessionId
+        && frame.sessionRef?.provider === 'codex' && frame.sessionRef.sessionId === recoveredId)))
+    const memoryLossWarning = await step(() => managedWaitFor('replacement B memory warning at original presentation', () =>
+      wire.frames.slice(recoveryFrameCursor).find(frame => frame.type === 'freshAgent.event'
+        && frame.provider === 'codex' && frame.sessionType === 'freshcodex'
+        && frame.sessionId === created.sessionId && frame.event?.sessionId === created.sessionId
+        && frame.event.type === 'freshAgent.error' && frame.event.code === 'THREAD_MEMORY_LOST'
+        && frame.event.journalIdentity?.nativeSessionId === recoveredId
+        && frame.event.journalIdentity?.soulId === recovered!.soulId)))
+    expect(typeof memoryLossWarning.event.message === 'string' && memoryLossWarning.event.message.length > 0).toBe(true)
+    expect(wire.frames.indexOf(replacementAnnouncement)).toBeLessThan(wire.frames.indexOf(memoryLossWarning))
+    // Keep the delivered ordering and routing identities without recording
+    // arbitrary provider text, payloads, or credentials in this observation.
+    const recoveryPublicFrames = () => {
+      const identity = (id: unknown) => id === created.sessionId ? 'managed'
+        : id === view.nativeSessionId ? 'original' : id === recoveredId ? 'replacement'
+          : id == null ? null : 'other'
+      const types = new Set(['freshAgent.session.materialized', 'freshAgent.send.accepted', 'freshAgent.event'])
+      const eventTypes = new Set(['freshAgent.error', 'freshAgent.turn.complete', 'freshAgent.session.changed',
+        'freshAgent.session.snapshot', 'freshAgent.session.init', 'freshAgent.transcript.patch',
+        'freshAgent.host.backpressure'])
+      const frames = wire.frames.slice(recoveryFrameCursor).flatMap((frame, offset) => {
+        if (frame.provider !== 'codex' || !types.has(frame.type)) return []
+        const eventType = eventTypes.has(frame.event?.type) ? frame.event.type : null
+        if (frame.type === 'freshAgent.event' && !eventType) return []
+        return [{ offset, type: frame.type, eventType, sessionId: identity(frame.sessionId),
+          previousSessionId: identity(frame.previousSessionId), sessionRef: identity(frame.sessionRef?.sessionId),
+          eventSessionId: identity(frame.event?.sessionId),
+          retainedNativeId: identity(frame.event?.retainedState?.snapshot?.threadId),
+          memoryLost: frame.event?.code === 'THREAD_MEMORY_LOST',
+          recoveryRequest: frame.requestId === recoveryAccepted.requestId }]
+      })
+      return { cursor: recoveryFrameCursor, count: frames.length, frames: frames.slice(-200) }
+    }
     const recoveryControl = await step(() => managedWaitFor('new native source control through original durable user reference', async () => {
       const value = await step(() => snapshot())
       expect(value.threadId).toBe(recoveredId)
       expect(value.settings).toEqual(recoverySettings)
       return value.pendingQuestions?.find((question: any) => question.providerRequest.threadId === recoveredId)
     }))
+    receiveCapturedRecoveryFrames()
+    expect(originalClientPane()).toMatchObject({ sessionId: created.sessionId,
+      sessionRef: { provider: 'codex', sessionId: recoveredId } })
+    expect(clientStore.getState().freshAgent.sessions[clientKey]?.lastErrorCode).toBe('THREAD_MEMORY_LOST')
+    expect(clientStore.getState().freshAgent.sessions[clientKey]?.lastError === memoryLossWarning.event.message).toBe(true)
+    // Reusing the newly accepted native root must keep its public resume ID,
+    // while both presentations continue receiving events from this one soul.
+    const recoveredResumeRequest = `resume-recovered-${randomUUID()}`
+    const recoveredResumeCursor = wire.frames.length
+    sendBodyFrame({ type: 'freshAgent.create', requestId: recoveredResumeRequest, provider: 'codex',
+      sessionType: 'freshcodex', cwd: workspace, sessionRef: { provider: 'codex', sessionId: recoveredId } })
+    const recoveredResume = await step(() => managedWaitFor('accepted replacement native resume', () =>
+      wire.frames.slice(recoveredResumeCursor).find(frame => frame.requestId === recoveredResumeRequest
+        && (frame.type === 'freshAgent.created' || frame.type === 'freshAgent.create.failed'))))
+    expect(recoveredResume.type).toBe('freshAgent.created')
+    expect(recoveredResume.sessionId).toBe(recoveredId)
+    expect(recoveredResume.sessionRef).toEqual({ provider: 'codex', sessionId: recoveredId })
+    const resumedRecoveredView = await step(() => rig.runningViewForFreshSession(recoveredResume.sessionId))
+    expect(resumedRecoveredView?.soulId).toBe(recovered!.soulId)
+    expect(resumedRecoveredView?.nativeSessionId).toBe(recoveredId)
+    // Resume reads from journal cursor zero: the hosted Codex route sends its
+    // actual retained projection and the current source's replayed warning.
+    const recoveredReplay = await step(() => managedWaitFor('replacement B retained resume and warning', () => {
+      const frames = wire.frames.slice(recoveredResumeCursor).filter(frame =>
+        frame.provider === 'codex' && frame.sessionType === 'freshcodex' && frame.sessionId === recoveredId)
+      const announcement = frames.find(frame => frame.type === 'freshAgent.session.materialized'
+        && frame.previousSessionId === recoveredId && frame.sessionRef?.provider === 'codex'
+        && frame.sessionRef.sessionId === recoveredId)
+      const retained = frames.find(frame => frame.type === 'freshAgent.event'
+        && ['freshAgent.host.backpressure', 'freshAgent.host.journal.reset'].includes(frame.event?.type)
+        && frame.event.retainedState?.source?.soulId === recovered!.soulId
+        && frame.event.retainedState?.source?.nativeSessionId === recoveredId
+        && frame.event.retainedState?.snapshot?.threadId === recoveredId)
+      const warning = frames.find(frame => frame.type === 'freshAgent.event' && frame.event?.sessionId === recoveredId
+        && frame.event.type === 'freshAgent.error' && frame.event.code === 'THREAD_MEMORY_LOST'
+        && frame.event.retainedReplay === true
+        && frame.event.journalIdentity?.nativeSessionId === recoveredId
+        && frame.event.journalIdentity?.soulId === recovered!.soulId)
+      return announcement && retained && warning ? { announcement, retained, warning } : undefined
+    }))
+    expect(wire.frames.indexOf(recoveredReplay.announcement)).toBeLessThan(wire.frames.indexOf(recoveredReplay.retained))
+    expect(wire.frames.indexOf(recoveredReplay.announcement)).toBeLessThan(wire.frames.indexOf(recoveredReplay.warning))
+    receiveCapturedRecoveryFrames()
+    expect(originalClientPane()).toMatchObject({ sessionId: created.sessionId,
+      sessionRef: { provider: 'codex', sessionId: recoveredId } })
+    const replayedLive = clientStore.getState().freshAgentLive.bySession[`freshcodex:codex:${recoveredId}`]
+    expect(replayedLive?.retainedSnapshot?.threadId).toBe(recoveredId)
+    expect(replayedLive?.projection?.id).toBe(recoveredReplay.retained.event.retainedState.snapshot.extensions.codex.projection.id)
+    expect(clientStore.getState().freshAgent.sessions[`freshcodex:codex:${recoveredId}`]?.lastErrorCode).toBe('THREAD_MEMORY_LOST')
+    // The native rekey carries A's attention into B. Read that actual floor
+    // while B's first question is unanswered, before its own completion exists.
+    expect(recoveredReplay.retained.event.retainedState.snapshot.pendingQuestions?.some((question: any) =>
+      question.requestId === recoveryControl.requestId && question.providerRequest?.threadId === recoveredId)).toBe(true)
+    const inheritedAttention = recoveredReplay.retained.event.retainedState.attentionMarks?.find((mark: any) =>
+      mark.sessionId === recoveredId)
+    const recoveryAttentionFloor = inheritedAttention?.lastTurnCompleteAt ?? 0
+    expect(typeof recoveryAttentionFloor === 'number' && Number.isFinite(recoveryAttentionFloor)
+      && recoveryAttentionFloor >= 0).toBe(true)
     sendBodyFrame({ type: 'freshAgent.question.respond', provider: 'codex', sessionType: 'freshcodex', sessionId: created.sessionId,
       requestId: recoveryControl.requestId, answers: { managed_choice: 'Alpha' } })
-    await step(() => managedWaitFor('recovered native exact control resolution', async () => {
+    const recoverySettled = await step(() => managedWaitFor('recovered native exact control resolution', async () => {
       const value = await step(() => snapshot())
-      return value.status === 'idle' && !value.pendingQuestions.length ? true : undefined
+      return value.status === 'idle' && !value.pendingQuestions.length ? value : undefined
     }))
-    await step(() => send('MANAGED_RECOVERY_SECOND'))
+    const recoveryTurn = recoverySettled.turns.find((turn: any) => turn.role === 'user'
+      && turn.items?.some((item: any) => item.text === 'AWAITED_PLAN_RECOVERY'))
+    expect(recoveryTurn?.nativeTurnId).toBeTruthy()
+    const recoveryProjection = readTranscriptProjection(FreshAgentSnapshotSchema.parse(recoverySettled))
+    expect(recoveryProjection).toBeDefined()
+    // Native-final groups can outlive the event-owned settled-ID list. The saved
+    // representation is equally valid; do not require obsolete live rows.
+    const retainedTurnAt = (frame: any, nativeTurnId: string, projectionId: string) => {
+      const event = frame.event
+      const retained = event?.retainedState
+      if (!['freshAgent.host.backpressure', 'freshAgent.host.journal.reset'].includes(event?.type)
+        || retained?.source?.soulId !== recovered!.soulId || retained?.source?.nativeSessionId !== recoveredId
+        || retained?.snapshot?.threadId !== recoveredId) return undefined
+      const parsed = FreshAgentSnapshotSchema.safeParse(retained.snapshot)
+      const metadata = parsed.success ? readTranscriptProjection(parsed.data) : undefined
+      return metadata?.id === projectionId && retained.source.projectionId === projectionId
+        && (metadata.settledTurnIds?.includes(nativeTurnId) || metadata.nativeFinalTurnIds.includes(nativeTurnId))
+        ? retained : undefined
+    }
+    // Public completion edges have no turn ID. Correlate using the exact M
+    // settlement position and a witnessed preceding completion on B's clock.
+    const capturedCompletionAfter = (frames: typeof wire.frames, settlementIndex: number,
+      nativeTurnId: string, projectionId: string, baseline: number) => {
+      for (let index = settlementIndex; index < frames.length; index++) {
+        const frame = frames[index]
+        if (frame.type !== 'freshAgent.event' || frame.provider !== 'codex'
+          || frame.sessionType !== 'freshcodex' || frame.sessionId !== created.sessionId) continue
+        const event = frame.event
+        if (index > settlementIndex && event?.type === 'freshAgent.turn.complete' && event.sessionId === created.sessionId
+          && event.outcome === 'completed' && typeof event.at === 'number' && Number.isFinite(event.at)
+          && event.at > baseline) return { at: event.at, retained: false }
+        const retained = retainedTurnAt(frame, nativeTurnId, projectionId)
+        const mark = retained?.attentionMarks?.find((mark: any) => mark.sessionId === created.sessionId
+          && typeof mark.lastTurnCompleteAt === 'number' && Number.isFinite(mark.lastTurnCompleteAt)
+          && mark.lastTurnCompleteAt > baseline)
+        if (mark) return { at: mark.lastTurnCompleteAt, retained: true }
+      }
+      return undefined
+    }
+    // An idle REST read and a cursor-zero replay can precede the outstanding
+    // recovery notification. Wait for its actual completion/attention first.
+    // This is B's first turn; no later send is issued until this boundary.
+    const recoveryCompletion = await step(() => managedWaitFor('recovery turn completion boundary at original presentation', () => {
+      const settlementIndex = wire.frames.findIndex((frame, index) => index > wire.frames.indexOf(replacementAnnouncement)
+        && frame.type === 'freshAgent.event' && frame.provider === 'codex' && frame.sessionType === 'freshcodex'
+        && frame.sessionId === created.sessionId
+        && ((frame.event?.sessionId === created.sessionId && frame.event?.type === 'freshAgent.transcript.patch'
+          && frame.event.projectionId === recoveryProjection!.id && frame.event.ops?.some((op: any) =>
+            op.op === 'settleTurn' && op.nativeTurnId === recoveryTurn.nativeTurnId && op.status === 'completed'))
+          || retainedTurnAt(frame, recoveryTurn.nativeTurnId, recoveryProjection!.id)))
+      return settlementIndex < 0 ? undefined : capturedCompletionAfter(wire.frames, settlementIndex,
+        recoveryTurn.nativeTurnId, recoveryProjection!.id, recoveryAttentionFloor)
+    }))
+    receiveCapturedRecoveryFrames()
+    const clientCompletionBaseline = clientStore.getState().turnCompletion.lastAtByTerminalId[`codex:${created.sessionId}`] ?? 0
+    expect(clientCompletionBaseline).toBeGreaterThanOrEqual(recoveryCompletion.at)
+    const followupFrameCursor = wire.frames.length
+    const followupAccepted = await step(() => send('MANAGED_RECOVERY_SECOND'))
     const second = await step(() => managedWaitFor('second send on same durable user reference', async () => {
       const value = await step(() => snapshot())
       return value.status === 'idle' && JSON.stringify(value.turns).includes('Managed recovery second answer.') ? value : undefined
     }))
+    const followupTurn = second.turns.find((turn: any) => turn.role === 'user'
+      && turn.items?.some((item: any) => item.text === 'MANAGED_RECOVERY_SECOND'))
+    expect(followupTurn?.nativeTurnId).toBeTruthy()
+    const delivery = await step(() => managedWaitFor('same recovered native turn at both presentations', () => {
+      const presentations = [created.sessionId, recoveredResume.sessionId]
+      const matching = presentations.map(sessionId => wire.frames.slice(followupFrameCursor).find(frame =>
+        frame.type === 'freshAgent.event' && frame.provider === 'codex' && frame.sessionType === 'freshcodex'
+        && frame.sessionId === sessionId && frame.event?.sessionId === sessionId
+        && frame.event?.type === 'freshAgent.transcript.patch' && frame.event.ops?.some((op: any) =>
+          op.op === 'settleTurn' && op.nativeTurnId === followupTurn.nativeTurnId && op.status === 'completed')))
+      return matching.every(Boolean) ? matching : undefined
+    }))
+    const settledOps = delivery.map(frame => frame.event.ops.find((op: any) =>
+      op.op === 'settleTurn' && op.nativeTurnId === followupTurn.nativeTurnId))
+    expect(delivery[0].event.projectionId).toBe(delivery[1].event.projectionId)
+    expect(settledOps[0].revision).toBe(settledOps[1].revision)
+    const firstReplacementProjectionFrame = wire.frames.slice(recoveryFrameCursor).find(frame =>
+      frame.type === 'freshAgent.event' && frame.provider === 'codex' && frame.sessionType === 'freshcodex'
+      && frame.sessionId === created.sessionId && (frame.event?.projectionId === delivery[0].event.projectionId
+        || frame.event?.retainedState?.snapshot?.threadId === recoveredId))
+    expect(firstReplacementProjectionFrame).toBeDefined()
+    expect(wire.frames.indexOf(replacementAnnouncement)).toBeLessThan(wire.frames.indexOf(firstReplacementProjectionFrame))
+    // Bind this completion to the exact correlated M settlement, never to the
+    // send acknowledgement or merely to the start of the follow-up interval.
+    const followupSettlementIndex = wire.frames.indexOf(delivery[0])
+    expect(followupSettlementIndex).toBeGreaterThanOrEqual(followupFrameCursor)
+    const followupCompletion = await step(() => managedWaitFor('replacement B completion at original presentation', () =>
+      capturedCompletionAfter(wire.frames, followupSettlementIndex, followupTurn.nativeTurnId,
+        delivery[0].event.projectionId, clientCompletionBaseline)))
+    receiveCapturedRecoveryFrames()
+    expect(originalClientPane()).toMatchObject({ sessionId: created.sessionId,
+      sessionRef: { provider: 'codex', sessionId: recoveredId } })
+    const clientSession = clientStore.getState().freshAgent.sessions[clientKey]
+    expect(clientSession?.lastErrorCode).toBe('THREAD_MEMORY_LOST')
+    expect(clientSession?.lastError === memoryLossWarning.event.message).toBe(true)
+    const clientLive = clientStore.getState().freshAgentLive.bySession[clientKey]
+    const clientProjection = clientLive?.projection
+    expect(clientProjection?.id).toBe(delivery[0].event.projectionId)
+    expect(clientProjection?.settledTurns?.[followupTurn.nativeTurnId]).toBe(true)
+    const retainedProjection = clientLive?.retainedSnapshot ? readTranscriptProjection(clientLive.retainedSnapshot) : undefined
+    const followupRows = new Set([...(clientProjection?.turnRows?.[followupTurn.nativeTurnId] ?? []),
+      ...(retainedProjection?.turnRows[followupTurn.nativeTurnId] ?? [])])
+    const clientTurns = capturedClientTurns(clientKey)
+    const clientItems = clientTurns.filter(row => followupRows.has(row.turnId)).flatMap(row => row.items)
+    expect(clientItems.some(item => item.kind === 'text' && item.text === 'MANAGED_RECOVERY_SECOND')).toBe(true)
+    expect(clientItems.some(item => item.kind === 'text' && item.text === 'Managed recovery second answer.')).toBe(true)
+    expect(clientTurns.some(row => row.items.some(item => item.kind === 'text' && item.text === 'MANAGED_NATIVE_FIRST'))).toBe(false)
+    expect(clientStore.getState().turnCompletion.pendingEvents.some(event => event.tabId === clientTabId
+      && event.paneId === clientPaneId && event.terminalId === `codex:${created.sessionId}`
+      && event.source === 'freshAgent' && event.at === followupCompletion.at
+      && (followupCompletion.retained || event.outcome === 'completed'))).toBe(true)
+    const capturedClientEvidence = { originalPublicIdPreserved: true, replacementAdopted: true,
+      warningVisible: true, replacementReplayHydrated: true, correlatedTurnSettled: true,
+      correlatedTurnOutputPresent: true, originalHistoryAbsent: true, completionQueuedForOriginalPane: true,
+      completionFromRetainedState: followupCompletion.retained, priorCompletionBoundaryObserved: true }
+    const resumedDeliveryEvidence = { resumeAcknowledged: recoveredResume.type === 'freshAgent.created',
+      nativeRefMatches: recoveredResume.sessionRef?.sessionId === recoveredId,
+      sameSoul: resumedRecoveredView?.soulId === recovered!.soulId,
+      followupAccepted: followupAccepted.type === 'freshAgent.send.accepted',
+      originalAndResumedReceivedSameTurn: true, sameProjection: true, sameRevision: true }
     expect(second.threadId).toBe(recoveredId)
     expect(second.settings).toEqual(recoverySettings)
     expect(JSON.stringify(second.turns)).not.toContain('MANAGED_NATIVE_FIRST')
@@ -1134,6 +1449,7 @@ tool_timeout_sec = 120
     expect((await step(() => rig.inventory())).filter(row => row.provider === 'codex' && row.nativeSessionId === recoveredId && row.launchState === 'running')).toHaveLength(1)
     writeBodyIncident('freshcodex-managed-native-recovery', { userRef: created.sessionId, oldNativeRef: created.sessionRef,
       newNativeRef: recoveredNameRef, beforeCrash, archiveManifest, nativeExit, recoveryAccepted, recovered, recoveryControl, second, capture,
+      recoveryPublicFrames: recoveryPublicFrames(), resumedDeliveryEvidence, capturedClientEvidence,
       oldName: await step(() => readName()), firstNewName: recoveredName, finalNewName: await step(() => readNameFor(recoveredNameRef)),
       nativeName: await step(() => readNativeName(recoveredId, recoveredNativeContext)), recoveredNativeContext, newTraffic })
 
