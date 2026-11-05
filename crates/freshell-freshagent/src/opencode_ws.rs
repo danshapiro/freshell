@@ -1331,6 +1331,19 @@ impl FreshOpencodeState {
         let state = self.clone();
         let expected = session_arc.clone();
         guard.settle_startup_before_repair(async move {
+            // Stop exposing the refused startup before waiting on an in-flight
+            // session holder. The guard retains its ownership claim through
+            // teardown; only this exact cell's aliases and leases are removed.
+            {
+                let mut sessions = state.sessions.lock().await;
+                sessions.retain(|key, candidate| {
+                    if !Arc::ptr_eq(candidate, &expected) {
+                        return true;
+                    }
+                    state.leases.clear_binding(PROVIDER, key);
+                    false
+                });
+            }
             let (turn, bridge, real, cwd, accepted) = {
                 let mut session = expected.lock().await;
                 session.killed.store(true, Ordering::SeqCst);
@@ -1347,18 +1360,6 @@ impl FreshOpencodeState {
                     session.daemon_turn_accepted.clone(),
                 )
             };
-            {
-                let mut sessions = state.sessions.lock().await;
-                if let Some(real) = real.as_deref() {
-                    if sessions
-                        .get(real)
-                        .is_some_and(|candidate| Arc::ptr_eq(candidate, &expected))
-                    {
-                        state.leases.clear_binding(PROVIDER, real);
-                    }
-                }
-                sessions.retain(|_, candidate| !Arc::ptr_eq(candidate, &expected));
-            }
             if let Some(turn) = turn {
                 turn.abort_and_settle().await;
             }
@@ -8356,8 +8357,8 @@ impl FreshOpencodeState {
         // D8 (focused-ep1-r5 Finding 2): "meaningful provenance" only — a
         // HOLLOW `Some` (a partially initialized client's hello) behaves like
         // `None` on every decision below: the park falls through to the
-        // durable row's stamp seed, and the refresh gate never fires on
-        // hollow alone.
+        // durable row's stamp seed, and the required identity write inherits
+        // those stamps instead of asserting a hollow value.
         let provenance = provenance.filter(|p| p.is_meaningful());
         // Round 4 (focused-ep5-r3 Finding 1): the claim's dead-state
         // SNAPSHOT — taken at claim start, before the serve-manager awaits
@@ -8604,13 +8605,11 @@ impl FreshOpencodeState {
         // 4): this resume/attach GENUINELY CLAIMS the durable session — the
         // claim COMMITS here (the rebuilt session is registered, the lease
         // resolution is final): clear the durable kill fence BEFORE any
-        // binding write of this rebuilt session (the refresh below AND every
+        // binding write of this rebuilt session (the identity write below AND every
         // later per-send refresh), so the claim is never suppressed as the
         // killed session's stale orphan, AND return a kill-closed row to
-        // Bound now — the refresh write below is V7-gated on a recovered
-        // settings snapshot / connection provenance, so a lineage-only row
-        // attached conn-less would otherwise stay Closed while the session
-        // runs live (the finding).
+        // Bound now. The required identity write below preserves absent
+        // settings with Keep, including lineage-only, conn-less resumes.
         //
         // Round 4 (focused-ep5-r3 Finding 1): the commit is CONDITIONAL on
         // the claim-start dead-state snapshot — including on the
@@ -14397,6 +14396,11 @@ mod tests {
                 .clone()
         };
         let session_guard = session_arc.lock().await;
+        let bridge = session_guard
+            .serve_bridge
+            .as_ref()
+            .expect("the registered resume has a bridge to tear down")
+            .abort_handle();
         fake.retire_closed("opencode", DURABLE_ID)
             .await
             .expect("the mid-resume close records");
@@ -14449,6 +14453,10 @@ mod tests {
             state.sessions.lock().await.get(DURABLE_ID).is_none(),
             "the refusal teardown removed the just-registered session"
         );
+        let session = session_arc.lock().await;
+        assert!(session.killed.load(Ordering::SeqCst));
+        assert!(session.serve_bridge.is_none());
+        assert!(bridge.is_finished(), "the refusal joins the aborted bridge");
         assert!(
             fake.claim_refusals
                 .lock()
@@ -17538,6 +17546,18 @@ mod tests {
         );
     }
 
+    async fn cancel_parked_startup<T>(task: &mut tokio::task::JoinHandle<T>) {
+        // abort() only requests cancellation. Keep the write parked until the
+        // task has dropped its guard, or it can commit before its next yield.
+        task.abort();
+        let error = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the parked startup observes cancellation")
+            .err()
+            .expect("the startup cannot finish while its write remains parked");
+        assert!(error.is_cancelled());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn registered_startup_opencode_settles_before_repair_on_cancel_and_failure() {
         for cancel in [true, false] {
@@ -17548,7 +17568,7 @@ mod tests {
             st.set_identity_sink(sink.clone());
             let id = "ses_registered_startup_cleanup";
             let stall = sink.arm_binding_stall_result(PROVIDER, id, !cancel);
-            let task = {
+            let mut task = {
                 let st = st.clone();
                 tokio::spawn(
                     async move { st.resume_durable_session(id, None, None, None, None).await },
@@ -17565,7 +17585,7 @@ mod tests {
                 .is_some_and(|h| !h.is_finished());
             assert!(bridge_running);
             if cancel {
-                task.abort();
+                cancel_parked_startup(&mut task).await;
             }
             let _ = stall.release.send(());
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -17579,9 +17599,7 @@ mod tests {
                 fenced && unrepaired,
                 "cancel={cancel}: ownership and binding must wait for registered-session cleanup"
             );
-            if cancel {
-                assert!(task.await.err().unwrap().is_cancelled());
-            } else {
+            if !cancel {
                 assert!(task.await.unwrap().is_err());
             }
             tokio::time::timeout(Duration::from_secs(10), async {
@@ -17631,7 +17649,7 @@ mod tests {
                         .await;
                 }
                 let stall = sink.arm_binding_stall_result(PROVIDER, id, !cancel);
-                let task = {
+                let mut task = {
                     let st = st.clone();
                     let registry = registry.clone();
                     tokio::spawn(async move {
@@ -17653,7 +17671,7 @@ mod tests {
                 let held = st.sessions.lock().await;
                 let cell = held[id].clone();
                 if cancel {
-                    task.abort();
+                    cancel_parked_startup(&mut task).await;
                 }
                 let _ = stall.release.send(());
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -17666,9 +17684,7 @@ mod tests {
                 );
                 assert!(sink.repairs.lock().unwrap().is_empty());
                 drop(held);
-                if cancel {
-                    assert!(task.await.unwrap_err().is_cancelled());
-                } else {
+                if !cancel {
                     task.await.unwrap();
                 }
                 tokio::time::timeout(Duration::from_secs(5), async {
@@ -17711,7 +17727,7 @@ mod tests {
             st.set_identity_sink(sink.clone());
             let id = "ses_replaced_startup";
             let stall = sink.arm_binding_stall_result(PROVIDER, id, !cancel);
-            let task = {
+            let mut task = {
                 let st = st.clone();
                 tokio::spawn(
                     async move { st.resume_durable_session(id, None, None, None, None).await },
@@ -17752,12 +17768,10 @@ mod tests {
             st.commit_lane_claim_at(&mut Some(ticket), id).unwrap();
             let owner = registry.observe(PROVIDER, id);
             if cancel {
-                task.abort();
+                cancel_parked_startup(&mut task).await;
             }
             let _ = stall.release.send(());
-            if cancel {
-                assert!(task.await.err().unwrap().is_cancelled());
-            } else {
+            if !cancel {
                 assert!(task.await.unwrap().is_err());
             }
             tokio::time::timeout(Duration::from_secs(5), async {
@@ -18778,16 +18792,15 @@ mod tests {
     }
 
     /// Focused-ep1-r5 Finding 2 (the cold-resume park, `resume_durable_session`):
-    /// a connection-scoped resume-create carrying a HOLLOW provenance behaves
-    /// like None — the row seed (not the hollow value) is what gets parked,
-    /// and the refresh gate does not fire on hollow alone (parked/row truth
-    /// is never replaced with nothing).
+    /// A hollow connection provenance behaves like None: the durable row's
+    /// stamps are parked and preserved. Task 3 still requires an identity
+    /// write before success, but it must not assert attribution or settings.
     #[tokio::test]
-    async fn hollow_cold_resume_falls_back_to_the_row_seed_and_writes_nothing() {
-        let (state, _rx) = state_with_durable_serve_session().await;
+    async fn hollow_cold_resume_falls_back_to_the_row_seed_and_writes_only_identity() {
+        let (state, mut rx) = state_with_durable_serve_session().await;
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
-        // A stamped LINEAGE-ONLY row (blank settings): the only gate driver
-        // here would be the provenance — exactly Finding 2's shape.
+        // A stamped lineage-only row: resuming it must establish identity
+        // without creating a settings record or replacing its attribution.
         fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
             genesis: crate::identity_sink::GenesisUpdate::Keep,
             provider: "opencode".into(),
@@ -18814,6 +18827,7 @@ mod tests {
         })
         .await
         .expect("seed binding write ok");
+        let saved_provenance = fake.load_provenance(PROVIDER, DURABLE_ID);
         state.set_identity_sink(fake.clone());
 
         let mut create = create_msg("req-hollow-cold");
@@ -18839,24 +18853,38 @@ mod tests {
             assert_eq!(p.client_instance_id.as_deref(), Some("client-row"));
             assert_eq!(p.device_id.as_deref(), Some("device-row"));
             assert_eq!(p.tab_key.as_deref(), Some("device-row:tab-row"));
+            assert_eq!(Some(p), saved_provenance);
         }
-        let bindings = fake.bindings.lock().unwrap();
+        let bindings: Vec<_> = fake
+            .bindings
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|b| b.session_id == DURABLE_ID)
+            .cloned()
+            .collect();
+        assert_eq!(bindings.len(), 2, "the seed plus one identity write");
         assert_eq!(
-            bindings
-                .iter()
-                .filter(|b| b.session_id == DURABLE_ID)
-                .count(),
-            1,
-            "a hollow provenance does not fire the refresh gate (only the seed row exists)"
+            bindings[1].settings,
+            crate::identity_sink::SettingsUpdate::Keep
         );
+        assert_eq!(
+            bindings[1].provenance,
+            crate::identity_sink::ProvenanceUpdate::Inherit
+        );
+        assert_eq!(fake.load_provenance(PROVIDER, DURABLE_ID), saved_provenance);
+        assert!(fake.load_settings(PROVIDER, DURABLE_ID).is_none());
+        assert!(!fake.was_recorded(PROVIDER, DURABLE_ID));
+        assert!(drain_frames(&mut rx).iter().any(|frame| {
+            frame["type"] == "freshAgent.created" && frame["requestId"] == "req-hollow-cold"
+        }));
     }
 
-    /// Focused-ep1-r5 Finding 2 (the named `opencode_ws.rs:677` gate): an
-    /// in-memory resume-create hit carrying a HOLLOW provenance keeps the
-    /// parked Some EXACTLY and writes nothing — hollow behaves like None.
+    /// An in-memory resume with hollow provenance keeps the parked and saved
+    /// stamps exactly. Its required identity write preserves saved settings.
     #[tokio::test]
-    async fn hollow_in_memory_resume_keeps_the_parked_stamps_and_writes_nothing() {
-        let (state, _rx) = state_with_durable_serve_session().await;
+    async fn hollow_in_memory_resume_keeps_the_parked_stamps_and_writes_only_identity() {
+        let (state, mut rx) = state_with_durable_serve_session().await;
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         state.set_identity_sink(fake.clone());
 
@@ -18877,6 +18905,14 @@ mod tests {
                 )),
             )
             .await;
+        let saved_provenance = fake.load_provenance(PROVIDER, DURABLE_ID);
+        let saved_settings = crate::identity_sink::FreshAgentSettings {
+            model: Some("prov-a/mdl-x".into()),
+            effort: Some("low".into()),
+            cwd: Some("/saved/dir".into()),
+            ..Default::default()
+        };
+        fake.seed(PROVIDER, DURABLE_ID, saved_settings.clone());
         let rows_before = fake
             .bindings
             .lock()
@@ -18910,16 +18946,35 @@ mod tests {
             assert_eq!(p.client_instance_id.as_deref(), Some("client-mem"));
             assert_eq!(p.device_id.as_deref(), Some("device-mem"));
             assert_eq!(p.tab_key.as_deref(), Some("device-mem:tab-mem"));
+            assert_eq!(Some(p), saved_provenance);
         }
-        let bindings = fake.bindings.lock().unwrap();
+        let bindings: Vec<_> = fake
+            .bindings
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|b| b.session_id == DURABLE_ID)
+            .cloned()
+            .collect();
         assert_eq!(
-            bindings
-                .iter()
-                .filter(|b| b.session_id == DURABLE_ID)
-                .count(),
-            rows_before,
-            "a hollow in-memory resume writes nothing (like the conn-less resume)"
+            bindings.len(),
+            rows_before + 1,
+            "the map-hit adoption establishes identity once"
         );
+        let binding = bindings.last().unwrap();
+        assert_eq!(binding.settings, crate::identity_sink::SettingsUpdate::Keep);
+        assert_eq!(
+            binding.provenance,
+            crate::identity_sink::ProvenanceUpdate::Inherit
+        );
+        assert_eq!(fake.load_provenance(PROVIDER, DURABLE_ID), saved_provenance);
+        assert_eq!(
+            fake.load_settings(PROVIDER, DURABLE_ID),
+            Some(saved_settings)
+        );
+        assert!(drain_frames(&mut rx).iter().any(|frame| {
+            frame["type"] == "freshAgent.created" && frame["requestId"] == "req-mem-hollow"
+        }));
     }
 
     /// Focused-ep1-r5 Finding 2 (the create-lane park): a create carrying a
@@ -23901,12 +23956,10 @@ mod tests {
 
     /// kata b8ke Task 3 review M-1: a fork commit that goes STALE (the
     /// coordinator moved on while the child registered — here: the
-    /// watchdog's stale-start recovery flips the child's `Starting` to
-    /// `Stopping` mid-fork) must tear the uncommitted child down
-    /// COMPLETELY: map keys gone, killed flag set, serve-SSE bridge
-    /// aborted. The pre-fix teardown re-got the just-removed map entry,
-    /// so the bridge task leaked (broadcasting for a session that no
-    /// longer exists) and the killed flag never landed.
+    /// registry releases the child's `Starting` claim mid-fork) must remove
+    /// the uncommitted child and mark it
+    /// killed. Task 3 defers its serve-SSE bridge until after the commit, so
+    /// neither the parked child nor the refused child may publish events.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_fork_commit_that_goes_stale_tears_the_child_down_completely() {
         let http = Arc::new(ForkFakeHttp::child_ok());
@@ -23927,7 +23980,7 @@ mod tests {
 
         // The mid-fork mover: once the fork parks on the child's binding
         // write, capture the registered child (proving its serve-SSE bridge
-        // is live at the park), then move the coordinator on (b8ke ext
+        // has not started before commit), then move the coordinator on (b8ke ext
         // r26 F1/F3: the fork's start is WITNESSED after the rekey — its
         // settle flag has not fired, so the stale-start sweep correctly
         // SKIPS it; the watchdog's recovery is driven here through the
@@ -23947,7 +24000,7 @@ mod tests {
                 .get("ses_child")
                 .cloned()
                 .expect("the child registered before the park");
-            let bridge_was_live = child_arc.lock().await.serve_bridge.is_some();
+            let bridge_was_absent = child_arc.lock().await.serve_bridge.is_none();
             let (held_op, held_generation) =
                 match registry_mover.observe(PROVIDER, "ses_child").state {
                     freshell_ownership::OwnershipState::Starting {
@@ -23960,7 +24013,7 @@ mod tests {
             let fail_outcome =
                 registry_mover.fail(PROVIDER, "ses_child", &held_op, held_generation, false);
             stall.release.send(()).expect("release the stalled write");
-            (child_arc, bridge_was_live, fail_outcome)
+            (child_arc, bridge_was_absent, fail_outcome)
         });
 
         let mut fork_request = fork_msg("ses_parent", "fork-req-stale", None);
@@ -23970,14 +24023,15 @@ mod tests {
         ) = fenced_observed(&registry, "ses_parent");
         st.handle_fork(fork_request, None, sink).await;
 
-        let (child_arc, bridge_was_live, fail_outcome) = mover.await.expect("mover task completed");
+        let (child_arc, bridge_was_absent, fail_outcome) =
+            mover.await.expect("mover task completed");
         assert!(
             matches!(fail_outcome, freshell_ownership::FailOutcome::Released),
             "fixture: the coordinator moved the child's start on (Released)"
         );
         assert!(
-            bridge_was_live,
-            "fixture: the child's serve-SSE bridge was live at the park"
+            bridge_was_absent,
+            "the child must not start its event bridge before its binding commits"
         );
 
         // The child is GONE from the map...
@@ -23985,9 +24039,7 @@ mod tests {
             !st.sessions.lock().await.contains_key("ses_child"),
             "the stale commit must remove the uncommitted child"
         );
-        // ...AND fully torn down: killed flag set + serve bridge aborted
-        // (the pre-fix dead re-get left the bridge task leaked and the flag
-        // unset).
+        // ...AND marked killed, with no bridge installed by the refused tail.
         {
             let s = child_arc.lock().await;
             assert!(
@@ -23996,7 +24048,7 @@ mod tests {
             );
             assert!(
                 s.serve_bridge.is_none(),
-                "the torn-down child's serve bridge was aborted"
+                "the refused child never starts an event bridge"
             );
         }
         // The fork answers the typed INTERNAL_ERROR, never a success.
