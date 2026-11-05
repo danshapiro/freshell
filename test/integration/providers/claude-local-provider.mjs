@@ -120,7 +120,7 @@ export async function resolvePinnedClaude(repoRoot = DEFAULT_REPO_ROOT) {
  * complete environment for the CLI: nothing from the caller's environment
  * leaks in except PATH's node directory.
  */
-export async function createClaudeFixture({ parent = os.tmpdir(), prefix = 'freshell-claude-contract-' } = {}) {
+export async function createClaudeFixture({ parent = os.tmpdir(), prefix = 'freshell-claude-contract-', removeRoot = fs.rm } = {}) {
   const root = await fs.mkdtemp(path.join(parent, prefix))
   await fs.chmod(root, 0o700)
   const home = path.join(root, 'home')
@@ -209,7 +209,9 @@ export async function createClaudeFixture({ parent = os.tmpdir(), prefix = 'fres
       if (failures.length) throw new AggregateError(failures, `Claude fixture process cleanup incomplete; retained ${root}`)
       // Retain the main-branch retries for callers without registered writers
       // and transient filesystem contention after all registered owners settle.
-      await fs.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+      // The removal seam lets harness regressions inject a failure after every
+      // owned writer has settled, without racing or changing other fixtures.
+      await removeRoot(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
     },
   }
 }

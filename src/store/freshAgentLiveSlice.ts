@@ -1,5 +1,6 @@
 import { createSlice, type PayloadAction } from '@reduxjs/toolkit'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
+import { isCodexRetainedDiagnosticNotice } from '@/lib/fresh-agent-notice'
 import { isLiveBlockLanded, landedTranscript, type LandedTranscript } from '@/lib/fresh-agent-landed-transcript'
 import { applyFreshAgentTranscriptPatch, bindTranscriptProjection, freezeTranscriptProjection, hydrateTranscriptProjection, readTranscriptProjection } from '@/lib/fresh-agent-transcript-projection'
 import type { FreshAgentSnapshot, FreshAgentTranscriptPatch } from '@shared/fresh-agent-contract'
@@ -243,9 +244,11 @@ const freshAgentLiveSlice = createSlice({
       for (const id of Object.keys(projection.frozenTurns ?? {})) if (!accepted.has(id)) delete projection.frozenTurns![id]
       for (const id of metadata.nativeFinalTurnIds ?? []) {
         (projection.settledTurns ??= {})[id] = true
+        if ((projection.correctedTurns?.[id] ?? 0) > metadata.eventRevision) continue
         const rows = new Set(projection.turnRows?.[id] ?? [])
         projection.turns = projection.turns.filter((row) => !rows.has(row.turnId))
         if (projection.turnRows) delete projection.turnRows[id]
+        if (projection.correctedTurns) delete projection.correctedTurns[id]
         if (metadata.turnOutputStates[id]?.diagnostic !== 'interrupted' && projection.frozenTurns) delete projection.frozenTurns[id]
       }
     },
@@ -334,8 +337,12 @@ const freshAgentLiveSlice = createSlice({
      */
     liveNoticeReceived(state, action: PayloadAction<FreshAgentSessionLocator & Omit<LiveNotice, 'seq'>>) {
       const { sessionId, sessionType, provider, ...notice } = action.payload
+      if (isCodexRetainedDiagnosticNotice(provider, notice.code)) return
       state.noticeSeq += 1
-      sessionFor(state, { sessionId, sessionType, provider }).notice = { seq: state.noticeSeq, ...notice }
+      const session = sessionFor(state, { sessionId, sessionType, provider })
+      const current = { seq: state.noticeSeq, ...notice }
+      if (notice.level === 'error') session.errorNotice = current
+      else session.notice = current
     },
 
     /**

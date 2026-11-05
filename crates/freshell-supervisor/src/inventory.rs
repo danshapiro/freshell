@@ -795,6 +795,7 @@ mod tests {
                                         .as_ref()
                                         .map(|observation| observation.native_session_id.clone()),
                                     native_identity_observation: observation,
+                                    native_readiness_receipt: None,
                                     opencode_transfer_receipt: None, opencode_adoption: Default::default(),
                                 })
                             }

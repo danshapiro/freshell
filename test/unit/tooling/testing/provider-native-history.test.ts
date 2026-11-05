@@ -471,7 +471,7 @@ describe('OpenCode native history proof', () => {
     const inEnclosure = JSON.parse(execFileSync(
       process.execPath,
       ['--no-warnings', '-e', OPENCODE_NATIVE_HISTORY_SCRIPT, dbPath, 'ses_exact'],
-      { encoding: 'utf8' },
+      { timeout: 30_000, killSignal: 'SIGKILL', encoding: 'utf8' },
     ))
     expect(inEnclosure).toMatchObject({
       schemaVersion: 1,

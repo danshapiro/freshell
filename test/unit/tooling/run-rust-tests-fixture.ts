@@ -97,7 +97,7 @@ export function fixture() {
       const result = spawnSync(process.execPath, ['--import', tsx, path.join(root, 'scripts/testing/run-rust-tests.ts'), ...args], {
         env: { ...process.env, PATH: `${root}/bin:${process.env.PATH}`, RECEIPT: receipt,
           FRESHELL_RUST_TEST_SANDBOX: '0', CARGO_TARGET_DIR: '', FRESHELL_SERVER_BIN: '/host/stale-server', ...env },
-        encoding: 'utf8', timeout: 15_000,
+        encoding: 'utf8', timeout: 15_000, killSignal: 'SIGKILL',
       })
       const events = existsSync(receipt) ? readFileSync(receipt, 'utf8').trim().split('\n').map(line => JSON.parse(line)) : []
       return { ...result, events }

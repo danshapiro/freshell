@@ -98,12 +98,26 @@ pub enum FreshAgentNativeNameOperation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FreshAgentNativeNameError {
-    Unavailable { message: String },
-    Rpc { code: i64, message: String },
-    Timeout { timeout_ms: u64 },
+    /// The per-soul lifecycle fence was held; the request was refused before
+    /// any host/native operation was dispatched and may be retried freshly.
+    LifecycleBusy,
+    Unavailable {
+        message: String,
+    },
+    Rpc {
+        code: i64,
+        message: String,
+    },
+    Timeout {
+        timeout_ms: u64,
+    },
     Closed,
-    Transport { message: String },
-    InvalidResponse { detail: String },
+    Transport {
+        message: String,
+    },
+    InvalidResponse {
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,23 +1,36 @@
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 
-// This entire child runs under the shared harness lock. In particular, Cargo
-// exiting does not allow another harness producer to replace its binaries
-// before their run-private copies exist. OS lock ownership ends with the child.
-const { command, args, copies, timeoutMs } = JSON.parse(process.argv[2])
-execFileSync(command, args, { stdio: 'inherit', ...(timeoutMs === undefined ? {} : { timeout: timeoutMs }) })
-try {
-  for (const { source, target } of copies) {
-    fs.mkdirSync(path.dirname(target), { recursive: true })
-    fs.copyFileSync(source, target)
-    fs.chmodSync(target, 0o755)
+/** Run under the shared artifact lock; a failed build never snapshots old output. */
+export function runRuntimeCargoArtifactWorker({ command, args, copies, timeoutMs }, {
+  execute = execFileSync,
+  reportFailure = failure => fs.writeFileSync(3, JSON.stringify(failure)),
+  log = message => process.stderr.write(message),
+} = {}) {
+  try {
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+      throw new Error('runtime Cargo watchdog requires a positive finite millisecond budget')
+    }
+    execute(command, args, { stdio: 'inherit', timeout: timeoutMs, killSignal: 'SIGKILL' })
+    for (const { source, target } of copies) {
+      fs.mkdirSync(path.dirname(target), { recursive: true })
+      fs.copyFileSync(source, target)
+      fs.chmodSync(target, 0o755)
+    }
+  } catch (error) {
+    // Preserve native build interruption/spawn fields as well as actionable
+    // copy errors across the child boundary. Cargo inherits only standard I/O,
+    // never this private failure channel.
+    const { message, code, errno, syscall, path: source, dest, status, signal, pid, killed } = error
+    try { reportFailure({ message, code, errno, syscall, path: source, dest, status, signal, pid, killed }) }
+    catch { /* A closed diagnostic pipe must not replace the original failure. */ }
+    throw error
   }
-} catch (error) {
-  // Keep actionable filesystem errors across the locked child boundary.
-  // Cargo and its descendants inherit only normal stdout/stderr, not this pipe.
-  const { message, code, errno, syscall, path: source, dest } = error
-  fs.writeFileSync(3, JSON.stringify({ message, code, errno, syscall, path: source, dest }))
-  throw error
+  log(`${JSON.stringify({ severity: 'info', event: 'runtime.cargo.artifacts_snapshotted', artifactCount: copies.length })}\n`)
 }
-process.stderr.write(`${JSON.stringify({ severity: 'info', event: 'runtime.cargo.artifacts_snapshotted', artifactCount: copies.length })}\n`)
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  runRuntimeCargoArtifactWorker(JSON.parse(process.argv[2]))
+}

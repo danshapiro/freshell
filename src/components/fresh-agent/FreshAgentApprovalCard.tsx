@@ -76,7 +76,7 @@ function NativeApprovalCard({ approval, disabled, onRespond }: FreshAgentApprova
     ...(native.cwd ? { directory: native.cwd } : {}),
     ...(native.permissions ? { permissions: native.permissions } : {}),
     ...(native.additionalPermissions ? { additionalPermissions: native.additionalPermissions } : {}),
-    ...(native.grantRoot ? { path: native.grantRoot } : {}),
+    ...(typeof native.grantRoot === 'string' ? {} : native.grantRoot ? { path: native.grantRoot } : {}),
   }
   const detailsText = formatInputPreview(details)
   return (
@@ -161,7 +161,7 @@ function FreshAgentToolApprovalCard({ approval, disabled, onRespond, onAlwaysAll
           <DiffView oldStr={editDiff.oldStr} newStr={editDiff.newStr} filePath={editDiff.filePath} />
         </div></Preview>
       ) : Object.keys(input).length > 0 ? (
-        <Preview text={inputText}><pre className="fresh-agent-approval-preview mt-2 max-h-40 overflow-auto rounded border border-border/60 bg-background/70 px-2 py-1.5 font-mono text-xs">
+        <Preview text={inputText}><pre className="fresh-agent-approval-preview mt-2 max-h-40 overflow-auto whitespace-pre-wrap rounded border border-border/60 bg-background/70 px-2 py-1.5 font-mono text-xs">
           {inputText}
         </pre></Preview>
       ) : null}

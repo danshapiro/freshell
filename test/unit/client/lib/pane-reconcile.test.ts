@@ -24,7 +24,7 @@ import panesReducer, {
   updatePaneContent,
 } from '@/store/panesSlice'
 import type { PanesState } from '@/store/panesSlice'
-import type { TerminalPaneContent, PaneNode } from '@/store/paneTypes'
+import type { TerminalPaneContent, FreshAgentPaneContent, PaneNode } from '@/store/paneTypes'
 import type { AppDispatch, RootState } from '@/store/store'
 import tabsReducer, { addTab } from '@/store/tabsSlice'
 import type { PaneVerdict, PaneReconcileRequest, PaneReconcileResultMessage } from '@shared/ws-protocol'
@@ -37,6 +37,7 @@ import {
   isDeadSessionReconcileNotice,
   paneKeyFor,
   DEAD_SESSION_RECONCILE_NOTICES,
+  SESSION_STORE_UNREADABLE_RECONCILE_NOTICE,
 } from '@/lib/pane-reconcile'
 import { configureStore, type UnknownAction } from '@reduxjs/toolkit'
 import { ManagedRuntimeInventorySnapshotSchema } from '@shared/managed-runtime'
@@ -562,6 +563,34 @@ describe('foldVerdicts', () => {
     expect(dispatched.countOf(setPaneRestoreError.type)).toBe(1)
   })
 
+  it('folds error{session_store_unreadable} into an honest per-pane restore error, never warming', () => {
+    // Honest unreadable-store verdict (auto-restore-warming): the index is
+    // PUBLISHED but this identity's store could not be read — NOT warming
+    // (post-readiness warming would be a lying label). A per-pane error
+    // that preserves the session identity for a later reconnect retry.
+    const { req, dispatch, dispatched } = foldHarness([['error', { reason: 'session_store_unreadable' }]])
+    const outcome = foldVerdicts(dispatch, req, resultFor(req, dispatched.verdicts))
+    expect(outcome.warming).toBe(0)
+    expect(dispatched.countOf(setReconcileWarming.type)).toBe(0)
+    expect(dispatched.countOf(setPaneRestoreError.type)).toBe(1)
+    expect(dispatched.lastPayloadOf(setPaneRestoreError.type)).toMatchObject({
+      tabId: 'tab1',
+      paneId: 'p1',
+      restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'session_store_unreadable' },
+    })
+    // Delta fix finding 1: the terminal arm also mints the VISIBLE
+    // explanation (the dead-copy pattern) — a terminal pane latched
+    // unreadable must not be a silently dead pane. The mint is the durable
+    // copy source for TerminalView's notice-line machinery, cleared with
+    // the latch by the recovery folds.
+    expect(dispatched.countOf(setPaneReconcileNotice.type)).toBe(1)
+    expect(dispatched.lastPayloadOf(setPaneReconcileNotice.type)).toMatchObject({
+      tabId: 'tab1',
+      paneId: 'p1',
+      notice: SESSION_STORE_UNREADABLE_RECONCILE_NOTICE,
+    })
+  })
+
   it('invalid becomes a per-pane restoreError and counts as invalid', () => {
     const { req, dispatch, dispatched } = foldHarness([['invalid', { reason: 'unsupported_kind' }]])
     const outcome = foldVerdicts(dispatch, req, resultFor(req, dispatched.verdicts))
@@ -651,6 +680,486 @@ describe('foldVerdicts stale-verdict identity guard (delta round 4, finding 2)',
       reason: 'durable_artifact_missing',
     })
     expect(isDeadSessionReconcileNotice(content.reconcileNotice)).toBe(true)
+  })
+})
+
+describe('foldVerdicts FreshUnbound reconnect carrier (focused repair round 5, Major)', () => {
+  // The cap-round hole: the live terminal.replaced fold clears the pane's
+  // stale session identity, but a browser DISCONNECTED during the
+  // server-side auto-resume (or reloaded after it) never sees that frame.
+  // Its reconnection goes through pane.reconcile, and the identity-less
+  // attach verdict must carry the same clearing signal — the pane attaches
+  // the NEW terminal while its saved sessionRef still names the deleted
+  // conversation; without the signal the stale id survives the fold, and
+  // the fresh conversation's later association (a new id with NO
+  // previousSessionId) is rejected by the conflict rule forever.
+  function realStorePanes() {
+    return configureStore({ reducer: { panes: panesReducer } })
+  }
+
+  function seedFreshUnboundReplacedPane(store: ReturnType<typeof realStorePanes>) {
+    store.dispatch(initLayout({
+      tabId: 'tab1',
+      paneId: 'p1',
+      content: {
+        kind: 'terminal',
+        mode: 'antigravity',
+        shell: 'system',
+        createRequestId: 'cr-keep',
+        status: 'running',
+        // The pane's pre-replacement view: the dead predecessor's handle and
+        // the stale identity the resume gate refused (the frames that would
+        // have corrected these never arrived — the browser was disconnected).
+        terminalId: 'term-crashed',
+        sessionRef: { provider: 'antigravity', sessionId: 'deleted-conversation' },
+        resumeSessionId: 'deleted-conversation',
+      },
+    }))
+  }
+
+  function leafContent(store: ReturnType<typeof realStorePanes>): TerminalPaneContent {
+    const layout = store.getState().panes.layouts['tab1'] as { type: 'leaf'; content: TerminalPaneContent }
+    return layout.content
+  }
+
+  it('the reconnect attach of a FreshUnbound-replaced pane clears the stale session identity', () => {
+    const store = realStorePanes()
+    seedFreshUnboundReplacedPane(store)
+    const req = buildReconcileRequest(asRootState(store.getState().panes))!
+    expect(req.panes[0].sessionRef).toEqual({
+      provider: 'antigravity',
+      sessionId: 'deleted-conversation',
+    })
+
+    // The server's verdict: row-1 attach of the identity-less replacement
+    // terminal, carrying the fresh_unbound disposition (the mirror of the
+    // terminal.replaced frame the pane missed).
+    const result = resultFor(req, [{
+      paneKey: req.panes[0].paneKey,
+      verdict: 'attach',
+      terminalId: 'term-fresh',
+      identityDisposition: 'fresh_unbound',
+    }])
+    foldVerdicts(store.dispatch, req, result)
+
+    const c = leafContent(store)
+    expect(c.terminalId).toBe('term-fresh')
+    expect(c.createRequestId).toBe('cr-keep') // council rule: never re-minted
+    expect(c.sessionRef).toBeUndefined()
+    expect(c.resumeSessionId).toBeUndefined()
+  })
+
+  it('a plain identity-less attach that is NOT a FreshUnbound replacement retains the pane\'s sessionRef', () => {
+    // The young-pane guard: an identity-less attach is ORDINARY while the
+    // terminal's identity has not been captured yet (e.g. a young resume
+    // pane waiting for the CLI's association) — no disposition, no
+    // clearing, or the fold would nuke a still-valid resume intent.
+    const store = realStorePanes()
+    seedFreshUnboundReplacedPane(store)
+    const req = buildReconcileRequest(asRootState(store.getState().panes))!
+    const result = resultFor(req, [{
+      paneKey: req.panes[0].paneKey,
+      verdict: 'attach',
+      terminalId: 'term-young',
+    }])
+    foldVerdicts(store.dispatch, req, result)
+
+    const c = leafContent(store)
+    expect(c.terminalId).toBe('term-young')
+    expect(c.sessionRef).toEqual({ provider: 'antigravity', sessionId: 'deleted-conversation' })
+    expect(c.resumeSessionId).toBe('deleted-conversation')
+  })
+
+  it('the attach fold maps the fresh_unbound disposition onto clearSessionIdentity in the dispatched payload', () => {
+    const store = realStorePanes()
+    seedFreshUnboundReplacedPane(store)
+    const req = buildReconcileRequest(asRootState(store.getState().panes))!
+    const { dispatch, dispatched } = recordingDispatch()
+    const result = resultFor(req, [{
+      paneKey: req.panes[0].paneKey,
+      verdict: 'attach',
+      terminalId: 'term-fresh',
+      identityDisposition: 'fresh_unbound',
+    }])
+    foldVerdicts(dispatch, req, result)
+    expect(dispatched.lastPayloadOf(applyReconcileAttach.type)).toMatchObject({
+      tabId: 'tab1',
+      paneId: 'p1',
+      terminalId: 'term-fresh',
+      clearSessionIdentity: true,
+    })
+  })
+
+  // Final-delta review round 2, Fix 1 (Major): the pane missed the live
+  // terminal.replaced frame entirely (disconnected during the server-side
+  // auto-resume), so it ALSO missed that frame's staleSessionNotice — the
+  // only operator-visible explanation naming the lost conversation. The
+  // reconnect verdict must carry the notice beside the fresh_unbound
+  // disposition, and the fold must surface it exactly as the live replaced
+  // fold does: the pane-level dismissible staleSessionNotice.
+  it('the reconnect attach of a FreshUnbound-replaced pane surfaces the stale-id notice the pane missed', () => {
+    const store = realStorePanes()
+    seedFreshUnboundReplacedPane(store)
+    const req = buildReconcileRequest(asRootState(store.getState().panes))!
+    const notice = 'Saved antigravity session 11111111-2222-3333-4444-555555555555 could not be found on disk — started a fresh session instead.'
+    const result = resultFor(req, [{
+      paneKey: req.panes[0].paneKey,
+      verdict: 'attach',
+      terminalId: 'term-fresh',
+      identityDisposition: 'fresh_unbound',
+      staleSessionNotice: notice,
+    }])
+    foldVerdicts(store.dispatch, req, result)
+
+    const c = leafContent(store)
+    expect(c.terminalId).toBe('term-fresh')
+    expect(c.staleSessionNotice).toBe(notice)
+  })
+
+  it('a fresh_unbound attach verdict without a notice (older server) surfaces no stale-session notice', () => {
+    const store = realStorePanes()
+    seedFreshUnboundReplacedPane(store)
+    const req = buildReconcileRequest(asRootState(store.getState().panes))!
+    const result = resultFor(req, [{
+      paneKey: req.panes[0].paneKey,
+      verdict: 'attach',
+      terminalId: 'term-fresh',
+      identityDisposition: 'fresh_unbound',
+    }])
+    foldVerdicts(store.dispatch, req, result)
+
+    expect(leafContent(store).staleSessionNotice).toBeUndefined()
+  })
+
+  it('a plain identity-less attach verdict carries no stale-session notice surface', () => {
+    // The young-pane guard's notice twin: an ORDINARY identity-less attach
+    // (no disposition) never writes a stale-session notice — only the
+    // FreshUnbound reconnect carrier does.
+    const store = realStorePanes()
+    seedFreshUnboundReplacedPane(store)
+    const req = buildReconcileRequest(asRootState(store.getState().panes))!
+    const result = resultFor(req, [{
+      paneKey: req.panes[0].paneKey,
+      verdict: 'attach',
+      terminalId: 'term-young',
+    }])
+    foldVerdicts(store.dispatch, req, result)
+
+    expect(leafContent(store).staleSessionNotice).toBeUndefined()
+  })
+})
+
+describe('foldVerdicts identity guards on every fold arm (auto-restore-warming round-2 findings 2+3)', () => {
+  // The guards live in the reducers the fold dispatches to, and the warming
+  // refs are minted identity-bound; these pins drive a REAL store through
+  // the Replace-pane rebind flow the kata names (same paneId, re-keyed
+  // content with a NEW createRequestId).
+  function realStoreWithTerminalPanes(paneIds: string[]) {
+    const store = configureStore({ reducer: { panes: panesReducer } })
+    for (const paneId of paneIds) {
+      store.dispatch(initLayout({
+        tabId: `tab-${paneId}`,
+        paneId,
+        content: {
+          kind: 'terminal',
+          mode: 'claude',
+          shell: 'system',
+          createRequestId: `cr-${paneId}`,
+          status: 'creating',
+        },
+      }))
+    }
+    return store
+  }
+
+  function rebindPane(
+    store: ReturnType<typeof realStoreWithTerminalPanes>,
+    tabId: string,
+    paneId: string,
+    newCreateRequestId: string,
+  ): void {
+    store.dispatch(replacePane({ tabId, paneId }))
+    store.dispatch(updatePaneContent({
+      tabId,
+      paneId,
+      content: {
+        kind: 'terminal',
+        mode: 'claude',
+        shell: 'system',
+        createRequestId: newCreateRequestId,
+        status: 'creating',
+      },
+    }))
+  }
+
+  function leafContentOf<T extends TerminalPaneContent | FreshAgentPaneContent>(
+    store: ReturnType<typeof realStoreWithTerminalPanes> | { getState(): { panes: { layouts: Record<string, PaneNode> } } },
+    tabId: string,
+  ): T {
+    const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: T }
+    return layout.content
+  }
+
+  it('a stale attach verdict for a replaced pane (new createRequestId) folds NOTHING onto the rebound content', () => {
+    const store = realStoreWithTerminalPanes(['p1'])
+    // A reconcile request goes out carrying the OLD content's identity.
+    const req = buildReconcileRequest(asRootState(store.getState().panes))!
+    expect(req.panes[0].createRequestId).toBe('cr-p1')
+
+    // While the verdict is in flight the pane is re-keyed (Replace pane
+    // keeps the paneId, new content mints a NEW createRequestId).
+    rebindPane(store, 'tab-p1', 'p1', 'cr-new')
+
+    // The OLD request's attach verdict arrives: RED while the attach arm
+    // supplies no identity guard — the live handle would land on the
+    // replacement and re-key its lifecycle from a verdict that describes
+    // the replaced-away content.
+    foldVerdicts(store.dispatch, req, resultFor(req, [
+      { paneKey: req.panes[0].paneKey, verdict: 'attach', terminalId: 'live-1' },
+    ]))
+
+    const c = leafContentOf<TerminalPaneContent>(store, 'tab-p1')
+    expect(c.createRequestId).toBe('cr-new')
+    expect(c.terminalId).toBeUndefined()
+    expect(c.status).toBe('creating')
+    expect(c.reconcileEpoch).toBeUndefined()
+    expect(c.sessionRef).toBeUndefined()
+    expect(c.reconcileNotice).toBeUndefined()
+  })
+
+  it('a stale respawn/fresh verdict for a replaced pane folds NOTHING (expectedCreateRequestId guard)', () => {
+    const store = realStoreWithTerminalPanes(['p1', 'p2'])
+    const req = buildReconcileRequest(asRootState(store.getState().panes))!
+    rebindPane(store, 'tab-p1', 'p1', 'cr-p1-new')
+    rebindPane(store, 'tab-p2', 'p2', 'cr-p2-new')
+
+    foldVerdicts(store.dispatch, req, resultFor(req, [
+      { paneKey: req.panes[0].paneKey, verdict: 'respawn', sessionRef: { provider: 'claude', sessionId: 'srv-truth' } },
+      { paneKey: req.panes[1].paneKey, verdict: 'fresh', reason: 'identity_never_observed' },
+    ]))
+
+    const respawned = leafContentOf<TerminalPaneContent>(store, 'tab-p1')
+    expect(respawned.createRequestId).toBe('cr-p1-new')
+    expect(respawned.sessionRef).toBeUndefined()
+    expect(respawned.pendingReconcile).toBeUndefined()
+    expect(respawned.reconcileEpoch).toBeUndefined()
+    expect(respawned.status).toBe('creating')
+    const freshened = leafContentOf<TerminalPaneContent>(store, 'tab-p2')
+    expect(freshened.createRequestId).toBe('cr-p2-new')
+    expect(freshened.pendingReconcile).toBeUndefined()
+    expect(freshened.reconcileNotice).toBeUndefined()
+    expect(freshened.reconcileEpoch).toBeUndefined()
+  })
+
+  it('a stale error verdict (session_store_unreadable / provider_runtime_failed) for a replaced pane folds NOTHING — it cannot latch a wrong error onto the rebound content and block its restoration', () => {
+    const store = realStoreWithTerminalPanes(['p1', 'p2'])
+    const req = buildReconcileRequest(asRootState(store.getState().panes))!
+    rebindPane(store, 'tab-p1', 'p1', 'cr-p1-new')
+    rebindPane(store, 'tab-p2', 'p2', 'cr-p2-new')
+
+    // A delayed honest-error verdict for the OLD identity must not latch a
+    // wrong restoreError onto the replacement — that would block its
+    // restoration with an error it never earned.
+    foldVerdicts(store.dispatch, req, resultFor(req, [
+      { paneKey: req.panes[0].paneKey, verdict: 'error', reason: 'session_store_unreadable' },
+      { paneKey: req.panes[1].paneKey, verdict: 'error', reason: 'provider_unavailable' },
+    ]))
+
+    expect(leafContentOf<TerminalPaneContent>(store, 'tab-p1').restoreError).toBeUndefined()
+    expect(leafContentOf<TerminalPaneContent>(store, 'tab-p1').createRequestId).toBe('cr-p1-new')
+    expect(leafContentOf<TerminalPaneContent>(store, 'tab-p2').restoreError).toBeUndefined()
+    expect(leafContentOf<TerminalPaneContent>(store, 'tab-p2').createRequestId).toBe('cr-p2-new')
+  })
+
+  it('a stale fresh-agent attach/respawn verdict for a replaced pane folds NOTHING (fresh-agent arms guarded too)', () => {
+    const store = configureStore({ reducer: { panes: panesReducer } })
+    for (const tabId of ['tab-f1', 'tab-f2']) {
+      store.dispatch(initLayout({
+        tabId,
+        paneId: 'fp',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
+          createRequestId: `cr-${tabId}`,
+          status: 'creating',
+        } as any,
+      }))
+    }
+    const req = buildReconcileRequest(asRootState(store.getState().panes), { includeFreshAgent: true })!
+    expect(req.panes).toHaveLength(2)
+    for (const [tabId, newId] of [['tab-f1', 'cr-tab-f1-new'], ['tab-f2', 'cr-tab-f2-new']] as const) {
+      store.dispatch(replacePane({ tabId, paneId: 'fp' }))
+      store.dispatch(updatePaneContent({
+        tabId,
+        paneId: 'fp',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
+          createRequestId: newId,
+          status: 'creating',
+        } as any,
+      }))
+    }
+
+    foldVerdicts(store.dispatch, req, resultFor(req, [
+      { paneKey: req.panes[0].paneKey, verdict: 'attach', sessionRef: { provider: 'claude', sessionId: 'sess-1' } },
+      { paneKey: req.panes[1].paneKey, verdict: 'respawn', sessionRef: { provider: 'claude', sessionId: 'srv-truth' } },
+    ]))
+
+    const attached = leafContentOf<FreshAgentPaneContent>(store, 'tab-f1')
+    expect(attached.createRequestId).toBe('cr-tab-f1-new')
+    expect(attached.sessionId).toBeUndefined()
+    expect(attached.sessionRef).toBeUndefined()
+    expect(attached.status).toBe('creating')
+    expect(attached.reconcileEpoch).toBeUndefined()
+    const respawned = leafContentOf<FreshAgentPaneContent>(store, 'tab-f2')
+    expect(respawned.createRequestId).toBe('cr-tab-f2-new')
+    expect(respawned.sessionRef).toBeUndefined()
+    expect(respawned.pendingReconcile).toBeUndefined()
+    expect(respawned.reconcileEpoch).toBeUndefined()
+  })
+
+  it('the warming paneRefs carry the parked createRequestId and foldVerdicts mints them from the request pane claims', () => {
+    const { req, dispatch, dispatched } = foldHarness([
+      ['error', { reason: 'index_warming' }],
+      ['error', { reason: 'index_warming' }],
+    ])
+    const outcome = foldVerdicts(dispatch, req, resultFor(req, dispatched.verdicts))
+    expect(outcome.warming).toBe(2)
+    expect(dispatched.lastPayloadOf(setReconcileWarming.type)).toMatchObject({
+      count: 2,
+      paneRefs: [
+        { tabId: 'tab1', paneId: 'p1', createRequestId: 'cr-p1' },
+        { tabId: 'tab2', paneId: 'p2', createRequestId: 'cr-p2' },
+      ],
+    })
+  })
+
+  it('a stale fresh-agent error verdict for a replaced pane folds NOTHING onto the rebound content', () => {
+    const store = configureStore({ reducer: { panes: panesReducer } })
+    store.dispatch(initLayout({
+      tabId: 'tab-f1',
+      paneId: 'fp',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'cr-f1',
+        status: 'creating',
+      } as any,
+    }))
+    const req = buildReconcileRequest(asRootState(store.getState().panes), { includeFreshAgent: true })!
+    store.dispatch(replacePane({ tabId: 'tab-f1', paneId: 'fp' }))
+    store.dispatch(updatePaneContent({
+      tabId: 'tab-f1',
+      paneId: 'fp',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'cr-f1-new',
+        status: 'creating',
+      } as any,
+    }))
+
+    foldVerdicts(store.dispatch, req, resultFor(req, [
+      { paneKey: req.panes[0].paneKey, verdict: 'error', reason: 'session_store_unreadable' },
+    ]))
+
+    const c = leafContentOf<FreshAgentPaneContent>(store, 'tab-f1')
+    expect(c.createRequestId).toBe('cr-f1-new')
+    expect(c.restoreError).toBeUndefined()
+  })
+
+  it('a stale invalid verdict for a replaced pane folds NOTHING — no restoreError latch, no rejected-pane notice', () => {
+    const store = realStoreWithTerminalPanes(['p1'])
+    const req = buildReconcileRequest(asRootState(store.getState().panes))!
+    expect(req.panes[0].createRequestId).toBe('cr-p1')
+
+    rebindPane(store, 'tab-p1', 'p1', 'cr-p1-new')
+
+    // The OLD request's invalid verdict carries a reason, so the arm
+    // dispatches BOTH the restoreError latch and the rejected-pane notice
+    // — neither may land on the rebound content.
+    foldVerdicts(store.dispatch, req, resultFor(req, [
+      { paneKey: req.panes[0].paneKey, verdict: 'invalid', reason: 'unsupported_kind' },
+    ]))
+
+    const rebound = leafContentOf<TerminalPaneContent>(store, 'tab-p1')
+    expect(rebound.createRequestId).toBe('cr-p1-new')
+    expect(rebound.restoreError).toBeUndefined()
+    expect(rebound.reconcileNotice).toBeUndefined()
+    expect(rebound.status).toBe('creating')
+  })
+
+  function realStoreWithFreshAgentPane(tabId: string, createRequestId: string) {
+    const store = configureStore({ reducer: { panes: panesReducer } })
+    store.dispatch(initLayout({
+      tabId,
+      paneId: 'fp',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId,
+        status: 'creating',
+      } as any,
+    }))
+    return store
+  }
+
+  function rebindFreshAgentPane(
+    store: ReturnType<typeof realStoreWithFreshAgentPane>,
+    tabId: string,
+    newCreateRequestId: string,
+  ): void {
+    store.dispatch(replacePane({ tabId, paneId: 'fp' }))
+    store.dispatch(updatePaneContent({
+      tabId,
+      paneId: 'fp',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: newCreateRequestId,
+        status: 'creating',
+      } as any,
+    }))
+  }
+
+  it('a stale fresh-agent dead_session verdict for a replaced pane folds NOTHING onto the rebound content', () => {
+    const store = realStoreWithFreshAgentPane('tab-f1', 'cr-f1')
+    const req = buildReconcileRequest(asRootState(store.getState().panes), { includeFreshAgent: true })!
+    expect(req.panes[0].createRequestId).toBe('cr-f1')
+    rebindFreshAgentPane(store, 'tab-f1', 'cr-f1-new')
+
+    foldVerdicts(store.dispatch, req, resultFor(req, [
+      { paneKey: req.panes[0].paneKey, verdict: 'dead_session', sessionRef: { provider: 'claude', sessionId: 'gone-1' }, reason: 'session_missing' },
+    ]))
+
+    const c = leafContentOf<FreshAgentPaneContent>(store, 'tab-f1')
+    expect(c.createRequestId).toBe('cr-f1-new')
+    expect(c.restoreError).toBeUndefined()
+  })
+
+  it('a stale fresh-agent invalid verdict for a replaced pane folds NOTHING onto the rebound content', () => {
+    const store = realStoreWithFreshAgentPane('tab-f1', 'cr-f1')
+    const req = buildReconcileRequest(asRootState(store.getState().panes), { includeFreshAgent: true })!
+    rebindFreshAgentPane(store, 'tab-f1', 'cr-f1-new')
+
+    // Reason present, so the arm dispatches BOTH the restoreError latch
+    // and the rejected-pane notice — neither may land on the rebound
+    // content.
+    foldVerdicts(store.dispatch, req, resultFor(req, [
+      { paneKey: req.panes[0].paneKey, verdict: 'invalid', reason: 'unsupported_kind' },
+    ]))
+
+    const c = leafContentOf<FreshAgentPaneContent>(store, 'tab-f1')
+    expect(c.createRequestId).toBe('cr-f1-new')
+    expect(c.restoreError).toBeUndefined()
+    expect(c.reconcileNotice).toBeUndefined()
   })
 })
 

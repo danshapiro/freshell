@@ -464,15 +464,17 @@ pub struct AntigravityActivityRecord {
 
 /// Bounded BACKWARD tolerance for the antigravity recency rule (whole-delta
 /// review round 3, Major 1; shared by round 4, Minor 1): a matching user
-/// record whose own `at` is within this window BEFORE the captured submit
-/// timestamp still counts as at/after-that-submit. The registry writes input
-/// to the PTY BEFORE timestamping the `ActivityEvent::Input`
+/// record whose own `created_at` is within this window BEFORE the captured
+/// submit timestamp still counts as at/after-that-submit. The registry
+/// writes input to the PTY BEFORE timestamping the `ActivityEvent::Input`
 /// (registry.rs:3890,3931), so the CLI child — on another core — can append
-/// its `user_message` record between the write and our stamp, with an `at`
-/// that precedes the submit. The bound covers cross-process/cross-clock
-/// skew (the CLI's own `at` granularity is a Stage-1 unknown; NTP slew adds
-/// seconds), NOT history: it is 12× below the 60 s pending lifetime, so
-/// minutes-old conversations stay rejected.
+/// its `USER_INPUT` record between the write and our stamp, with a
+/// `created_at` that precedes the submit. The bound covers
+/// cross-process/cross-clock skew (the CLI's own `created_at` granularity
+/// is binary-evidenced at RFC3339 SECONDS — agy 1.4.12,
+/// real-binary-transcript-evidence.md; NTP slew adds seconds), NOT history:
+/// it is 12× below the 60 s pending lifetime, so minutes-old conversations
+/// stay rejected.
 ///
 /// Canonical home (round 4, Minor 1 — one number, never forked):
 /// `freshell-sessions`' locator recency rule AND `freshell-activity`'s

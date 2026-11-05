@@ -230,6 +230,7 @@ async fn spawn_server_returning_state(
     identity.set_session_naming(sink.clone());
 
     let state = freshell_ws::WsState {
+        session_index_ready: None,
         layout: Default::default(),
         terminal_meta: Default::default(),
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(

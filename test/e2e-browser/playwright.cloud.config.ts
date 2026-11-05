@@ -1,6 +1,6 @@
 import { defineConfig } from '@playwright/test'
 import baseConfig from './playwright.config.js'
-import { LOCAL_ONLY_SPECS, managedExternal } from './playwright.config.js'
+import { LOCAL_ONLY_SPECS, managedExternal, managedExternalP2G01Artifacts } from './playwright.config.js'
 import { fileURLToPath } from 'node:url'
 
 // Cloud Run Playwright config.
@@ -40,13 +40,6 @@ export const CLOUD_SKIP_SPECS = [
   'freshopencode-db-history.spec.ts',
   'freshopencode-restart-recovery.spec.ts',
   'freshopencode-first-send-reload-repro.spec.ts',
-  // Same provider-lifecycle-timing class as its model above, plus a
-  // backoff-guarded daemon respawn window: 2-CPU/2-worker cloud contention
-  // cannot guarantee daemon-death + re-warm timing. Cloud PR coverage for
-  // the incident class is carried by the cloud-legal
-  // freshopencode-snapshot-409-recovery.spec.ts; this spec is the local-lane
-  // end-to-end proof.
-  'freshopencode-daemon-death-selfheal.spec.ts',
   'opencode-restart-recovery.spec.ts',
   'opencode-terminal-restore-rust.spec.ts',
   // Requires codex binary
@@ -78,6 +71,13 @@ export const CLOUD_SKIP_SPECS = [
   // Environment-sensitive: checkpoint/rewind with fake codex sidecar
   // exceeds 120s timeout under cloud resource constraints
   'agent-checkpoint-rewind.spec.ts',
+  // The auto-restore-warming acceptance spec holds every boot's session
+  // index publish behind FRESHELL_TEST_SESSION_INDEX_STARTUP_HOLD_MS (15s
+  // per boot, twice per test) and ends in a stable-count settle (two
+  // samples >=5s apart): the bodies exceed the cloud 120s budget under
+  // 2-worker contention (same class as agent-checkpoint-rewind.spec.ts).
+  // The configured backend is local; the spec is executed there.
+  'reconcile-auto-restore-warming-rust.spec.ts',
   // Local-only receipts need provider binaries or a host Docker supervisor
   // and broker. Their positive selectors are exported by the base config.
   ...LOCAL_ONLY_SPECS.map(({ spec }) => spec),
@@ -110,7 +110,8 @@ export default defineConfig({
   },
   reporter: [
     ['line'],
-    ['html', { open: 'never' }],
+    ['html', { open: 'never', ...(managedExternalP2G01Artifacts
+      ? { outputFolder: managedExternalP2G01Artifacts.htmlReportDir } : {}) }],
     ...(managedExternal ? [[fileURLToPath(new URL('../../scripts/testing/runtime-external-browser.ts', import.meta.url))] as const] : []),
     ...(retryEvidenceReportPath ? [['json', { outputFile: retryEvidenceReportPath }] as const] : []),
   ],

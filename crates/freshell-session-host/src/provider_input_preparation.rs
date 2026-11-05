@@ -297,7 +297,12 @@ pub(crate) async fn prepare_for_identity(
                 use freshell_platform::claude_inputs::{
                     settings_with_owned_hooks, INLINE_SETTINGS_SOURCE, MAX_NATIVE_SETTINGS_BYTES,
                 };
-                let raw = read_private(stage, INLINE_SETTINGS_SOURCE, MAX_NATIVE_SETTINGS_BYTES).map_err(|reason| format!("Claude inline --settings private source (native 2 MiB limit): {reason}"))?;
+                let raw = read_private(stage, INLINE_SETTINGS_SOURCE, MAX_NATIVE_SETTINGS_BYTES)
+                    .map_err(|reason| {
+                        format!(
+                            "Claude inline --settings private source (native 2 MiB limit): {reason}"
+                        )
+                    })?;
                 if format!("{:x}", Sha256::digest(&raw)) != *digest {
                     return Err("selected Claude inline settings source changed; retain inputs and reprepare before dispatch".into());
                 }
@@ -731,11 +736,13 @@ mod tests {
                 "foreign" => assert!(result
                     .expect_err("foreign native auth must be refused")
                     .contains("escaped owned HOME")),
-                "reserved" => assert!(result
-                    .expect_err(
-                        "reserved native keys must remain invalid even with no selected keys"
-                    )
-                    .contains("native auth file cannot be decoded")),
+                "reserved" => {
+                    assert!(result
+                        .expect_err(
+                            "reserved native keys must remain invalid even with no selected keys"
+                        )
+                        .contains("native auth file cannot be decoded"))
+                }
                 _ => unreachable!(),
             }
             return;
@@ -1863,7 +1870,10 @@ mod tests {
         let generated = prepare(Some(&context), &mut secrets, &frozen, &stage, &home)
             .await
             .unwrap();
-        assert!(secrets.opencode_plan.is_some(), "the accepted source plan must reach provider preparation without rescanning mounted templates");
+        assert!(
+            secrets.opencode_plan.is_some(),
+            "the accepted source plan must reach provider preparation without rescanning mounted templates"
+        );
         assert!(
             secrets
                 .opencode_plan
@@ -1874,10 +1884,15 @@ mod tests {
         let value=generated.get("FRESHELL_CONFIG_REFERENCE_0").expect("host must generate the selected native child source from private path inputs before dispatch");
         let expected = r#"{"instructions":["PRIVATE_PREFIX{file:/home/freshell/provider/.freshell/references/0}PRIVATE_SUFFIX"]}"#;
         assert_eq!(value, expected);
-        assert_eq!(generated.get("OPENCODE_CONFIG").map(String::as_str),
+        assert_eq!(
+            generated.get("OPENCODE_CONFIG").map(String::as_str),
             Some("/original-unavailable/project/opencode.json"),
-            "an explicitly selected native source must be delivered to the actual child environment");
-        assert!(!generated.contains_key("INSERT"),"independent generated recipes do not forward an original ambient variable into the native child");
+            "an explicitly selected native source must be delivered to the actual child environment"
+        );
+        assert!(
+            !generated.contains_key("INSERT"),
+            "independent generated recipes do not forward an original ambient variable into the native child"
+        );
         let current_bytes = serde_json::to_vec(&manifest).unwrap();
         let mut legacy: serde_json::Value = serde_json::from_slice(&current_bytes).unwrap();
         legacy["sources"][0]
@@ -1966,7 +1981,12 @@ mod tests {
             r#"{"instructions":["{file:/unapproved/private-file}"]}"#,
         )
         .unwrap();
-        assert!(prepare(Some(&context), &mut secrets, &frozen, &stage, &home).await.is_err(), "changed inline template must fail before an unapproved file can reach the native child");
+        assert!(
+            prepare(Some(&context), &mut secrets, &frozen, &stage, &home)
+                .await
+                .is_err(),
+            "changed inline template must fail before an unapproved file can reach the native child"
+        );
         manifest.sources[0].lane = SourceLane::Main;
         manifest.sources[0].template_sha256 = None;
         manifest.native_source_flags = native_flags;
@@ -1979,7 +1999,12 @@ mod tests {
             "{file:/different-unapproved/rules}".into(),
         )]))
         .unwrap();
-        assert!(prepare(Some(&context),&mut secrets,&changed,&stage,&home).await.is_err(),"changed lexical selection must fail without canonicalizing or reading an unavailable original tree");
+        assert!(
+            prepare(Some(&context), &mut secrets, &changed, &stage, &home)
+                .await
+                .is_err(),
+            "changed lexical selection must fail without canonicalizing or reading an unavailable original tree"
+        );
         assert_eq!(
             std::fs::read_to_string(stage.join(".freshell/source-views/source-0")).unwrap(),
             raw

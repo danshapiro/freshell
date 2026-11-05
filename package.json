@@ -39,6 +39,7 @@
     "electron:build": "pnpm run build && pnpm run build:electron && pnpm run build:wizard && pnpm run build:launch-chooser && pnpm run prepare:claude-sidecar && pnpm run prepare:electron-runtime && electron-builder --config config/electron-builder.yml && pnpm run verify:electron-artifact",
     "electron:build:win": "tsx scripts/assert-native-windows-build.ts && pnpm run build && pnpm run build:electron && pnpm run build:wizard && pnpm run build:launch-chooser && pnpm run prepare:claude-sidecar && pnpm run prepare:electron-runtime && electron-builder --config config/electron-builder.yml --win nsis --publish never && pnpm run verify:electron-artifact",
     "prepare:rust-runtime": "tsx scripts/prepare-rust-runtime.ts",
+    "update:managed-runtime": "tsx scripts/update-managed-runtime.ts",
     "prepare:claude-sidecar": "tsx scripts/ensure-claude-sidecar.ts",
     "prepare:electron-runtime": "tsx scripts/prepare-electron-runtime.ts",
     "verify:electron-artifact": "tsx scripts/verify-electron-artifact.ts",

@@ -106,12 +106,24 @@ struct Server {
 /// so tests can seed and assert deterministically (the §9.1 headless
 /// convention).
 async fn spawn_server_with_probe(probe: Arc<StubProbe>) -> Server {
-    spawn_server_with_claude_environment(probe, None).await
+    spawn_server_with_options(probe, None, |_| {}).await
 }
 
 async fn spawn_server_with_claude_environment(
     probe: Arc<StubProbe>,
     environment: Option<Vec<(String, String)>>,
+) -> Server {
+    spawn_server_with_options(probe, environment, |_| {}).await
+}
+
+/// [`spawn_server_with_probe`] plus a `WsState` mutator (e.g. shrink the
+/// warming deferral budget — kata vnpc Task 4's parked
+/// error{index_warming} fresh-agent verdicts arm the handler's single
+/// deferral, and the tests must not wait a real 2s per request).
+async fn spawn_server_with_options(
+    probe: Arc<StubProbe>,
+    environment: Option<Vec<(String, String)>>,
+    mutate: impl FnOnce(&mut WsState),
 ) -> Server {
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
@@ -130,7 +142,8 @@ async fn spawn_server_with_claude_environment(
         fresh_claude = fresh_claude.with_sidecar_environment(environment);
     }
 
-    let state = WsState {
+    let mut state = WsState {
+        session_index_ready: None,
         layout: Default::default(),
         terminal_meta: Default::default(),
         pane_ledger: Arc::clone(&pane_ledger),
@@ -185,6 +198,7 @@ async fn spawn_server_with_claude_environment(
         fresh_agent_respawn_counts: Arc::clone(&respawn_counts),
         ownership: None,
     };
+    mutate(&mut state);
 
     let router = freshell_ws::router(state);
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -530,13 +544,16 @@ async fn warming_deferral_rederivation_burns_the_respawn_counter_once() {
     );
 }
 
-/// WAVE-B B1xB4 seam pin: B1's `ProviderUnavailable` existence answer maps to
-/// the B4 pre-decision (V9/A12): presence Unknown => conservative
-/// respawn-with-cap -- never dead_session, and never the terminal arm's
-/// error{provider_unavailable} shape (fresh-agent liveness does not depend on
-/// the disk index being able to warm).
+/// Kata vnpc Task 4 (round-3 finding 2): a fresh-agent pane for a provider
+/// whose session root is missing on this machine derives the honest
+/// error{provider_unavailable} — NEVER a respawn. The July §3 doctrine
+/// (fresh-agent liveness does not depend on the disk index warming) is
+/// served by the error, not by the pre-change fail-open respawn-with-cap;
+/// a respawn for an uninstalled provider would have burned the counter
+/// toward a false dead_session{respawn_exhausted}. Replaces the
+/// pre-parking pin `provider_unavailable_existence_maps_to_respawn_with_cap`.
 #[tokio::test]
-async fn provider_unavailable_existence_maps_to_respawn_with_cap() {
+async fn fresh_agent_provider_unavailable_yields_the_honest_error_never_a_respawn() {
     let probe = std::sync::Arc::new(StubProbe::default());
     probe.answers.lock().unwrap().insert(
         ("codex".into(), "pu-1".into()),
@@ -552,13 +569,139 @@ async fn provider_unavailable_existence_maps_to_respawn_with_cap() {
         ]),
     )
     .await;
-    assert_eq!(verdicts[0]["verdict"], "respawn");
-    assert_eq!(verdicts[0]["sessionRef"]["sessionId"], "pu-1");
+    assert_eq!(verdicts[0]["verdict"], "error");
+    assert_eq!(verdicts[0]["reason"], "provider_unavailable");
+    assert_eq!(
+        verdicts[0]["sessionRef"]["sessionId"], "pu-1",
+        "identity retained for the error UI"
+    );
     let counts = server.respawn_counts.lock().expect("counts lock");
     assert_eq!(
         counts.get(&("codex".into(), "pu-1".into())).copied(),
+        None,
+        "the honest error burns ZERO respawn counter"
+    );
+}
+
+/// Kata vnpc Task 4 (round-1 finding 4): a fresh-agent pane whose probe
+/// answers Unreadable derives error{session_store_unreadable} — the respawn
+/// counter burns ZERO, the pane keeps its session identity, and the fold
+/// surfaces the honest error. Never a respawn (the store may hold the
+/// session; an unreadable-store respawn loop would march the counter toward
+/// a false dead_session{respawn_exhausted}), never dead_session/fresh.
+#[tokio::test]
+async fn fresh_agent_unreadable_presence_yields_the_honest_error_never_a_respawn() {
+    let probe = std::sync::Arc::new(StubProbe::default());
+    probe.answers.lock().unwrap().insert(
+        ("opencode".into(), "locked-1".into()),
+        SessionExistence::Unreadable,
+    );
+    let server = spawn_server_with_probe(probe).await;
+    let (mut ws, _ready) = connect(&server.url, true, true).await;
+    let verdicts = reconcile_request(
+        &mut ws,
+        serde_json::json!([
+            { "paneKey": "u", "kind": "fresh-agent",
+              "sessionRef": {"provider": "opencode", "sessionId": "locked-1"} }
+        ]),
+    )
+    .await;
+    assert_eq!(verdicts[0]["verdict"], "error");
+    assert_eq!(verdicts[0]["reason"], "session_store_unreadable");
+    assert_eq!(
+        verdicts[0]["sessionRef"]["sessionId"], "locked-1",
+        "identity retained — never replaced with a new conversation"
+    );
+    let counts = server.respawn_counts.lock().expect("counts lock");
+    assert_eq!(
+        counts.get(&("opencode".into(), "locked-1".into())).copied(),
+        None,
+        "an unreadable store must not burn the respawn counter"
+    );
+}
+
+/// Kata vnpc Task 4 (round-3 finding 2): probe Unknown + NO ledger
+/// ever_bound evidence ⇒ error{index_warming} (park until readiness-driven
+/// recovery re-derives), respawn counter UNTOUCHED across repeated cold
+/// reconciles — three reconnects during a slow scan must not manufacture a
+/// false dead_session{respawn_exhausted} for a session the index never
+/// adjudicated. Unknown WITH ledger ever_bound evidence keeps OnDisk ⇒
+/// respawn (positive disk truth, subject to the existing cap).
+#[tokio::test]
+async fn fresh_agent_cold_unknown_parks_as_warming_and_burns_no_respawn_counter() {
+    let probe = std::sync::Arc::new(StubProbe::default());
+    // ("codex", "cold-1") stays unset => StubProbe answers Unknown; no
+    // ledger binding is recorded for it either (the cold, unevidenced shape).
+    let server = spawn_server_with_options(probe, None, |state| {
+        state.reconcile_deferral_budget_ms = 10;
+    })
+    .await;
+    let (mut ws, _ready) = connect(&server.url, true, true).await;
+    for attempt in 0..3 {
+        let verdicts = reconcile_request(
+            &mut ws,
+            serde_json::json!([
+                { "paneKey": "c", "kind": "fresh-agent",
+                  "sessionRef": {"provider": "codex", "sessionId": "cold-1"} }
+            ]),
+        )
+        .await;
+        assert_eq!(verdicts[0]["verdict"], "error", "cold attempt {attempt}");
+        assert_eq!(verdicts[0]["reason"], "index_warming");
+        assert_eq!(verdicts[0]["sessionRef"]["sessionId"], "cold-1");
+    }
+    {
+        let counts = server.respawn_counts.lock().expect("counts lock");
+        assert_eq!(
+            counts.get(&("codex".into(), "cold-1".into())).copied(),
+            None,
+            "parked cold reconciles burn ZERO respawn counter"
+        );
+    }
+
+    // The evidenced twin: Unknown WITH ledger ever_bound evidence keeps
+    // OnDisk ⇒ respawn (positive disk truth — the ledger proves the session
+    // existed; the cold index must not park it).
+    server
+        .pane_ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            collaboration_mode: None,
+            genesis: freshell_ws::pane_ledger::GenesisWrite::Keep,
+            provider: "codex",
+            session_id: "bound-cold",
+            mode: "freshcodex",
+            cwd: Some("/w"),
+            create_request_id: None,
+            model: None,
+            sandbox: None,
+            permission_mode: None,
+            effort: None,
+            supersedes: None,
+            provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+            authoritative: false,
+            now_ms: 1_000,
+            plugins: None,
+        })
+        .unwrap();
+    let verdicts = reconcile_request(
+        &mut ws,
+        serde_json::json!([
+            { "paneKey": "b", "kind": "fresh-agent",
+              "sessionRef": {"provider": "codex", "sessionId": "bound-cold"} }
+        ]),
+    )
+    .await;
+    assert_eq!(
+        verdicts[0]["verdict"], "respawn",
+        "ledger-evidenced Unknown keeps the respawn doctrine"
+    );
+    let counts = server.respawn_counts.lock().expect("counts lock");
+    assert_eq!(
+        counts.get(&("codex".into(), "bound-cold".into())).copied(),
         Some(1),
-        "the answer counted against the respawn cap"
+        "the evidenced respawn burns exactly one"
     );
 }
 

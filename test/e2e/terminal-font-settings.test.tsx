@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, waitFor, cleanup } from '@testing-library/react'
+import { act, render, waitFor, cleanup } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import App from '@/App'
@@ -256,18 +256,10 @@ describe('terminal font preference (e2e)', () => {
   })
 
   it('hydrates a legacyLocalSettingsSeed terminal font into browser preferences when no local settings exist', async () => {
+    let resolveBootstrap!: (value: unknown) => void
+    const bootstrap = new Promise<unknown>((resolve) => { resolveBootstrap = resolve })
     mockApiGet.mockImplementation((url: string) => {
-      if (url === '/api/bootstrap') {
-        return Promise.resolve({
-          settings: defaultServerSettings,
-          legacyLocalSettingsSeed: {
-            terminal: {
-              fontFamily: 'Consolas',
-            },
-          },
-          platform: { platform: 'darwin' },
-        })
-      }
+      if (url === '/api/bootstrap') return bootstrap
       return Promise.resolve({})
     })
 
@@ -276,6 +268,20 @@ describe('terminal font preference (e2e)', () => {
 
     await waitFor(() => {
       expect(mockApiGet).toHaveBeenCalledWith('/api/bootstrap')
+    })
+    // An invocation is not completion. Release the response inside act so
+    // React and Redux finish consuming it before either hydration assertion.
+    await act(async () => {
+      resolveBootstrap({
+        settings: defaultServerSettings,
+        legacyLocalSettingsSeed: {
+          terminal: {
+            fontFamily: 'Consolas',
+          },
+        },
+        platform: { platform: 'darwin' },
+      })
+      await bootstrap
     })
 
     expect(store.getState().settings.settings.terminal.fontFamily).toBe('Consolas')

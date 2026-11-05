@@ -6,15 +6,17 @@ registry schema upgrade.
 
 ## Current staged release scope
 
-The current candidate checks for this repair are the four user-approved
-ordinary turns: terminal Codex and OpenCode, plus FreshCodex and FreshOpenCode.
-Claude live behavior remains unverified by explicit agreement. The configured
-full-suite gate, affected managed browser/smoke checks, and required independent
-reviews are also part of this run. Record actual results against the tested
-candidate in the repair's run record. Native recovery proofs and the
-backup/upgrade drill below are general rollout procedures, not acceptance
-gates for this repair. This runbook
-does not certify, promote, or describe an installed candidate. Managed
+The capability manifest enables four ordinary routes: terminal Codex and
+OpenCode, plus FreshCodex and FreshOpenCode. The provider-free UI continuity
+fixture for this repair creates all four through the ordinary picker paths and
+checks their identities across a web-only update, reload, and follow-up turn.
+It uses no live provider credentials or external model calls. The configured
+full-suite gate, affected managed browser/smoke checks, and required
+independent reviews are also part of this run. Record actual results against
+the tested candidate in the repair's run record. Native recovery proofs and
+the backup/upgrade drill below are general rollout procedures, not acceptance
+gates for this repair. This runbook does not certify, promote, or describe an
+installed candidate. Managed
 Amplifier and Kilroy remain unqualified and release-disabled. Their exclusion
 does not remove ordinary legacy CLI integrations or existing regression tests.
 
@@ -72,9 +74,33 @@ Install `installers/systemd/freshell-supervisor.service` and
 `installers/systemd/freshell-rust.service.d/managed-runtime.conf` under
 `~/.config/systemd/user/`, then reload systemd. Enable and start the supervisor
 first; verify its control socket exists with mode `0600`. The drop-in enables
-the feature and makes the Rust server depend on the supervisor. Restarting the
-existing production server still requires the user's exact **APPROVED**. Do not
-run Compose `down` or remove the runtime root during an ordinary rollout.
+the feature and orders the web server after the supervisor. It must not include
+`Requires=`, `Wants=`, or `Requisite=` between those units, because a web
+restart must not restart or stop the supervisor. When changing the installed
+drop-in, inspect the effective unit, install the ordering-only relationship,
+and run `systemctl --user daemon-reload` before updating. The updater rejects an
+effective graph where a web action can affect the supervisor. Fixture tests do
+not certify the installed unit graph. Do not run Compose `down` or remove the
+runtime root during an ordinary rollout.
+
+The canonical launcher adds the `managed-runtime-v1` feature to its build
+when `FRESHELL_MANAGED_RUNTIME_V1=1` is set and rejects a featureless binary.
+It can start a managed server only when that port is inactive and the
+configured supervisor socket and readable secret are available. Before
+printing ready, it checks authenticated runtime readiness and confirms that
+the readiness response matches the same supervisor identity before and after
+the request. It reports host-managed and unknown panes as outside durable-soul
+protection and leaves them running. Its `--stop` and `--restart` actions
+refuse a running managed server because they do not perform the pane census.
+
+The updater currently supports systemd-owned deployments only. A featureless
+or legacy server that returns 404 for authenticated
+`/api/runtime/readiness` cannot provide a complete pane census. The updater
+refuses before building or changing services; it cannot safely bootstrap that
+install. Keep existing work running, save or port host-agent sessions, and use
+a separate deliberate approved recovery. Verify authenticated runtime
+readiness against the intended supervisor before describing those agents as
+protected.
 
 For the intended fresh modes, the server also needs
 `FRESHELL_MANAGED_FRESH_AGENT_V1=1`. The checked-in managed-runtime server
@@ -90,6 +116,90 @@ be limited to the server host and `/api/runtime/*`, inject only `x-auth-token`,
 and be granted only to the machine's named agent. The OneCLI bridge must be
 allowed to reach the host's runtime API port; requests must actually use the
 OneCLI proxy rather than bypassing it through `NO_PROXY`.
+
+## Managed maintenance update modes
+
+Run updates from a host shell in the deployment checkout. A Freshell-managed
+pane runs inside a soul container and does not own the host systemd user
+manager or deployment checkout. The ordinary web/client update has no
+`APPROVED` gate and does not restart the durable supervisor or managed coding
+sessions. Use the reset-capable modes only when that reset is intended:
+
+```bash
+# Default: update web/client and restart only the web service.
+pnpm exec tsx scripts/update-managed-runtime.ts
+
+# Update web/client and durable runtime after resetting managed coding sessions.
+pnpm exec tsx scripts/update-managed-runtime.ts --all
+
+# Update durable runtime after reset; keep old web executable, client, callback.
+pnpm exec tsx scripts/update-managed-runtime.ts --durable-only
+```
+
+The default mode prints and records a reminder that the supervisor and managed
+sessions were not restarted and that reset-capable updates require the exact
+word `APPROVED`. It verifies authenticated runtime readiness and the intended
+supervisor installation identity before success. Generic HTTP health and a
+connected socket alone do not prove readiness.
+
+When `FRESHELL_MANAGED_RUNTIME_V1=1` is set, the web binary must include the
+compile-time `managed-runtime-v1` Cargo feature. The server refuses startup
+with a useful error if that feature is missing. The updater checks the staged
+server feature marker before installation, so a routine web update cannot
+install a binary that silently disables requested managed runtime.
+
+`--all` and `--durable-only` first resolve the selected mode, run read-only
+ownership, service-graph, persistent-resource, and candidate schema checks,
+then read one raw approval line. They accept only exactly `APPROVED`. Both
+reset managed coding sessions by default, preserve saved conversation
+history, and attempt to reopen saved conversations against the updated
+runtime. Recovery may need manual reopening or session porting. The updater
+does not guarantee successful recovery.
+
+Before reset-capable modes, complete the read-only registry preflight and
+verified old-schema backup procedure in
+[Upgrade an existing installation while preserving stores](#upgrade-an-existing-installation-while-preserving-stores).
+The candidate schema is checked before a candidate opens the live registry.
+The updater also checks the current/candidate schema versions before applying
+the selected mode. Do not treat a migration preview as a backup.
+
+Before build or service effects in any mode, the updater reads authenticated
+runtime readiness and the pane-ownership census. If an open pane is known to
+be host-managed or ownership cannot be established, it reports the pane and
+refuses before mutation. A known host-managed process remains running and
+usable. Unknown ownership is not evidence that a process is still running;
+the updater fails closed without trying to interrupt or migrate it. A second
+census runs after admitted work drains. If a host-owned pane appears during
+artifact preparation, the updater releases the temporary admission lease,
+refuses before stopping services, and leaves that known host-owned work
+running. Any migration that may interrupt such work is a separate deliberate
+operation.
+
+`--all` installs and starts the new web/client and durable runtime. The
+`--durable-only` mode keeps the old web executable, client directory, and
+callback peer selected while replacing the supervisor/workload; it restarts
+the old web process only as needed to restore and verify its callback to the
+new supervisor. The default mode replaces web/client and restarts only the
+web unit. All successful paths verify callback readiness where applicable and
+the authenticated runtime API against the intended supervisor identity.
+
+After the updater prints its run ID and transient unit, check service status
+and the unit journal, then inspect the JSONL completion record:
+
+```bash
+systemctl --user status freshell-rust.service freshell-supervisor.service
+journalctl --user -u <printed-transient-update-unit> --no-pager
+less ~/.freshell/logs/managed-runtime-update-<run-id>.jsonl
+```
+
+The JSONL log records candidate checks, ownership/readiness, service effects,
+reopen results, and `update.completed` or `update.failed`. On partial failure,
+preserve registry, provider/history, runtime, workspace, and installed
+artifacts. Use the log phase and live service state for forward recovery; do
+not assume automatic artifact rollback. Verify the old web process has
+stopped before reopening host-agent admission. Use the separate verified
+backup restore procedure only when it will not discard later writes or user
+intent.
 
 ## Preflight and dry run
 
@@ -200,23 +310,27 @@ Apply only after the backup and all blockers are recorded as successful. The
 change affects subsequent routing; it does not recreate already running souls.
 
 An existing managed-default installation does not need a routing transition
-merely to upgrade. This repair's acceptance remains the four user-approved
-ordinary-use checks, the final configured default suite, affected managed
-browser/smoke checks, and required independent reviews. A failed or unobserved
+merely to upgrade. This repair's provider-free UI continuity acceptance covers
+ordinary Codex and OpenCode terminal creation plus FreshCodex and FreshOpenCode
+through the same web-only update, reload, and follow-up turn. It runs alongside
+the separately selected update-mode, ownership, and maintenance-gate checks.
+The final configured default suite, affected managed browser/smoke checks, and
+required independent reviews are also part of the run. A failed or unobserved
 check is not acceptance. The native recovery proofs and backup/upgrade drill
-below remain
-operator rollout guidance but are outside this repair's acceptance. The old
-all-mode production/pressure campaign is not an additional delivery gate.
-Selected-mode results must never be reported as global campaign or Gate 5 PASS.
+below remain operator rollout guidance but are outside this repair's
+acceptance. The old all-mode production/pressure campaign is not an additional
+delivery gate. Selected-mode results must never be reported as global campaign
+or Gate 5 PASS.
 
 ## Upgrade an existing installation while preserving stores
 
 Preparation does not write live artifacts, open the live registry with the
 candidate, pause writers, or restart services. The deployment packet remains
 in private files outside Git. Use the repair's run record for current test and
-review results. The later operator rollout steps still require resolving running-owner
-and artifact metadata, verifying backups where applicable, and obtaining
-production approval.
+review results. Before a live update, resolve running-owner and artifact
+metadata and verify backups where the selected update can open or change the
+registry. The ordinary web/client update has no mode approval gate; the updater
+requires the exact word `APPROVED` only for `--all` and `--durable-only`.
 
 1. Identify the actual port-3001 server owner and supervisor owner, effective
    unit/drop-in or launcher commands, PID/cwd/executable, startup build identity,
@@ -263,35 +377,36 @@ production approval.
    only after that approval and fast-forward clean local main. Compare the
    merged source tree with the verified candidate; a changed runtime tree
    needs the relevant checks. Historical PR approval is not approval here.
-7. Present the concrete installation packet for the separate exact
-   **APPROVED**: verified artifacts and isolated backup/readability results,
-   actual owner-specific installation and restart commands, any backup
-   maintenance, live-backup boundary, post-install checks, and failure recovery.
-   A live backup not yet taken stays explicitly pending. Do not request
-   production approval while these preparation details are unresolved.
-8. Only after that approval, recheck exact ownership and candidate/main pins.
-   Create and independently verify the consistent old-schema live backup
-   **before any candidate registry opener**. Abort installation if integrity,
-   consistency, or old-build readability fails. Preserve the existing
-   registry/control/runtime/provider/session paths and prior artifacts/config.
-   Install the prepared candidate through the actual owning procedure in the
-   [self-hosted launch runbook](self-hosted-launch-runbook.md#managed-runtime-upgrades).
-   Restart the recorded supervisor first and verify control readiness, then
-   restart the owning server retaining port 3001. A launcher-owned server uses
-   `scripts/launch-rust.sh --skip-build --restart --port 3001` after installing
-   the prepared managed-feature binary; its default rebuild omits that feature.
-   Never use the launcher to control a systemd-owned server.
-9. Check health, startup build/features, effective image, intended four-mode
-   admission, structured errors, and preserved inventory/history metadata.
-   Do not import, prompt, or start historical conversations as a smoke test.
-   No historical repair route, duplicate-owner choice, notice withdrawal, or
-   bulk reconciliation is part of this installation.
+7. Complete the separately authorized deployment packet with verified
+   artifacts and isolated backup/readability results, the actual owner and
+   checkout, any required live backup, post-update checks, and failure
+   recovery. A live backup not yet taken stays explicitly pending. Do not
+   deploy while ownership, backup, or recovery details are unresolved.
+8. Recheck exact ownership and candidate/main pins. Create and independently
+   verify the consistent old-schema live backup **before any candidate
+   registry opener**. Abort if integrity, consistency, or old-build
+   readability fails. Preserve registry/control/runtime/provider/session
+   paths and prior artifacts/config. From the host shell, run the selected
+   updater mode in the deployment checkout as described in the
+   [self-hosted launch runbook](self-hosted-launch-runbook.md#managed-runtime-update-modes).
+   The default mode needs no mode approval and changes only web/client; the
+   updater itself accepts the exact word `APPROVED` only for `--all` and
+   `--durable-only`. Do not use the launcher's `--stop` or `--restart` for a
+   live managed installation; those actions do not perform the ownership
+   census. The updater supports systemd-owned installations only.
+9. Check the authenticated runtime readiness response and supervisor
+   installation identity, startup build/features, effective image, callback
+   readiness, intended release-mode admission as recorded in the candidate
+   manifest, structured errors, and preserved inventory/history metadata. Do
+   not import, prompt, or start historical
+   conversations as a smoke test. No historical repair route, duplicate-owner
+   choice, notice withdrawal, or bulk reconciliation is part of this update.
 
 On failure preserve the upgraded state and stores, inspect the recorded logs,
 and prefer a compatible fix-forward. An old binary may reject the new schema.
 An old-state restore needs the verified old-schema backup, matching stores,
-configuration/artifacts/image, and a separately approved concrete restore and
-restart. Refuse a restore that would discard later writes or changed user
+configuration/artifacts/image, and a separately authorized concrete restore
+and restart. Refuse a restore that would discard later writes or changed user
 intent; preserve that state and fix forward. There is no generic down-migration
 or permission to destroy source stores. See the existing
 [restore guidance](lost-soul-runbook.md#restore-from-backup).
@@ -364,9 +479,10 @@ pnpm run contract:generate
 
 Follow repository test coordination and destructive-test containment for these
 checks. Reuse current candidate results rather than repeating suites solely
-for prose changes. This repair's final record needs Task 9 ordinary-use results
-for the four selected modes, the final configured full-suite gate, affected
-managed browser/smoke checks, and the required Stage 5 review records. The
+for prose changes. This repair's final record needs Task 6 ordinary UI
+continuity results for OpenCode terminal and Freshcodex, the final configured
+full-suite gate, affected managed browser/smoke checks, and the required
+independent review records. The
 native-recovery rows and isolated backup/upgrade drill in the operator
 procedure above are not acceptance gates for this repair. A deterministic
 fixture does not replace a live ordinary-use result or a live recovery receipt
@@ -374,7 +490,7 @@ when a future rollout requires either one.
 
 Existing full runtime gates and their receipt producers remain available for
 claims that require them. They are not additional all-mode/pressure obligations
-for this four-mode repair. Evidence is untracked beneath
+for this repair. Evidence is untracked beneath
 `.runtime-evidence/<candidate-sha>/<run-id>/` or in the current private run
 directory. Another commit/image, a skipped test, failed cleanup, or an unsafe
 broker attempt does not establish a pass. Report exactly what ran and what

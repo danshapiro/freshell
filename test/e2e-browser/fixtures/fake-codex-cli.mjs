@@ -15,6 +15,13 @@
 //     scenario only exercises the resume path, but a fresh marker is kept
 //     for parity/diagnosability if a future scenario needs it.
 //
+//   - EXIT affordance (auto-restore-warming delta fix, finding 3): typing
+//     the literal line `exit` exits the process cleanly (exit 0) — the
+//     natural "the CLI session ended" shape an e2e needs to park a pane
+//     whose park must survive a restart (an EXITED pane has no
+//     self-recovery lane). No other spec types `exit`, so this is inert
+//     everywhere else.
+//
 // Stays alive (`stdin.resume()`) so the pane's terminal status remains
 // 'running', matching a real interactive TUI.
 
@@ -46,4 +53,11 @@ if (resumeIndex !== -1) {
 } else {
   process.stdout.write('codex> \r\n')
 }
+process.stdin.setEncoding('utf8')
+process.stdin.on('data', (chunk) => {
+  if (String(chunk).trim() === 'exit') {
+    process.stdout.write('codex: bye\r\n')
+    process.exit(0)
+  }
+})
 process.stdin.resume()

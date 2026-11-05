@@ -36,6 +36,8 @@ export interface E2eServerHandle {
 export interface E2eServerConstructOptions {
   /** Extra environment variables merged into (and able to override) the spawned server's environment. */
   env?: Record<string, string>
+  /** Environment prefixes removed from the owned test server after merging. */
+  stripEnvPrefixes?: string[]
   /** Hook to populate the isolated HOME before the server boots. */
   setupHome?: (homeDir: string) => Promise<void>
   /** Preserve the isolated HOME after stop() (for audit/debugging). */
@@ -181,5 +183,11 @@ export async function createE2eServerHandle(
 
   const construct = options.construct ?? {}
   const { RustServer } = await import('./rust-server.js')
-  return new RustServer(construct)
+  const explicitlyConfiguredManagedRuntime = Object.hasOwn(
+    construct.env ?? {},
+    'FRESHELL_MANAGED_RUNTIME_V1',
+  )
+  const stripEnvPrefixes = new Set(construct.stripEnvPrefixes ?? [])
+  if (!explicitlyConfiguredManagedRuntime) stripEnvPrefixes.add('FRESHELL_MANAGED_RUNTIME_V1')
+  return new RustServer({ ...construct, stripEnvPrefixes: [...stripEnvPrefixes] })
 }

@@ -1,1 +1,1 @@
-{"type":"session_start","conversationId":"55555555-6666-7777-8888-999999999999","workspacePaths":["/home/u/idle"],"model":"gemini-3-pro","startedAt":"2026-10-30T00:00:00.000Z"}
+{"type":"SYSTEM_MESSAGE","source":"SYSTEM","status":"DONE","step_index":0,"created_at":"2026-10-30T00:00:00Z","content":"<system notice placeholder>"}

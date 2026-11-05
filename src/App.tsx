@@ -1,6 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState, type TouchEvent as ReactTouchEvent } from 'react'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
-import { setStatus, setError, setErrorCode, setServerInstanceId, setBootId, setServerRestarted, setLiveTerminalIds, setPlatform, setAvailableClis, setFeatureFlags } from '@/store/connectionSlice'
+import { setStatus, setError, setErrorCode, setServerInstanceId, setBootId, setServerRestarted, setLiveTerminalIds, setPlatform, setAvailableClis, setFeatureFlags, setSessionIndexReady } from '@/store/connectionSlice'
 import { resetCompletionDedupeBaselines } from '@/store/turnCompletionSlice'
 import { foldReadyFreshAgentAttention } from '@/store/turnCompletionThunks'
 import { setLocalSettings, setServerConfigDir, setServerSettings, localSettingsPlatformDefaults } from '@/store/settingsSlice'
@@ -94,6 +94,7 @@ import PaneDivider from '@/components/panes/PaneDivider'
 import { AuthRequiredModal } from '@/components/AuthRequiredModal'
 import { TerminalInterestReporter } from '@/components/TerminalInterestReporter'
 import { ReconcileWarmingBanner } from '@/components/ReconcileWarmingBanner'
+import { ReconcileWarmingRecoveryDriver } from '@/components/ReconcileWarmingRecoveryDriver'
 import { SetupWizard } from '@/components/SetupWizard'
 import { RecoveryOfferPanel } from '@/components/RecoveryOfferPanel'
 import { MachineChooser } from '@/components/MachineChooser'
@@ -1392,6 +1393,12 @@ export default function App() {
             // must never be ignored in favor of stale pre-reconnect records.
             foldReadyRuntimeOwners(dispatch, ready.data.runtimeOwners)
             dispatch(foldReadyFreshAgentAttention(ready.data.freshAgentAttention))
+            // Session-index readiness (auto-restore-warming Task 5): fold
+            // the handshake's CURRENT readiness state — true only when the
+            // server says so; absent (old server, non-negotiating client)
+            // folds false. Idempotent, and a restart's ready re-folds the
+            // new boot's truth (a false RESETS a stale true).
+            dispatch(setSessionIndexReady(ready.data.sessionIndexReady === true))
             // pane.reconcile adoption: capability re-captured per connection,
             // and the request re-sent on EVERY ready — a result is not
             // guaranteed (deferral, drop, error frame), so reconnect covers
@@ -1614,6 +1621,13 @@ export default function App() {
             // failure (fetchSessionWindow records the error in Redux), so it cannot leak.
             void appStore.dispatch(queueActiveSessionWindowRefresh() as any)
           }
+        }
+        if (msg.type === 'sessions.index.ready') {
+          // Session-index readiness broadcast (auto-restore-warming): the
+          // server gates this frame on the hello capability, so receiving
+          // it implies this connection negotiated `sessionIndexReadyV1`.
+          // Idempotent state raise — the ready frame owns the reset path.
+          dispatch(setSessionIndexReady(true))
         }
         if (msg.type === 'settings.updated') {
           dispatch(setServerSettings(msg.settings as ServerSettings))
@@ -2604,6 +2618,7 @@ pnpm run serve`}</pre>
       <AuthRequiredModal />
       <TerminalInterestReporter workspaceVisible={view === 'terminal'} />
       <ReconcileWarmingBanner />
+      <ReconcileWarmingRecoveryDriver />
       {showSetupWizard && (
         <SetupWizard
           initialStep={wizardInitialStep}

@@ -15,6 +15,8 @@ export type RuntimeCandidate = {
 /** Hash source changes; never copy source contents or credentials into receipts. */
 export function captureRuntimeCandidate(repoRoot: string): RuntimeCandidate {
   const git = (args: string[]) => execFileSync('git', args, {
+    timeout: 30_000,
+    killSignal: 'SIGKILL',
     cwd: repoRoot,
     maxBuffer: 128 * 1024 * 1024,
     stdio: ['ignore', 'pipe', 'pipe'],
