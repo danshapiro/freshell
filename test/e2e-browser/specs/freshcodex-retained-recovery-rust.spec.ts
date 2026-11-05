@@ -64,6 +64,33 @@ test('Freshcodex renders retained hosted output before native HTTP recovery and 
     await expect(composer).toHaveValue('Draft stays local')
     await expect(composer).toBeFocused()
     await expect(pane.getByRole('note',{name:'Output persistence'})).toHaveText('Retained output. Saved output could not be confirmed.')
+    const warningMessage = 'Codex restarted without the earlier conversation'
+    const warningFrame = (sequence: number, retainedReplay = false) => ({
+      type: 'freshAgent.event',
+      provider: 'codex',
+      sessionType: 'freshcodex',
+      sessionId,
+      event: {
+        type: 'freshAgent.error',
+        code: 'THREAD_MEMORY_LOST',
+        message: warningMessage,
+        journalIdentity: { soulId: 'browser-soul', nativeSessionId: 'browser-native', sequence },
+        ...(retainedReplay ? { retainedReplay: true } : {}),
+      },
+    })
+    const warningAlert = page.getByRole('alert').filter({ hasText: warningMessage })
+    await harness.receiveWsMessage(warningFrame(41))
+    await expect(warningAlert).toContainText(`Agent error: ${warningMessage}`)
+    await warningAlert.getByRole('button', { name: 'Dismiss' }).click()
+    await expect(warningAlert).toHaveCount(0)
+    await composer.focus()
+    await harness.receiveWsMessage(warningFrame(41, true))
+    await expect(warningAlert).toHaveCount(0)
+    await expect(pane.getByText('Final hosted output recovered without another token', { exact: true })).toBeVisible()
+    await expect(composer).toHaveValue('Draft stays local')
+    await expect(composer).toBeFocused()
+    await harness.receiveWsMessage(warningFrame(42))
+    await expect(warningAlert).toContainText(`Agent error: ${warningMessage}`)
   } finally {
     release?.()
     await context?.close().catch(() => {})
