@@ -1557,6 +1557,8 @@ struct BindingStallGate {
     /// mutations already applied — the row is on record and only the
     /// answer stalls).
     entered_tx: std::sync::mpsc::Sender<()>,
+    /// Signaled in the poll that returns the released write's result.
+    completed_tx: std::sync::mpsc::Sender<()>,
     /// The test's release: the returned future resolves only after this.
     release_rx: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     fail: bool,
@@ -1594,11 +1596,13 @@ pub(crate) struct RepairBarrierHandles {
 /// kata b8ke Task 3 review M-1 test hook: the handles
 /// [`FakeIdentitySink::arm_binding_stall`] hands the test. `entered`
 /// fires when the stalled write's mutations LANDED (row recorded, answer
-/// parked); `release` lets the stalled answer resolve.
+/// parked); `release` lets the stalled answer resolve, and `completed`
+/// fires when the returned future is polled to completion.
 #[cfg(test)]
 pub(crate) struct BindingStallHandles {
     pub entered: std::sync::mpsc::Receiver<()>,
     pub release: tokio::sync::oneshot::Sender<()>,
+    pub completed: std::sync::mpsc::Receiver<()>,
 }
 
 #[cfg(test)]
@@ -1897,16 +1901,19 @@ impl FakeIdentitySink {
         fail: bool,
     ) -> BindingStallHandles {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         *self.binding_stall.lock().unwrap() = Some(BindingStallGate {
             fail,
             key: (provider.into(), session_id.into()),
             entered_tx,
+            completed_tx,
             release_rx: std::sync::Mutex::new(Some(release_rx)),
         });
         BindingStallHandles {
             entered: entered_rx,
             release: release_tx,
+            completed: completed_rx,
         }
     }
     /// The shared claim-commit decide+apply (the direct path AND the claim
@@ -2159,19 +2166,21 @@ impl PaneIdentitySink for FakeIdentitySink {
                 gate.as_ref().and_then(|g| {
                     if g.key == (upsert.provider.clone(), upsert.session_id.clone()) {
                         let release_rx = g.release_rx.lock().unwrap().take();
-                        release_rx.map(|rx| (g.entered_tx.clone(), rx, g.fail))
+                        release_rx
+                            .map(|rx| (g.entered_tx.clone(), g.completed_tx.clone(), rx, g.fail))
                     } else {
                         None
                     }
                 })
             };
-            if let Some((entered_tx, release_rx, fail)) = stall_arm {
+            if let Some((entered_tx, completed_tx, release_rx, fail)) = stall_arm {
                 // One-shot: disarm so later writes for the key apply inline.
                 *self.binding_stall.lock().unwrap() = None;
                 self.apply_binding(upsert);
                 let _ = entered_tx.send(());
                 return Box::pin(async move {
                     let _ = release_rx.await;
+                    let _ = completed_tx.send(());
                     if fail {
                         Err(std::io::Error::other("binding failed after persistence"))
                     } else {

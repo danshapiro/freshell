@@ -1,5 +1,28 @@
 use super::*;
 
+async fn poll_adoption_to_checkpoint(
+    mut adoption: std::pin::Pin<&mut impl std::future::Future>,
+    signal: &std::sync::mpsc::Receiver<()>,
+    checkpoint: &str,
+) {
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        std::future::poll_fn(|cx| {
+            assert!(
+                std::future::Future::poll(adoption.as_mut(), cx).is_pending(),
+                "adoption completed before {checkpoint}"
+            );
+            match signal.try_recv() {
+                Ok(()) => std::task::Poll::Ready(()),
+                Err(std::sync::mpsc::TryRecvError::Empty) => std::task::Poll::Pending,
+                Err(error) => panic!("{checkpoint} disconnected: {error}"),
+            }
+        }),
+    )
+    .await
+    .expect(checkpoint);
+}
+
 fn vacate_claude_owner_for_map_hit(
     registry: &Arc<freshell_ownership::RuntimeOwnershipRegistry>,
     session_id: &str,
@@ -340,22 +363,33 @@ async fn vacant_map_hit_cancellation_after_binding_keeps_the_existing_writer_fen
         "claude",
         Some(ticket),
     ));
+    // A sidecar reader may hold this lock before adoption reaches persistence.
+    // Force that scheduling order instead of relying on incidental contention.
+    let initial_map_hold = state.sessions.lock().await;
     std::future::poll_fn(|cx| {
         assert!(std::future::Future::poll(adoption.as_mut(), cx).is_pending());
         std::task::Poll::Ready(())
     })
     .await;
-    stall
-        .entered
-        .try_recv()
-        .expect("the binding write is parked");
+    assert!(matches!(
+        stall.entered.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    drop(initial_map_hold);
+    poll_adoption_to_checkpoint(
+        adoption.as_mut(),
+        &stall.entered,
+        "the binding write is parked",
+    )
+    .await;
 
     let mapped_runtime = state.sessions.lock().await;
     stall.release.send(()).unwrap();
-    std::future::poll_fn(|cx| {
-        assert!(std::future::Future::poll(adoption.as_mut(), cx).is_pending());
-        std::task::Poll::Ready(())
-    })
+    poll_adoption_to_checkpoint(
+        adoption.as_mut(),
+        &stall.completed,
+        "the binding write returned before cancellation",
+    )
     .await;
     // Persistence has returned; the next map lookup is blocked by our lock.
     // Cancel precisely here, while the existing native runtime is still mapped.
