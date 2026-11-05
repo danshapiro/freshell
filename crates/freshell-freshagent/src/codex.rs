@@ -11126,6 +11126,27 @@ impl FreshCodexState {
         self.overlay_controls(thread_id, &mut snapshot).await;
         self.overlay_settings_snapshot(thread_id, &mut snapshot)
             .await;
+        // Native history can remain readable after its process exits. Resolve
+        // liveness from this same source after every awaited overlay, so a
+        // failed late read cannot revive an idle prefix or stain a replacement.
+        let source_exited = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .get(thread_id)
+                .filter(|session| {
+                    Arc::ptr_eq(&session.client, &client)
+                        && Arc::ptr_eq(&session.projection, &projection)
+                })
+                .map(|session| session.exited.load(Ordering::SeqCst))
+        };
+        let Some(source_exited) = source_exited else {
+            return Err(CodexSnapshotError::HandoffInProgress {
+                generation: self.ownership_snapshot(PROVIDER, thread_id).generation,
+            });
+        };
+        if source_exited {
+            snapshot["status"] = json!("exited");
+        }
         Ok(snapshot)
     }
 
@@ -34810,6 +34831,191 @@ pub(crate) mod tests {
         assert_eq!(snapshot["turns"][0]["summaryKind"], json!("echo"));
         assert_eq!(turns[0]["items"][0]["kind"], json!("text"));
         assert_eq!(turns[0]["items"][0]["text"], json!("hello from codex"));
+    }
+
+    fn spawn_snapshot_exit_process(
+        ownership_id: &str,
+    ) -> (tokio::process::Child, tokio::process::ChildStdin) {
+        // Node is already the native-provider fixture runtime in this suite.
+        // A stdin EOF works on native Windows as well as Unix.
+        let mut command = tokio::process::Command::new("node");
+        command
+            .args([
+                "-e",
+                "process.stdin.resume(); process.stdin.on('end', () => process.exit(1));",
+            ])
+            .env(CODEX_SIDECAR_OWNERSHIP_ENV, ownership_id)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().expect("spawn the owned waiting fixture");
+        let exit_gate = child.stdin.take().expect("the child exit gate");
+        (child, exit_gate)
+    }
+
+    // The RPC transport is scripted, while the watcher observes an actual
+    // owned child exiting before its outstanding read is acknowledged.
+    // This isolates snapshot liveness from provider-death detection.
+    async fn assert_snapshot_after_native_exit(replace_source: bool) {
+        let thread_id = "thread-snapshot-after-native-exit";
+        let ownership_id = mint_ownership_id();
+        let native_home = small_native_home(thread_id);
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifications) = CodexAppServerClient::connect(transport);
+        let (state, mut wire) = state_with_bus();
+        let (child, exit_gate) = spawn_snapshot_exit_process(&ownership_id);
+        insert_fake_session(
+            &state,
+            thread_id,
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            child,
+            &ownership_id,
+        )
+        .await;
+
+        let initial = {
+            let state = state.clone();
+            tokio::spawn(async move { state.get_snapshot(thread_id, None).await })
+        };
+        let (id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "initialize");
+        peer.respond(
+            &id,
+            json!({"codexHome":native_home.path(),"userAgent":"fixture"}),
+        );
+        let _ = peer.expect_notification().await;
+        let (id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "thread/read");
+        peer.respond(
+            &id,
+            json!({"thread":{"id":thread_id,"status":{"type":"idle"},
+                "updatedAt":1770000007,"turns":[{"id":"retained-turn", "status":"completed",
+                "items":[{"type":"agentMessage","id":"retained-item","text":"original retained text"}]}]}}),
+        );
+        assert_eq!(initial.await.unwrap().unwrap()["status"], "idle");
+
+        let late_read = {
+            let state = state.clone();
+            tokio::spawn(async move { state.get_snapshot(thread_id, None).await })
+        };
+        let (_, method, _) = peer.expect_request().await;
+        assert_eq!(method, "thread/read");
+        assert!(
+            !late_read.is_finished(),
+            "the native reply remains unacknowledged"
+        );
+
+        // Closing only the test-owned stdin makes this exact child exit on
+        // EOF. The watcher, rather than a forged exited flag, must observe it.
+        drop(exit_gate);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let frame: Value = serde_json::from_str(&wire.recv().await.unwrap()).unwrap();
+                if frame["event"]["type"] == "freshAgent.status"
+                    && frame["event"]["status"] == "exited"
+                {
+                    assert_eq!(frame["sessionId"], thread_id);
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the actual child exit is published before the native reply closes");
+        assert!(state.sessions.lock().await[thread_id]
+            .exited
+            .load(Ordering::SeqCst));
+
+        let replacement = if replace_source {
+            let (transport, replacement_peer) = freshell_codex::new_channel_transport();
+            let (client, _notifications) = CodexAppServerClient::connect(transport);
+            let client = Arc::new(client);
+            let replacement_ownership_id = mint_ownership_id();
+            let (child, replacement_exit_gate) =
+                spawn_snapshot_exit_process(&replacement_ownership_id);
+            insert_fake_session(
+                &state,
+                thread_id,
+                client.clone(),
+                Arc::new(StdMutex::new(None)),
+                child,
+                &replacement_ownership_id,
+            )
+            .await;
+            Some((client, replacement_peer, replacement_exit_gate))
+        } else {
+            None
+        };
+        peer.disconnect();
+        let late_result = late_read.await.expect("the snapshot task completes");
+        if let Some((client, replacement_peer, _replacement_exit_gate)) = replacement {
+            assert!(
+                matches!(
+                    late_result,
+                    Err(CodexSnapshotError::HandoffInProgress { .. })
+                ),
+                "the old exited client cannot publish through a newer source: {late_result:?}"
+            );
+            {
+                let sessions = state.sessions.lock().await;
+                assert!(Arc::ptr_eq(&sessions[thread_id].client, &client));
+                assert!(!sessions[thread_id].exited.load(Ordering::SeqCst));
+                assert!(!sessions[thread_id]
+                    .projection
+                    .lock()
+                    .unwrap()
+                    .source_retired());
+            }
+            let current_read = {
+                let state = state.clone();
+                tokio::spawn(async move { state.get_snapshot(thread_id, None).await })
+            };
+            let (id, method, _) = replacement_peer.expect_request().await;
+            assert_eq!(method, "initialize");
+            replacement_peer.respond(
+                &id,
+                json!({"codexHome":native_home.path(),"userAgent":"fixture"}),
+            );
+            let _ = replacement_peer.expect_notification().await;
+            let (id, method, _) = replacement_peer.expect_request().await;
+            assert_eq!(method, "thread/read");
+            replacement_peer.respond(
+                &id,
+                json!({"thread":{"id":thread_id,"status":{"type":"idle"},
+                "updatedAt":1770000008,"turns":[]}}),
+            );
+            assert_eq!(current_read.await.unwrap().unwrap()["status"], "idle");
+        } else {
+            let snapshot = late_result.expect("the exited source retains readable history");
+            assert_eq!(snapshot["threadId"], thread_id);
+            assert_eq!(
+                snapshot["status"], "exited",
+                "a late failed native read must not revive the last idle status"
+            );
+            assert_eq!(snapshot["turns"][0]["summary"], "original retained text");
+        }
+        state.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn get_snapshot_exit_race_keeps_exited_after_watcher_and_native_read_error() {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            assert_snapshot_after_native_exit(false),
+        )
+        .await
+        .expect("the exited snapshot race completes");
+    }
+
+    #[tokio::test]
+    async fn get_snapshot_exit_race_old_client_cannot_poison_live_replacement() {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            assert_snapshot_after_native_exit(true),
+        )
+        .await
+        .expect("the replacement snapshot race completes");
     }
 
     #[tokio::test]
