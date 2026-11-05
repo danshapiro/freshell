@@ -185,7 +185,6 @@ pub(crate) const MAX_NATIVE_READS: u32 = 6;
 pub(crate) const MAX_NATIVE_LIFECYCLE_BUSY_DEFERRALS: u32 = 6;
 #[cfg(any(feature = "managed-runtime-v1", test))]
 const NATIVE_LIFECYCLE_BUSY_RETRY_BASE_MS: i64 = 1_000;
-#[cfg(any(feature = "managed-runtime-v1", test))]
 pub(crate) const NATIVE_LIFECYCLE_BUSY_COOLDOWN_MS: i64 = 60_000;
 /// Task 3: cycle 2 becomes ready at least this long after a cycle-1 failure.
 const NATIVE_CYCLE_RETRY_1_MS: i64 = 5_000;
