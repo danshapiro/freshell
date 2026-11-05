@@ -32,6 +32,7 @@ import {
   summarizeNativeNameWorkerLogs,
   type NativeSyncDiagnosticSample,
 } from '../../helpers/native-name-timeout-diagnostics.js'
+import { managedLifecycleWaitMs } from '../../helpers/provider-parity-timeouts.js'
 
 const root = path.resolve(import.meta.dirname, '../../..')
 const runFile = promisify(execFile)
@@ -260,12 +261,12 @@ class FreshWire {
     this.socket.send(JSON.stringify(frame))
   }
 
-  wait(predicate: (frame: any) => boolean): Promise<any> {
-    return this.waitFrom(0, predicate)
+  wait(predicate: (frame: any) => boolean, timeoutMs?: number): Promise<any> {
+    return this.waitFrom(0, predicate, timeoutMs)
   }
 
-  waitFrom(startCursor: number, predicate: (frame: any) => boolean): Promise<any> {
-    return waitFor('fresh-agent frame', () => this.frames.slice(startCursor).find(predicate)).catch(error => {
+  waitFrom(startCursor: number, predicate: (frame: any) => boolean, timeoutMs?: number): Promise<any> {
+    return waitFor('fresh-agent frame', () => this.frames.slice(startCursor).find(predicate), timeoutMs).catch(error => {
       throw new Error(`${String(error)}; recent frames: ${JSON.stringify(this.frames.slice(-12))}`)
     })
   }
@@ -418,7 +419,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     const owner = authorizeFreshRequest(row.provider, requestId)
     wire.send(createRequest)
     const created = await wire.wait(frame => frame.requestId === requestId
-      && (frame.type === 'freshAgent.created' || frame.type === 'freshAgent.create.failed'))
+      && (frame.type === 'freshAgent.created' || frame.type === 'freshAgent.create.failed'), managedLifecycleWaitMs(row.provider))
     if (created.type === 'freshAgent.create.failed') {
       let providerInputs: unknown[] = []
       try {
@@ -561,7 +562,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
       provider: row.provider, sessionType: row.sessionType, cwd,
       sessionRef: { provider: row.provider, sessionId: recorded.nativeSessionId } })
     const resumed = await wire.wait(frame => frame.requestId === resumeId
-      && (frame.type === 'freshAgent.created' || frame.type === 'freshAgent.create.failed'))
+      && (frame.type === 'freshAgent.created' || frame.type === 'freshAgent.create.failed'), managedLifecycleWaitMs(row.provider))
     expect(resumed.type, JSON.stringify(resumed)).toBe('freshAgent.created')
     expect(resumed.sessionRef?.sessionId).toBe(recorded.nativeSessionId)
     let rejectedCreate: { requestType: string; responseType: string } | undefined
@@ -605,7 +606,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
         },
       }))
     }
-  }, 240_000)
+  }, 180_000 + managedLifecycleWaitMs('claude'))
 })
 
 describe.each(['warm host', 'cold replacement'] as const)(

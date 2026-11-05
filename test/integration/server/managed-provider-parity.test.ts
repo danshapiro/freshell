@@ -13,6 +13,7 @@ import { exposeGrantsToHarness, fakeOnecliGrants, withMissingGrant } from '../..
 import { makeProviderParityResourcesReadable, prepareProviderParityUserRoots, providerParityCommands, providerParityFailureDiagnostics, providerParityFailureLogTail, resetProviderParityOpenCodeInputs, supervisorRegistrySecretScan, writeProviderParityEnvironment } from '../../helpers/provider-parity-environment.js'
 import { authorizeProviderParityRequest, readProviderParitySource, type ProviderParitySource } from '../../helpers/provider-parity-broker.js'
 import { cleanupProviderParity } from '../../helpers/provider-parity-cleanup.js'
+import { managedLifecycleWaitMs } from '../../helpers/provider-parity-timeouts.js'
 import type { InitialProviderVolumeAuthorization } from '../../../scripts/testing/runtime-test-broker.js'
 
 type Provider = 'claude' | 'codex' | 'opencode' | 'amplifier'
@@ -21,34 +22,6 @@ const root = path.resolve(import.meta.dirname, '../../..')
 const fixture = path.join(root, 'test/fixtures/providers/parity-provider.mjs')
 const providers: Provider[] = ['claude', 'codex', 'opencode', 'amplifier']
 const nestedSecretMarker = 'nested-secret-byte'
-
-// Match the owned startup phases in freshell-platform/provider_startup.rs.
-// A replacement stages inputs before its existing stop/create/native wait;
-// the 4,201-file selection must be allowed to finish both ordinary projections.
-function providerPreparationWaitMs(provider: Provider): number {
-  const controller = 35_000
-  if (provider !== 'claude') return controller
-  const nativeObservation = 25_000
-  const ordinaryProjection = 25_000
-  const readerCleanup = 5_000
-  return controller + nativeObservation + readerCleanup
-    + nativeObservation + ordinaryProjection * 2 + readerCleanup
-}
-
-function managedLifecycleWaitMs(provider: Provider): number {
-  const runtimeStopCreateAndNativeReady = 90_000
-  const retainedMountpointCleanup = 60_000
-  const mountpointCreate = 60_000
-  const mountpointWork = 30_000
-  const mountpointCleanup = 60_000
-  const publisherOperationAndCleanup = 20_000 + 60_000
-  // Slow rootless Docker creation/removal is valid within these separate
-  // backend bounds. Add their preparation allowance to the existing runtime
-  // wait, including reconciliation of a retained helper from an earlier try.
-  return runtimeStopCreateAndNativeReady + providerPreparationWaitMs(provider)
-    + retainedMountpointCleanup + mountpointCreate + mountpointWork
-    + mountpointCleanup + publisherOperationAndCleanup
-}
 
 async function waitFor<T>(label: string, probe: () => T | undefined | Promise<T | undefined>, timeoutMs = 45_000): Promise<T> {
   const deadline = Date.now() + timeoutMs
