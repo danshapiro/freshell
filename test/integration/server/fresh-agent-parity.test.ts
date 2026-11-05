@@ -1784,7 +1784,7 @@ tool_timeout_sec = 120
         rig.runtime.recoverBody(beforeCrash.view.soulId, 'provider_exit'))
       const observerSettled = (await rig.inventory()).find(row => row.containerId === providerContainerId)
       expect(observerSettled).toMatchObject({ launchState: 'running', recoveryState: 'blocked',
-        recoveryReason: 'STORE_UNREADABLE', nativeSessionId: view.nativeSessionId })
+        recoveryReason: 'IMPLEMENTATION_UNAVAILABLE', nativeSessionId: view.nativeSessionId })
       rig.runtime.writeIncident('freshcodex-managed-native-observer-settled-loss', {
         userRef: created.sessionId, observerRecovery, observerSettled, archiveManifest,
       })
@@ -1809,7 +1809,7 @@ tool_timeout_sec = 120
           const trigger = rows.find(row => row.sequence > supervisorSequenceBeforeHostPause
             && row.event === 'supervisor.runtime_observer.recovery_scheduled'
             && row.data?.soulId === beforeCrash.view!.soulId
-            && row.data?.trigger === 'host_unreachable')
+            && row.data?.trigger === 'provider_exit')
           if (!trigger) return undefined
           const settlements = rows.filter(row => row.sequence > trigger.sequence
             && row.data?.soulId === beforeCrash.view!.soulId
@@ -1838,7 +1838,7 @@ tool_timeout_sec = 120
       }
       const coldRecoveryDiagnostic = coldRecoveryDiagnostics()
       rig.runtime.writeIncident('freshcodex-managed-native-cold-recovery-settlement', coldRecoveryDiagnostic)
-      expect(settledColdRecovery.trigger.data.trigger).toBe('host_unreachable')
+      expect(settledColdRecovery.trigger.data.trigger).toBe('provider_exit')
       expect(settledColdRecovery.settled.event).toBe('supervisor.recovery_retry.settled')
       expect(settledColdRecovery.settled.data.reason).toBe('recovered')
       expect(settledColdRecovery.settled.data.incarnationId).not.toBe(beforeCrash.view!.incarnationId)
