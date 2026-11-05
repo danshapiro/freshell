@@ -3466,6 +3466,14 @@ async fn prepare_same_root_codex_native(state: &HostState) -> Result<(), Runtime
     let source = retained_codex_recovery_source(state, &before, &actor)
         .await
         .ok_or_else(refuse)?;
+    let control_is_current = state
+        .control_fence
+        .lock()
+        .unwrap()
+        .is_current_running(before.max_control_epoch, before.max_execution_generation);
+    if !control_is_current {
+        return Err(refuse());
+    }
     actor
         .prepare_same_root_native_readiness()
         .await

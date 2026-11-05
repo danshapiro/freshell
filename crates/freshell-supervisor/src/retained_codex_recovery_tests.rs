@@ -5,7 +5,7 @@ use crate::backend::{
 use crate::registry::OwnedRuntimeHandle;
 use freshell_runtime_protocol::{
     FreshProvider, NativeDispatchIdentity, NativeIdentityLaunch, NativeIdentityObservation,
-    NativeIdentitySource,
+    NativeIdentitySource, RecoverRequest, RecoveryOutcome, RecoveryState, RecoveryTrigger,
 };
 use rusqlite::{params, Connection};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -889,6 +889,11 @@ async fn public_send_recovers_retained_codex_source_and_commits_before_second_in
         .unwrap();
     assert_eq!(context.native_session_id.as_deref(), Some("native-child"));
     assert_eq!(
+        fixture.native_prepares.load(Ordering::SeqCst),
+        1,
+        "SEND must obtain and commit Codex readiness before journaling user input"
+    );
+    assert_eq!(
         fixture.source.lock().unwrap().evidence_revision,
         context
             .native_identity_launch
@@ -932,10 +937,46 @@ async fn public_send_recovers_retained_codex_source_and_commits_before_second_in
     assert_eq!(fixture.inputs.load(Ordering::SeqCst), 2);
     assert_eq!(
         fixture.recovery_probes.load(Ordering::SeqCst),
-        1,
-        "the observer's bounded provider check does not invalidate the committed root"
+        2,
+        "explicit SEND readiness and the observer each make one bounded provider check"
     );
     fixture.assert_retained().await;
+}
+
+#[tokio::test]
+async fn manual_retry_prepares_retained_codex_before_marking_it_live() {
+    let fixture = ControlledCodex::new().await;
+    let before = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+
+    let result = fixture
+        .supervisor
+        .recover(RecoverRequest {
+            soul_id: fixture.soul.clone(),
+            trigger: RecoveryTrigger::ManualRetry,
+            expected_intent_revision: Some(before.intent_revision),
+            expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result.outcome, RecoveryOutcome::Reattached, "{result:?}");
+    assert_eq!(fixture.native_prepares.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.inputs.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.backend.creates.load(Ordering::SeqCst), 0);
+    assert!(!fixture.exited.load(Ordering::SeqCst));
+    let after = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    assert_eq!(after.recovery_state, RecoveryState::Live);
+    assert_eq!(after.native_session_id, before.native_session_id);
 }
 
 #[tokio::test]

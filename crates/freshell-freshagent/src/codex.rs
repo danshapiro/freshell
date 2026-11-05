@@ -5097,6 +5097,23 @@ impl FreshCodexState {
     }
 
     pub async fn handle_send(&self, msg: FreshAgentSend) -> CodexSendOutcome {
+        self.handle_send_with_recovery_policy(msg, CrashRecoveryPolicy::AllowNewThread)
+            .await
+    }
+
+    /// Hosted sends may resume the recorded conversation, but a replacement
+    /// root must first be authorized and committed by the supervisor's
+    /// receipt-backed native-readiness step.
+    pub async fn handle_send_same_root(&self, msg: FreshAgentSend) -> CodexSendOutcome {
+        self.handle_send_with_recovery_policy(msg, CrashRecoveryPolicy::SameRootOnly)
+            .await
+    }
+
+    async fn handle_send_with_recovery_policy(
+        &self,
+        msg: FreshAgentSend,
+        recovery_policy: CrashRecoveryPolicy,
+    ) -> CodexSendOutcome {
         let request_id = msg.request_id.clone();
         let checkpoint_identity_request = msg.checkpoint_intent.as_ref().and_then(|intent| {
             request_id
@@ -5125,7 +5142,7 @@ impl FreshCodexState {
             .ensure_session_alive(
                 &session_id,
                 send_fence,
-                CrashRecoveryPolicy::AllowNewThread,
+                recovery_policy,
                 DeadThreadCachePolicy::Respect,
             )
             .await

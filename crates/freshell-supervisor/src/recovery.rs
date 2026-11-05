@@ -3198,7 +3198,7 @@ impl Supervisor {
             .assert_soul_intent_revision(request.soul_id.clone(), request.expected_intent_revision)
             .await
             .map_err(map_registry)?;
-        let before_retry = self
+        let mut before_retry = self
             .registry
             .recovery_context(request.soul_id.clone())
             .await
@@ -3231,6 +3231,36 @@ impl Supervisor {
                 observed_native_session_id: None,
                 incident_id: None,
             });
+        }
+        if request.trigger == RecoveryTrigger::ManualRetry
+            && before_retry.desired_state == DesiredState::Running
+            && before_retry.recovery_state != freshell_runtime_protocol::RecoveryState::Lost
+            && before_retry.provider == "codex"
+            && before_retry.fixture.is_none()
+            && before_retry.fresh_agent.as_ref().is_some_and(|agent| {
+                agent.provider == freshell_runtime_protocol::FreshProvider::Codex
+                    && agent.fixture_transport.is_none()
+            })
+            && self
+                .backend
+                .inspect(&before_retry.prior_handle)
+                .await
+                .is_ok_and(|inspection| inspection.state == BackendRuntimeState::Running)
+        {
+            // Do readiness before ManualRetry advances intent. A durable
+            // receipt from an earlier exact provider check can then be
+            // reconciled under its original write fence; afterward the
+            // retry's new intent can safely classify the now-current root.
+            self.authenticate_current_codex_recovery_host(
+                &request.soul_id,
+                &before_retry.prior_handle,
+            )
+            .await?;
+            before_retry = self
+                .registry
+                .recovery_context(request.soul_id.clone())
+                .await
+                .map_err(map_registry)?;
         }
         if request.trigger == RecoveryTrigger::ManualRetry
             && before_retry.desired_state == DesiredState::Stopped
