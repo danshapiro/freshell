@@ -21,7 +21,7 @@ function registry(files: Record<string, string>): string {
 /** Run the scan as the parity tests run it in the supervisor container. */
 function scan(directory: string, markers: string[], preload?: string): number | null {
   const [program, ...args] = supervisorRegistrySecretScan(markers, directory)
-  return spawnSync(program, preload ? ['--require', preload, ...args] : args, { encoding: 'utf8' }).status
+  return spawnSync(program, preload ? ['--require', preload, ...args] : args, { timeout: 30_000, killSignal: 'SIGKILL', encoding: 'utf8' }).status
 }
 
 /** Make SQLite's checkpoint race happen: the first read of `name` finds it

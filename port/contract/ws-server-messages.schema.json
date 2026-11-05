@@ -3,7 +3,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `pnpm run contract:generate`. Each entry is a JSON Schema for one server→client message shape, keyed by its `type` discriminant and synthesized from the ServerMessage union via the TypeScript type checker. Opaque values (unknown / index signatures / any) are intentionally permissive — see nondeterministic-fields.md. The wire contract is frozen for the Rust port.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "messageCount": 70,
+  "messageCount": 73,
   "messages": {
     "amplifier.activity.list.response": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -89,6 +89,130 @@
         },
         "type": {
           "const": "amplifier.activity.updated",
+          "type": "string"
+        },
+        "upsert": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "phase": {
+                "enum": [
+                  "idle",
+                  "busy"
+                ],
+                "type": "string"
+              },
+              "sessionId": {
+                "type": "string"
+              },
+              "terminalId": {
+                "type": "string"
+              },
+              "updatedAt": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "phase",
+              "terminalId",
+              "updatedAt"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "remove",
+        "type",
+        "upsert"
+      ],
+      "type": "object"
+    },
+    "antigravity.activity.list.response": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "latestTurnCompletions": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "at": {
+                "type": "number"
+              },
+              "completionSeq": {
+                "type": "number"
+              },
+              "terminalId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "at",
+              "completionSeq",
+              "terminalId"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "terminals": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "phase": {
+                "enum": [
+                  "idle",
+                  "busy"
+                ],
+                "type": "string"
+              },
+              "sessionId": {
+                "type": "string"
+              },
+              "terminalId": {
+                "type": "string"
+              },
+              "updatedAt": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "phase",
+              "terminalId",
+              "updatedAt"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "antigravity.activity.list.response",
+          "type": "string"
+        }
+      },
+      "required": [
+        "requestId",
+        "terminals",
+        "type"
+      ],
+      "type": "object"
+    },
+    "antigravity.activity.updated": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "remove": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "antigravity.activity.updated",
           "type": "string"
         },
         "upsert": {
@@ -1096,7 +1220,8 @@
                   "enum": [
                     "codex",
                     "claude",
-                    "opencode"
+                    "opencode",
+                    "antigravity"
                   ],
                   "type": "string"
                 },
@@ -1168,7 +1293,8 @@
                       "enum": [
                         "codex",
                         "claude",
-                        "opencode"
+                        "opencode",
+                        "antigravity"
                       ],
                       "type": "string"
                     },
@@ -1429,7 +1555,8 @@
                   "enum": [
                     "codex",
                     "claude",
-                    "opencode"
+                    "opencode",
+                    "antigravity"
                   ],
                   "type": "string"
                 },
@@ -1498,7 +1625,8 @@
                       "enum": [
                         "codex",
                         "claude",
-                        "opencode"
+                        "opencode",
+                        "antigravity"
                       ],
                       "type": "string"
                     },
@@ -2932,6 +3060,14 @@
               "duplicate": {
                 "type": "string"
               },
+              "identityDisposition": {
+                "enum": [
+                  "resumed",
+                  "minted_replacement",
+                  "fresh_unbound"
+                ],
+                "type": "string"
+              },
               "paneKey": {
                 "type": "string"
               },
@@ -2953,6 +3089,9 @@
                   "sessionId"
                 ],
                 "type": "object"
+              },
+              "staleSessionNotice": {
+                "type": "string"
               },
               "terminalId": {
                 "type": "string"
@@ -3074,6 +3213,9 @@
               "type": "boolean"
             },
             "paneReconcileV1": {
+              "type": "boolean"
+            },
+            "sessionIndexReadyV1": {
               "type": "boolean"
             },
             "terminalInterestV1": {
@@ -3454,7 +3596,8 @@
                       "enum": [
                         "codex",
                         "claude",
-                        "opencode"
+                        "opencode",
+                        "antigravity"
                       ],
                       "type": "string"
                     },
@@ -3531,7 +3674,8 @@
                         "enum": [
                           "codex",
                           "claude",
-                          "opencode"
+                          "opencode",
+                          "antigravity"
                         ],
                         "type": "string"
                       },
@@ -3581,7 +3725,8 @@
                         "enum": [
                           "codex",
                           "claude",
-                          "opencode"
+                          "opencode",
+                          "antigravity"
                         ],
                         "type": "string"
                       },
@@ -3778,6 +3923,20 @@
       },
       "required": [
         "revision",
+        "type"
+      ],
+      "type": "object"
+    },
+    "sessions.index.ready": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "sessions.index.ready",
+          "type": "string"
+        }
+      },
+      "required": [
         "type"
       ],
       "type": "object"
@@ -4578,7 +4737,8 @@
                   "enum": [
                     "codex",
                     "claude",
-                    "opencode"
+                    "opencode",
+                    "antigravity"
                   ],
                   "type": "string"
                 },
@@ -4624,7 +4784,8 @@
                 "missing_canonical_identity",
                 "invalid_legacy_restore_target",
                 "provider_runtime_failed",
-                "durable_artifact_missing"
+                "durable_artifact_missing",
+                "session_store_unreadable"
               ],
               "type": "string"
             }
@@ -4678,7 +4839,8 @@
                       "enum": [
                         "codex",
                         "claude",
-                        "opencode"
+                        "opencode",
+                        "antigravity"
                       ],
                       "type": "string"
                     },
@@ -5104,7 +5266,8 @@
                         "enum": [
                           "codex",
                           "claude",
-                          "opencode"
+                          "opencode",
+                          "antigravity"
                         ],
                         "type": "string"
                       },
@@ -5165,7 +5328,8 @@
                       "blocked",
                       "recovering",
                       "stopped",
-                      "lost"
+                      "lost",
+                      "data_repair_complete"
                     ],
                     "type": "string"
                   }
@@ -5233,7 +5397,8 @@
                             "enum": [
                               "codex",
                               "claude",
-                              "opencode"
+                              "opencode",
+                              "antigravity"
                             ],
                             "type": "string"
                           },
@@ -5703,6 +5868,14 @@
         "exitCode": {
           "type": "number"
         },
+        "identityDisposition": {
+          "enum": [
+            "resumed",
+            "minted_replacement",
+            "fresh_unbound"
+          ],
+          "type": "string"
+        },
         "maxAttempts": {
           "type": "number"
         },
@@ -5710,6 +5883,9 @@
           "type": "string"
         },
         "oldTerminalId": {
+          "type": "string"
+        },
+        "staleSessionNotice": {
           "type": "string"
         },
         "type": {
@@ -5761,7 +5937,8 @@
                   "enum": [
                     "codex",
                     "claude",
-                    "opencode"
+                    "opencode",
+                    "antigravity"
                   ],
                   "type": "string"
                 },
@@ -5872,7 +6049,8 @@
                 "blocked",
                 "recovering",
                 "stopped",
-                "lost"
+                "lost",
+                "data_repair_complete"
               ],
               "type": "string"
             }
@@ -6017,7 +6195,8 @@
             "codex",
             "claude",
             "opencode",
-            "amplifier"
+            "amplifier",
+            "antigravity"
           ],
           "type": "string"
         },

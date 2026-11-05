@@ -4,6 +4,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { resolveManagerExecFileCommand } from '../setup/manager-command.js'
+import { assertSubprocessCompleted } from '../../scripts/testing/sync-subprocess.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -24,6 +25,13 @@ interface EnsureFreshE2eBuildDeps {
   log: Pick<Console, 'log'>
 }
 
+function assertBuildSucceeded(result: ReturnType<typeof spawnSync>, stage: string): void {
+  assertSubprocessCompleted(result, `[e2e-setup] ${stage}`)
+  if (result.status !== 0) {
+    throw new Error(`[e2e-setup] ${stage} failed (exit ${result.status}); refusing to run browsers against stale assets`)
+  }
+}
+
 export function ensureFreshE2eBuild(
   root: string,
   deps: EnsureFreshE2eBuildDeps = {
@@ -35,25 +43,28 @@ export function ensureFreshE2eBuild(
 ): void {
   const env = { ...deps.env, NODE_ENV: 'production' }
   const prebuild = resolveManagerExecFileCommand(['run', 'prebuild'], deps.env, deps.platform, process.execPath, root)
-  deps.spawnSync(prebuild.command, prebuild.args, {
+  const prebuildResult = deps.spawnSync(prebuild.command, prebuild.args, {
     cwd: root,
     stdio: 'inherit',
     env,
     shell: prebuild.viaShell ?? false,
   })
+  assertBuildSucceeded(prebuildResult, 'prebuild')
   deps.log.log('[e2e-setup] Building client and Rust server...')
   const client = resolveManagerExecFileCommand(['run', 'build:client'], deps.env, deps.platform, process.execPath, root)
-  deps.spawnSync(client.command, client.args, {
+  const clientResult = deps.spawnSync(client.command, client.args, {
     cwd: root,
     stdio: 'inherit',
     env,
     shell: client.viaShell ?? false,
   })
-  deps.spawnSync('cargo', ['build', '--release', '-p', 'freshell-server', '--locked'], {
+  assertBuildSucceeded(clientResult, 'client build')
+  const serverResult = deps.spawnSync('cargo', ['build', '--release', '-p', 'freshell-server', '--locked'], {
     cwd: root,
     stdio: 'inherit',
     env,
   })
+  assertBuildSucceeded(serverResult, 'Rust server build')
   deps.log.log('[e2e-setup] Build complete.')
 }
 

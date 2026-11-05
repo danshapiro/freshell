@@ -1,6 +1,0 @@
-{"type":"session_start","conversationId":"33333333-4444-5555-6666-777777777777","workspacePaths":["/home/u/tools"],"model":"gemini-3-pro","startedAt":"2026-10-29T22:00:00.000Z"}
-{"type":"user_message","conversationId":"33333333-4444-5555-6666-777777777777","text":"Run the test suite","at":"2026-10-29T22:00:01.000Z"}
-{"type":"tool_call","conversationId":"33333333-4444-5555-6666-777777777777","toolName":"bash","arguments":{"command":"npm test"},"at":"2026-10-29T22:00:02.000Z"}
-{"type":"tool_result","conversationId":"33333333-4444-5555-6666-777777777777","status":"ok","at":"2026-10-29T22:00:03.000Z"}
-{"type":"assistant_message","conversationId":"33333333-4444-5555-6666-777777777777","text":"Tests pass.","at":"2026-10-29T22:00:04.000Z","usage":{"inputTokens":100,"outputTokens":50,"cachedTokens":25,"totalTokens":175}}
-{"type":"turn_settled","conversationId":"33333333-4444-5555-6666-777777777777","at":"2026-10-29T22:00:04.500Z","outcome":"completed","fullyIdle":true}

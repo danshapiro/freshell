@@ -79,6 +79,39 @@ pub struct TerminalIdentity {
     /// retained-on-retire by design, see [`TerminalIdentityRegistry::retire`]),
     /// so it adds no new growth beyond the map that already exists.
     classify_generation: u64,
+    /// Focused repair round 5, Major: this terminal is an identity-less
+    /// FreshUnbound REPLACEMENT — the auto-resume respawn spawned it after
+    /// the resume gate refused its predecessor's recorded session id, and
+    /// the hub RELEASED the stale claim (never completing it against this
+    /// terminal). The in-memory mirror of the live `terminal.replaced`
+    /// frame's `fresh_unbound` disposition: a browser that was DISCONNECTED
+    /// during the server-side auto-resume (or reloaded after it) missed
+    /// that transient frame, so the reconcile attach derivation reads this
+    /// marker to carry the same identity-clearing signal on its verdict —
+    /// without it the pane keeps a stale saved sessionRef across the
+    /// reconnection and a later re-bind association folds as a conflict.
+    /// Stamped ONLY by the auto-resume respawn door
+    /// (`terminal.rs::respawn_agent_terminal` — ordinary creates never
+    /// set it, which is exactly what keeps an ordinary identity-less
+    /// attach — a young pane whose identity is not captured yet — from
+    /// clearing a still-valid claim). Preserved by plain upserts (the
+    /// marker describes the terminal's ORIGIN, not its current binding);
+    /// moot once a later association gives the terminal an identity
+    /// (the reconcile derivation only consults it while the terminal has
+    /// no session ref).
+    pub fresh_unbound_replacement: bool,
+    /// Final-delta review round 2, Fix 1: the stale-id notice that rode the
+    /// missed `terminal.replaced` frame (`staleSessionNotice` — the
+    /// operator-visible text naming the refused conversation). The
+    /// reconnect path needs the SAME text the live frame carried: without
+    /// it a browser that was disconnected during the recovery re-attaches
+    /// with its id cleared but no visible explanation of what was lost.
+    /// Stored beside the marker at stamp time (the marker and its notice
+    /// are one fact — the FreshUnbound replacement and the text that
+    /// explains it) and read by the reconcile attach derivation to carry
+    /// `staleSessionNotice` on the verdict. Preserved by plain upserts
+    /// like the marker itself.
+    pub fresh_unbound_notice: Option<String>,
 }
 
 /// The minimal entry created when a write lands before the terminal's first
@@ -97,6 +130,8 @@ fn minimal_entry(terminal_id: &str) -> TerminalIdentity {
         name_ref: None,
         naming_handle: None,
         classify_generation: 0,
+        fresh_unbound_replacement: false,
+        fresh_unbound_notice: None,
     }
 }
 
@@ -356,6 +391,55 @@ impl TerminalIdentityRegistry {
             .or_insert_with(|| minimal_entry(terminal_id));
         entry.is_subagent = value;
         entry.updated_at = crate::terminal::now_ms();
+    }
+
+    /// Focused repair round 5, Major: mark this terminal as an identity-less
+    /// FreshUnbound replacement — the auto-resume respawn's `FreshUnbound`
+    /// shape (the gate refused the predecessor's recorded id; the hub
+    /// RELEASED the stale claim). See [`TerminalIdentity::fresh_unbound_replacement`].
+    /// Creates a minimal entry when the terminal has no identity row yet
+    /// (the respawn's session-less seed upsert runs on the same registry, so
+    /// in practice the entry exists; the or-insert keeps the stamp
+    /// order-independent). Same in-place patch discipline as
+    /// [`Self::set_is_subagent`]: touches nothing else.
+    ///
+    /// `notice` (final-delta review round 2, Fix 1): the stale-id notice
+    /// that rode the live `terminal.replaced` frame, stored beside the
+    /// marker so the reconnect path can carry the same visible
+    /// explanation. `None` stores the marker alone (an older caller or a
+    /// notice-less refusal).
+    pub fn mark_fresh_unbound_replacement(&self, terminal_id: &str, notice: Option<&str>) {
+        let mut map = self.inner.write().expect("identity registry lock poisoned");
+        let entry = map
+            .entry(terminal_id.to_string())
+            .or_insert_with(|| minimal_entry(terminal_id));
+        entry.fresh_unbound_replacement = true;
+        entry.fresh_unbound_notice = notice.map(str::to_string);
+    }
+
+    /// Whether this terminal is an identity-less FreshUnbound replacement
+    /// (see [`TerminalIdentity::fresh_unbound_replacement`]). `false` for
+    /// unknown ids — an ordinary terminal is never one.
+    pub fn is_fresh_unbound_replacement(&self, terminal_id: &str) -> bool {
+        self.inner
+            .read()
+            .expect("identity registry lock poisoned")
+            .get(terminal_id)
+            .is_some_and(|entry| entry.fresh_unbound_replacement)
+    }
+
+    /// Final-delta review round 2, Fix 1: the stale-id notice stamped with
+    /// the FreshUnbound replacement marker — the text that rode the live
+    /// `terminal.replaced` frame's `staleSessionNotice`. `None` for
+    /// unknown ids and marker-less terminals; also `None` when the marker
+    /// was stamped without a notice. Read by the reconcile attach
+    /// derivation to carry the notice on the reconnect verdict.
+    pub fn fresh_unbound_replacement_notice(&self, terminal_id: &str) -> Option<String> {
+        self.inner
+            .read()
+            .expect("identity registry lock poisoned")
+            .get(terminal_id)
+            .and_then(|entry| entry.fresh_unbound_notice.clone())
     }
 
     /// Out-of-order guard, request half (Bug-1 review): atomically advance

@@ -74,6 +74,12 @@ const RESTORE_ERROR_REASONS = new Set<RestoreError['reason']>([
   'dead_live_handle',
   'provider_runtime_failed',
   'durable_artifact_missing',
+  // Auto-restore-warming: keep the persisted `session_store_unreadable`
+  // latch alive across legacy-payload migration (readRestoreError drops an
+  // unknown reason silently). Twin of the Rust allowlists
+  // (tabs_store_model.rs, layout_store_content.rs) and
+  // RestoreErrorReasonSchema (session-contract.ts).
+  'session_store_unreadable',
 ])
 
 export const FRESH_AGENT_DESCRIPTORS: readonly FreshAgentDescriptor[] = [

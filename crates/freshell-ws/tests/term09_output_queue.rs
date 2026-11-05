@@ -170,6 +170,7 @@ async fn spawn_server(term09: Term09Config) -> String {
         Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
 
     let state = WsState {
+        session_index_ready: None,
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
         layout: Default::default(),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
@@ -494,8 +495,31 @@ async fn slow_client_does_not_block_fast_client_and_is_bounded() {
     let mut fast = connect_and_complete_handshake(&url).await;
     attach(&mut fast, &terminal_id, "attach-fast").await;
 
-    // Let both attach.ready frames settle before flooding.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The creator sends on a different connection. Observe both attach
+    // receipts before it floods, otherwise slow input handling can deliver
+    // the flood before either consumer has subscribed.
+    for (client, request_id) in [(&mut slow, "attach-slow"), (&mut fast, "attach-fast")] {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let frame = client
+                    .next()
+                    .await
+                    .expect("socket remains open before flood")
+                    .expect("attach receipt frame");
+                if let WsMessage::Text(text) = frame {
+                    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if value["type"] == "terminal.attach.ready"
+                        && value["terminalId"] == terminal_id
+                        && value["attachRequestId"] == request_id
+                    {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("consumer attach receipt before flood");
+    }
 
     let marker = "FLOOD-DONE-MARKER";
     // ~90 bytes/line * 300_000 lines =~ 27 MB -- large enough to overwhelm

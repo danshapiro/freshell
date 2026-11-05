@@ -186,6 +186,7 @@ async fn spawn_server() -> (
     let registry = freshell_terminal::TerminalRegistry::new();
 
     let state = WsState {
+        session_index_ready: None,
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
         layout: Default::default(),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
@@ -752,7 +753,8 @@ async fn codex_terminal_create_argv_default_managed_and_flag_zero_optout() {
         },
     )
     .await
-    .expect("managed Codex auto-resume spawn");
+    .expect("managed Codex auto-resume spawn")
+    .terminal_id;
     let auto_resume_tui = wait_for_captured_process(&auto_resume_capture);
     let auto_resume_sidecar = wait_for_captured_process(&auto_resume_sidecar_capture);
     let auto_resume_argv = &auto_resume_tui.argv;

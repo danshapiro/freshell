@@ -254,6 +254,7 @@ async fn a_create_dequeued_after_shutdown_started_is_skipped_without_a_reply() {
         &state,
         &crate::terminal::ConnectionIdentity::default(),
         0,
+        None,
     ))
     .await
     .unwrap();

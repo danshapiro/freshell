@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import panesReducer, {
@@ -543,8 +543,19 @@ describe('FreshAgentView SESSION_RESERVED re-drive (Task 14)', () => {
       receiveWsBoth({ type: 'freshAgent.create.failed', requestId: selected.createRequestId,
         code: 'INVALID_REQUEST', message, retryable: false })
       await flush()
-      fireEvent.click(screen.getByText('Agent could not start', { exact: true }))
-      expect(screen.getByText(message)).toBeVisible()
+      const disclosure = document.querySelector('[data-agent-error="create"]') as HTMLElement
+      const summary = disclosure.querySelector('summary') as HTMLElement
+      const body = disclosure.querySelector('.fresh-agent-diagnostic-body') as HTMLElement
+      expect(disclosure).toHaveAttribute('open')
+      expect(within(body).getByText(message)).toBeVisible()
+      expect(summary).toHaveTextContent(message)
+      fireEvent.click(summary)
+      expect(disclosure).not.toHaveAttribute('open')
+      expect(body).not.toBeVisible()
+      expect(summary).toHaveTextContent(message)
+      fireEvent.click(summary)
+      expect(disclosure).toHaveAttribute('open')
+      expect(within(body).getByText(message)).toBeVisible()
       expect(leafContent(store.getState())).toEqual(expect.objectContaining({ ...selected, status: 'create-failed' }))
       expect(store.getState().freshAgent.pendingCreateFailures[selected.createRequestId]).toEqual({ code: 'INVALID_REQUEST', message, retryable: false })
       expect(screen.getByRole('textbox')).toHaveValue(draft)

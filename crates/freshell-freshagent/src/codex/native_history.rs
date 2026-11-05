@@ -46,6 +46,206 @@ mod activity_tests {
     }
 }
 
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+
+    const CAPACITY: &str = "Selected model is at capacity. Please try a different model.";
+
+    fn saved_snapshot(events: &[Value]) -> Value {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let mut rows = vec![json!({"type":"session_meta","payload":{"id":"saved-root"}})];
+        rows.extend_from_slice(events);
+        let jsonl = rows
+            .iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>();
+        std::fs::write(&path, jsonl).unwrap();
+        read_rollout(&path, "saved-root").unwrap()
+    }
+
+    fn event(payload: Value) -> Value {
+        json!({"type":"event_msg","payload":payload})
+    }
+
+    fn start(id: &str) -> Value {
+        event(json!({"type":"task_started","turn_id":id}))
+    }
+
+    fn user_message(text: &str) -> Value {
+        json!({"type":"response_item","payload":{
+            "type":"message","role":"user","content":[{"type":"input_text","text":text}]
+        }})
+    }
+
+    fn failure(id: &str) -> Value {
+        event(
+            json!({"type":"task_complete","turn_id":id,"last_agent_message":null,
+            "error":{"message":CAPACITY,"codex_error_info":"server_overloaded"}}),
+        )
+    }
+
+    fn errors_for(snapshot: &Value, native_id: &str) -> Vec<Value> {
+        snapshot["turns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|turn| {
+                turn["turnId"].as_str().is_some_and(|id| {
+                    id == native_id
+                        || id
+                            .strip_prefix(native_id)
+                            .is_some_and(|suffix| suffix.starts_with(":row-"))
+                })
+            })
+            .filter_map(|turn| turn.get("error").cloned())
+            .collect()
+    }
+
+    fn capacity_error() -> Value {
+        json!({"name":"CodexError","message":CAPACITY})
+    }
+
+    #[test]
+    fn saved_failure_preserves_provider_error_without_claiming_success() {
+        let snapshot = saved_snapshot(&[
+            start("failed"),
+            user_message("Do the work"),
+            failure("failed"),
+        ]);
+
+        assert_eq!(errors_for(&snapshot, "failed"), vec![capacity_error()]);
+        assert!(!snapshot
+            .to_string()
+            .contains("Codex completed this turn without recording an assistant response"));
+    }
+
+    #[test]
+    fn saved_itemless_failure_remains_visible_as_last_turn() {
+        let snapshot = saved_snapshot(&[start("failed"), failure("failed")]);
+        assert_eq!(errors_for(&snapshot, "failed"), vec![capacity_error()]);
+    }
+
+    #[test]
+    fn saved_itemless_failure_survives_the_next_turn() {
+        let snapshot = saved_snapshot(&[
+            start("failed"),
+            failure("failed"),
+            start("next"),
+            user_message("Continue"),
+            event(json!({"type":"task_complete","turn_id":"next","last_agent_message":"Done"})),
+        ]);
+
+        assert_eq!(errors_for(&snapshot, "failed"), vec![capacity_error()]);
+        assert!(errors_for(&snapshot, "next").is_empty());
+        assert!(snapshot.to_string().contains("Done"));
+    }
+
+    #[test]
+    fn delayed_failure_is_attached_to_its_earlier_turn() {
+        let snapshot = saved_snapshot(&[
+            start("earlier"),
+            user_message("First request"),
+            start("later"),
+            user_message("Second request"),
+            failure("earlier"),
+            event(json!({"type":"task_complete","turn_id":"later","last_agent_message":"Done"})),
+        ]);
+
+        assert_eq!(errors_for(&snapshot, "earlier"), vec![capacity_error()]);
+        assert!(errors_for(&snapshot, "later").is_empty());
+        assert!(snapshot.to_string().contains("Done"));
+    }
+
+    #[test]
+    fn delayed_itemless_failure_keeps_its_original_position() {
+        let snapshot = saved_snapshot(&[
+            start("earlier"),
+            start("later"),
+            user_message("Second request"),
+            failure("earlier"),
+            event(json!({"type":"task_complete","turn_id":"later","last_agent_message":"Done"})),
+        ]);
+
+        assert_eq!(errors_for(&snapshot, "earlier"), vec![capacity_error()]);
+        assert!(errors_for(&snapshot, "later").is_empty());
+        let turns = snapshot["turns"].as_array().unwrap();
+        let earlier = turns
+            .iter()
+            .position(|turn| {
+                turn["turnId"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("earlier"))
+            })
+            .unwrap();
+        let later = turns
+            .iter()
+            .position(|turn| {
+                turn["turnId"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("later"))
+            })
+            .unwrap();
+        assert!(
+            earlier < later,
+            "a delayed failure belongs before the next turn"
+        );
+    }
+
+    #[test]
+    fn itemless_success_is_invisible_even_when_its_completion_is_delayed() {
+        let completion = event(json!({"type":"task_complete","turn_id":"empty",
+            "last_agent_message":null,"error":null}));
+        for events in [
+            vec![
+                start("empty"),
+                completion.clone(),
+                start("later"),
+                user_message("Second request"),
+            ],
+            vec![
+                start("empty"),
+                start("later"),
+                user_message("Second request"),
+                completion.clone(),
+            ],
+        ] {
+            let snapshot = saved_snapshot(&events);
+            let turns = snapshot["turns"].as_array().unwrap();
+            assert!(turns.iter().all(|turn| {
+                !turn["turnId"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("empty"))
+            }));
+            assert!(snapshot.to_string().contains("Second request"));
+        }
+    }
+
+    #[test]
+    fn successful_and_interrupted_turns_do_not_gain_provider_errors() {
+        let snapshot = saved_snapshot(&[
+            start("successful"),
+            user_message("First request"),
+            event(json!({"type":"task_complete","turn_id":"successful",
+                "last_agent_message":"Done","error":null})),
+            start("interrupted"),
+            user_message("Second request"),
+            event(json!({"type":"turn_aborted","turn_id":"interrupted"})),
+        ]);
+
+        assert!(errors_for(&snapshot, "successful").is_empty());
+        assert!(errors_for(&snapshot, "interrupted").is_empty());
+        assert!(snapshot.to_string().contains("Done"));
+        assert!(snapshot["turns"].as_array().unwrap().iter().any(|turn| {
+            turn["turnId"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("interrupted"))
+                && turn["outputState"]["diagnostic"] == "interrupted"
+        }));
+    }
+}
+
 pub(crate) fn read(home: &Path, id: &str) -> Result<Value, String> {
     let path = super::locate_thread_rollout(&home.join(".codex/sessions"), id)
         .ok_or("saved native session not found")?;
@@ -220,8 +420,18 @@ pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
                 target.bytes = 0;
                 target.finished |= finished;
                 if finished {
+                    let completion_error = if payload["type"] == "task_complete" {
+                        payload.get("error").filter(|error| !error.is_null())
+                    } else {
+                        None
+                    };
+                    if let Some(error) = completion_error {
+                        target.value["error"] = error.clone();
+                    }
                     target.value["status"] = json!(if payload["type"] == "turn_aborted" {
                         "interrupted"
+                    } else if completion_error.is_some() {
+                        "failed"
                     } else {
                         "completed"
                     });
@@ -239,7 +449,7 @@ pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
         &mut retired,
         &retention,
     );
-    if turn.has_items() {
+    if turn.has_content() {
         turns.push(turn);
     }
     let mut ordinal = omitted_rows;
@@ -468,8 +678,12 @@ impl NativeTurn {
         self.value["id"] == id
     }
 
-    fn has_items(&self) -> bool {
+    fn has_content(&self) -> bool {
         !self.value["items"].as_array().unwrap().is_empty()
+            || self
+                .value
+                .get("error")
+                .is_some_and(|error| !error.is_null())
     }
 
     fn starts_new_input(&self, item: &Value, source: MessageSource) -> bool {
@@ -517,9 +731,11 @@ fn activate_turn(
 }
 
 fn advance_turn(turns: &mut Vec<NativeTurn>, turn: &mut NativeTurn) {
-    let has_items = turn.has_items();
-    let previous = std::mem::replace(turn, NativeTurn::new(turn.index + usize::from(has_items)));
-    if has_items {
+    // A completion can arrive after the next task starts. Keep an unfinished
+    // itemless task so its eventual error retains the original position.
+    let retain = turn.has_content() || (turn.started && !turn.finished);
+    let previous = std::mem::replace(turn, NativeTurn::new(turn.index + usize::from(retain)));
+    if retain {
         turns.push(previous);
     }
 }

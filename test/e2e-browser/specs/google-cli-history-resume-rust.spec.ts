@@ -41,10 +41,10 @@ import type { Page } from '@playwright/test'
  *   3. A `userMessages`-tier search hits the NORMALIZED conversation, not a
  *      raw JSON grep: the nonce row matches (matchedIn `userMessage`),
  *      an UPPERCASE query still matches (case-insensitive text
- *      normalization), the literal record-type string `user_message` —
- *      present in EVERY raw transcript line, present in NO user text —
- *      matches NOTHING, and assistant-only text never matches the
- *      userMessages tier.
+ *      normalization), the literal record-type string `USER_INPUT` —
+ *      present in every raw user-record transcript line, present in no
+ *      user-authored text — matches NOTHING, and assistant-only text
+ *      never matches the userMessages tier.
  *
  * TEST 2 — stop, exact resume across restart, adjacency, zero-turn:
  *   4. Stop the owned fixture process (WS `terminal.kill` with
@@ -63,28 +63,35 @@ import type { Page } from '@playwright/test'
  *      sessionRef, no resume argv, and NO conversation was ever minted for
  *      it (the brain tree holds only the bound pane's conversation).
  *
- * TEST 3 — deleted store, honest restore (two-part shape):
+ * TEST 3 — deleted store, honest restore (three-part shape):
  *   8. Delete `brain/<id>/` under the isolated HOME. PART A: the restart
  *      resume attempt spawns NOTHING — the reconcile door intercepts the
  *      deleted store (`dead_session`/`session_not_on_disk`, no provider
- *      carve-out) into the loud user-driven Dead-sessions dialog, so no
- *      restore spawn ever happens on the restart path. PART B: a direct
- *      create-door restore attempt (this spec's raw WS client) launches
- *      with `--conversation <id>` (the antigravity resume gate is deferred
- *      by design — Task 7's honest-restore: no SpawnFresh substitution),
- *      and the PROBED real-binary contract (v1.4.10 + v1.4.12, round-6
- *      receipts; the fake reproduces it byte-for-byte) plays out end to
- *      end: the CLI prints `warning: conversation "<id>" not found` in
- *      the pane and CONTINUES INTO A FRESH INTERACTIVE SESSION — the
- *      pane stays ALIVE (exactly one spawn, no respawn cycle, no exit),
- *      its identity keeps naming the deleted id, the next clean prompt
- *      mints brain/<new-id>/ and the pane REBINDS dead→new through the
- *      server's rebind machinery (previousSessionId names the dead id),
- *      and the History read model lists the fresh conversation. Never a
- *      silent replacement: the dead id is never re-minted and
- *      `--continue` never appears.
-  *
-  * Cloud legality: deterministic fakes, generous polls (15-100 s), no
+ *      carve-out) into the no-modal dead-session state: the pane parks
+ *      with the `durable_artifact_missing` latch and exactly ONE notice
+ *      line in its own xterm buffer, no create attempt, no dialog (the
+ *      modal-dialog contract this scenario originally asserted was
+ *      removed by the no-modal dead-session rework; this rewrite pins
+ *      the shipped surface — reconcile-client-adoption-rust.spec.ts's
+ *      pinned shape). PART B: a direct create-door restore attempt (this
+ *      spec's raw WS client) answers the TYPED SESSION_MISSING refusal —
+ *      the antigravity resume gate is ACTIVE (activated 2026-11-03 on
+ *      real-binary transcript evidence (2026-11-02) + a proven
+ *      settings-conformant real resume (2026-11-03;
+ *      real-binary-transcript-evidence.md)): the stale id is named,
+ *      NOTHING spawns, and the CLI's probed missing-ID passthrough
+ *      (v1.4.10 + v1.4.12: warn and continue into a fresh session) never
+ *      sees the id. PART C: the same create door driven through a PANE
+ *      (a re-added pane carrying the deleted sessionRef) surfaces the
+ *      typed launch-failure card — SESSION_MISSING, naming the stale id,
+ *      with the explicit Start fresh action as the ONLY new-session
+ *      path; clicking it launches a genuinely fresh conversation that
+ *      mints a NEW brain/<id>/ (the dead id is never re-minted) and the
+ *      pane binds to it. Never a silent replacement, at any door:
+ *      `--conversation` never reaches the CLI and `--continue` never
+ *      appears.
+ *
+ * Cloud legality: deterministic fakes, generous polls (15-100 s), no
  * wall-clock-sensitive waits, and every selector is role/accessible-name
  * based except the a11y-gate-exempt `.xterm` widget root and value-carrying
  * attribute selectors (`[data-session-id=…]`, the session-directory-matrix
@@ -102,6 +109,14 @@ const FAKE_AGY_TERMINAL_SOURCE = path.resolve(__dirname, '../fixtures/fake-agy-t
 const SEEDED_PROVIDERS = ['antigravity']
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+// The dead-session buffer notice line (no-modal contract, pinned
+// byte-for-byte from TerminalView's DEAD_SESSION_BUFFER_NOTICES.missing —
+// donor reconcile-client-adoption-rust.spec.ts:184): a pane whose saved
+// session was deleted explains itself with exactly ONE line in its own
+// xterm buffer, never a modal dialog.
+const DEAD_SESSION_BUFFER_NOTICE =
+  "[This pane's saved session no longer exists on disk - close this pane or start a new one]"
 
 // ── per-spec-owned helper copies (the repo convention: copied, not imported) ──
 
@@ -657,11 +672,11 @@ test.describe('Google CLI history + exact resume (Rust): antigravity identity, d
         })
 
         // (c) NOT a raw JSON grep: the literal record-type string
-        // `user_message` appears in EVERY raw transcript line
-        // (`"type":"user_message"`) but in NO user-authored text — a raw
+        // `USER_INPUT` appears in every raw user-record transcript line
+        // (`"type":"USER_INPUT"`) but in NO user-authored text — a raw
         // file grep would return both conversations; the normalized tier
         // returns NOTHING.
-        const hitStructural = await runSearch('user_message', 'userMessages')
+        const hitStructural = await runSearch('USER_INPUT', 'userMessages')
         expect(hitStructural).toEqual([])
 
         // (d) tier scoping: assistant-only text never matches the
@@ -802,6 +817,35 @@ test.describe('Google CLI history + exact resume (Rust): antigravity identity, d
         await submitLine(page, paneIdBound, 'second turn after restart')
         await pollLeafBuffer(harness, tabId!, paneIdBound, `agy: remembered: ${nonce}`, 30_000)
 
+        // STEP continuation across the restart — the real binary's
+        // evidenced cross-process continuation (Task 1's receipts:
+        // USER_INPUT steps 0→2→5 across three separate resumed
+        // processes, no per-process reset): the second turn's records
+        // land with step_index values strictly past every record the
+        // first process wrote, so in-file step_index uniqueness holds
+        // (a per-process counter reset would duplicate 0,1,2 instead).
+        const boundTranscriptPath = path.join(
+          brainRootOf(info), boundId, '.system_generated', 'logs', 'transcript.jsonl',
+        )
+        const readBoundStepIndexes = async (): Promise<number[]> => {
+          const raw = await fs.readFile(boundTranscriptPath, 'utf8').catch(() => '')
+          const steps: number[] = []
+          for (const line of raw.split('\n')) {
+            if (!line.trim()) continue
+            try {
+              const record = JSON.parse(line) as { step_index?: unknown }
+              if (typeof record.step_index === 'number') steps.push(record.step_index)
+            } catch {
+              // malformed tail — skip
+            }
+          }
+          return steps
+        }
+        await expect.poll(async () => readBoundStepIndexes(), {
+          timeout: 15_000,
+          message: 'the restarted process continues the conversation\'s steps (0,1,2 then 3,4,5 — never a per-process reset)',
+        }).toEqual([0, 1, 2, 3, 4, 5])
+
         // ── Scenario 7: the zero-turn pane restores FRESH ─────────────────
         // No sessionRef, no resume argv — its restore create carries no
         // identity, so the CLI launches fresh (`agy> `) and NO conversation
@@ -857,7 +901,7 @@ test.describe('Google CLI history + exact resume (Rust): antigravity identity, d
     }
   })
 
-  test('scenario 8: a deleted brain/<id> parks the pane in the distinct dead-session state; a direct resume attempt warns in-pane, stays alive, and rebinds to the CLI\'s fresh conversation — never a silent replacement', async ({ page }) => {
+  test('scenario 8: a deleted brain/<id> parks the pane in the no-modal dead-session state; the gated resume door answers the typed SESSION_MISSING refusal at both surfaces — nothing ever spawns, and the pane-side Start fresh card is the only new-session path', async ({ page }) => {
     const fixture = await makeFixture('freshell-google-cli-deleted-store-')
     try {
       const server = await startOwnedServer(fixture)
@@ -921,36 +965,47 @@ test.describe('Google CLI history + exact resume (Rust): antigravity identity, d
           expect(status).toBe('ready')
         }).toPass({ timeout: 30_000 })
 
-        // ── Part A: the shipped browser-restart honest state ────────────
+        // ── Part A: the shipped browser-restart honest state (no-modal) ──
         // The pane-reconcile door consults the session-existence probe
         // BEFORE any restore spawn: a session that WAS on disk and is now
         // gone answers the typed `dead_session` verdict with reason
         // `session_not_on_disk` (reconcile.rs's §5.3 rows 4/4b gate), and
-        // the client parks the pane in the batched Dead sessions dialog —
-        // "dead_session is a UI state, not a deletion — nothing is
-        // auto-closed; every row waits for an explicit user decision"
-        // (DeadSessionPanel). NO resume attempt, NO spawn, NO replacement:
-        // the restart flow surfaces the missing store DISTINCTLY through a
-        // deliberate user-driven choice. (DEVIATION from the plan's
-        // scenario-8 wording — recorded in the task report: the plan
-        // assumed the restart restore would reach the CREATE door and the
-        // CLI's own error would print in-pane; the shipped reconcile door
-        // intercepts first, which is strictly MORE protective. The
-        // create-door behavior the plan describes — launch with
-        // `--conversation <id>`, the CLI's own error surfaces, never a
-        // replacement — is pinned by Part B below, end to end.)
-        const dialog = page.getByRole('dialog', { name: 'Dead sessions' })
-        await expect(dialog).toBeVisible({ timeout: 60_000 })
-        await expect(dialog.getByText('antigravity — session_not_on_disk')).toBeVisible()
-        await expect(dialog.getByRole('button', { name: 'Start fresh here' })).toBeVisible()
-        await expect(dialog.getByRole('button', { name: 'Close pane' })).toBeVisible()
-
-        // The parked pane keeps its identity (never a substituted fresh id)
-        // and carries the per-pane missing-store breadcrumb
-        // (`durable_artifact_missing`).
+        // the client parks the pane in the NO-MODAL dead-session state
+        // (the shipped contract, pinned by
+        // reconcile-client-adoption-rust.spec.ts): the pane keeps its
+        // identity, the `durable_artifact_missing` latch stands, the pane
+        // explains itself with exactly ONE notice line in its own xterm
+        // buffer, and NO create attempt is ever minted from the parked
+        // pane — no resume spawn, no replacement. (The modal Dead-sessions
+        // dialog this scenario asserted at its original drafting was
+        // removed by the no-modal dead-session rework — that was the
+        // pre-existing red this gated rewrite fixes.)
+        await expect.poll(async () => {
+          const leafNow = await findLeafById(harness, tabId!, paneId)
+          return leafNow?.content?.restoreError?.reason ?? null
+        }, { timeout: 60_000 }).toBe('durable_artifact_missing')
+        await expect(page.getByRole('dialog', { name: 'Dead sessions' })).toHaveCount(0)
+        await expect.poll(async () => {
+          // The old terminalId is a runtime handle and is stripped when the
+          // browser reloads. The dead pane still has a current xterm surface,
+          // so inspect it by the stable pane identity rather than asking the
+          // harness for a no-longer-registered terminalId (the deflake
+          // lookup from PR #902).
+          const buffer = await harness.getPaneTerminalBuffer(paneId)
+          return typeof buffer === 'string'
+            ? buffer.split(DEAD_SESSION_BUFFER_NOTICE).length - 1
+            : 0
+        }, { timeout: 60_000 }).toBe(1)
         const parkedLeaf = await findLeafById(harness, tabId!, paneId)
         expect(parkedLeaf?.content?.sessionRef).toMatchObject({ provider: 'antigravity', sessionId: boundId })
         expect(parkedLeaf?.content?.restoreError).toMatchObject({ code: 'RESTORE_UNAVAILABLE', reason: 'durable_artifact_missing' })
+        // The parked pane carries NO typed launch failure: nothing was
+        // created and nothing was refused — the typed-refusal shape
+        // belongs to the CREATE door (Parts B and C below), which the
+        // stood-down pane never enters.
+        expect(parkedLeaf?.content?.launchFailure).toBeFalsy()
+        // (The one dead-session notice line in the pane's own buffer is
+        // asserted above by the pane-identity poll — the deflake lookup.)
 
         // NO spawn happened for the parked pane: the argv log still holds
         // EXACTLY the original fresh launch (row 0) — no resume attempt, no
@@ -959,35 +1014,23 @@ test.describe('Google CLI history + exact resume (Rust): antigravity identity, d
         expect(partARows.length, 'the reconcile door never spawns for a dead session').toBe(1)
         expectNoContinueAnywhere(partARows)
 
-        // ── Part B: the resume attempt itself (the create door the plan's
-        // scenario describes) ────────────────────────────────────────────
-          // A deliberate restore create carrying the deleted sessionRef goes
-          // through the CREATE door, where the antigravity resume gate is
-          // DEFERRED by design (Task 7: never a typed SESSION_MISSING
-          // refusal, never a Freshell-side substituted id): the CLI
-          // launches with the ADJACENT `--conversation <deleted id>` pair,
-          // and the REAL CLI contract (probed v1.4.10 + v1.4.12, the
-          // round-6 PTY receipts; the fake reproduces it byte-for-byte)
-          // prints `warning: conversation "<id>" not found` and CONTINUES
-          // INTO A FRESH INTERACTIVE SESSION — the pane STAYS ALIVE (no
-          // exit, no auto-resume respawn cycle, exactly ONE spawn), the
-          // warning surfaces in the pane's own output, and the pane's
-          // identity still names the DEAD id. The next clean prompt mints
-          // brain/<new-id>/ and the pane REBINDS dead→new through the
-          // server's rebind machinery (the association frame names the
-          // dead id as previousSessionId) — a stale resume never
-          // dead-ends the pane and never silently substitutes: it warns
-          // AND rebinds transparently. Driven through the spec-owned raw
-          // WS client, attached to the spawned terminal so the output
-          // bytes and the association frames are captured directly.
-          let newId: string | null = null
-          let ws: WebSocket | null = null
-          try {
+        // ── Part B: the direct resume create (the create door, GATED) ───
+        // A deliberate restore create carrying the deleted sessionRef goes
+        // through the CREATE door, where the antigravity resume gate is
+        // ACTIVE (activated 2026-11-03 on real-binary transcript evidence
+        // (2026-11-02) + a proven settings-conformant real resume
+        // (2026-11-03; real-binary-transcript-evidence.md)): the gate
+        // validates the id against the on-disk store BEFORE the CLI is
+        // ever invoked, and positive absence answers the TYPED
+        // SESSION_MISSING refusal — nothing was started, the stale id is
+        // named, and the CLI's probed missing-ID passthrough (print
+        // `warning: conversation "<id>" not found` and CONTINUE into a
+        // fresh interactive session) is closed off at the door. Driven
+        // through the spec's raw WS client; the pane-side surface (the
+        // typed launch-failure card) is Part C.
+        let ws: WebSocket | null = null
+        try {
           ws = await connectAndHello(info.wsUrl, info.token)
-          // A persistent frame collector: everything this connection
-          // receives from here on (the created reply, the attach replay,
-          // the fake's output stream, the rebind broadcast) lands in one
-          // array the polls below scan — no listener-arithmetic races.
           const collected: any[] = []
           ws.on('message', (raw) => {
             try {
@@ -1007,186 +1050,147 @@ test.describe('Google CLI history + exact resume (Rust): antigravity identity, d
             sessionRef: { provider: 'antigravity', sessionId: boundId },
           }))
 
-          // The create is NEVER refused (the deferred gate) and the EXACT
-          // deleted id passes through — never a substituted fresh id.
-          const created = await new Promise<any>((resolve, reject) => {
-            const deadline = setTimeout(() => reject(new Error('no terminal.created for the restore create')), 30_000)
-            const timer = setInterval(() => {
-              const hit = collected.find((m) => m?.type === 'terminal.created' && m?.requestId === createRequestId)
-              if (hit) {
-                clearTimeout(deadline)
-                clearInterval(timer)
-                resolve(hit)
-              }
-            }, 50)
-          })
-          expect(created.sessionRef).toMatchObject({ provider: 'antigravity', sessionId: boundId })
-          const resumeTerminalId: string = created.terminalId
-          expect(resumeTerminalId).toBeTruthy()
-
-          // ATTACH. Under the probed contract the fake never dies, so a
-          // plain attach streams the warning; the bounded retry below
-          // merely tolerates a transient SESSION_RESERVED bounce (the
-          // pre-round-7 spec followed auto-resume replacement chains
-          // that only existed because the FAKE exited — cycles the real
-          // CLI never produces).
-          const attachDeadline = Date.now() + 30_000
-          let currentTerminalId: string = resumeTerminalId
-          let attached = false
-          for (let attempt = 0; !attached && Date.now() < attachDeadline; attempt += 1) {
-            const attachRequestId = `att-agy-deleted-store-${attempt}`
-            ws.send(JSON.stringify({
-              type: 'terminal.attach',
-              terminalId: currentTerminalId,
-              requestId: attachRequestId,
-              intent: 'viewport_hydrate',
-              cols: 120,
-              rows: 30,
-            }))
-            const outcome = await new Promise<'output' | 'bounce' | 'timeout'>((resolve) => {
-              const timer = setInterval(() => {
-                const bounce = collected.find((m) => m?.type === 'error' && m?.requestId === attachRequestId && m?.code === 'SESSION_RESERVED')
-                if (bounce) {
-                  clearInterval(timer)
-                  resolve('bounce')
-                  return
-                }
-                const out = collected.find((m) => (m?.type === 'terminal.output' || m?.type === 'terminal.output.batch') && m?.terminalId === currentTerminalId)
-                if (out) {
-                  clearInterval(timer)
-                  resolve('output')
-                  return
-                }
-                if (Date.now() > attachDeadline) {
-                  clearInterval(timer)
-                  resolve('timeout')
-                }
-              }, 50)
-            })
-            if (outcome === 'output') {
-              attached = true
-            } else if (outcome === 'bounce') {
-              // The server's bounce names a settle budget; poll well
-              // inside it and retry (a poll, never a fixed wait).
-              await new Promise((resolve) => setTimeout(resolve, 300))
-            }
-            // 'timeout' exits the loop and fails the assertion below.
-          }
-          expect(attached, 'the stale-resume terminal never streamed output to this client').toBe(true)
-
-          // The CLI's OWN probed warning surfaces in the resumed
-          // terminal's output stream — byte-faithful, quotes included.
-          const warningNeedle = `warning: conversation "${boundId}" not found`
-          // The poll's value on a miss is the collected-frame summary, so
-          // a failure names exactly what this attached client saw.
-          const summarizeCollected = () => collected.map((m) => {
-            if (m?.type === 'terminal.output' || m?.type === 'terminal.output.batch') {
-              return `${m.type}:${String(m?.data ?? '').slice(0, 200)}`
-            }
-            const detail = JSON.stringify({
-              type: m?.type,
-              code: m?.code,
-              message: m?.message,
-              status: m?.status,
-              exitCode: m?.exitCode,
-              terminalId: m?.terminalId,
-            })
-            return detail.slice(0, 400)
-          }).join(' | ')
-          await expect.poll(async () => {
-            const joined = collected
-              .filter((m) => m?.type === 'terminal.output' || m?.type === 'terminal.output.batch')
-              .map((m) => String(m?.data ?? ''))
-              .join('')
-              .replace(/[\r\n]/g, '')
-            return joined.includes(warningNeedle) ? true : summarizeCollected()
-          }, { timeout: 45_000 }).toBe(true)
-
-          // The pane STAYS ALIVE: no exit frame for the resumed terminal
-          // ever arrives (a bounded absence window — the pre-round-7
-          // fake exited 1 and drove a respawn cycle the real CLI never
-          // produces), and the spawn stays exactly ONE (no respawn
-          // row carrying the dead id).
-          await new Promise((resolve) => setTimeout(resolve, 2_000))
-          const exited = collected.find(
-            (m) => m?.type === 'terminal.exit' && m?.terminalId === resumeTerminalId && typeof m?.exitCode === 'number',
+          // The gated restore answers the typed refusal — never a
+          // terminal.created.
+          const refusal = await nextMessage(
+            ws,
+            (m) => m?.type === 'error' && m?.requestId === createRequestId,
+            30_000,
           )
-          expect(exited, 'the stale-resume pane never exits (the probed fresh session stays alive)').toBeUndefined()
-          const resumeSpawnCount = (await readArgvLog(fixture.agyArgLog))
-            .filter((row) => {
-              const idx = row.argv.indexOf('--conversation')
-              return idx !== -1 && row.argv[idx + 1] === boundId
-            }).length
-          expect(resumeSpawnCount, 'exactly ONE spawn carries the dead id (no respawn cycle, no replacement spawn)').toBe(1)
-
-          // The pane's identity still names the DEAD id (the created
-          // frame carried it verbatim — the rebind below names it as
-          // previousSessionId, proving the identity held the dead id up
-          // to the rebind). The next clean prompt mints the CLI's fresh
-          // conversation and REBINDS the pane dead→new.
-          ws.send(JSON.stringify({ type: 'terminal.input', terminalId: resumeTerminalId, data: 'stale-resume nonce 6y3n8p\r' }))
-
-          // The fresh conversation is minted under a NEW id — the dead id
-          // is never re-minted.
-          await expect.poll(async () => {
-            const ids = await listBrainIds(info)
-            const fresh = ids.find((id) => id !== boundId)
-            if (fresh) newId = fresh
-            return newId
-          }, { timeout: 30_000, message: 'the CLI\'s fresh session mints a NEW brain/<id>/ (the dead id is never re-minted)' }).not.toBeNull()
-          expect(newId).not.toBe(boundId)
-          expect(newId).toMatch(UUID_RE)
-
-          // …and the pane REBINDS dead→new through the server's rebind
-          // machinery: the association frame names the NEW conversation
-          // with the DEAD id as previousSessionId (the loud supersede —
-          // never a silent swap).
-          await expect.poll(async () => {
-            const hit = collected.find((m) => m?.type === 'terminal.session.associated'
-              && m?.terminalId === resumeTerminalId
-              && m?.sessionRef?.provider === 'antigravity'
-              && m?.sessionRef?.sessionId === newId
-              && m?.previousSessionId === boundId)
-            return hit ? true : summarizeCollected()
-          }, { timeout: 45_000, message: 'the stale-resume pane REBINDS dead→new (terminal.session.associated with previousSessionId = the dead id)' }).toBe(true)
-
-          // Sidebar/history reflect the NEW conversation: the session
-          // index picks the minted transcript up through the watcher and
-          // the History read model lists it (generous budget — the
-          // watcher coalesces events and the re-parse lands late under
-          // cloud contention; the poll settles the moment the row
-          // appears).
-          await expect.poll(async () => {
-            const rows = await fetchDirectory(info)
-            return rows.some((row) => row.provider === 'antigravity' && row.sessionId === newId)
-              ? true
-              : `directory rows: ${rows.filter((row) => row.provider === 'antigravity').map((row) => row.sessionId).join(',')}`
-          }, { timeout: 100_000, message: 'the History read model lists the rebound fresh conversation' }).toBe(true)
+          expect(refusal.code, 'the gated restore refuses the stale id (the typed SESSION_MISSING refusal): ' + JSON.stringify(refusal)).toBe('SESSION_MISSING')
+          expect(String(refusal.message ?? ''), 'the refusal names the stale id').toContain(boundId)
+          // A bounded absence window: no terminal.created for the request
+          // ever arrives (the collected frames are the evidence).
+          await new Promise((resolve) => setTimeout(resolve, 1_000))
+          expect(
+            collected.find((m) => m?.type === 'terminal.created' && m?.requestId === createRequestId),
+            'the refused restore never creates a terminal',
+          ).toBeUndefined()
         } finally {
           closeWs(ws)
         }
 
-        // ── The no-replacement invariants (both doors) ───────────────────
+        // ZERO spawns, and the fake store minted NOTHING: the CLI never
+        // saw the stale id (no warning-driven fresh session either).
+        expect((await readArgvLog(fixture.agyArgLog)).length, 'the refused create never spawns').toBe(1)
+        await expect.poll(async () => listBrainIds(info), { timeout: 15_000 }).toEqual([])
+
+        // ── Part C: the pane-driven resume create surfaces the typed card ─
+        // A pane that still believes it owns the deleted conversation (a
+        // re-added pane carrying the stale sessionRef — the shape a saved
+        // layout restores when its conversation was deleted on disk)
+        // drives the SAME create door through the client's own machinery:
+        // the refusal lands the typed launch-failure card —
+        // SESSION_MISSING, naming the stale id — with the explicit Start
+        // fresh action as the ONLY new-session path. Nothing spawns in
+        // its place; clicking Start fresh launches a genuinely new
+        // conversation that mints a NEW brain/<id>/ (the dead id is never
+        // re-minted) and the pane binds to it.
+        const refusalPaneId = 'pane-gated-refusal'
+        await page.evaluate((payload: Record<string, unknown>) => {
+          (window as any).__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'panes/splitPane', payload })
+        }, {
+          tabId,
+          paneId,
+          direction: 'vertical',
+          newPaneId: refusalPaneId,
+          newContent: {
+            kind: 'terminal',
+            mode: 'antigravity',
+            shell: 'system',
+            status: 'creating',
+            createRequestId: 'req-agy-gated-refusal-pane',
+            sessionRef: { provider: 'antigravity', sessionId: boundId },
+            initialCwd: fixture.cwdDir,
+          },
+          activate: true,
+        })
+
+        // The pane's own create is refused at the door: the typed
+        // launchFailure lands (SESSION_MISSING, naming the stale id), NO
+        // terminal is ever created, and the pane keeps naming the dead id
+        // (the identity is cleared only by the explicit start-fresh
+        // action below).
+        await expect.poll(async () => {
+          const refusalLeaf = await findLeafById(harness, tabId!, refusalPaneId)
+          return refusalLeaf?.content?.launchFailure?.code ?? null
+        }, { timeout: 30_000 }).toBe('SESSION_MISSING')
+        const refusalLeaf = await findLeafById(harness, tabId!, refusalPaneId)
+        expect(String(refusalLeaf?.content?.launchFailure?.message ?? ''), 'the pane-side refusal names the stale id').toContain(boundId)
+        expect(refusalLeaf?.content?.terminalId, 'no terminal was ever created for the refused create').toBeFalsy()
+        expect(refusalLeaf?.content?.sessionRef).toMatchObject({ provider: 'antigravity', sessionId: boundId })
+
+        // The typed launch-failure card renders in the pane (the
+        // TerminalLaunchFailureCard SESSION_MISSING arm): the alert names
+        // the typed code and the message names the stale id, with the
+        // Start fresh action present.
+        const refusalPaneRoot = page.locator(`[data-context="terminal"][data-pane-id="${refusalPaneId}"]`)
+        const card = refusalPaneRoot.getByRole('alert', { name: 'Launch failed: SESSION_MISSING' })
+        await expect(card).toBeVisible({ timeout: 15_000 })
+        await expect(card.getByText(boundId), 'the card message names the stale id').toBeVisible()
+        const startFreshButton = card.getByTestId('terminal-launch-failure-start-fresh')
+        await expect(startFreshButton).toBeVisible()
+
+        // Still ZERO spawns and an empty brain tree — the refusal never
+        // starts anything (no replacement conversation mints).
+        expect((await readArgvLog(fixture.agyArgLog)).length, 'the pane-side typed refusal never spawns either').toBe(1)
+        expect(await listBrainIds(info), 'no replacement conversation minted').toEqual([])
+
+        // Clicking Start fresh is the ONLY new-session path: the stale
+        // identity is cleared (a fresh-nanoid createRequestId, the
+        // sessionRef dropped), a genuinely new create fires, and the fake
+        // spawns a FRESH interactive session (bare argv — `--conversation`
+        // never appears, and `--continue` never does either).
+        await startFreshButton.click()
+
+        await expect.poll(async () => {
+          const freshLeaf = await findLeafById(harness, tabId!, refusalPaneId)
+          return freshLeaf?.content?.terminalId ?? null
+        }, { timeout: 30_000, message: 'the start-fresh create spawns a new terminal' }).not.toBeNull()
+        const freshLeaf = await findLeafById(harness, tabId!, refusalPaneId)
+        expect(freshLeaf?.content?.launchFailure, 'the card clears once the fresh create runs').toBeFalsy()
+        expect(freshLeaf?.content?.sessionRef ?? null, 'the fresh create is identity-less — the stale ref is gone').toBeNull()
+        await pollLeafBuffer(harness, tabId!, refusalPaneId, 'agy> ', 30_000)
+
+        // The first submitted line mints the CLI's fresh conversation
+        // under a NEW id (the dead id is never re-minted) and the pane
+        // binds to it.
+        await submitLine(page, refusalPaneId, 'fresh-after-refusal nonce 7h4m2q')
+        let newId: string | null = null
+        await expect.poll(async () => {
+          const ids = await listBrainIds(info)
+          const fresh = ids.find((id) => id !== boundId)
+          if (fresh) newId = fresh
+          return newId
+        }, { timeout: 30_000, message: 'the start-fresh session mints a NEW brain/<id>/ (the dead id is never re-minted)' }).not.toBeNull()
+        expect(newId, 'the fresh conversation mints under a new id').not.toBe(boundId)
+        expect(newId).toMatch(UUID_RE)
+        await expect.poll(async () => {
+          const boundAgain = await findLeafById(harness, tabId!, refusalPaneId)
+          return boundAgain?.content?.sessionRef?.sessionId ?? null
+        }, { timeout: 30_000, message: 'the pane binds to the fresh conversation on its first submitted line' }).toBe(newId)
+
+        // ── The no-replacement invariants (all doors) ───────────────────
         // argv: row 0 is the pane's original fresh launch; row 1 is the
-        // Part-B resume attempt carrying the ADJACENT `--conversation
-        // <deleted id>` pair; NO further row EVER exists (no respawn
-        // cycle, no replacement fresh spawn — the pane stayed alive), and
-        // no row names any other id. `--continue` never appears.
+        // start-fresh spawn — BARE (the refused resume NEVER reached the
+        // CLI: no row carries `--conversation`, and `--continue` never
+        // appears). The brain tree holds EXACTLY the fresh conversation.
         await expect.poll(async () => (await readArgvLog(fixture.agyArgLog)).length, { timeout: 30_000 }).toBe(2)
         const rows = await readArgvLog(fixture.agyArgLog)
         expectNoContinueAnywhere(rows)
         expect(rows[0].argv, 'row 0 is the original fresh launch').not.toContain('--conversation')
-        expect(rows.length, 'exactly two spawns: the fresh launch + the ONE stale resume').toBe(2)
-        const resumeIdx = rows[1].argv.indexOf('--conversation')
-        expect(resumeIdx, 'the resume attempt carries the adjacent pair').not.toBe(-1)
-        expect(rows[1].argv[resumeIdx + 1], 'the resume attempt names the deleted id').toBe(boundId)
+        expect(rows[1].argv, 'row 1 is the start-fresh launch (bare — no resume id ever reached the CLI)').not.toContain('--conversation')
+        expect(rows.length, 'exactly two spawns: the fresh launch + the start-fresh launch').toBe(2)
+        expect(newId, 'the mint landed before the tail invariants').not.toBeNull()
+        await expect.poll(async () => listBrainIds(info), { timeout: 15_000 }).toEqual([newId!])
 
-        // The brain tree holds EXACTLY the fresh conversation: the
-        // deleted conversation was never re-minted under its dead id —
-        // the CLI's fresh session minted a NEW id and the pane is
-        // rebound to it.
-        expect(newId, 'the rebind landed before the tail invariants').not.toBeNull()
-        await expect.poll(async () => listBrainIds(info), { timeout: 15_000 }).toEqual([newId])
+        // History lists the fresh conversation (the minted transcript).
+        await expect.poll(async () => {
+          const dirRows = await fetchDirectory(info)
+          return dirRows.some((row) => row.provider === 'antigravity' && row.sessionId === newId)
+            ? true
+            : `directory rows: ${dirRows.filter((row) => row.provider === 'antigravity').map((row) => row.sessionId).join(',')}`
+        }, { timeout: 100_000, message: 'the History read model lists the start-fresh conversation' }).toBe(true)
       } finally {
         await server.stop().catch(() => {})
       }

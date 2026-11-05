@@ -2,7 +2,7 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { test, expect } from '../helpers/fixtures.js'
+import { createFreshE2ePage, test, expect } from '../helpers/fixtures.js'
 import { RustServer } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
@@ -36,23 +36,14 @@ async function installFakeCli(binDir: string, name: string, source: string): Pro
   return target
 }
 
-// Helpers copied verbatim from launch-retry-restart-rust.spec.ts per this
-// suite's per-spec-ownership convention.
-
 async function selectShellIfPickerShowing(page: import('@playwright/test').Page): Promise<void> {
-  await page.waitForTimeout(500)
-  const xtermVisible = await page.locator('.xterm').first().isVisible().catch(() => false)
-  if (xtermVisible) return
-  const shellNames = ['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash']
-  for (const name of shellNames) {
-    try {
-      await page.getByRole('button', { name: new RegExp(`^${name}$`, 'i') }).click({ timeout: 5_000 })
-      await page.locator('.xterm').first().waitFor({ state: 'visible', timeout: 15_000 })
-      return
-    } catch {
-      continue
-    }
-  }
+  const terminal = page.locator('.xterm').first()
+  const picker = page.getByRole('toolbar', { name: /pane type picker/i }).last()
+  await expect.poll(async () => await terminal.isVisible() || await picker.isVisible()).toBe(true)
+  if (await terminal.isVisible()) return
+  await picker.getByRole('button', { name: /^(Shell|WSL|CMD|PowerShell|Bash)$/i })
+    .first().press('Enter')
+  await expect(terminal).toBeVisible({ timeout: 15_000 })
 }
 
 function collectLeaves(node: any): any[] {
@@ -66,24 +57,28 @@ async function openCodexPaneAndGetTerminalId(
   page: import('@playwright/test').Page,
   harness: TestHarness,
   tabId: string,
+  cwd: string,
 ): Promise<string> {
   const before = collectLeaves(await harness.getPaneLayout(tabId))
     .filter((leaf) => leaf?.content?.mode === 'codex')
   const beforeIds = new Set(before.map((leaf) => leaf.id))
   const picker = await openPanePicker(page)
-  await picker.getByRole('button', { name: /Codex/i }).click({ force: true })
-  await page.getByRole('combobox', { name: /Starting directory/i }).press('Enter')
+  await picker.getByRole('button', { name: /^Codex CLI$/i }).press('Enter')
+  const directory = page.getByRole('combobox', { name: /Starting directory/i })
+  // The default directory arrives asynchronously from the shell projection.
+  // Enter on an empty input is an invalid request, not a slow create.
+  await directory.fill(cwd)
+  await directory.press('Enter')
   await expect(page.locator('.xterm').last()).toBeVisible({ timeout: 15_000 })
+  let terminalId: string | null = null
   await expect.poll(async () => {
     const layout = await harness.getPaneLayout(tabId)
     const leaf = collectLeaves(layout)
       .find((l) => l?.content?.mode === 'codex' && !beforeIds.has(l.id) && l?.content?.terminalId)
-    return leaf?.content?.terminalId ?? null
+    terminalId = leaf?.content?.terminalId ?? null
+    return terminalId
   }, { timeout: 15_000 }).not.toBeNull()
-  const layout = await harness.getPaneLayout(tabId)
-  const leaf = collectLeaves(layout)
-    .find((l) => l?.content?.mode === 'codex' && !beforeIds.has(l.id) && l?.content?.terminalId)
-  return leaf.content.terminalId as string
+  return terminalId!
 }
 
 async function typePromptIntoLastPane(page: import('@playwright/test').Page, text: string): Promise<void> {
@@ -95,7 +90,7 @@ async function typePromptIntoLastPane(page: import('@playwright/test').Page, tex
 test.describe('Turn-complete alert across abrupt restart (Rust only)', () => {
   test.setTimeout(180_000)
 
-  test('a recovered CLI pane rings exactly once for its first post-restart turn', async ({ page }) => {
+  test('a recovered CLI pane rings exactly once for its first post-restart turn', async ({ browser }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-lane-c-chime-'))
     // Dual-role: the Rust codex terminal lane boots a `codex app-server`
     // sidecar first from the same CODEX_CMD; a terminal-only fake exits 0 on
@@ -112,8 +107,12 @@ test.describe('Turn-complete alert across abrupt restart (Rust only)', () => {
         }, null, 2))
       },
     })
-    const info = await server.start()
+    let context: import('@playwright/test').BrowserContext | undefined
     try {
+      const info = await server.start()
+      const owned = await createFreshE2ePage(browser, info, { serviceWorkers: 'block' })
+      context = owned.context
+      const { page } = owned
       await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
       const harness = new TestHarness(page)
       await harness.waitForHarness()
@@ -122,7 +121,7 @@ test.describe('Turn-complete alert across abrupt restart (Rust only)', () => {
       await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
       const tabId = await harness.getActiveTabId()
 
-      const terminalId1 = await openCodexPaneAndGetTerminalId(page, harness, tabId!)
+      const terminalId1 = await openCodexPaneAndGetTerminalId(page, harness, tabId!, sharedRoot)
       await expect.poll(async () => {
         const buffer = await harness.getTerminalBuffer(terminalId1)
         return typeof buffer === 'string' && buffer.includes('fake-cli>')
@@ -173,6 +172,7 @@ test.describe('Turn-complete alert across abrupt restart (Rust only)', () => {
       await page.waitForTimeout(3_000)
       expect((await harness.getState()).turnCompletion.seq).toBe(seqBeforeTurn2 + 1)
     } finally {
+      await context?.close().catch(() => {})
       await server.stop().catch(() => {})
       await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
     }

@@ -387,6 +387,16 @@ export type TerminalPaneContent = {
   /** znhn item 1: persisted deliberately — do NOT add to
    * stripTransientSessionFields. Absent on old layouts = no trace. */
   crashTrace?: CrashTrace
+  /** Focused repair round 3, Major 2 (the setPaneCrashTrace pattern's
+   * sibling): the gate's stale-id notice naming the REFUSED conversation,
+   * carried on the `terminal.replaced` frame (`staleSessionNotice`, the
+   * fresh_unbound shape only) — the path the pane actually consumes; the
+   * respawn's Recovering broadcast names it too but is addressed to the NEW
+   * terminal id the pane cannot match. Persisted deliberately (survives
+   * reload until dismissed) — do NOT add to stripTransientSessionFields;
+   * rides the normalizePaneContent whitelist. Absent on old layouts = no
+   * notice. */
+  staleSessionNotice?: string
   /**
    * Unified agent names (Task 1): the canonical naming identity this pane's
    * name resolves through — a pending handle while provider identity is
@@ -644,11 +654,17 @@ export type RestoreFallbackAttempt = {
 
 /**
  * Slice-level banner state while reconcile-driven creates are warming.
- * Ephemeral — must never be persisted.
+ * Ephemeral — must never be persisted. Each paneRef is IDENTITY-BOUND
+ * (auto-restore-warming round-2 finding 3): it carries the PARKED pane's
+ * createRequestId as minted by `foldVerdicts` from the request pane claims,
+ * so the recovery driver drives only refs whose CURRENT content still
+ * carries the parked identity — a pane replaced while waiting (same paneId,
+ * new content) drops out exactly like a closed pane: its pending recovery
+ * is canceled, never transferred to the replacement.
  */
 export type ReconcileWarmingState = {
   count: number
-  paneRefs: { tabId: string; paneId: string }[]
+  paneRefs: { tabId: string; paneId: string; createRequestId: string }[]
 }
 
 /**

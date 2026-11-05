@@ -63,6 +63,7 @@ where
 #[allow(clippy::too_many_arguments)] // Same create-context plumbing as `handle_create`.
 pub(crate) fn spawn_gated_restore_create(
     create: TerminalCreate,
+    host_agent_permit: Option<freshell_freshagent::host_agent_admission::HostAgentAdmissionPermit>,
     state: &WsState,
     conn_sink: &freshell_terminal::FrameSink,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
@@ -84,6 +85,10 @@ pub(crate) fn spawn_gated_restore_create(
     // events (prepare/gate/spawn) keep the serving connection's `connection_id`.
     tokio::spawn(
         async move {
+            // The maintenance admission permit starts before launch planning,
+            // which may itself create a provider sidecar, and remains held
+            // through handle_create's terminal/ownership publication.
+            let _host_agent_permit = host_agent_permit;
             // P1 (graceful restore/resume S1): prepare — resume-identity
             // derivation + the codex managed plan — runs BEFORE the gate, so
             // permits only ever cover fast, mode-uniform PTY-spawn->settle work

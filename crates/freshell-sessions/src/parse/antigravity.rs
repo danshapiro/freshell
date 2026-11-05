@@ -1,35 +1,33 @@
 //! Antigravity CLI (`agy`) conversation transcript `.jsonl` parser.
 //!
-//! // Stage-1 candidate contract: the transcript PATH
-//! (`~/.gemini/antigravity-cli/brain/<conversationId>/.system_generated/logs/transcript.jsonl`)
-//! and the hook inputs (`conversationId`, `workspacePaths`, `transcriptPath`)
-//! are documented+probe-validated facts (Provider Contract Record,
-//! `docs/plans/2026-10-29-google-cli-first-class-support.md`). The on-disk
-//! RECORD SCHEMA parsed here is NOT documented anywhere official and is
-//! validated ONLY against the committed fixtures
-//! (`test/fixtures/coding-cli/antigravity/*.sanitized.jsonl`, pinned by
-//! `tests/antigravity_fixture_parity.rs`); it remains the A2 named blocker.
-//! No capability flag, qualification entry, or recovery claim may be
-//! enabled on this candidate evidence.
+//! REAL-BINARY record contract (corrected 2026-11-02 against real agy
+//! 1.4.12 transcripts; evidence:
+//! .worktrees/.the-usual-logs/antigravity-transcript-validation/reports/
+//! real-binary-transcript-evidence.md): step-indexed records —
+//! USER_INPUT / PLANNER_RESPONSE / GENERIC / SYSTEM_MESSAGE /
+//! CHECKPOINT — every record carrying `source`, `status`, `step_index`,
+//! and a SECOND-granularity RFC3339 `created_at`. The SIXTH contract
+//! type (evidenced 2026-11-03, same report's overlay-conformant
+//! receipts) is the failure-path `ERROR_MESSAGE` (src=SYSTEM,
+//! status=DONE, carries `error` + `step_index` + `created_at`): it
+//! carries no content/thinking, so it stays a NON-message record here —
+//! its `created_at` folds into the session clock exactly like the other
+//! known types (a failed turn IS activity; final-delta round 4), but
+//! nothing else about it is read (no message extraction, no summary, no
+//! token fold; pinned by the fixture-parity suite's ERROR_MESSAGE
+//! tests). Real records carry NO
+//! conversation id and NO workspace evidence: the conversation id IS
+//! the `brain/<id>` directory name (passed in by the caller), and `cwd`
+//! is `None` for real transcripts (rows group under an unknown project).
+//! The e2e/rebind fakes additionally append ONE labeled fake-contract
+//! extension this parser tolerates: the `session_start` ownership anchor
+//! (cwd evidence for the fake contract — real transcripts carry none).
 //!
-//! Structure follows the codex parser (`parse/codex.rs`): corruption-tolerant
-//! by construction — a malformed line is skipped, never panicking the
-//! process; unknown record types are ignored; and `message_count` counts
-//! every non-empty line (including unparseable ones).
-//!
-//! Candidate record types:
-//! - `session_start` (the ownership record): `conversationId`,
-//!   `workspacePaths` (absolute; may carry several — the FIRST recorded is
-//!   the evidenced primary cwd, never the current terminal's cwd), `model`,
-//!   `startedAt`.
-//! - `user_message`: `text`, `at`.
-//! - `assistant_message`: `text`, `at`, optional `usage` envelope
-//!   (`inputTokens`/`outputTokens`/`cachedTokens`/`totalTokens`).
-//! - `turn_settled`: `at`, `outcome` (`completed`|`errored`), `fullyIdle`.
-//!
-//! Only those four semantic record types move the created/last-activity
-//! clock; `session_start` timestamps come from `startedAt`, the rest from
-//! `at`.
+//! Corruption tolerance (unchanged): a malformed line is skipped, never
+//! panicking the process; unknown record types are ignored; and
+//! `message_count` counts every non-empty line (including unparseable
+//! ones). A transcript with NO recognized record is excluded (`None`) —
+//! absence is never silent upstream (`antigravity_parse_failed`).
 
 use serde_json::Value;
 
@@ -39,30 +37,26 @@ use crate::time::{parse_timestamp_ms, to_finite_number};
 
 /// The title bound for user-derived titles (codex/claude parity).
 const ANTIGRAVITY_TITLE_MAX_CHARS: usize = 200;
-/// The assistant-summary bound (first assistant text; codex parity).
+/// The assistant-summary bound (first PLANNER_RESPONSE content; codex parity).
 const ANTIGRAVITY_SUMMARY_MAX_CHARS: usize = 240;
 
 fn finite_i64(v: Option<&Value>) -> Option<i64> {
     v.and_then(to_finite_number).map(|f| f as i64)
 }
 
-/// `parseAntigravityTokenEnvelope` — maps the candidate schema's `usage`
-/// object into [`TokenSummary`] with codex-style plausibility coercion
-/// (model: `parse_codex_token_envelope`'s `parse_usage_payload`,
-/// parse/codex.rs:151-180): absent keys default to 0, `totalTokens` falls
-/// back to `input+output` when omitted, a non-object envelope is ignored,
-/// and an all-zero envelope stays `None` — missing usage stays unknown.
-/// The candidate schema carries no context-window fields, so the
-/// context-meter trio stays `None`.
-fn parse_antigravity_token_envelope(usage: &Value) -> Option<TokenSummary> {
-    if !usage.is_object() {
-        return None;
-    }
-    let input = finite_i64(usage.get("inputTokens")).unwrap_or(0);
-    let output = finite_i64(usage.get("outputTokens")).unwrap_or(0);
-    let cached = finite_i64(usage.get("cachedTokens")).unwrap_or(0);
-    let total = finite_i64(usage.get("totalTokens")).unwrap_or(input + output);
-    if input == 0 && output == 0 && cached == 0 && total == 0 {
+/// The real format's FLAT token fields (binary v1.4.12): sparse
+/// snake_case counts on a subset of PLANNER_RESPONSE records — null on
+/// almost all records, and no `totalTokens` key exists (total falls
+/// back to input+output). An all-null/all-zero read stays `None`
+/// (missing usage is unknown, never a zeroed summary). The LAST
+/// token-bearing record wins — the documented reading per the evidence
+/// receipts (Provider Contract Record row 75(b)).
+fn parse_antigravity_token_fields(obj: &Value) -> Option<TokenSummary> {
+    let input = finite_i64(obj.get("input_tokens")).unwrap_or(0);
+    let output = finite_i64(obj.get("output_tokens")).unwrap_or(0);
+    let cached = finite_i64(obj.get("cache_read_tokens")).unwrap_or(0);
+    let total = input + output;
+    if input == 0 && output == 0 && cached == 0 {
         return None;
     }
     Some(TokenSummary {
@@ -77,9 +71,10 @@ fn parse_antigravity_token_envelope(usage: &Value) -> Option<TokenSummary> {
     })
 }
 
-/// Fold one semantic-record timestamp into the meta clock:
-/// `created_at` = min, `last_activity_at` = max (codex semantic-fold model,
-/// parse/codex.rs:303-308).
+/// Fold one recognized record's `created_at` into the meta clock:
+/// `created_at` = min, `last_activity_at` = max (codex semantic-fold
+/// model). The real vocabulary is closed (all six types carry real
+/// stamps), so every recognized record folds.
 fn fold_ts(meta: &mut ParsedSessionMeta, value: Option<&Value>) {
     if let Some(at) = value.and_then(parse_timestamp_ms) {
         meta.created_at = Some(meta.created_at.map_or(at, |c| c.min(at)));
@@ -88,29 +83,26 @@ fn fold_ts(meta: &mut ParsedSessionMeta, value: Option<&Value>) {
 }
 
 /// Parse one antigravity conversation transcript into
-/// [`ParsedSessionMeta`], or `None` when no ownership record yields a
-/// `conversationId` — an id-less file is an excluded row (the R10b-style
-/// cwd/identity-less exclusion; it never indexes a ghost session).
+/// [`ParsedSessionMeta`], or `None` when no recognized record parses —
+/// an empty/garbage-only file is an excluded row (it proves nothing
+/// happened; the directory alone carries no message evidence).
 ///
-/// Determinism rules (pinned by the fixture-parity test):
-/// - The FIRST `session_start` record's `conversationId` wins; later ones
-///   never reassign it (a resumed conversation may append another
-///   `session_start`, and a two-id file keeps the first id — never a guess).
-/// - `cwd` is the first recorded `workspacePaths` entry that looks like a
-///   path; later records never override it. The full path set is retained in
-///   the transcript itself for consumers that need it (the Task-6 locator
-///   re-reads the ownership record); the parse layer surfaces only the
-///   evidenced primary.
-/// - `first_user_message` is the first `user_message` text that normalizes
-///   to a non-empty message; `title` derives from it (200 chars), never
-///   provider-generated.
-pub fn parse_antigravity_session_content(content: &str) -> Option<ParsedSessionMeta> {
-    let mut meta = ParsedSessionMeta::default();
-    let mut have_id = false;
+/// `conversation_id` is the `brain/<id>` directory name (real records
+/// carry no id — binary v1.4.12); it is authoritative and never
+/// reassigned by record content.
+pub fn parse_antigravity_session_content(
+    content: &str,
+    conversation_id: &str,
+) -> Option<ParsedSessionMeta> {
+    let mut meta = ParsedSessionMeta {
+        session_id: Some(conversation_id.to_string()),
+        ..ParsedSessionMeta::default()
+    };
     let mut have_cwd = false;
     let mut first_user: Option<String> = None;
     let mut summary: Option<String> = None;
     let mut count = 0i64;
+    let mut parsed_semantic = 0i64;
 
     for line in content.split('\n') {
         let line = line.strip_suffix('\r').unwrap_or(line);
@@ -121,18 +113,16 @@ pub fn parse_antigravity_session_content(content: &str) -> Option<ParsedSessionM
         let Ok(obj) = serde_json::from_str::<Value>(line) else {
             continue; // malformed ⇒ skip (a truncated mid-write tail lands here)
         };
-        let conv = obj
-            .get("conversationId")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty());
-        match obj.get("type").and_then(Value::as_str) {
-            Some("session_start") => {
-                if !have_id {
-                    if let Some(id) = conv {
-                        meta.session_id = Some(id.to_string());
-                        have_id = true;
-                    }
-                }
+        let Some(record_type) = obj.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        match record_type {
+            // Fake-contract extension (the e2e/rebind fakes' ownership
+            // anchor): cwd evidence only — its conversationId never
+            // reassigns the directory id, and real transcripts carry no
+            // such record (binary evidence).
+            "session_start" => {
+                parsed_semantic += 1;
                 if !have_cwd {
                     if let Some(paths) = obj.get("workspacePaths").and_then(Value::as_array) {
                         if let Some(primary) = paths.iter().find_map(|p| p.as_str()) {
@@ -145,17 +135,21 @@ pub fn parse_antigravity_session_content(content: &str) -> Option<ParsedSessionM
                 }
                 fold_ts(&mut meta, obj.get("startedAt"));
             }
-            Some("user_message") => {
-                if first_user.is_none() {
-                    if let Some(text) = obj.get("text").and_then(Value::as_str) {
+            "USER_INPUT" => {
+                parsed_semantic += 1;
+                if first_user.is_none()
+                    && obj.get("source").and_then(Value::as_str) == Some("USER_EXPLICIT")
+                {
+                    if let Some(text) = obj.get("content").and_then(Value::as_str) {
                         first_user = normalize_first_user_message(text);
                     }
                 }
-                fold_ts(&mut meta, obj.get("at"));
+                fold_ts(&mut meta, obj.get("created_at"));
             }
-            Some("assistant_message") => {
+            "PLANNER_RESPONSE" => {
+                parsed_semantic += 1;
                 if summary.is_none() {
-                    if let Some(text) = obj.get("text").and_then(Value::as_str) {
+                    if let Some(text) = obj.get("content").and_then(Value::as_str) {
                         let trimmed = text.trim();
                         if !trimmed.is_empty() {
                             summary = Some(
@@ -167,32 +161,25 @@ pub fn parse_antigravity_session_content(content: &str) -> Option<ParsedSessionM
                         }
                     }
                 }
-                fold_ts(&mut meta, obj.get("at"));
-                if let Some(usage) = obj.get("usage") {
-                    // Whole-delta review round 6, Nit 1: this takes the
-                    // LAST assistant envelope, not an accumulated total —
-                    // whether the candidate schema's per-message `usage`
-                    // is per-message or cumulative is a Stage-1 UNKNOWN
-                    // (the A2 schema blocker; recorded in the plan's
-                    // Provider Contract Record "real-binary follow-up"
-                    // row). Under a per-message reading a multi-turn
-                    // conversation reports only the final message's
-                    // envelope; a real authenticated session must settle
-                    // the semantics before this projection may be called
-                    // a total.
-                    meta.token_usage =
-                        parse_antigravity_token_envelope(usage).or(meta.token_usage.take());
-                }
+                fold_ts(&mut meta, obj.get("created_at"));
+                meta.token_usage = parse_antigravity_token_fields(&obj).or(meta.token_usage.take());
             }
-            Some("turn_settled") => {
-                fold_ts(&mut meta, obj.get("at"));
+            // The inert known types: no message extraction, no tokens —
+            // only their stamps fold. ERROR_MESSAGE is the failure-path
+            // record: a failed turn IS activity (final-delta round 4), so
+            // its `created_at` folds like every known type while
+            // everything else about it stays inert (no message, no
+            // summary, no token fold).
+            "GENERIC" | "SYSTEM_MESSAGE" | "CHECKPOINT" | "ERROR_MESSAGE" => {
+                parsed_semantic += 1;
+                fold_ts(&mut meta, obj.get("created_at"));
             }
-            _ => {} // unknown record types are ignored
+            _ => {} // unknown record types are ignored (forward-compat)
         }
     }
 
-    if !have_id {
-        return None; // no ownership evidence ⇒ excluded row (R10b-style)
+    if parsed_semantic == 0 {
+        return None; // nothing recognized ⇒ excluded row
     }
     meta.message_count = count;
     meta.first_user_message = first_user;
@@ -209,134 +196,75 @@ mod tests {
     use super::*;
 
     #[test]
-    fn content_without_conversation_id_is_excluded() {
-        // Messages without an ownership record carry no identity evidence:
-        // the row is excluded (None), never indexed as a ghost session.
-        let content = concat!(
-            r#"{"type":"user_message","text":"Hi","at":"2026-10-29T20:00:01.000Z"}"#,
-            "\n",
-            r#"{"type":"assistant_message","text":"Hello","at":"2026-10-29T20:00:02.000Z"}"#,
-            "\n",
-            r#"{"type":"turn_settled","at":"2026-10-29T20:00:02.500Z","outcome":"completed","fullyIdle":true}"#,
-        );
-        assert!(
-            parse_antigravity_session_content(content).is_none(),
-            "R10b-style: no ownership record yields a conversationId ⇒ None"
-        );
-        // An empty conversationId string is the same as an absent one.
-        let empty_id = r#"{"type":"session_start","conversationId":"","workspacePaths":["/w"],"startedAt":"2026-10-29T20:00:00.000Z"}"#;
-        assert!(parse_antigravity_session_content(empty_id).is_none());
-        // Garbage-only content is excluded too.
-        assert!(parse_antigravity_session_content("not json\n{oops").is_none());
+    fn content_with_no_parseable_records_is_excluded() {
+        // No recognized record at all (garbage-only, empty, or blank) yields
+        // no row — the dir name alone proves nothing parseable happened.
+        assert!(parse_antigravity_session_content("not json\n{oops", "c1").is_none());
+        assert!(parse_antigravity_session_content("", "c1").is_none());
+        assert!(parse_antigravity_session_content("\n \n", "c1").is_none());
     }
 
     #[test]
-    fn malformed_lines_are_skipped_but_counted() {
+    fn second_granularity_created_at_folds_to_ms() {
+        // Real binary stamps are RFC3339 with NO fractional part
+        // (2026-10-29T20:00:01Z) — the shared coercion must read them.
         let content = concat!(
-            r#"{"type":"session_start","conversationId":"c1","workspacePaths":["/w"],"startedAt":"2026-10-29T20:00:00.000Z"}"#,
+            r#"{"type":"USER_INPUT","source":"USER_EXPLICIT","status":"DONE","step_index":0,"created_at":"2026-10-29T20:00:01Z","content":"Prompt"}"#,
             "\n",
-            "totally not json garbage",
-            "\n",
-            r#"{"type":"user_message","conversationId":"c1","text":"Prompt","at":"2026-10-29T20:00:01.000Z"}"#,
-            "\n",
-            r#"{"type":"turn_settled","conversationId":"c1","at":"2026-10-30T0"#,
-            // (truncated mid-write tail, no closing quote or brace)
+            r#"{"type":"PLANNER_RESPONSE","source":"MODEL","status":"DONE","step_index":1,"created_at":"2026-10-29T20:00:02Z","content":"Reply."}"#,
         );
-        let meta = parse_antigravity_session_content(content).expect("ownership record present");
-        assert_eq!(meta.session_id.as_deref(), Some("c1"));
-        assert_eq!(meta.first_user_message.as_deref(), Some("Prompt"));
-        assert_eq!(meta.message_count, 4, "every non-empty line counts");
-        assert_eq!(meta.created_at, Some(1_793_304_000_000));
+        let meta = parse_antigravity_session_content(content, "c2").expect("parses");
+        assert_eq!(meta.created_at, Some(1_793_304_001_000));
+        assert_eq!(meta.last_activity_at, Some(1_793_304_002_000));
+    }
+
+    #[test]
+    fn unknown_record_types_are_ignored_but_counted() {
+        // A future record type with a NEWER stamp moves nothing.
+        let content = concat!(
+            r#"{"type":"USER_INPUT","source":"USER_EXPLICIT","status":"DONE","step_index":0,"created_at":"2026-10-29T20:00:01Z","content":"Prompt"}"#,
+            "\n",
+            r#"{"type":"FUTURE_RECORD","source":"MODEL","status":"DONE","step_index":9,"created_at":"2026-10-29T20:00:09Z","content":"noise"}"#,
+        );
+        let meta = parse_antigravity_session_content(content, "c3").expect("parses");
         assert_eq!(meta.last_activity_at, Some(1_793_304_001_000));
+        assert_eq!(meta.message_count, 2);
+        assert_eq!(meta.summary, None);
     }
 
     #[test]
-    fn unknown_record_types_are_ignored() {
-        // The tool_call's `at` (20:00:02) is NEWER than every semantic
-        // record's, so it would move the activity clock if unknown records
-        // folded — they must not.
-        let content = concat!(
-            r#"{"type":"session_start","conversationId":"c2","workspacePaths":["/w2"],"startedAt":"2026-10-29T20:00:00.000Z"}"#,
-            "\n",
-            r#"{"type":"tool_call","conversationId":"c2","toolName":"bash","at":"2026-10-29T20:00:02.000Z"}"#,
-            "\n",
-            r#"{"type":"user_message","conversationId":"c2","text":"Prompt","at":"2026-10-29T20:00:01.000Z"}"#,
-        );
-        let meta = parse_antigravity_session_content(content).expect("ownership record present");
-        assert_eq!(meta.created_at, Some(1_793_304_000_000));
-        assert_eq!(meta.last_activity_at, Some(1_793_304_001_000));
-        assert_eq!(meta.message_count, 3);
-        assert_eq!(meta.summary, None, "unknown records never contribute text");
-    }
-
-    #[test]
-    fn multi_workspace_paths_keep_first_recorded_as_primary() {
-        let content = concat!(
-            r#"{"type":"session_start","conversationId":"c3","workspacePaths":["/first/workspace","/second/workspace"],"startedAt":"2026-10-29T20:00:00.000Z"}"#,
-            "\n",
-            r#"{"type":"user_message","conversationId":"c3","text":"Prompt","at":"2026-10-29T20:00:01.000Z"}"#,
-            "\n",
-            // A later session_start with a different single path never
-            // overrides the first recorded primary.
-            r#"{"type":"session_start","conversationId":"c3","workspacePaths":["/later/workspace"],"startedAt":"2026-10-29T21:00:00.000Z","source":"resume"}"#,
-        );
-        let meta = parse_antigravity_session_content(content).expect("ownership record present");
-        assert_eq!(meta.cwd.as_deref(), Some("/first/workspace"));
+    fn system_authored_user_input_folds_the_clock_but_never_a_title() {
+        // The title read is source-gated to USER_EXPLICIT (the pane's own
+        // prompt); a SYSTEM-authored USER_INPUT is still activity.
+        let content = r#"{"type":"USER_INPUT","source":"SYSTEM","status":"DONE","step_index":0,"created_at":"2026-10-29T20:00:01Z","content":"injected prompt"}"#;
+        let meta = parse_antigravity_session_content(content, "c4").expect("parses");
+        assert_eq!(meta.first_user_message, None);
+        assert_eq!(meta.title, None);
+        assert_eq!(meta.created_at, Some(1_793_304_001_000));
     }
 
     #[test]
     fn non_path_workspace_entry_is_rejected_for_cwd() {
-        // The first workspacePaths entry must look like a path; a URL or
-        // plain text never becomes the evidenced cwd.
         let content = concat!(
-            r#"{"type":"session_start","conversationId":"c4","workspacePaths":["https://example.com/x"],"startedAt":"2026-10-29T20:00:00.000Z"}"#,
+            r#"{"type":"session_start","conversationId":"c5","workspacePaths":["https://example.com/x"],"startedAt":"2026-10-29T20:00:00.000Z"}"#,
             "\n",
-            r#"{"type":"user_message","conversationId":"c4","text":"Prompt","at":"2026-10-29T20:00:01.000Z"}"#,
+            r#"{"type":"USER_INPUT","source":"USER_EXPLICIT","status":"DONE","step_index":0,"created_at":"2026-10-29T20:00:01Z","content":"Prompt"}"#,
         );
-        let meta = parse_antigravity_session_content(content).expect("ownership record present");
+        let meta = parse_antigravity_session_content(content, "c5").expect("parses");
         assert_eq!(meta.cwd, None);
-        assert_eq!(meta.session_id.as_deref(), Some("c4"));
     }
 
     #[test]
-    fn missing_usage_stays_none_and_last_usage_wins() {
+    fn missing_token_fields_stay_none() {
         let content = concat!(
-            r#"{"type":"session_start","conversationId":"c5","workspacePaths":["/w"],"startedAt":"2026-10-29T20:00:00.000Z"}"#,
+            r#"{"type":"USER_INPUT","source":"USER_EXPLICIT","status":"DONE","step_index":0,"created_at":"2026-10-29T20:00:01Z","content":"Prompt"}"#,
             "\n",
-            r#"{"type":"assistant_message","conversationId":"c5","text":"No usage here.","at":"2026-10-29T20:00:01.000Z"}"#,
+            r#"{"type":"PLANNER_RESPONSE","source":"MODEL","status":"DONE","step_index":1,"created_at":"2026-10-29T20:00:02Z","content":"Reply."}"#,
             "\n",
-            r#"{"type":"assistant_message","conversationId":"c5","text":"With usage.","at":"2026-10-29T20:00:02.000Z","usage":{"inputTokens":1,"outputTokens":2}}"#,
-            "\n",
-            // A later all-zero envelope never erases the last real one.
-            r#"{"type":"assistant_message","conversationId":"c5","text":"Zeroed.","at":"2026-10-29T20:00:03.000Z","usage":{"inputTokens":0,"outputTokens":0,"cachedTokens":0,"totalTokens":0}}"#,
+            // Null token fields (the real format's sparse shape) stay unknown.
+            r#"{"type":"PLANNER_RESPONSE","source":"MODEL","status":"DONE","step_index":2,"created_at":"2026-10-29T20:00:03Z","content":"Reply two.","input_tokens":null,"output_tokens":null,"cache_read_tokens":null}"#,
         );
-        let meta = parse_antigravity_session_content(content).expect("ownership record present");
-        assert_eq!(
-            meta.token_usage,
-            Some(TokenSummary {
-                input_tokens: 1,
-                output_tokens: 2,
-                cached_tokens: 0,
-                total_tokens: 3, // falls back to input+output when omitted
-                context_tokens: None,
-                model_context_window: None,
-                compact_threshold_tokens: None,
-                compact_percent: None,
-            })
-        );
-        // And the first assistant message with NO usage field leaves None.
-        let no_usage = concat!(
-            r#"{"type":"session_start","conversationId":"c6","workspacePaths":["/w"],"startedAt":"2026-10-29T20:00:00.000Z"}"#,
-            "\n",
-            r#"{"type":"assistant_message","conversationId":"c6","text":"Reply.","at":"2026-10-29T20:00:01.000Z"}"#,
-        );
-        let meta = parse_antigravity_session_content(no_usage).expect("ownership record present");
+        let meta = parse_antigravity_session_content(content, "c6").expect("parses");
         assert_eq!(meta.token_usage, None);
-    }
-
-    #[test]
-    fn empty_input_yields_none() {
-        assert!(parse_antigravity_session_content("").is_none());
-        assert!(parse_antigravity_session_content("\n \n").is_none());
     }
 }

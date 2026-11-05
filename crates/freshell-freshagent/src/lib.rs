@@ -61,7 +61,10 @@ pub(crate) mod claude_turns;
 pub mod codex;
 pub mod codex_rest_lane;
 pub(crate) mod codex_sidecar_tracking;
+#[cfg(windows)]
+mod codex_windows_guard;
 pub(crate) mod delegation;
+pub mod host_agent_admission;
 pub mod identity_sink;
 pub mod layout_store;
 pub mod layout_tree;
@@ -2234,6 +2237,11 @@ pub struct FreshAgentState {
     /// `identity_sink`). `None` = ungated (unwired unit tests keep legacy
     /// behavior; production always wires it).
     spawn_gate: Arc<std::sync::OnceLock<RestSpawnGate>>,
+    /// Shared close-and-drain admission for every host coding-agent
+    /// start/revival path. Unlike `spawn_gate`, this is a maintenance lease,
+    /// not a concurrency limit. The same `FreshAgentState` is wrapped by the
+    /// WS OpenCode state, so REST, WS, recovery, and maintenance all share it.
+    host_agent_admission: host_agent_admission::HostAgentAdmissionGate,
     /// Door 3 (resume-validation): the disk-existence probe consulted before
     /// a REST create turns a cached resume id into resume argv. Injected as
     /// [`freshell_platform::resume_gate::ResumeProbeFn`] because this crate
@@ -2490,6 +2498,7 @@ impl FreshAgentState {
             naming: NamingSink::default(),
             naming_handles: Arc::new(Mutex::new(HashMap::new())),
             spawn_gate: Arc::new(std::sync::OnceLock::new()),
+            host_agent_admission: host_agent_admission::HostAgentAdmissionGate::new(),
             resume_probe: None,
             on_stale_resume: None,
             sidecar_liveness: None,
@@ -2751,6 +2760,12 @@ impl FreshAgentState {
     /// regression fails LOUD at boot instead of silently ungating.
     pub fn spawn_gate_wired(&self) -> bool {
         self.spawn_gate.get().is_some()
+    }
+
+    /// The server-process-wide host coding-agent admission gate. Clones of
+    /// this state (including the WS Fresh Agent wrapper) share this gate.
+    pub fn host_agent_admission(&self) -> host_agent_admission::HostAgentAdmissionGate {
+        self.host_agent_admission.clone()
     }
 
     /// Record what a `restoreKey`-tagged create produced (continuity trio,
@@ -5080,6 +5095,23 @@ pub(crate) fn fail_json_code_retry_after(
     response
 }
 
+/// Admit a REST operation that can create or revive a host coding agent.
+/// Shell terminal and stateless content requests deliberately do not call this.
+pub(crate) fn try_host_agent_admission(
+    state: &FreshAgentState,
+) -> Result<host_agent_admission::HostAgentAdmissionPermit, Box<Response>> {
+    state.host_agent_admission.try_admit().map_err(|error| {
+        Box::new(fail_json_code_retry_after(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "HOST_AGENT_MAINTENANCE",
+            format!(
+                "Host coding-agent starts are temporarily paused for maintenance; retry shortly ({error})"
+            ),
+            Duration::from_secs(1),
+        ))
+    })
+}
+
 /// The error status the original maps serve failures to (`agentRouteErrorStatus`): a
 /// bounded cold-start failure / transport error is a 5xx; everything else 500 here.
 fn serve_error_status(err: &ServeError) -> StatusCode {
@@ -5126,6 +5158,14 @@ async fn create_tab(
             StatusCode::BAD_REQUEST,
             format!("unknown agent \"{agent}\""),
         );
+    };
+
+    // All Fresh Agent creation/resume branches can start or recover a host
+    // runtime. Hold the shared admission permit through process creation,
+    // identity/layout publication, and the reply/broadcast.
+    let _host_agent_permit = match try_host_agent_admission(&state) {
+        Ok(permit) => permit,
+        Err(response) => return *response,
     };
 
     let cwd = body.get("cwd").and_then(Value::as_str).map(str::to_string);
@@ -6622,6 +6662,14 @@ async fn send_keys(
         None => return fail_json(StatusCode::NOT_FOUND, "pane not found".to_string()),
     };
 
+    // Fresh Agent send may cold-start/recover a provider runtime. A terminal
+    // send has already returned through `maybe_send_keys` above and remains
+    // unchanged.
+    let _host_agent_permit = match try_host_agent_admission(&state) {
+        Ok(permit) => permit,
+        Err(response) => return *response,
+    };
+
     let turn_timeout = body
         .get("timeout")
         .and_then(value_as_secs)
@@ -6670,7 +6718,9 @@ async fn send_keys(
                     "status":if result.noop { "noop" } else if result.completed { "idle" } else { "approx" },
                 });
                 if !result.noop {
-                    data["submittedTurnId"] = json!(result.submitted_turn_id.unwrap_or(request_id));
+                    if let Some(submitted_turn_id) = result.submitted_turn_id {
+                        data["submittedTurnId"] = json!(submitted_turn_id);
+                    }
                 }
                 if result.noop {
                     ok_json(data, "no input sent")

@@ -1,8 +1,0 @@
-{"type":"session_start","conversationId":"66666666-7777-4888-8999-000000000001","workspacePaths":["/home/u/shared"],"model":"gemini-3-pro","startedAt":"2026-10-30T01:00:00.000Z"}
-{"type":"user_message","conversationId":"66666666-7777-4888-8999-000000000001","text":"Prompt in conversation one","at":"2026-10-30T01:00:01.000Z"}
-{"type":"assistant_message","conversationId":"66666666-7777-4888-8999-000000000001","text":"Reply one.","at":"2026-10-30T01:00:02.000Z"}
-{"type":"turn_settled","conversationId":"66666666-7777-4888-8999-000000000001","at":"2026-10-30T01:00:02.500Z","outcome":"completed","fullyIdle":true}
-{"type":"session_start","conversationId":"66666666-7777-4888-8999-000000000002","workspacePaths":["/home/u/shared"],"model":"gemini-3-pro","startedAt":"2026-10-30T01:01:00.000Z"}
-{"type":"user_message","conversationId":"66666666-7777-4888-8999-000000000002","text":"Prompt in conversation two","at":"2026-10-30T01:01:01.000Z"}
-{"type":"assistant_message","conversationId":"66666666-7777-4888-8999-000000000002","text":"Reply two.","at":"2026-10-30T01:01:02.000Z"}
-{"type":"turn_settled","conversationId":"66666666-7777-4888-8999-000000000002","at":"2026-10-30T01:01:02.500Z","outcome":"completed","fullyIdle":true}

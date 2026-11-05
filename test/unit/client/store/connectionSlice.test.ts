@@ -9,6 +9,7 @@ import connectionReducer, {
   setBootId,
   setServerRestarted,
   setLiveTerminalIds,
+  setSessionIndexReady,
   ConnectionState,
   ConnectionStatus,
 } from '../../../../src/store/connectionSlice'
@@ -389,6 +390,31 @@ describe('connectionSlice', () => {
       let state = connectionReducer(undefined, setLiveTerminalIds(['t1']))
       state = connectionReducer(state, setLiveTerminalIds(undefined))
       expect(state.liveTerminalIds).toBeUndefined()
+    })
+  })
+
+  describe('setSessionIndexReady', () => {
+    it('defaults to false in initial state', () => {
+      const state = connectionReducer(undefined, { type: 'unknown' })
+      expect(state.sessionIndexReady).toBe(false)
+    })
+
+    it('setSessionIndexReady stores the per-connection readiness state', () => {
+      let state = connectionReducer(undefined, setSessionIndexReady(true))
+      expect(state.sessionIndexReady).toBe(true)
+      state = connectionReducer(state, setSessionIndexReady(false))
+      expect(state.sessionIndexReady).toBe(false)
+    })
+
+    it('does not interfere with other connection state', () => {
+      const now = Date.now()
+      vi.spyOn(Date, 'now').mockReturnValue(now)
+      let state = connectionReducer(undefined, setStatus('ready'))
+      state = connectionReducer(state, setSessionIndexReady(true))
+      expect(state.status).toBe('ready')
+      expect(state.lastReadyAt).toBe(now)
+      expect(state.sessionIndexReady).toBe(true)
+      vi.restoreAllMocks()
     })
   })
 

@@ -161,7 +161,8 @@ async fn respawn_spawns_resume_generation_with_same_create_request_id() {
         },
     )
     .await
-    .expect("respawn");
+    .expect("respawn")
+    .terminal_id;
 
     assert_ne!(new_tid, old_tid, "a respawn mints a new terminalId");
     // Registry row: same createRequestId, mode claude, resume id recorded.
@@ -374,6 +375,7 @@ fn respawn_state_with_probe(
     let registry = freshell_terminal::TerminalRegistry::new();
 
     let state = WsState {
+        session_index_ready: None,
         layout: Default::default(),
         terminal_meta: Default::default(),
         pane_ledger: Arc::clone(&pane_ledger),
@@ -457,19 +459,36 @@ async fn respawn_with_absent_session_spawns_fresh_and_retires_binding() {
     seed_bound_row(&ledger, "amplifier", "stale-amp");
     let mut rx = state.broadcast_tx.subscribe();
 
-    let new_tid = freshell_ws::terminal::respawn_agent_terminal(
+    let outcome = freshell_ws::terminal::respawn_agent_terminal(
         &state,
         &freshell_ws::terminal::AgentRespawnRequest {
             mode: "amplifier".into(),
             provider: "amplifier".into(),
             session_id: "stale-amp".into(),
             create_request_id: "req-respawn-gate-1".into(),
-            cwd: Some(std::env::temp_dir().to_string_lossy().to_string()),
+            cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
             replaces_terminal_id: None,
         },
     )
     .await
     .expect("a gate-fired respawn must proceed as a fresh spawn, never an error");
+    let new_tid = outcome.terminal_id.clone();
+    // The minter disposition: the gate refused the stale id and MINTED a
+    // replacement — the hub still completes the stale locator's claim
+    // against this terminal (AD-3, scoped to the fresh-id minters).
+    assert_eq!(
+        outcome.identity,
+        freshell_ws::terminal::RespawnedIdentity::MintedReplacement,
+        "amplifier is a fresh-id-minting provider: the gate-fired respawn \
+         reports the AD-3 minter disposition"
+    );
+    // Focused repair round 3, Major 2: the minter shape passes NO stale-id
+    // notice — only FreshUnbound carries it (the fresh terminal here HAS an
+    // identity, the minted id; its fold stays exactly as today).
+    assert_eq!(
+        outcome.stale_session_notice, None,
+        "the MintedReplacement respawn outcome carries no stale-id notice"
+    );
 
     // 2. The stale row is retired SessionMissing — never retried forever.
     let stale_row = ledger
@@ -592,12 +611,13 @@ async fn respawn_with_unknown_existence_resumes_exactly_as_today() {
             provider: "amplifier".into(),
             session_id: "maybe-amp".into(),
             create_request_id: "req-respawn-gate-2".into(),
-            cwd: Some(std::env::temp_dir().to_string_lossy().to_string()),
+            cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
             replaces_terminal_id: None,
         },
     )
     .await
-    .expect("Unknown fails open: the respawn proceeds as a resume");
+    .expect("Unknown fails open: the respawn proceeds as a resume")
+    .terminal_id;
 
     // The spawned generation still carries the resume id (the sibling test's
     // registry-row observation point) and the row stays Bound.

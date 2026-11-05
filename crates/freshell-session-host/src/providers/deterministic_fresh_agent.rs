@@ -966,6 +966,7 @@ pub(crate) fn run_state_worker(args: &[String]) -> Result<(), String> {
 
 fn non_ambiguous(message: impl ToString) -> DispatchFailure {
     DispatchFailure {
+        provider_diagnostic: None,
         message: message.to_string(),
         acceptance_ambiguous: false,
     }

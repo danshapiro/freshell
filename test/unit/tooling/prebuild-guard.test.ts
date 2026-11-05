@@ -1,10 +1,11 @@
 import { describe, it, expect, afterEach, vi } from 'vitest'
 import http from 'http'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   checkProdRunning,
+  evaluatePrebuildBuildSafety,
   isLinkedWorktreeCheckout,
   parseEnv,
 } from '../../../scripts/prebuild-guard.js'
@@ -199,4 +200,32 @@ describe('prebuild-guard', () => {
       }
     })
   })
+})
+
+it('live production build guard recommends updater without approval gate', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'prebuild-guard-live-update-'))
+  const dist = join(root, 'dist')
+  mkdirSync(dist)
+  const liveArtifact = join(dist, 'live-marker.txt')
+  writeFileSync(liveArtifact, 'keep the running server artifact intact')
+
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ app: 'freshell', version: 'fixture-live' }))
+  })
+  try {
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const port = (server.address() as { port: number }).port
+    const decision = await evaluatePrebuildBuildSafety(root, port)
+
+    expect(decision.exitCode).toBe(1)
+    expect(decision.message).toContain('Building would overwrite dist/')
+    expect(decision.message).toContain('pnpm exec tsx scripts/update-managed-runtime.ts')
+    expect(decision.message).not.toMatch(/only with explicit approval/i)
+    expect(existsSync(liveArtifact)).toBe(true)
+    expect(readFileSync(liveArtifact, 'utf8')).toBe('keep the running server artifact intact')
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+    rmSync(root, { recursive: true, force: true })
+  }
 })

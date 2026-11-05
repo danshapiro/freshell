@@ -5,7 +5,7 @@ import path from 'node:path'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { describe, it, expect } from 'vitest'
-import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
+import { FAKE_CODEX_APP_SERVER, installDualRoleCodexCli } from '../fixtures/codex-dual-role'
 import {
   canBindLoopbackPort,
   canConnectLoopbackPort,
@@ -464,6 +464,93 @@ describe('codex-dual-role shim', () => {
       async () => { if (shim) await stopShim(shim) },
       () => fs.rm(binDir, { recursive: true, force: true }),
     ])
+  }, 30_000)
+
+  it.skipIf(SKIP_UNIX_SHIM_ON_WINDOWS)('keeps the app-server runnable when its authoring source is unavailable', async () => {
+    const binDir = await fs.mkdtemp(path.join(os.tmpdir(), 'dual-role-copied-app-server-'))
+    let shim: ShimProcess | undefined
+    await withCleanup(async () => {
+      const terminalSrc = await writeTerminalFake(binDir)
+      const appServerSource = path.join(binDir, 'authoring-app-server.mjs')
+      await fs.copyFile(FAKE_CODEX_APP_SERVER, appServerSource)
+      const bin = await installDualRoleCodexCli(binDir, terminalSrc, undefined, appServerSource)
+      // The managed runtime mounts this fixture workspace, not the checkout
+      // path where the shared app-server source lives. Removing the source
+      // here reproduces that runtime boundary without a Docker dependency.
+      await fs.rm(appServerSource)
+      const port = await findFreePort()
+      shim = spawnShim(bin, ['-c', 'features.apps=false', 'app-server', '--listen', `ws://127.0.0.1:${port}`])
+      await waitForAppServerReady(shim, port, 5_000)
+      expect(await waitExit(shim, 100)).toBeUndefined()
+    }, [
+      async () => { if (shim) await stopShim(shim) },
+      () => fs.rm(binDir, { recursive: true, force: true }),
+    ])
+  }, 30_000)
+
+  it.skipIf(SKIP_UNIX_SHIM_ON_WINDOWS)('keeps the terminal fake runnable when its authoring source is unavailable', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'dual-role-copied-terminal-'))
+    const workspace = path.join(root, 'workspace')
+    const binDir = path.join(workspace, 'bin')
+    const terminalSource = path.join(root, 'authoring-terminal.mjs')
+    let shim: ShimProcess | undefined
+    await withCleanup(async () => {
+      await fs.chmod(root, 0o755)
+      await fs.mkdir(workspace, { mode: 0o755 })
+      await fs.chmod(workspace, 0o755)
+      await fs.writeFile(terminalSource, `console.log(${JSON.stringify(TERMINAL_MARKER)})\nprocess.exit(0)\n`)
+      const bin = await installDualRoleCodexCli(binDir, terminalSource)
+      // The managed runtime mounts this fixture workspace, not the source
+      // checkout path supplied by the browser test.
+      await fs.rm(terminalSource)
+      shim = spawnShim(bin, [])
+      const exit = await waitExit(shim, 10_000)
+      expect(exit?.code).toBe(0)
+      await waitUntil(2_000, () => shim!.stdout.join('').includes(TERMINAL_MARKER))
+    }, [
+      async () => { if (shim && shim.child.exitCode === null) await stopShim(shim) },
+      () => fs.rm(root, { recursive: true, force: true }),
+    ])
+  }, 30_000)
+
+  it.skipIf(SKIP_UNIX_SHIM_ON_WINDOWS)('stages the Codex app-server tree for the managed provider uid under a private umask', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'dual-role-managed-provider-'))
+    const workspace = path.join(root, 'workspace')
+    const binDir = path.join(workspace, 'bin')
+    const terminalSource = path.join(workspace, 'terminal-fake.mjs')
+    try {
+      await fs.chmod(root, 0o755)
+      await fs.mkdir(workspace, { mode: 0o755 })
+      await fs.chmod(workspace, 0o755)
+      await fs.writeFile(terminalSource, 'process.exit(0)\n', { mode: 0o555 })
+      await fs.chmod(terminalSource, 0o555)
+
+      const previousUmask = process.umask(0o077)
+      try {
+        await installDualRoleCodexCli(binDir, terminalSource)
+      } finally {
+        process.umask(previousUmask)
+      }
+
+      const assertProviderCanTraverse = async (directory: string): Promise<void> => {
+        const stat = await fs.stat(directory)
+        expect(stat.mode & 0o005, `${path.relative(root, directory)} must be traversable by uid 65534`).toBe(0o005)
+        for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+          const file = path.join(directory, entry.name)
+          if (entry.isDirectory()) await assertProviderCanTraverse(file)
+          else if (entry.isFile()) {
+            const fileMode = (await fs.stat(file)).mode
+            expect(fileMode & 0o004, `${path.relative(root, file)} must be readable by uid 65534`).toBe(0o004)
+            if (file === path.join(binDir, 'codex')) {
+              expect(fileMode & 0o001, 'the Codex shim must be executable by uid 65534').toBe(0o001)
+            }
+          }
+        }
+      }
+      await assertProviderCanTraverse(workspace)
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
   }, 30_000)
 
   it.skipIf(SKIP_UNIX_SHIM_ON_WINDOWS)('passes terminalEnv through to the terminal role only', async () => {

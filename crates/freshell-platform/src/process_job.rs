@@ -12,10 +12,11 @@
 //! process (it has exited) only once that exit is done: on windows-2022 about 4 ms later
 //! for an idle node and 25-30 ms later for one holding 768 MB, every time.
 //! An owner that must know the whole tree has exited therefore watches the
-//! members' own handles too ([`JobMembers`]), learning of each member from
-//! the job's list and from the job's completion port, which reports every
-//! process that joins the job, even one that has started to exit by the
-//! time the report is read.
+//! members' own handles too ([`JobMembers`]), learning of members from
+//! the job's list and from completion-port reports. Those reports can cover
+//! a process that has started to exit, but Windows does not guarantee their
+//! delivery. [`StrictJobMembers`] also checks lifetime accounting when a
+//! caller needs to detect incomplete process coverage.
 //!
 //! This crate is tokio-free and does no logging: the blocking wait
 //! ([`KillOnCloseJob::wait_signaled`]) is meant to run on a blocking thread,
@@ -98,6 +99,22 @@ impl KillOnCloseJob {
         }
     }
 
+    /// Verify an already-open process handle against this exact job.
+    pub fn contains_process_handle(&self, process: usize) -> io::Result<bool> {
+        let mut member = 0;
+        if unsafe {
+            windows_sys::Win32::System::JobObjects::IsProcessInJob(
+                process as HANDLE,
+                self.handle,
+                &mut member,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(member != 0)
+    }
+
     /// The number of processes currently alive in the job.
     pub fn active_processes(&self) -> io::Result<u32> {
         use windows_sys::Win32::System::JobObjects::{
@@ -119,6 +136,30 @@ impl KillOnCloseJob {
             return Err(io::Error::last_os_error());
         }
         Ok(accounting.ActiveProcesses)
+    }
+
+    /// Number of processes ever associated with this job, including those
+    /// that have exited. A failed assignment due to a limit also increments
+    /// this count, conservatively preventing a complete observation.
+    pub fn total_processes(&self) -> io::Result<u32> {
+        use windows_sys::Win32::System::JobObjects::{
+            JobObjectBasicAccountingInformation, QueryInformationJobObject,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        };
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        let queried = unsafe {
+            QueryInformationJobObject(
+                self.handle,
+                JobObjectBasicAccountingInformation,
+                std::ptr::addr_of_mut!(accounting).cast(),
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if queried == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(accounting.TotalProcesses)
     }
 
     /// The ids of the processes the job counts as active, those in jobs
@@ -171,6 +212,33 @@ impl KillOnCloseJob {
         let terminated =
             unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(self.handle, 1) };
         if terminated == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Prevent any additional process from being associated with the job.
+    /// Keep kill-on-close enabled; callers must fail closed if the system
+    /// rejects the zero active-process limit.
+    pub fn close_admission(&self) -> io::Result<()> {
+        use windows_sys::Win32::System::JobObjects::{
+            JobObjectExtendedLimitInformation, SetInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+        limits.BasicLimitInformation.ActiveProcessLimit = 0;
+        let configured = unsafe {
+            SetInformationJobObject(
+                self.handle,
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of!(limits).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if configured == 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
@@ -346,6 +414,117 @@ pub struct JobMembers {
     joined: Option<JoinedProcesses>,
 }
 
+/// Strict process coverage for callers which must not treat an incomplete
+/// job notification history as proof that every writer has exited.
+///
+/// Subscribe while the job is empty, observe notifications continuously,
+/// and hold every process handle until the result is consumed. Notifications
+/// are best effort, so their count must agree with the job's lifetime
+/// accounting. An unopenable or ambiguous process permanently invalidates
+/// this observation; a vanished PID alone is not proof of completed exit.
+pub struct StrictJobMembers {
+    joined: JoinedProcesses,
+    watched: Vec<(u32, ProcessExitWatch)>,
+    reported: std::collections::HashSet<u32>,
+    incomplete: bool,
+}
+
+impl StrictJobMembers {
+    pub fn subscribe(job: &KillOnCloseJob) -> io::Result<Self> {
+        if job.total_processes()? != 0 {
+            return Err(io::Error::other(
+                "strict job observation must start before assignment",
+            ));
+        }
+        Ok(Self {
+            joined: JoinedProcesses::subscribe(job)?,
+            watched: Vec::new(),
+            reported: std::collections::HashSet::new(),
+            incomplete: false,
+        })
+    }
+
+    pub fn record(&mut self, job: &KillOnCloseJob) -> io::Result<()> {
+        self.record_wait(job, Duration::ZERO)
+    }
+
+    /// Wait for a job report before refreshing the observed members. Run on
+    /// a blocking thread, never an asynchronous executor worker.
+    pub fn record_wait(&mut self, job: &KillOnCloseJob, timeout: Duration) -> io::Result<()> {
+        let ids = match self.joined.take_wait(timeout) {
+            Ok(ids) => ids,
+            Err(error) => {
+                self.incomplete = true;
+                return Err(error);
+            }
+        };
+        for &id in &ids {
+            if !self.reported.insert(id) {
+                self.incomplete = true;
+                return Err(io::Error::other(
+                    "ambiguous repeated job member notification",
+                ));
+            }
+        }
+        let listed = match job.process_ids() {
+            Ok(ids) => ids,
+            Err(error) => {
+                self.incomplete = true;
+                return Err(error);
+            }
+        };
+        for id in ids.into_iter().chain(listed) {
+            self.record_member(job, id)?;
+        }
+        Ok(())
+    }
+
+    /// Retain an exact member while it is known to be alive, such as the
+    /// suspended root immediately after successful assignment.
+    pub fn record_member(&mut self, job: &KillOnCloseJob, id: u32) -> io::Result<()> {
+        if self.watched.iter().any(|(seen, _)| *seen == id) {
+            return Ok(());
+        }
+        match ProcessExitWatch::open_member(id, job) {
+            Ok(Some(watch)) => {
+                self.watched.push((id, watch));
+                Ok(())
+            }
+            Ok(None) => {
+                self.incomplete = true;
+                Err(io::Error::other("job member identity is unavailable"))
+            }
+            Err(error) => {
+                self.incomplete = true;
+                Err(error)
+            }
+        }
+    }
+
+    pub fn observed_processes(&self) -> usize {
+        self.watched.len()
+    }
+
+    /// Call only after stopping job admission and terminating its tree.
+    pub fn confirmed_exited(&self, job: &KillOnCloseJob) -> io::Result<bool> {
+        if self.incomplete
+            || self.reported.len() != self.watched.len()
+            || usize::try_from(job.total_processes()?).ok() != Some(self.watched.len())
+        {
+            return Ok(false);
+        }
+        for (_, watch) in &self.watched {
+            if !watch.wait(Duration::ZERO)? {
+                return Ok(false);
+            }
+        }
+        // A still-running member could have created another process while
+        // the first count was read. Once every observed handle is signaled,
+        // re-read the lifetime count to detect that admission as well.
+        Ok(usize::try_from(job.total_processes()?).ok() == Some(self.watched.len()))
+    }
+}
+
 impl JobMembers {
     /// Start watching every process in `job` that is not watched yet: those
     /// it lists and those it reported joining.
@@ -394,10 +573,9 @@ impl JobMembers {
     }
 }
 
-/// A job's completion port, which the job posts a report to for every
-/// process that joins it (and, when the port is attached, for every process
-/// already in it). Unlike the job's process list, a report stays readable
-/// after its process has started to exit.
+/// A job's completion port. Windows may post a report for a process that
+/// joins; unlike the job's process list, a queued report stays readable after
+/// that process has started to exit. Report delivery is not guaranteed.
 struct JoinedProcesses {
     port: HANDLE,
 }
@@ -444,19 +622,31 @@ impl JoinedProcesses {
     /// The ids of the processes reported joining since the last call. Other
     /// reports (a process exiting, the job emptying) are dropped.
     fn take(&self) -> io::Result<Vec<u32>> {
+        self.take_wait(Duration::ZERO)
+    }
+
+    fn take_wait(&self, timeout: Duration) -> io::Result<Vec<u32>> {
         use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
         use windows_sys::Win32::System::SystemServices::JOB_OBJECT_MSG_NEW_PROCESS;
         use windows_sys::Win32::System::IO::{GetQueuedCompletionStatus, OVERLAPPED};
 
         let mut joined = Vec::new();
+        let mut wait_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
         loop {
             let mut message = 0u32;
             let mut key = 0usize;
             // A job report carries its process id in place of an OVERLAPPED.
             let mut process_id: *mut OVERLAPPED = std::ptr::null_mut();
             let dequeued = unsafe {
-                GetQueuedCompletionStatus(self.port, &mut message, &mut key, &mut process_id, 0)
+                GetQueuedCompletionStatus(
+                    self.port,
+                    &mut message,
+                    &mut key,
+                    &mut process_id,
+                    wait_ms,
+                )
             };
+            wait_ms = 0;
             if dequeued == 0 {
                 let error = io::Error::last_os_error();
                 if process_id.is_null() && error.raw_os_error() == Some(WAIT_TIMEOUT as i32) {
@@ -497,8 +687,11 @@ mod tests {
             .creation_flags(CREATE_SUSPENDED)
             .spawn()
             .expect("spawn cmd suspended");
-        job.assign_suspended_process(child.id())
-            .expect("assign the suspended child and resume it");
+        if let Err(error) = job.assign_suspended_process(child.id()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("assign the suspended child and resume it: {error}");
+        }
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while job.active_processes().unwrap() < 3 {
             assert!(
@@ -602,7 +795,7 @@ mod tests {
     /// A long `ping`, spawned suspended into `job` and then resumed.
     fn spawn_ping_in(job: &KillOnCloseJob) -> std::process::Child {
         use std::os::windows::process::CommandExt;
-        let child = Command::new("ping")
+        let mut child = Command::new("ping")
             .args(["-n", "120", "127.0.0.1"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -610,8 +803,11 @@ mod tests {
             .creation_flags(CREATE_SUSPENDED)
             .spawn()
             .expect("spawn ping suspended");
-        job.assign_suspended_process(child.id())
-            .expect("assign the suspended ping and resume it");
+        if let Err(error) = job.assign_suspended_process(child.id()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("assign the suspended ping and resume it: {error}");
+        }
         child
     }
 
@@ -691,6 +887,177 @@ mod tests {
             "and it has exited"
         );
         member.wait().expect("reap the member");
+    }
+
+    #[test]
+    fn strict_job_confirmation_waits_for_the_observed_process() {
+        let job = KillOnCloseJob::new().expect("create the job");
+        let mut members = StrictJobMembers::subscribe(&job).expect("subscribe while empty");
+        let mut child = spawn_ping_in(&job);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            members.record(&job).expect("observe job members");
+            if members.observed_processes() == 1 && members.reported.len() == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "observe the live member"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!members.confirmed_exited(&job).expect("check live member"));
+        job.terminate().expect("terminate the job");
+        child.wait().expect("reap the child");
+        assert!(members.confirmed_exited(&job).expect("check exited member"));
+    }
+
+    #[test]
+    fn strict_job_confirmation_rejects_a_missing_join_notification() {
+        let job = KillOnCloseJob::new().expect("create the job");
+        let mut members = StrictJobMembers::subscribe(&job).expect("subscribe while empty");
+        let mut child = spawn_ping_in(&job);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if !members
+                .joined
+                .take()
+                .expect("read join notification")
+                .is_empty()
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "the member joins");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        job.terminate().expect("terminate the job");
+        child.wait().expect("reap the child");
+        members
+            .record(&job)
+            .expect("observe remaining notifications");
+        assert!(
+            !members
+                .confirmed_exited(&job)
+                .expect("check incomplete evidence"),
+            "an absent notification cannot establish complete process coverage"
+        );
+    }
+
+    #[test]
+    fn strict_job_confirmation_keeps_a_member_that_exits_before_cleanup() {
+        let job = KillOnCloseJob::new().expect("create the job");
+        let mut members = StrictJobMembers::subscribe(&job).expect("subscribe while empty");
+        let mut child = spawn_ping_in(&job);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            members.record(&job).expect("observe live member");
+            if members.observed_processes() == 1 && members.reported.len() == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "observe the live member"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        child.kill().expect("stop the short-lived member");
+        child.wait().expect("wait for the member");
+        drop(child);
+        // The job no longer needs to list the process: its exact wait handle
+        // was retained before exit and must still be signaled here.
+        job.terminate().expect("terminate the remaining job tree");
+        members.record(&job).expect("observe final reports");
+        assert!(members
+            .confirmed_exited(&job)
+            .expect("confirm the exited member"));
+    }
+
+    #[test]
+    fn closing_admission_prevents_a_late_process_from_joining() {
+        use std::os::windows::process::CommandExt;
+
+        let job = KillOnCloseJob::new().expect("create the job");
+        let mut original = spawn_ping_in(&job);
+        job.close_admission().expect("close the job to new members");
+        let mut late = std::process::Command::new("cmd")
+            .args(["/C", "ping -n 30 127.0.0.1 >nul"])
+            .creation_flags(CREATE_SUSPENDED)
+            .spawn()
+            .expect("spawn a suspended late member");
+        let assignment = job.assign_process(late.id());
+        // Always settle the exact process we spawned, including on failure.
+        let _ = late.kill();
+        let _ = late.wait();
+        job.terminate().expect("terminate the original job member");
+        original.wait().expect("reap the original member");
+        assert!(assignment.is_err(), "a late member must not be admitted");
+    }
+
+    #[test]
+    fn closing_admission_blocks_children_created_by_an_existing_member() {
+        use std::io::Write;
+        use std::os::windows::process::CommandExt;
+
+        let dir = tempfile::tempdir().expect("create isolated markers");
+        let ready = dir.path().join("ready");
+        let control = dir.path().join("control-output");
+        let child_output = dir.path().join("child-output");
+        let done = dir.path().join("done");
+        let job = KillOnCloseJob::new().expect("create the job");
+        let mut root = std::process::Command::new("cmd.exe")
+            .arg("/Q")
+            .env("FRESHELL_JOB_READY", &ready)
+            .env("FRESHELL_JOB_CONTROL_OUTPUT", &control)
+            .env("FRESHELL_JOB_CHILD_OUTPUT", &child_output)
+            .env("FRESHELL_JOB_DONE", &done)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(CREATE_SUSPENDED)
+            .spawn()
+            .expect("spawn the owned command processor");
+        if let Err(error) = job.assign_suspended_process(root.id()) {
+            let _ = root.kill();
+            let _ = root.wait();
+            panic!("assign and resume the root: {error}");
+        }
+        root.stdin.as_mut().expect("root stdin")
+            .write_all(b"cmd.exe /D /C echo control > \"%FRESHELL_JOB_CONTROL_OUTPUT%\"\r\necho ready > \"%FRESHELL_JOB_READY%\"\r\n")
+            .expect("ask the root to report readiness");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "root must become ready"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            std::fs::read_to_string(control)
+                .expect("read control child output")
+                .contains("control"),
+            "a child created before closure must actually run"
+        );
+
+        job.close_admission().expect("close the job to new members");
+        root.stdin.as_mut().expect("root stdin")
+            .write_all(b"cmd.exe /D /C echo admitted > \"%FRESHELL_JOB_CHILD_OUTPUT%\"\r\necho done > \"%FRESHELL_JOB_DONE%\"\r\nexit\r\n")
+            .expect("ask the existing member to create a child");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !done.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "root must finish its child attempt"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let child_text = std::fs::read_to_string(child_output).unwrap_or_default();
+        job.terminate().expect("terminate any remaining job member");
+        let _ = root.wait();
+        assert!(
+            !child_text.contains("admitted"),
+            "a child created after closure must not run"
+        );
     }
 
     #[test]

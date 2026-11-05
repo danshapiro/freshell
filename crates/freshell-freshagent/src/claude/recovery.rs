@@ -447,6 +447,7 @@ impl FreshClaudeState {
         let mut event = json!({"type":"freshAgent.error", "sessionId":session_id, "code":code, "message":message});
         if let Some(request_id) = request_id {
             event["requestId"] = json!(request_id);
+            event["operationReceipt"] = json!(true);
         }
         self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
             provider: PROVIDER.into(),

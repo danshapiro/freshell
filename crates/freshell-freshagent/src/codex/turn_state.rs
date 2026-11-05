@@ -16,6 +16,7 @@ pub(crate) enum StopDisposition {
     Interrupt {
         dispatch: DispatchToken,
         turn_id: String,
+        request_id: Option<String>,
     },
 }
 
@@ -48,6 +49,7 @@ pub(crate) struct DispatchFact {
 struct StopOperation {
     dispatch: DispatchToken,
     turn_id: Option<String>,
+    request_id: Option<String>,
     issued: bool,
 }
 
@@ -156,7 +158,7 @@ impl CodexTurnState {
         }
     }
 
-    pub fn request_stop(&mut self) -> StopDisposition {
+    pub fn request_stop(&mut self, request_id: Option<&str>) -> StopDisposition {
         if self.stop.is_some() {
             return StopDisposition::Latched;
         }
@@ -179,6 +181,7 @@ impl CodexTurnState {
         self.stop = Some(StopOperation {
             dispatch,
             turn_id: target.clone(),
+            request_id: request_id.map(str::to_owned),
             issued: false,
         });
         match target {
@@ -210,6 +213,7 @@ impl CodexTurnState {
         StopDisposition::Interrupt {
             dispatch: token,
             turn_id: turn_id.into(),
+            request_id: stop.request_id.clone(),
         }
     }
 
@@ -388,26 +392,28 @@ mod tests {
         let old = s.begin_dispatch("old");
         s.accept(old, "old");
         assert_eq!(
-            s.request_stop(),
+            s.request_stop(None),
             StopDisposition::Interrupt {
                 dispatch: old,
-                turn_id: "old".into()
+                turn_id: "old".into(),
+                request_id: None,
             }
         );
         s.interrupt_ack(old, "old");
         s.observe_idle();
         assert_eq!(
-            s.request_stop(),
+            s.request_stop(None),
             StopDisposition::None,
             "thread idle must not re-arm the same acknowledged Stop"
         );
         let new = s.begin_dispatch("new");
         s.accept(new, "new");
         assert_eq!(
-            s.request_stop(),
+            s.request_stop(None),
             StopDisposition::Interrupt {
                 dispatch: new,
-                turn_id: "new".into()
+                turn_id: "new".into(),
+                request_id: None,
             }
         );
     }
@@ -429,7 +435,7 @@ mod tests {
     fn rejected_initial_dispatch_releases_its_latched_stop_without_owing_work() {
         let mut s = CodexTurnState::default();
         let token = s.begin_dispatch("refused");
-        assert_eq!(s.request_stop(), StopDisposition::Latched);
+        assert_eq!(s.request_stop(None), StopDisposition::Latched);
         assert!(s.reject(token));
         assert!(!s.has_owed_work());
         assert!(!s.has_unresolved_stop());
@@ -486,12 +492,16 @@ mod tests {
     fn stop_latches_before_acceptance_and_ack_does_not_settle() {
         let mut s = CodexTurnState::default();
         let dispatch = s.begin_dispatch("pending");
-        assert_eq!(s.request_stop(), StopDisposition::Latched);
+        assert_eq!(
+            s.request_stop(Some("stop-request")),
+            StopDisposition::Latched
+        );
         assert_eq!(
             s.accept(dispatch, "old"),
             StopDisposition::Interrupt {
                 dispatch,
-                turn_id: "old".into()
+                turn_id: "old".into(),
+                request_id: Some("stop-request".into()),
             }
         );
         assert_eq!(s.accept(dispatch, "old"), StopDisposition::None);
@@ -507,7 +517,7 @@ mod tests {
         let mut s = CodexTurnState::default();
         let old = s.begin_dispatch("old");
         s.accept(old, "old");
-        s.request_stop();
+        s.request_stop(None);
         s.settle_native("old", NativeSettlement::Completed);
         assert!(!s.has_owed_work());
         assert!(s.has_unresolved_stop());
@@ -527,7 +537,7 @@ mod tests {
         let mut s = CodexTurnState::default();
         let dispatch = s.begin_dispatch("receipt");
         s.mark_ambiguous(dispatch);
-        assert_eq!(s.request_stop(), StopDisposition::Latched);
+        assert_eq!(s.request_stop(None), StopDisposition::Latched);
         s.interrupt_ack(dispatch, "");
         assert!(s.has_owed_work());
         assert!(s.has_unresolved_stop());

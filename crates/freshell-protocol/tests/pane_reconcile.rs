@@ -63,6 +63,7 @@ fn ready_capabilities_field_is_omitted_when_none() {
         capabilities: None,
         runtime_owners: None,
         fresh_agent_attention: None,
+        session_index_ready: None,
     };
     let wire = serde_json::to_value(ServerMessage::Ready(ready)).expect("serializes");
     assert!(
@@ -86,9 +87,11 @@ fn ready_capabilities_advertise_pane_reconcile_v1_when_negotiated() {
             paced_terminal_replay_v1: None,
             terminal_lifetime_claim_v1: None,
             managed_runtime_v1: None,
+            session_index_ready_v1: None,
         }),
         runtime_owners: None,
         fresh_agent_attention: None,
+        session_index_ready: None,
     };
     let wire = serde_json::to_value(ServerMessage::Ready(ready)).expect("serializes");
     assert_eq!(wire["capabilities"], json!({ "paneReconcileV1": true }));
@@ -179,6 +182,8 @@ fn reconcile_result_serializes_verdicts_with_optional_fields_omitted() {
                 corrected: Some(true),
                 reason: None,
                 duplicate: None,
+                identity_disposition: None,
+                stale_session_notice: None,
             },
             PaneVerdict {
                 pane_key: "tab3:paneB".to_string(),
@@ -188,6 +193,8 @@ fn reconcile_result_serializes_verdicts_with_optional_fields_omitted() {
                 corrected: None,
                 reason: Some("no_recoverable_identity".to_string()),
                 duplicate: None,
+                identity_disposition: None,
+                stale_session_notice: None,
             },
         ],
     });
@@ -233,10 +240,33 @@ fn error_verdict_carries_reason_and_no_retry_after_ms() {
         corrected: None,
         reason: Some("index_warming".to_string()),
         duplicate: None,
+        identity_disposition: None,
+        stale_session_notice: None,
     };
     let wire = serde_json::to_value(&verdict).expect("serializes");
     assert_eq!(wire["verdict"], "error");
     assert_eq!(wire["reason"], "index_warming");
+    assert!(wire.get("retryAfterMs").is_none());
+}
+
+/// Kata vnpc Task 4: the honest unreadable-store verdict reason serializes
+/// verbatim (extends the error-reason pin above with the new value).
+#[test]
+fn unreadable_store_error_verdict_serializes_the_session_store_unreadable_reason() {
+    let verdict = PaneVerdict {
+        pane_key: "p".to_string(),
+        verdict: ReconcileVerdict::Error,
+        terminal_id: None,
+        session_ref: None,
+        corrected: None,
+        reason: Some("session_store_unreadable".to_string()),
+        duplicate: None,
+        identity_disposition: None,
+        stale_session_notice: None,
+    };
+    let wire = serde_json::to_value(&verdict).expect("serializes");
+    assert_eq!(wire["verdict"], "error");
+    assert_eq!(wire["reason"], "session_store_unreadable");
     assert!(wire.get("retryAfterMs").is_none());
 }
 

@@ -33,6 +33,7 @@ import { captureTerminalOrdinaryTurnBaseline, reduceTerminalOrdinaryTurnFrames }
 
 import { playwright, campaignGate } from '../../../../scripts/testing/runtime-landing-campaign.js'
 import * as runner from '../../../../scripts/testing/runtime-external-browser.js'
+import * as p2Sandbox from '../../../../scripts/testing/external-browser-sandbox.js'
 import { ManagedRuntimeOwner, RuntimeHarness, assertExactRuntimeHandle, stripRuntimeWebEnvironment, type ManagedRuntimeView, type SupervisorInstance, type Phase3BrowserObservation, type RuntimeLossAssertions, type RuntimeWebConstructOptions } from '../../../../scripts/testing/runtime-sandbox.js'
 import { runTask2RetainedFixture, RetainedFixtureBrowserSession } from '../../../../scripts/testing/task002-retained-fixture.js'
 import * as retainedDriver from '../../../../scripts/testing/task002-retained-fixture.js'
@@ -339,6 +340,13 @@ const descriptor = {
   FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA: 'a'.repeat(40),
 }
 const smokeSpec = 'test/e2e-browser/specs/runtime-external-target-smoke-rust.spec.ts'
+const p2G01Spec = 'test/e2e-browser/specs/runtime-terminal-continuity-rust.spec.ts'
+const p2G01Title = 'P2-G01: real browser shell survives ten graceful/abrupt web replacements'
+const p2G01Case = {
+  id: 'p2-g01-case',
+  title: `Phase 2 managed runtime continuity › ${p2G01Title}`,
+  file: p2G01Spec,
+}
 
 describe('selected production owner registration', () => {
   it('keeps a combined provider subset limited to its selected bootstrap references', () => {
@@ -523,6 +531,9 @@ describe('selected production owner registration', () => {
       { provider: 'opencode' as const, selected: true, retained: false },
     ])('launches the actual $provider consumer with only its selected external qualification profile ($selected/$retained)', async ({ provider, selected, retained }) => {
       const home = path.join(fixtureRepoRoot, 'launch-home')
+      // Native MCP configuration belongs to this fixture's temporary namespace.
+      const temporaryDirectory = path.join(fixtureRepoRoot, 'tmp')
+      await fsp.mkdir(temporaryDirectory, { mode: 0o700 })
       const argvFile = path.join(fixtureRepoRoot, 'launch-argv.json')
       const processesFile = path.join(fixtureRepoRoot, 'launch-processes.jsonl')
       const command = path.join(fixtureRepoRoot, 'profile-provider')
@@ -548,7 +559,8 @@ if (argv.includes('app-server')) {
         // Only runtime builds and Docker allocation below are outside this test.
         web = new RustServer({ homeDir: home, setupHome: options.setupHome, providerFreeFixture: true,
           stripEnvPrefixes: ['FRESHELL_RUNTIME_', 'FRESHELL_MANAGED_', 'NODE_OPTIONS'],
-          env: { CLAUDE_CMD: command, CODEX_CMD: command, OPENCODE_CMD: command, FRESHELL_BIND_HOST: '127.0.0.1' } })
+          env: { CLAUDE_CMD: command, CODEX_CMD: command, OPENCODE_CMD: command, FRESHELL_BIND_HOST: '127.0.0.1',
+            TMPDIR: temporaryDirectory, TMP: temporaryDirectory, TEMP: temporaryDirectory } })
         return web as any
       }, retained)
       const prepare = vi.spyOn(owner.runtime, 'prepare').mockResolvedValue(undefined)
@@ -924,11 +936,139 @@ describe('actual runner child and nonvacuity lifecycle', () => {
     expect(childArgs).not.toContain('--local')
     // Preserve the 60-minute native case plus two 15-minute retained cases,
     // including their browser setup and cleanup time.
-    expect(childArgs).toContain('--timeout=120m')
+    expect(childArgs).toContain('--timeout=7200000')
     expect(owned.list.mock.invocationCallOrder[0]).toBeLessThan(child.mock.invocationCallOrder[0])
     expect(receipt).toMatchObject({ selected: 1, executed: 1, passed: 1, skipped: 0, failed: 0, timedOut: 0 })
     expect(owned.finish).toHaveBeenCalledOnce()
     expect(owned.abort).not.toHaveBeenCalled()
+  })
+  it('requires exactly one listed and reported P2-G01 pass and aborts on extras', async () => {
+    const { owned, child } = lifecycle()
+    owned.list.mockResolvedValue([p2G01Case])
+    child.mockResolvedValue({ exitCode: 0, cases: [
+      { ...p2G01Case, status: 'passed' },
+      { id: 'unexpected', title: 'unexpected skipped case', file: p2G01Spec, status: 'skipped' },
+    ] })
+    await expect(runner.dispatchOwnedExternalBrowser({ spec: p2G01Spec, grep: p2G01Title }, {
+      FRESHELL_E2E_BACKEND: 'local', FRESHELL_RUNTIME_EXTERNAL_LOCAL_SANDBOX: '1',
+    }, owned)).rejects.toThrow(/exactly one|extra/i)
+    expect(owned.abort).toHaveBeenCalledOnce()
+    expect(owned.finish).not.toHaveBeenCalled()
+  })
+  it('propagates cancellation to the P2-G01 sandbox child and aborts the owner after it settles', async () => {
+    const { owned } = lifecycle()
+    owned.list.mockResolvedValue([p2G01Case])
+    const cancellation = new AbortController()
+    let entered!: () => void
+    const childEntered = new Promise<void>(resolve => { entered = resolve })
+    owned.child.mockImplementation(async (_command, _args, _env, signal?: AbortSignal) => {
+      entered()
+      if (!signal) throw new Error('P2-G01 sandbox child has no cancellation signal')
+      await new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }))
+      return { exitCode: 0, cases: [{ ...p2G01Case, status: 'passed' }] }
+    })
+    const pending = runner.dispatchOwnedExternalBrowser({ spec: p2G01Spec, grep: p2G01Title }, {
+      FRESHELL_E2E_BACKEND: 'local', FRESHELL_RUNTIME_EXTERNAL_LOCAL_SANDBOX: '1',
+    }, owned, cancellation.signal)
+    await childEntered
+    cancellation.abort(new Error('P2-G01 sandbox cancelled'))
+    await expect(pending).rejects.toThrow(/P2-G01 sandbox cancelled/)
+    expect(owned.abort).toHaveBeenCalledOnce()
+    expect(owned.finish).not.toHaveBeenCalled()
+  })
+  it('dispatches the exact P2-G01 admission through the local sandbox with no selector or bearer token in argv', async () => {
+    const { owned, child } = lifecycle()
+    const publishOriginals = vi.fn()
+    owned.list.mockResolvedValue([p2G01Case])
+    child.mockResolvedValue({ exitCode: 0, cases: [{ ...p2G01Case, status: 'passed' }] })
+    const environment = {
+      FRESHELL_E2E_BACKEND: 'local',
+      FRESHELL_RUNTIME_EXTERNAL_LOCAL_SANDBOX: '1',
+    }
+
+    const result = await runner.dispatchOwnedExternalBrowser({ spec: p2G01Spec, grep: p2G01Title }, environment,
+      { ...owned, publishOriginals })
+
+    expect(owned.list.mock.invocationCallOrder[0]).toBeLessThan(child.mock.invocationCallOrder[0])
+    expect(child).toHaveBeenCalledWith('sandbox-p2-g01', [], expect.objectContaining({
+      ...descriptor,
+      FRESHELL_RUNTIME_EXTERNAL_SPEC: p2G01Spec,
+      FRESHELL_RUNTIME_EXTERNAL_GREP: p2G01Title,
+    }))
+    expect(JSON.stringify(child.mock.calls[0][1])).not.toContain(descriptor.FRESHELL_E2E_TARGET_TOKEN)
+    expect(publishOriginals).not.toHaveBeenCalled()
+    expect(result).toMatchObject({ selected: 1, executed: 1, passed: 1, failed: 0, skipped: 0 })
+    expect(owned.finish).toHaveBeenCalledOnce()
+    expect(owned.abort).not.toHaveBeenCalled()
+  })
+  it('builds a fixed seven-field P2-G01 handoff and a restricted Playwright child environment', () => {
+    const resolved = runner.resolveManagedExternalDescriptor(descriptor)!
+    const handoff = runner.createP2G01SandboxHandoff({ spec: p2G01Spec, grep: p2G01Title }, resolved)
+    expect(Object.keys(handoff)).toEqual([
+      'FRESHELL_E2E_TARGET_URL', 'FRESHELL_E2E_TARGET_WS_URL', 'FRESHELL_E2E_TARGET_TOKEN',
+      'FRESHELL_RUNTIME_EXTERNAL_RUN_ID', 'FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA',
+      'FRESHELL_RUNTIME_EXTERNAL_SPEC', 'FRESHELL_RUNTIME_EXTERNAL_GREP',
+    ])
+    expect(handoff.FRESHELL_RUNTIME_EXTERNAL_SPEC).toBe(p2G01Spec)
+    expect(handoff.FRESHELL_RUNTIME_EXTERNAL_GREP).toBe(p2G01Title)
+    expect(() => runner.createP2G01SandboxHandoff({ spec: p2G01Spec }, resolved)).toThrow(/exact P2-G01/i)
+    expect(() => runner.createP2G01SandboxHandoff({ spec: smokeSpec, grep: p2G01Title }, resolved)).toThrow(/exact P2-G01/i)
+
+    const invocation = runner.p2G01PlaywrightInvocation(handoff, {
+      HOME: '/home/sandbox', PATH: '/usr/local/bin:/usr/bin:/bin', TMPDIR: '/tmp',
+      npm_config_store_dir: '/home/sandbox/.local/share/pnpm/store', DOCKER_HOST: 'unix:///host/docker.sock',
+      GOOGLE_APPLICATION_CREDENTIALS: '/host/cloud.json',
+    })
+    expect(invocation.command).toBe('pnpm')
+    expect(invocation.args).toEqual([
+      'exec', 'playwright', 'test', '--config', 'test/e2e-browser/playwright.cloud.config.ts',
+      '--project=chromium-external-target', '--workers=1', '--retries=0', '--timeout=7200000',
+      p2G01Spec, '--grep', p2G01Title,
+    ])
+    expect(invocation.environment).toEqual({
+      HOME: '/home/sandbox', PATH: '/usr/local/bin:/usr/bin:/bin', TMPDIR: '/tmp',
+      npm_config_store_dir: '/home/sandbox/.local/share/pnpm/store',
+      ...handoff,
+    })
+    expect(invocation.environment).not.toHaveProperty('DOCKER_HOST')
+    expect(invocation.environment).not.toHaveProperty('GOOGLE_APPLICATION_CREDENTIALS')
+    expect(() => runner.p2G01PlaywrightInvocation({ ...handoff, EXTRA: 'not-admitted' } as any, {}))
+      .toThrow(/invalid.*external.*descriptor/i)
+  })
+  it('uses disposable tmpfs output paths only for the exact P2-G01 browser case', () => {
+    expect(p2Sandbox.p2G01PlaywrightArtifactPaths({
+      FRESHELL_RUNTIME_EXTERNAL_SPEC: p2G01Spec,
+      FRESHELL_RUNTIME_EXTERNAL_GREP: p2G01Title,
+    })).toEqual({
+      outputDir: '/tmp/freshell-p2g01-artifacts/test-results',
+      htmlReportDir: '/tmp/freshell-p2g01-artifacts/html-report',
+    })
+    expect(p2Sandbox.p2G01PlaywrightArtifactPaths({
+      FRESHELL_RUNTIME_EXTERNAL_SPEC: p2G01Spec,
+      FRESHELL_RUNTIME_EXTERNAL_GREP: `${p2G01Title}|another-case`,
+    })).toBeUndefined()
+  })
+  it.each([
+    { spec: p2G01Spec },
+    { spec: p2G01Spec, grep: `${p2G01Title}|P2-G04` },
+    { spec: smokeSpec, grep: p2G01Title },
+  ])('refuses a local-sandbox selection outside the exact P2-G01 case before starting its owner', async selection => {
+    const { owned, child } = lifecycle()
+    await expect(runner.dispatchOwnedExternalBrowser(selection, {
+      FRESHELL_E2E_BACKEND: 'local', FRESHELL_RUNTIME_EXTERNAL_LOCAL_SANDBOX: '1',
+    }, owned)).rejects.toThrow(/exact P2-G01/i)
+    expect(owned.start).not.toHaveBeenCalled()
+    expect(owned.list).not.toHaveBeenCalled()
+    expect(child).not.toHaveBeenCalled()
+    expect(owned.abort).not.toHaveBeenCalled()
+  })
+  it('requires an explicit sandbox opt-in for the local backend and keeps Cloud dispatch separate', async () => {
+    const { owned, child } = lifecycle()
+    await expect(runner.dispatchOwnedExternalBrowser({ spec: p2G01Spec, grep: p2G01Title }, {
+      FRESHELL_E2E_BACKEND: 'local',
+    }, owned)).rejects.toThrow(/configured Cloud backend|explicit local sandbox/i)
+    expect(owned.start).not.toHaveBeenCalled()
+    expect(child).not.toHaveBeenCalled()
   })
   it('hands current original references off only after actual child and settled cleanup', async () => {
     const { owned, cases } = lifecycle()
@@ -1055,6 +1195,227 @@ describe('actual runner child and nonvacuity lifecycle', () => {
     cancellation.abort(new Error('owned run cancelled'))
     await expect(pending).rejects.toThrow(/cancelled/)
     expect(owned.abort).toHaveBeenCalledOnce()
+  })
+})
+
+describe('P2-G01 sandbox handoff lifecycle', () => {
+  const selection = { spec: p2G01Spec, grep: p2G01Title }
+  const ownedDescriptor = runner.resolveManagedExternalDescriptor(descriptor)!
+  const executionEvents = (candidateSha = ownedDescriptor.candidateSha) => [
+    { severity: 'info', runId: ownedDescriptor.runId, candidateSha, event: 'managed_external_case',
+      id: 'p2-g01-case', file: p2G01Spec, title: p2G01Case.title, status: 'passed' },
+    { severity: 'info', runId: ownedDescriptor.runId, candidateSha, event: 'managed_external_complete', status: 'passed', cases: 1 },
+  ].map(event => JSON.stringify(event)).join('\n') + '\n'
+  const lifecycle = () => {
+    const runtime = { runId: ownedDescriptor.runId, candidateSha: ownedDescriptor.candidateSha,
+      recordLifecycle: vi.fn(), writeArtifact: vi.fn().mockReturnValue('evidence/p2-g01-sandbox-output-private.json') }
+    const owner = { runtime, stop: vi.fn().mockResolvedValue({ ok: true, errors: [] }) }
+    const tunnel = { assertAlive: vi.fn(), stop: vi.fn().mockResolvedValue(undefined) }
+    const environment = { HOME: '/home/dan', PATH: '/usr/bin:/bin', TMPDIR: os.tmpdir(),
+      DOCKER_HOST: 'unix:///run/user/1000/docker.sock' }
+    const value = new runner.ManagedExternalBrowserLifecycle(sourceRoot, environment)
+    Object.assign(value, { owner, descriptor: ownedDescriptor, tunnel })
+    return { value, owner, tunnel, environment }
+  }
+
+  it('refuses a passing browser report when the run-scoped pnpm store is not confirmed absent', async () => {
+    const { value, owner } = lifecycle()
+    const fakeChild = {
+      alive: () => false,
+      wait: vi.fn().mockResolvedValue(0),
+      stop: vi.fn().mockResolvedValue(undefined),
+      output: () => ({ stdout: executionEvents(), stderr: [
+        { severity: 'info', event: 'sandbox_container_settled', phase: 'preparation', container: 'freshell-sandbox-abcd1234', code: 0 },
+        { severity: 'info', event: 'sandbox_container_settled', phase: 'execution', container: 'freshell-sandbox-efgh5678', code: 0 },
+        { severity: 'info', event: 'sandbox_workload_finished', phase: 'preparation', container: 'freshell-sandbox-abcd1234', code: 0 },
+        { severity: 'info', event: 'sandbox_workload_finished', phase: 'execution', container: 'freshell-sandbox-efgh5678', code: 0 },
+      ].map(event => JSON.stringify(event)).join('\n') + '\n' }),
+    }
+    const create = vi.spyOn(runner.OwnedRuntimeChild, 'create').mockResolvedValue(fakeChild as any)
+    try {
+      await expect(value.child('sandbox-p2-g01', [], {
+        ...descriptor, FRESHELL_RUNTIME_EXTERNAL_SPEC: p2G01Spec, FRESHELL_RUNTIME_EXTERNAL_GREP: p2G01Title,
+      })).rejects.toThrow(/pnpm store cleanup evidence is missing or invalid/i)
+      expect(owner.runtime.writeArtifact).toHaveBeenCalledWith('p2-g01-sandbox-output-private.json', expect.objectContaining({
+        reason: 'pnpm_store_cleanup_evidence_invalid',
+      }))
+    } finally {
+      await value.abort()
+      create.mockRestore()
+    }
+  })
+
+  it('records safe run-bound reporter and cleanup counts before refusing a successful zero-case report', async () => {
+    const { value, owner } = lifecycle()
+    const fakeChild = {
+      alive: () => false,
+      wait: vi.fn().mockResolvedValue(0),
+      stop: vi.fn().mockResolvedValue(undefined),
+      output: () => ({
+        stdout: `${JSON.stringify({ severity: 'info', event: 'managed_external_complete',
+          runId: ownedDescriptor.runId, candidateSha: ownedDescriptor.candidateSha, status: 'passed', cases: 0 })}\n`,
+        stderr: [
+          { severity: 'info', event: 'sandbox_container_settled', phase: 'preparation',
+            container: 'freshell-sandbox-abcd1234', code: 0 },
+          { severity: 'info', event: 'sandbox_container_settled', phase: 'execution',
+            container: 'freshell-sandbox-efgh5678', code: 0 },
+          { severity: 'info', event: 'sandbox_workload_finished', phase: 'preparation',
+            container: 'freshell-sandbox-abcd1234', code: 0 },
+          { severity: 'info', event: 'sandbox_workload_finished', phase: 'execution',
+            container: 'freshell-sandbox-efgh5678', code: 0 },
+          { severity: 'info', event: 'sandbox_external_pnpm_store_settled', runId: ownedDescriptor.runId,
+            volume: `freshell-p2g01-pnpm-${ownedDescriptor.runId}`, phase: 'execution', absent: true, removed: true },
+        ].map(event => JSON.stringify(event)).join('\n') + '\n',
+      }),
+    }
+    const create = vi.spyOn(runner.OwnedRuntimeChild, 'create').mockResolvedValue(fakeChild as any)
+    try {
+      await expect(value.child('sandbox-p2-g01', [], {
+        ...descriptor, FRESHELL_RUNTIME_EXTERNAL_SPEC: p2G01Spec, FRESHELL_RUNTIME_EXTERNAL_GREP: p2G01Title,
+      })).rejects.toThrow(/completed without an executed case/i)
+      expect(owner.runtime.recordLifecycle).toHaveBeenCalledWith('external.sandbox_browser_reporter_observed', {
+        runId: ownedDescriptor.runId,
+        candidateSha: ownedDescriptor.candidateSha,
+        exitCode: 0,
+        reporterEventCount: 1,
+        caseCount: 0,
+        completionCount: 1,
+        completionStatus: 'passed',
+        completionCases: 0,
+        workloadPreparationState: 'finished',
+        workloadExecutionState: 'finished',
+        cleanupCompletionCount: 2,
+        cleanupPreparationCount: 1,
+        cleanupExecutionCount: 1,
+        cleanupFailureCount: 0,
+        pnpmStoreCleanupCount: 1,
+        pnpmStoreAbsent: true,
+      })
+    } finally {
+      const cleanup = await value.abort()
+      expect(cleanup.ok).toBe(true)
+      create.mockRestore()
+    }
+  })
+
+  it('uses a private descriptor mount, passes no bearer value in host argv/env, and removes it after wrapper settlement', async () => {
+    const { value, environment } = lifecycle()
+    let handoffFile = ''
+    const stopped = vi.fn(async () => {
+      expect(fs.existsSync(handoffFile)).toBe(true)
+    })
+    const fakeChild = {
+      alive: () => false,
+      wait: vi.fn().mockResolvedValue(0),
+      stop: stopped,
+      output: () => ({ stdout: executionEvents(), stderr: [
+        { severity: 'info', event: 'sandbox_container_settled', phase: 'preparation',
+          container: 'freshell-sandbox-abcd1234', code: 0 },
+        { severity: 'info', event: 'sandbox_container_settled', phase: 'execution',
+          container: 'freshell-sandbox-efgh5678', code: 0 },
+        { severity: 'info', event: 'sandbox_workload_finished', phase: 'preparation',
+          container: 'freshell-sandbox-abcd1234', code: 0 },
+        { severity: 'info', event: 'sandbox_workload_finished', phase: 'execution',
+          container: 'freshell-sandbox-efgh5678', code: 0 },
+        { severity: 'info', event: 'sandbox_external_pnpm_store_settled', runId: ownedDescriptor.runId,
+          volume: `freshell-p2g01-pnpm-${ownedDescriptor.runId}`, phase: 'execution', absent: true, removed: true },
+      ].map(event => JSON.stringify(event)).join('\n') + '\n' }),
+    }
+    const create = vi.spyOn(runner.OwnedRuntimeChild, 'create').mockImplementation(async (executable, args, cwd, childEnvironment) => {
+      handoffFile = args.at(-1)!
+      const directory = path.dirname(handoffFile)
+      expect(executable).toBe('/usr/bin/bash')
+      expect(args).toEqual([path.join(sourceRoot, 'scripts/sandbox-test.sh'), '--workspace-root', sourceRoot,
+        '--external-browser', handoffFile])
+      expect(args.join(' ')).not.toContain(descriptor.FRESHELL_E2E_TARGET_TOKEN)
+      expect(childEnvironment).toEqual({
+        ...environment,
+        FRESHELL_SANDBOX_P2_G01_RUN_ID: ownedDescriptor.runId,
+        FRESHELL_SANDBOX_P2_G01_PNPM_STORE_VOLUME: `freshell-p2g01-pnpm-${ownedDescriptor.runId}`,
+      })
+      expect(JSON.stringify(childEnvironment)).not.toContain(descriptor.FRESHELL_E2E_TARGET_TOKEN)
+      expect(fs.statSync(directory).mode & 0o777).toBe(0o700)
+      expect(fs.statSync(handoffFile).mode & 0o777).toBe(0o444)
+      expect(JSON.parse(fs.readFileSync(handoffFile, 'utf8'))).toEqual({
+        FRESHELL_E2E_TARGET_URL: ownedDescriptor.baseUrl,
+        FRESHELL_E2E_TARGET_WS_URL: ownedDescriptor.wsUrl,
+        FRESHELL_E2E_TARGET_TOKEN: ownedDescriptor.token,
+        FRESHELL_RUNTIME_EXTERNAL_RUN_ID: ownedDescriptor.runId,
+        FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA: ownedDescriptor.candidateSha,
+        FRESHELL_RUNTIME_EXTERNAL_SPEC: p2G01Spec,
+        FRESHELL_RUNTIME_EXTERNAL_GREP: p2G01Title,
+      })
+      return fakeChild as any
+    })
+    try {
+      await expect(value.child('sandbox-p2-g01', [], {
+        ...descriptor, FRESHELL_RUNTIME_EXTERNAL_SPEC: p2G01Spec, FRESHELL_RUNTIME_EXTERNAL_GREP: p2G01Title,
+      })).resolves.toMatchObject({ exitCode: 0, cases: [{ id: p2G01Case.id, status: 'passed' }] })
+      expect(stopped).toHaveBeenCalledOnce()
+      expect(fs.existsSync(handoffFile)).toBe(false)
+    } finally { create.mockRestore() }
+  })
+
+  it('keeps private nonzero child diagnostics redacted and bound to each settled sandbox phase', async () => {
+    const { value, owner } = lifecycle()
+    const stderr = [
+      { severity: 'info', event: 'sandbox_container_settled', phase: 'preparation', container: 'freshell-sandbox-abcd1234', code: 0 },
+      { severity: 'info', event: 'sandbox_container_settled', phase: 'execution', container: 'freshell-sandbox-efgh5678', code: 0 },
+      { severity: 'info', event: 'sandbox_workload_finished', phase: 'preparation', container: 'freshell-sandbox-abcd1234', code: 0 },
+      { severity: 'error', event: 'sandbox_workload_failed', phase: 'execution', container: 'freshell-sandbox-efgh5678', code: 1 },
+    ].map(event => JSON.stringify(event)).join('\n') + '\n'
+    const fakeChild = {
+      alive: () => false,
+      wait: vi.fn().mockResolvedValue(1),
+      stop: vi.fn().mockResolvedValue(undefined),
+      output: () => ({ stdout: `target ${ownedDescriptor.token} ${ownedDescriptor.baseUrl}`, stderr }),
+    }
+    const create = vi.spyOn(runner.OwnedRuntimeChild, 'create').mockResolvedValue(fakeChild as any)
+    try {
+      await expect(value.child('sandbox-p2-g01', [], {
+        ...descriptor, FRESHELL_RUNTIME_EXTERNAL_SPEC: p2G01Spec, FRESHELL_RUNTIME_EXTERNAL_GREP: p2G01Title,
+      })).rejects.toThrow(/browser child failed/i)
+      expect(owner.runtime.writeArtifact).toHaveBeenCalledOnce()
+      expect(owner.runtime.writeArtifact).toHaveBeenCalledWith('p2-g01-sandbox-output-private.json', expect.objectContaining({
+        runId: ownedDescriptor.runId,
+        candidateSha: ownedDescriptor.candidateSha,
+        reason: 'execution_workload_failed',
+      }))
+      const saved = owner.runtime.writeArtifact.mock.calls[0][1]
+      expect(JSON.stringify(saved)).not.toContain(ownedDescriptor.token)
+      expect(JSON.stringify(saved)).not.toContain(ownedDescriptor.baseUrl)
+    } finally {
+      await value.abort()
+      create.mockRestore()
+    }
+  })
+
+  it('retains the descriptor until cancelled child settlement, then removes it during owner abort', async () => {
+    const { value } = lifecycle()
+    const cancellation = new AbortController()
+    let handoffFile = ''
+    let childAlive = true
+    const stopped = vi.fn(async () => {
+      expect(fs.existsSync(handoffFile)).toBe(true)
+      childAlive = false
+    })
+    const fakeChild = { alive: () => childAlive, wait: vi.fn().mockResolvedValue(0), stop: stopped,
+      output: () => ({ stdout: '', stderr: '' }) }
+    const create = vi.spyOn(runner.OwnedRuntimeChild, 'create').mockImplementation(async (_executable, args) => {
+      handoffFile = args.at(-1)!
+      queueMicrotask(() => cancellation.abort(new Error('P2-G01 sandbox cancellation')))
+      return fakeChild as any
+    })
+    try {
+      await expect(value.child('sandbox-p2-g01', [], {
+        ...descriptor, FRESHELL_RUNTIME_EXTERNAL_SPEC: p2G01Spec, FRESHELL_RUNTIME_EXTERNAL_GREP: p2G01Title,
+      }, cancellation.signal)).rejects.toThrow(/P2-G01 sandbox cancellation/)
+      expect(fs.existsSync(handoffFile)).toBe(true)
+      const cleanup = await value.abort()
+      expect(cleanup).toEqual({ ok: true, errors: [] })
+      expect(stopped).toHaveBeenCalledOnce()
+      expect(fs.existsSync(handoffFile)).toBe(false)
+    } finally { create.mockRestore() }
   })
 })
 
