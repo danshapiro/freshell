@@ -75,7 +75,7 @@ cleanup_selftest_decoys() {
 }
 trap cleanup_selftest_decoys EXIT
 
-bash -c 'exec -a freshell-server-sandbox-host-sentinel sleep 300' &
+bash -c 'exec -a freshell-server-sandbox-host-sentinel sleep infinity' &
 HOST_PID_SENTINEL_PID=$!
 
 python3 - "${HOST_PORT_FILE}" <<'PYHOST' &
