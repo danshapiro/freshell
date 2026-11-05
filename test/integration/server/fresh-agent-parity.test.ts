@@ -1064,6 +1064,14 @@ tool_timeout_sec = 120
       } catch { return [] }
     }
     let classifiedExit: any
+    const readAllSupervisorLifecycle = (): any[] => {
+      if (!fs.existsSync(supervisorLifecyclePath)) return []
+      try {
+        const contents = fs.readFileSync(supervisorLifecyclePath, 'utf8').trim()
+        if (!contents) return []
+        return contents.split('\n').filter(Boolean).map(line => JSON.parse(line))
+      } catch { return [] }
+    }
     const classification = await waitFor('supervisor send-recoverable classification of the native exit for this soul', async () => {
       if (!classifiedExit) {
         classifiedExit = readNewSupervisorLifecycle().find((row: any) => row.event === 'supervisor.runtime_observer.native_exit_send_recoverable'
@@ -1077,8 +1085,11 @@ tool_timeout_sec = 120
       return row && row.recoveryState === 'live' && !row.recoveryReason ? { event: classifiedExit, row } : undefined
     }, 150_000)
     // The classification admits the send: no recovery was scheduled for
-    // this soul after the classification event.
-    expect(readNewSupervisorLifecycle().some((row: any) => row.event === 'supervisor.runtime_observer.recovery_scheduled'
+    // this soul after the classification event. Scan the FULL lifecycle
+    // stream (not just the cursor advance after the wait settled) so a
+    // recovery_scheduled row sharing the classification event's read
+    // batch cannot escape the assertion.
+    expect(readAllSupervisorLifecycle().some((row: any) => row.event === 'supervisor.runtime_observer.recovery_scheduled'
       && row.data?.soulId === beforeCrash.view!.soulId
       && Number(row.sequence) > Number(classification.event.sequence))).toBe(false)
     const recoveryAccepted = await send('AWAITED_PLAN_RECOVERY')
