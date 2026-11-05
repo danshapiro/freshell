@@ -743,12 +743,14 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
 
       // Task 6's contract: memory loss must be user-visible, not server-log-only.
       const memoryLoss = paneRoot.locator('[data-agent-error="session"]')
-      const banner = memoryLoss.getByText(/no longer has memory/)
-      await expect(banner).toHaveCount(1, { timeout: 15_000 })
+      await expect(memoryLoss).toHaveCount(1, { timeout: 15_000 })
+      await expect(memoryLoss.locator('summary')).toContainText(/no longer has memory/)
       if (!(await memoryLoss.evaluate(node => node.hasAttribute('open')))) {
         await memoryLoss.locator('summary').click()
       }
-      await expect(banner, 'memory loss must be user-visible, not just a server warn').toBeVisible({ timeout: 15000 })
+      const banner = memoryLoss.locator('.fresh-agent-diagnostic-body').getByRole('alert')
+      await expect(banner, 'memory loss must be user-visible, not just a server warn').toBeVisible({ timeout: 15_000 })
+      await expect(banner).toContainText(/no longer has memory/)
 
       // "New thread minted" = TWO thread/start entries in the op log. The fake
       // reuses the same configured thread id and errored
