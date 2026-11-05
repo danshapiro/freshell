@@ -2888,6 +2888,13 @@ impl Supervisor {
             .recovery_context(soul_id.clone())
             .await
             .map_err(map_registry)?;
+        let active_provider = active.fresh_agent().map(|agent| agent.provider.as_str());
+        if active_provider != Some(current.provider.as_str()) {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::OwnershipMismatch,
+                "active fresh-agent provider does not match the registry owner",
+            ));
+        }
         let fixture = current.fresh_agent.as_ref().is_some_and(|agent| {
             crate::registry::deterministic_fresh_agent_fixture(&current.provider, agent)
         });

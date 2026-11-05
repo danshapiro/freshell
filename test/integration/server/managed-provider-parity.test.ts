@@ -148,11 +148,11 @@ function recoveryRetryEventsForSoul(rig: ManagedRuntimeBrowserRig, soulId: strin
   return events
 }
 
-function hasMatchingPreparationRetryEvent(
+function matchingPreparationRetryEvent(
   events: RecoveryRetryLifecycleEvent[],
   before: { soulId: string; incarnationId: string; intentRevision: number; controlEpoch: number },
-): boolean {
-  return events.some(event => {
+): RecoveryRetryLifecycleEvent | undefined {
+  return events.find(event => {
     const data = event.data
     return event.event === 'supervisor.recovery_retry.scheduled'
       && data?.soulId === before.soulId
@@ -164,6 +164,13 @@ function hasMatchingPreparationRetryEvent(
       && Number.isSafeInteger(data.attemptCount) && data.attemptCount! >= 1 && data.attemptCount! <= 2
       && Number.isSafeInteger(data.nextDueAtMs)
   })
+}
+
+function hasMatchingPreparationRetryEvent(
+  events: RecoveryRetryLifecycleEvent[],
+  before: { soulId: string; incarnationId: string; intentRevision: number; controlEpoch: number },
+): boolean {
+  return matchingPreparationRetryEvent(events, before) !== undefined
 }
 
 async function waitForUntil<T>(
@@ -312,7 +319,7 @@ describe('OpenCode replacement readiness wait', () => {
         inventoryReads++
         return inventoryReads === 1
           ? [{ ...before, recoveryState: 'blocked', recoveryReason: 'CAPABILITY_PENDING', evidenceRevision: 4 }]
-          : [{ ...before, launchState: 'running', containerId: 'container-after-race', incarnationId: 'incarnation-after-race' }]
+          : [{ ...before, recoveryState: 'live', launchState: 'running', containerId: 'container-after-race', incarnationId: 'incarnation-after-race' }]
       },
       retryEventsForSoul: (): RecoveryRetryLifecycleEvent[] => {
         eventReads++
@@ -711,11 +718,9 @@ describe('ordinary and managed terminal provider parity', () => {
     registeredVolumes.push({ ...authorization, requestId })
     rig.runtime.writeIncident('provider-parity-registered-requests', registeredVolumes)
   }
-  async function replacementObservation() {
+  async function replacementObservation(soulId: string) {
     const rows = await rig.inventory()
-    const file = path.join(path.dirname(rig.supervisor.runtimeRoot), 'evidence/lifecycle.jsonl')
-    const events = (await fs.promises.readFile(file, 'utf8')).split('\n').filter(Boolean)
-      .map(line => JSON.parse(line) as RetryEvent)
+    const events = recoveryRetryEventsForSoul(rig, soulId)
     return { rows, events }
   }
   async function providerOwnedMountEvidence(containerId: string): Promise<unknown> {
@@ -1391,16 +1396,35 @@ process.stdout.write(JSON.stringify({uid:process.getuid(),gid:process.getgid(),c
     const controlEpoch = await rig.controlEpoch()
     const recoveryFence = { ...before, terminalId, controlEpoch }
     const recoveryDeadline = Date.now() + managedLifecycleWaitMs('opencode')
+    let previouslyAuthorizedRetries: RetryEvent[] = []
     await rig.web.kill()
     const editedTui = '{ // changed while web is down\n  "theme": "solarized"\n}\n'
     fs.writeFileSync(path.join(xdgConfigHome, 'opencode/tui.jsonc'), editedTui)
     await rig.crashRuntimeHost(rig.exactRuntimeHandle(before))
     const pending = await waitFor('same-fenced OpenCode preparation retry while web is down', async () => {
-      const observation = await replacementObservation()
-      // This validates the typed retry and every fence; genuine blocks throw.
+      const observation = await replacementObservation(before.soulId)
+      const matching = observation.rows.filter(row => row.terminalId === terminalId)
+      if (matching.some(row => row.soulId !== recoveryFence.soulId
+        || row.intentRevision !== recoveryFence.intentRevision
+        || row.nativeSessionId !== recoveryFence.nativeSessionId)) {
+        throw new Error('provider replacement identity fence changed')
+      }
+      const blocked = matching.find(row => row.recoveryState === 'blocked')
+      if (!blocked) return undefined
+      if (blocked.recoveryReason !== 'CAPABILITY_PENDING') {
+        selectProviderReplacement(observation.rows, recoveryFence, observation.events)
+      }
+      // Inventory can publish the blocked state just before the supervisor
+      // appends the retry event. Wait for its exact bounded retry authorization.
+      const authorizedRetry = matchingPreparationRetryEvent(observation.events, recoveryFence)
+      if (!authorizedRetry) return undefined
+      previouslyAuthorizedRetries = [{
+        event: authorizedRetry.event,
+        at: authorizedRetry.at,
+        data: authorizedRetry.data!,
+      }]
       selectProviderReplacement(observation.rows, recoveryFence, observation.events)
-      return observation.rows.find(row => row.terminalId === terminalId
-        && row.recoveryState === 'blocked' && row.recoveryReason === 'CAPABILITY_PENDING')
+      return blocked.recoveryReason === 'CAPABILITY_PENDING' ? blocked : undefined
     }, Math.max(0, recoveryDeadline - Date.now()))
     expect(pending.incarnationId).toBe(before.incarnationId)
     rig.runtime.recordLifecycle('provider_parity.preparation_retry_observed', {
@@ -1421,7 +1445,39 @@ process.stdout.write(JSON.stringify({uid:process.getuid(),gid:process.getgid(),c
       && frame.reconcileId === reconcileId, 30_000)
     expect(reconcile.verdicts[0].verdict).toBe('attach')
     await recoveredWire.requestAttachOnce(terminalId)
-    const after = await waitForProviderReplacement(recoveryFence, replacementObservation, recoveryDeadline)
+    const after = await waitForProviderReplacement(
+      recoveryFence, replacementObservation, recoveryDeadline, previouslyAuthorizedRetries,
+    ).catch(async error => {
+      const observation = await replacementObservation(before.soulId)
+      const retries = observation.events.map(event => ({
+        event: event.event,
+        at: event.at,
+        soulId: event.data.soulId,
+        incarnationId: event.data.incarnationId,
+        intentRevision: event.data.intentRevision,
+        controlEpoch: event.data.controlEpoch,
+        reason: event.data.reason,
+        attemptId: event.data.attemptId,
+        attemptCount: event.data.attemptCount,
+        nextDueAtMs: event.data.nextDueAtMs,
+      }))
+      const rows = observation.rows.filter(row => row.terminalId === terminalId).map(row => ({
+        soulId: row.soulId,
+        incarnationId: row.incarnationId,
+        launchState: row.launchState,
+        recoveryState: row.recoveryState,
+        recoveryReason: row.recoveryReason,
+        evidenceRevision: row.evidenceRevision,
+        containerId: row.containerId,
+      }))
+      const retryFence = {
+        soulId: recoveryFence.soulId,
+        incarnationId: recoveryFence.incarnationId,
+        intentRevision: recoveryFence.intentRevision,
+        controlEpoch: recoveryFence.controlEpoch,
+      }
+      throw new Error(`${String(error)}; retry fence=${JSON.stringify(retryFence)}; current control epoch=${await rig.controlEpoch()}; rows=${JSON.stringify(rows)}; retry events=${JSON.stringify(retries)}`)
+    })
     expect(after.soulId).toBe(before.soulId)
     await recoveredWire.attach(terminalId)
     const resumed = await waitFor('resumed OpenCode child after web restart', () => recoveredWire.recordRows().find(row => (

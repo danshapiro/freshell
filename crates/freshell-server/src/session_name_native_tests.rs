@@ -787,7 +787,7 @@ impl NativeNameBackend for LifecycleContentionBackend {
     }
 
     fn route_available(&self, _: NativeNameTarget) -> super::NativeProbeFuture {
-        Box::pin(async { true })
+        Box::pin(async { super::NativeProbeResult::Available })
     }
 }
 
@@ -1039,7 +1039,8 @@ async fn lifecycle_contention_exhaustion_preserves_backoff_and_eventual_sync() {
         );
         assert_eq!(
             native_sync_of(&store, target.clone()).await.unwrap().status,
-            NativeSyncStatus::Unsynced
+            NativeSyncStatus::Pending,
+            "phase {phase} must remain pending until a readback confirms the native state"
         );
         assert!(store.native_work_snapshot().is_empty());
         {

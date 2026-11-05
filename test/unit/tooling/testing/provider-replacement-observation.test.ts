@@ -17,7 +17,7 @@ afterEach(() => { vi.useRealTimers() })
 
 describe('provider replacement observation', () => {
   it('accepts an identity-fenced running replacement before its retry event is observed', () => {
-    expect(selectProviderReplacement([pending, ready], before, [])).toEqual(ready)
+    expect(selectProviderReplacement([ready], before, [])).toEqual(ready)
   })
 
   it('observes a valid bounded preparation retry through the same native replacement', async () => {
@@ -32,6 +32,60 @@ describe('provider replacement observation', () => {
     await vi.advanceTimersByTimeAsync(200)
     expect(await result).toEqual({ value: ready })
     expect(read).toHaveBeenCalledTimes(3)
+  })
+
+  it('waits while the first recovery attempt is reserved before its retry schedule is written', async () => {
+    vi.useFakeTimers()
+    const reserved: RetryEvent = { event: 'supervisor.recovery_retry.reserved', data: {
+      ...scheduled.data, attemptId: 'first-attempt', attemptCount: 1, nextDueAtMs: null, reason: 'reserved',
+    } }
+    const firstSchedule = { ...scheduled, data: { ...scheduled.data, attemptId: 'first-attempt' } }
+    const read = vi.fn()
+      .mockResolvedValueOnce({ rows: [pending], events: [reserved] })
+      .mockResolvedValueOnce({ rows: [pending], events: [reserved, firstSchedule] })
+      .mockResolvedValue({ rows: [ready], events: [firstSchedule] })
+    const result = waitForProviderReplacement(before, read, Date.now() + 500)
+      .then(value => ({ value }), error => ({ error }))
+    await vi.advanceTimersByTimeAsync(200)
+    expect(await result).toEqual({ value: ready })
+    expect(read).toHaveBeenCalledTimes(3)
+  })
+
+  it('allows the inventory update to arrive just before its first retry event', async () => {
+    vi.useFakeTimers()
+    const reserved: RetryEvent = { event: 'supervisor.recovery_retry.reserved', data: {
+      ...scheduled.data, attemptId: 'first-attempt', attemptCount: 1, nextDueAtMs: null, reason: 'reserved',
+    } }
+    const read = vi.fn()
+      .mockResolvedValueOnce({ rows: [pending], events: [] })
+      .mockResolvedValueOnce({ rows: [pending], events: [reserved] })
+      .mockResolvedValueOnce({ rows: [ready], events: [scheduled] })
+    const result = waitForProviderReplacement(before, read, Date.now() + 500)
+      .then(value => ({ value }), error => ({ error }))
+    await vi.advanceTimersByTimeAsync(200)
+    expect(await result).toEqual({ value: ready })
+    expect(read).toHaveBeenCalledTimes(3)
+  })
+
+  it('retains a previously observed retry authorization when later reads omit lifecycle events', async () => {
+    vi.useFakeTimers()
+    let observations = 0
+    const read = vi.fn(async () => {
+      observations += 1
+      return { rows: observations < 20 ? [pending] : [ready], events: [] }
+    })
+    const result = waitForProviderReplacement(before, read, Date.now() + 2_500, [scheduled])
+      .then(value => ({ value }), error => ({ error }))
+    await vi.advanceTimersByTimeAsync(1_900)
+    expect(await result).toEqual({ value: ready })
+    expect(read).toHaveBeenCalledTimes(20)
+  })
+
+  it('lets a later cancellation revoke previously observed retry authorization', async () => {
+    const cancelled: RetryEvent = { ...scheduled, event: 'supervisor.recovery_retry.cancelled',
+      data: { ...scheduled.data, reason: 'cancelled' } }
+    await expect(waitForProviderReplacement(before, async () => ({ rows: [pending], events: [cancelled] }), Date.now() + 500, [scheduled]))
+      .rejects.toThrow('CAPABILITY_PENDING')
   })
 
   it('fails a capability block without a matching retry authorization', () => {

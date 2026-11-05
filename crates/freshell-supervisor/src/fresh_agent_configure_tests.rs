@@ -870,6 +870,7 @@ async fn codex_readiness_reconciles_receipt_after_host_commit_reply_is_lost() {
                                 .as_ref()
                                 .map(|observation| observation.native_session_id.clone()),
                             native_identity_observation: observation,
+                            fresh_agent_recovery_source: None,
                             host_boot_id: boot.clone(),
                             worker_pid: Some(123),
                             worker_launch_count: 1,
@@ -2377,6 +2378,7 @@ async fn native_name_lifecycle_busy_is_typed_and_fresh_retry_dispatches_once() {
                 source: source.clone(),
                 codex_home: "/owning/codex".into(),
                 operation: FreshAgentNativeNameOperation::Read,
+                accepts_lifecycle_busy: true,
                 expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
             }),
         );
