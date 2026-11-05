@@ -2604,6 +2604,7 @@ async fn native_name_lifecycle_busy_is_typed_and_fresh_retry_dispatches_once() {
                 codex_home: "/owning/codex".into(),
                 operation: FreshAgentNativeNameOperation::Read,
                 expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
+                deadline_unix_ms: None,
             }),
         );
         request.auth = Some(SECRET.into());
