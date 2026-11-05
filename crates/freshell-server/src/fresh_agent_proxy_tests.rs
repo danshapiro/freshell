@@ -820,6 +820,7 @@ mod initial_grant_reference_tests {
                                 fixture_evidence: serde_json::json!({}),
                                 native_session_id: native_root.clone(),
                                 native_identity_observation: None,
+                                native_readiness_receipt: None,
                                 opencode_transfer_receipt: None,
                                 opencode_adoption: Default::default(),
                             }
