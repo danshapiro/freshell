@@ -873,8 +873,13 @@ tool_timeout_sec = 120
         try{appServer=fs.readFileSync('/proc/'+pid+'/cmdline','utf8').split(String.fromCharCode(0)).includes('app-server')}catch{}
         if(executable!==layout.nativeExecutable&&!appServer&&field('Name')!=='codex')return[];
         let cwd,cwdError,workspace;try{cwd=fs.readlinkSync('/proc/'+pid+'/cwd');const s=fs.statSync(cwd);let writable=false;try{fs.accessSync(cwd,fs.constants.W_OK);writable=true}catch{}workspace={uid:s.uid,gid:s.gid,mode:(s.mode&511).toString(8),writable}}catch(error){cwdError=error.code}
+        const stat=fs.readFileSync('/proc/'+pid+'/stat','utf8');
+        const starttime=stat.slice(stat.lastIndexOf(')')+2).split(' ')[19];
+        const argv=fs.readFileSync('/proc/'+pid+'/cmdline','utf8').split(String.fromCharCode(0)).filter(Boolean);
+        const ownership=fs.readFileSync('/proc/'+pid+'/environ','utf8').split(String.fromCharCode(0)).find(value=>value.startsWith('FRESHELL_CODEX_SIDECAR_ID='))?.slice('FRESHELL_CODEX_SIDECAR_ID='.length);
+        if(!starttime||!ownership)throw Error('Owned native process identity is incomplete');
         return[{pid:Number(pid),parentPid:Number(field('PPid')),state:field('State'),uid:Number(field('Uid')?.split(String.fromCharCode(9))[0]),gid:Number(field('Gid')?.split(String.fromCharCode(9))[0]),
-          executable,exeError,appServer,cwd,cwdError,workspace,noNewPrivs:field('NoNewPrivs'),capEff:field('CapEff')}];
+          executable,exeError,appServer,cwd,cwdError,workspace,noNewPrivs:field('NoNewPrivs'),capEff:field('CapEff'),processIdentity:{pid:Number(pid),starttime,argv,ownership,executable,cwd,namespace:{net:fs.readlinkSync('/proc/'+pid+'/ns/net'),pid:fs.readlinkSync('/proc/'+pid+'/ns/pid'),mnt:fs.readlinkSync('/proc/'+pid+'/ns/mnt')}}}];
       }catch{return[]}});const found=candidates.filter(row=>row.executable===layout.nativeExecutable&&row.appServer&&row.cwd===expectedCwd);
       if(found.length!==1)throw Error('Expected one actual installed native Codex app-server for the accepted working directory: '+JSON.stringify({expectedNative:layout.nativeExecutable,expectedCwd,matches:found.length,candidates}));process.stdout.write(JSON.stringify(found[0]));`]))
     const inspectNativeAppServers = async () => JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
@@ -1321,9 +1326,23 @@ tool_timeout_sec = 120
     const nativeSessionId = view.nativeSessionId
     if (typeof nativeSessionId !== 'string') throw new Error('Managed Codex view has no native session ID')
     const readNativeName = async (nativeId = view.nativeSessionId, context = nativeContext) => JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
-      const fs=require('node:fs');const argv=fs.readFileSync('/proc/${context.pid}/cmdline','utf8').split(String.fromCharCode(0));
-      const endpoint=argv[argv.indexOf('--listen')+1];const target=new URL(endpoint);
-      if(target.protocol!=='ws:'||target.hostname!=='127.0.0.1'||!target.port)throw Error('Expected the existing native loopback endpoint');
+      const fs=require('node:fs');const root='/proc/${context.pid}';const expected=${JSON.stringify(context.processIdentity)};
+      const identity=()=>{const stat=fs.readFileSync(root+'/stat','utf8');return{pid:${context.pid},
+        starttime:stat.slice(stat.lastIndexOf(')')+2).split(' ')[19],
+        argv:fs.readFileSync(root+'/cmdline','utf8').split(String.fromCharCode(0)).filter(Boolean),
+        ownership:fs.readFileSync(root+'/environ','utf8').split(String.fromCharCode(0)).find(value=>value.startsWith('FRESHELL_CODEX_SIDECAR_ID='))?.slice('FRESHELL_CODEX_SIDECAR_ID='.length),
+        executable:fs.readlinkSync(root+'/exe'),cwd:fs.readlinkSync(root+'/cwd'),namespace:{net:fs.readlinkSync(root+'/ns/net'),pid:fs.readlinkSync(root+'/ns/pid'),mnt:fs.readlinkSync(root+'/ns/mnt')}};};
+      const qualify=()=>{const actual=identity();if(!expected||JSON.stringify(actual)!==JSON.stringify(expected))throw Error('Owned native process identity changed');return actual;};
+      const proof=qualify();if(proof.namespace.net!==fs.readlinkSync('/proc/self/ns/net'))throw Error('Native metadata observer is outside the owned network namespace');const at=proof.argv.indexOf('--listen');
+      if(!proof.argv.includes('app-server')||at<0||proof.argv.filter(value=>value==='--listen').length!==1)throw Error('Expected one owned native app-server listen request');
+      const requested=new URL(proof.argv[at+1]);
+      if(requested.protocol!=='ws:'||requested.hostname!=='127.0.0.1'||requested.username||requested.password||requested.search||requested.hash||!requested.port)throw Error('Expected the owned native loopback listen request');
+      const listener=()=>{qualify();const owned=new Set(fs.readdirSync(root+'/fd').flatMap(fd=>{try{const value=fs.readlinkSync(root+'/fd/'+fd);return value.startsWith('socket:[')&&value.endsWith(']')?[value.slice(8,-1)]:[];}catch{return[];}}));
+        const matches=fs.readFileSync(root+'/net/tcp','utf8').trim().split(String.fromCharCode(10)).slice(1).flatMap(line=>{const fields=line.trim().split(' ').filter(Boolean);const [ip,port]=fields[1].split(':');const value=parseInt(port,16);
+          return fields[3]==='0A'&&ip==='0100007F'&&owned.has(fields[9])&&value>0&&value<=65535?[{port:value,inode:fields[9]}]:[];});
+        if(matches.length!==1)throw Error('Expected exactly one loopback listener owned by the native process');qualify();return matches[0];};
+      const selected=listener();if(Number(requested.port)!==0&&Number(requested.port)!==selected.port)throw Error('Owned native listener differs from its fixed-port request');
+      const endpoint='ws://127.0.0.1:'+selected.port;
       const socket=new WebSocket(endpoint);let settled=false;
       const finish=(error,value)=>{if(settled)return;settled=true;clearTimeout(timer);socket.close();
         if(error){process.stderr.write(String(error));process.exit(1)}process.stdout.write(JSON.stringify(value),()=>process.exit(0));};
@@ -1332,7 +1351,8 @@ tool_timeout_sec = 120
       socket.addEventListener('open',()=>socket.send(JSON.stringify({id:1,method:'initialize',params:{clientInfo:{name:'freshell_name_read_probe',version:'1'}}})));
       socket.addEventListener('message',event=>{const frame=JSON.parse(String(event.data));if(frame.error)return finish(frame.error.message);
         if(frame.id===1){socket.send(JSON.stringify({method:'initialized'}));socket.send(JSON.stringify({id:2,method:'thread/read',params:{threadId:${JSON.stringify(nativeId)},includeTurns:false}}));}
-        if(frame.id===2)finish(null,{id:frame.result.thread.id,title:frame.result.thread.name??null});});`]))
+        if(frame.id===2){try{const current=listener();if(current.port!==selected.port||current.inode!==selected.inode||frame.result.thread.id!==${JSON.stringify(nativeId)})throw Error('Owned native metadata source changed');
+          finish(null,{id:frame.result.thread.id,title:frame.result.thread.name??null});}catch(error){finish(error instanceof Error?error.message:String(error));}}});`]))
     const nativeNameBeforeWait = await readNativeName()
     rig.runtime.writeIncident('freshcodex-managed-native-name-writeback', { canonicalName, nativeNameBeforeWait, view, nativeContext })
     await waitForNativeNameSync(durableNameRef, canonicalName, 'managed native name synchronization',
