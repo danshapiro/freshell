@@ -2927,10 +2927,6 @@ impl Supervisor {
             });
         let readiness_needed = status.exited
             || crate::recovery::current_native_observation(&current, &status).is_none();
-        let retained_codex_send = admission == FreshNativeAdmission::CodexSendRecovery
-            && self
-                .retained_codex_host_eligible(&current, &host, &status)
-                .await?;
         let supports_codex_same_root_readiness = host
             .capabilities
             .iter()
@@ -2940,16 +2936,6 @@ impl Supervisor {
             && self
                 .retained_codex_host_eligible(&current, &host, &status)
                 .await?;
-        if readiness_needed
-            && admission == FreshNativeAdmission::CodexCompactReadiness
-            && current.provider == "codex"
-            && !supports_codex_same_root_readiness
-        {
-            return Err(RuntimeError::new(
-                RuntimeErrorCode::RecoveryBlocked,
-                "Codex Compact requires a host with same-root native readiness support",
-            ));
-        }
         if readiness_needed && can_prepare_claude {
             let before = current.write_fence();
             let expected_launch = current
@@ -3096,8 +3082,8 @@ impl Supervisor {
                 ));
             }
         } else if readiness_needed
-            && admission != FreshNativeAdmission::CodexCompactReadiness
-            && !retained_codex_send
+            && admission == FreshNativeAdmission::CodexCompactReadiness
+            && !supports_codex_same_root_readiness
             && !fixture
             && current.provider == "codex"
             && current.desired_state == freshell_runtime_protocol::DesiredState::Running
@@ -3131,6 +3117,9 @@ impl Supervisor {
                     .any(|capability| capability == required)
             })
         {
+            // This compatibility path is only for Compact on older hosts
+            // without the dedicated same-root check. SEND and permission
+            // resolution require retained or current live identity proof.
             let before_probe = current.write_fence();
             let (probe, probed_context) = self
                 .probe_codex_native_readiness_locked(&current, &host)
@@ -3347,7 +3336,23 @@ impl Supervisor {
             append_event(
                 &self.config.lifecycle_log,
                 "fresh_agent.input_native_identity_unsettled",
-                serde_json::json!({"severity":"warn","soulId":soul_id,"incarnationId":active.incarnation_id()}),
+                serde_json::json!({
+                    "severity":"warn",
+                    "soulId":soul_id,
+                    "incarnationId":active.incarnation_id(),
+                    "currentIncarnationId":current.prior_handle.incarnation_id(),
+                    "provider":current.provider,
+                    "desiredState":current.desired_state,
+                    "statusExited":status.exited,
+                    "retainedCodex":retained_codex,
+                    "fixture":fixture,
+                    "hasCurrentNativeObservation":
+                        crate::recovery::current_native_observation(&current, &status).is_some(),
+                    "statusHostBootId":status.host_boot_id,
+                    "authenticatedHostBootId":host.host_boot_id,
+                    "statusControlEpoch":status.max_control_epoch,
+                    "currentControlEpoch":current.control_epoch,
+                }),
             );
             return Err(RuntimeError::new(
                 RuntimeErrorCode::RecoveryBlocked,

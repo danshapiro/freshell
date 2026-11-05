@@ -128,6 +128,7 @@ impl ControlledCodex {
         agent.provider = FreshProvider::Codex;
         agent.session_type = "freshcodex".into();
         agent.runtime_variant = "codex-app-server-v1".into();
+        agent.fixture_transport = None;
         let boot = HostBootId::new();
         let conn = Connection::open(registry.database_path()).unwrap();
         conn.execute(
@@ -180,6 +181,23 @@ impl ControlledCodex {
         registry
             .store_verified_resume_spec(soul.clone(), candidate)
             .await
+            .unwrap();
+        let current_context = registry.recovery_context(soul.clone()).await.unwrap();
+        let current_evidence_revision = current_context.evidence_revision;
+        let mut launch = launch;
+        launch.evidence_revision = current_evidence_revision;
+        let mut parent = parent;
+        parent.evidence_revision = current_evidence_revision;
+        Connection::open(registry.database_path())
+            .unwrap()
+            .execute(
+                "UPDATE incarnations SET native_identity_launch=?1,native_identity_observation=?2 WHERE incarnation_id=?3",
+                params![
+                    serde_json::to_string(&launch).unwrap(),
+                    serde_json::to_string(&parent).unwrap(),
+                    prepared.incarnation_id.as_str(),
+                ],
+            )
             .unwrap();
         let source = Arc::new(std::sync::Mutex::new(parent));
         let exited = Arc::new(AtomicBool::new(true));
@@ -327,7 +345,10 @@ impl ControlledCodex {
                                 {
                                     let mut observation = source.lock().unwrap();
                                     observation.native_session_id = "native-child".into();
-                                    observation.evidence_revision = 8;
+                                    observation.evidence_revision = launch
+                                        .evidence_revision
+                                        .checked_add(1)
+                                        .expect("synthetic Codex identity revision has room");
                                 }
                                 exited.store(false, Ordering::SeqCst);
                                 HostResult::FreshAgentCommand {
@@ -757,17 +778,33 @@ async fn public_compact_prepares_retained_codex_same_root_without_input_or_repla
 }
 
 #[tokio::test]
-async fn public_compact_fails_closed_when_host_lacks_same_root_readiness() {
+async fn public_compact_uses_exact_store_readiness_without_same_root_support() {
     let fixture = ControlledCodex::new().await;
     fixture.same_root_capability.store(false, Ordering::SeqCst);
 
-    let error = fixture.compact().await.unwrap_err();
+    assert!(matches!(
+        fixture.compact().await.unwrap(),
+        AdminResult::FreshAgentCommand {
+            state: CommandState::ProviderAcked
+        }
+    ));
 
-    assert_eq!(error.code, RuntimeErrorCode::RecoveryBlocked);
-    assert!(error.message.contains("same-root native readiness support"));
+    assert_eq!(fixture.native_prepares.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.prepares.load(Ordering::SeqCst), 0);
-    assert_eq!(fixture.compacts.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.compacts.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.inputs.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .supervisor
+            .registry
+            .recovery_context(fixture.soul.clone())
+            .await
+            .unwrap()
+            .native_session_id
+            .as_deref(),
+        Some("native-parent"),
+        "readiness must preserve the exact retained Codex root"
+    );
 }
 
 #[tokio::test]
@@ -802,12 +839,47 @@ async fn observer_retains_eligible_codex_actor_without_attempts_then_host_loss_u
 #[tokio::test]
 async fn public_send_recovers_retained_codex_source_and_commits_before_second_input() {
     let fixture = ControlledCodex::new().await;
-    assert!(matches!(
-        fixture.send(RequestId::new()).await.unwrap(),
-        AdminResult::FreshAgentCommand {
-            state: CommandState::ProviderAcked
-        }
-    ));
+    let before = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    let active = fixture
+        .supervisor
+        .registry
+        .active_handle_for_soul(fixture.soul.clone())
+        .await
+        .unwrap();
+    let host = fixture
+        .supervisor
+        .authenticate_host(active.incarnation_id(), active.runtime_dir())
+        .await
+        .unwrap();
+    let status = fixture
+        .supervisor
+        .host_status(active.incarnation_id().clone(), active.runtime_dir(), &host)
+        .await
+        .unwrap();
+    assert!(
+        fixture
+            .supervisor
+            .retained_codex_host_eligible(&before, &host, &status)
+            .await
+            .unwrap(),
+        "initial retained root should satisfy the exact SEND admission checks"
+    );
+    let send = fixture.send(RequestId::new()).await;
+    assert!(
+        matches!(
+            &send,
+            Ok(AdminResult::FreshAgentCommand {
+                state: CommandState::ProviderAcked
+            })
+        ),
+        "initial send returned {send:?}; lifecycle: {}",
+        std::fs::read_to_string(fixture._root.path().join("lifecycle.jsonl")).unwrap_or_default()
+    );
     fixture.assert_retained().await;
     let context = fixture
         .supervisor
@@ -816,9 +888,53 @@ async fn public_send_recovers_retained_codex_source_and_commits_before_second_in
         .await
         .unwrap();
     assert_eq!(context.native_session_id.as_deref(), Some("native-child"));
+    assert_eq!(
+        fixture.source.lock().unwrap().evidence_revision,
+        context
+            .native_identity_launch
+            .as_ref()
+            .expect("committed child retains its launch binding")
+            .evidence_revision,
+        "the host observation must use the revision committed with the child root"
+    );
+    let active = fixture
+        .supervisor
+        .registry
+        .active_handle_for_soul(fixture.soul.clone())
+        .await
+        .unwrap();
+    let host = fixture
+        .supervisor
+        .authenticate_host(active.incarnation_id(), active.runtime_dir())
+        .await
+        .unwrap();
+    let status = fixture
+        .supervisor
+        .host_status(active.incarnation_id().clone(), active.runtime_dir(), &host)
+        .await
+        .unwrap();
+    assert!(
+        crate::recovery::current_native_observation(&context, &status).is_some(),
+        "accepted Codex dispatch must publish the current committed identity"
+    );
     fixture.supervisor.observe_once().await.unwrap();
-    fixture.send(RequestId::new()).await.unwrap();
+    let second_send = fixture.send(RequestId::new()).await;
+    assert!(
+        matches!(
+            &second_send,
+            Ok(AdminResult::FreshAgentCommand {
+                state: CommandState::ProviderAcked
+            })
+        ),
+        "second send returned {second_send:?}; lifecycle: {}",
+        std::fs::read_to_string(fixture._root.path().join("lifecycle.jsonl")).unwrap_or_default()
+    );
     assert_eq!(fixture.inputs.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fixture.recovery_probes.load(Ordering::SeqCst),
+        1,
+        "the observer's bounded provider check does not invalidate the committed root"
+    );
     fixture.assert_retained().await;
 }
 
@@ -1165,13 +1281,12 @@ async fn public_send_recovery_keeps_owner_source_and_control_fences() {
 #[tokio::test]
 async fn retained_codex_recovery_does_not_admit_native_controls() {
     let fixture = ControlledCodex::new().await;
-    let mut context = fixture
+    let context = fixture
         .supervisor
         .registry
         .recovery_context(fixture.soul.clone())
         .await
         .unwrap();
-    context.fresh_agent.as_mut().unwrap().fixture_transport = None;
     assert_eq!(context.provider, "codex");
     assert!(context.fixture.is_none());
     assert_eq!(
@@ -1181,6 +1296,10 @@ async fn retained_codex_recovery_does_not_admit_native_controls() {
     assert_eq!(context.native_session_id.as_deref(), Some("native-parent"));
     let launch = context.native_identity_launch.as_ref().unwrap();
     assert_eq!(
+        launch.evidence_revision, context.evidence_revision,
+        "native launch proof and current durable evidence must share a revision"
+    );
+    assert_eq!(
         launch.incarnation_id,
         *context.prior_handle.incarnation_id()
     );
@@ -1189,6 +1308,7 @@ async fn retained_codex_recovery_does_not_admit_native_controls() {
         context.prior_handle.launch_nonce().as_str()
     );
     assert_eq!(launch.execution_generation, 1);
+    assert!(!context.never_dispatched);
     let native_observation = fixture
         .supervisor
         .registry
@@ -1196,7 +1316,7 @@ async fn retained_codex_recovery_does_not_admit_native_controls() {
         .await
         .unwrap()
         .into_iter()
-        .find(|view| &view.soul_id == &fixture.soul)
+        .find(|view| view.soul_id == fixture.soul)
         .and_then(|view| view.native_identity_observation)
         .expect("retained Codex fixture must have exact native identity evidence");
     assert_eq!(
@@ -1226,15 +1346,6 @@ async fn retained_codex_recovery_does_not_admit_native_controls() {
             .unwrap()
             .is_some()
     );
-    let conn = Connection::open(fixture.supervisor.registry.database_path()).unwrap();
-    conn.execute(
-        "UPDATE incarnations SET fresh_agent_spec=?1 WHERE incarnation_id=?2",
-        params![
-            serde_json::to_string(context.fresh_agent.as_ref().unwrap()).unwrap(),
-            fixture.incarnation.as_str(),
-        ],
-    )
-    .unwrap();
     let active = fixture
         .supervisor
         .registry
@@ -1250,6 +1361,21 @@ async fn retained_codex_recovery_does_not_admit_native_controls() {
         .capabilities
         .iter()
         .any(|capability| capability == HOST_CAPABILITY_NATIVE_READINESS_RECEIPT_V1));
+    let status = fixture
+        .supervisor
+        .host_status(active.incarnation_id().clone(), active.runtime_dir(), &host)
+        .await
+        .unwrap();
+    assert!(status.exited);
+    assert_eq!(status.max_execution_generation, 1);
+    assert!(
+        fixture
+            .supervisor
+            .retained_codex_host_eligible(&context, &host, &status)
+            .await
+            .unwrap(),
+        "the coherent exact Codex source remains eligible for SEND recovery"
+    );
     let prepare_error = fixture
         .supervisor
         .fresh_agent_prepare_native(fixture.soul.clone())
@@ -1259,13 +1385,6 @@ async fn retained_codex_recovery_does_not_admit_native_controls() {
     assert!(prepare_error
         .message
         .contains("fresh-agent input requires the current committed native identity"));
-    let status = fixture
-        .supervisor
-        .host_status(active.incarnation_id().clone(), active.runtime_dir(), &host)
-        .await
-        .unwrap();
-    assert!(status.exited);
-    assert_eq!(status.max_execution_generation, 1);
     let error = fixture
         .supervisor
         .fresh_agent_resolve(
@@ -1280,8 +1399,7 @@ async fn retained_codex_recovery_does_not_admit_native_controls() {
     assert_eq!(
         fixture.recovery_probes.load(Ordering::SeqCst),
         0,
-        "resolve returned {error:?}; lifecycle: {}",
-        std::fs::read_to_string(fixture._root.path().join("lifecycle.jsonl")).unwrap_or_default()
+        "neither native preparation nor permission resolution may probe/restart the old host"
     );
     assert_eq!(fixture.native_prepares.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.prepares.load(Ordering::SeqCst), 0);
