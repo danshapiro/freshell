@@ -144,7 +144,7 @@ async fn spawn_record_carries_verifiable_proc_identity_and_freshagent_lane() {
     let mut child = spawn_sleep_child();
     let pid = child.id().expect("spawned pid");
 
-    record_spawned_sidecar("codex-sidecar-wfah-t2", pid, "ws://127.0.0.1:1").await;
+    let _ = record_spawned_sidecar("codex-sidecar-wfah-t2", pid, "ws://127.0.0.1:1").await;
 
     let records = guard.records();
     assert_eq!(records.len(), 1, "exactly one record written");
@@ -173,8 +173,60 @@ async fn record_is_skipped_cleanly_when_no_store_is_installed() {
     drop(guard);
     let mut child = spawn_sleep_child();
     let pid = child.id().expect("spawned pid");
-    record_spawned_sidecar("codex-sidecar-wfah-disabled", pid, "ws://127.0.0.1:1").await;
+    assert!(
+        record_spawned_sidecar("codex-sidecar-wfah-disabled", pid, "ws://127.0.0.1:1")
+            .await
+            .is_none()
+    );
     // No panic, no record write possible; the disabled store swallows writes.
+    let _ = child.start_kill();
+}
+
+#[tokio::test]
+async fn announced_endpoint_write_failure_never_becomes_untracked_success() {
+    let _env = ENV_LOCK.lock().await;
+    let guard = TrackingStoreGuard::install();
+    let mut child = spawn_sleep_child();
+    let pid = child.id().unwrap();
+    let ownership_id = "codex-sidecar-endpoint-write-failure";
+    let tracked = record_spawned_sidecar(ownership_id, pid, "ws://127.0.0.1:0")
+        .await
+        .expect("the early process row is tracked");
+    assert_eq!(
+        guard.records().len(),
+        1,
+        "the early process row was written"
+    );
+    let record_path = guard._dir.path().join(format!("{ownership_id}.json"));
+    let _previous = std::fs::read(&record_path).unwrap();
+    std::fs::remove_file(&record_path).unwrap();
+    std::fs::create_dir(&record_path).unwrap();
+    assert!(
+        tracked
+            .record_announced_endpoint("ws://127.0.0.1:43219")
+            .is_err(),
+        "a previously tracked child must not acknowledge an unrecorded endpoint"
+    );
+    let _ = child.start_kill();
+}
+
+#[tokio::test]
+async fn startup_placeholder_record_never_becomes_resumable() {
+    let _env = ENV_LOCK.lock().await;
+    let guard = TrackingStoreGuard::install();
+    let mut child = spawn_sleep_child();
+    let pid = child.id().unwrap();
+    let ownership_id = "codex-sidecar-startup-placeholder";
+    let _ = record_spawned_sidecar(ownership_id, pid, "ws://127.0.0.1:0").await;
+    // A late initial-write error can leave this process-only row on disk.
+    // A later native identity must never make its placeholder connectable.
+    crate::codex_sidecar_tracking::enrich_record_session_id(ownership_id, "native-session");
+    let records = guard.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].session_id, None,
+        "no durable session may point to the startup placeholder"
+    );
     let _ = child.start_kill();
 }
 
@@ -206,6 +258,20 @@ async fn create_writes_a_freshagent_laned_record_for_the_real_sidecar() {
         record.cmdline
     );
     assert_eq!(verify_sidecar_identity(record), IdentityVerdict::Verified);
+    assert!(record
+        .cmdline
+        .windows(2)
+        .any(|args| args == ["--listen", "ws://127.0.0.1:0"]));
+    assert_ne!(
+        record.ws_url, "ws://127.0.0.1:0",
+        "created must publish the actual saved endpoint"
+    );
+    assert!(
+        freshell_codex::transport::TungsteniteTransport::connect(&record.ws_url)
+            .await
+            .is_ok(),
+        "the saved endpoint must reach the still-owned provider"
+    );
 
     st.shutdown().await; // scrubs the record only once Task 3's wiring lands
 }
@@ -286,7 +352,7 @@ async fn build_recorded_watch(
 ) {
     let child = spawn_sleep_child();
     let pid = child.id().expect("spawned pid");
-    record_spawned_sidecar(ownership_id, pid, "ws://127.0.0.1:1").await;
+    let _ = record_spawned_sidecar(ownership_id, pid, "ws://127.0.0.1:1").await;
     let (tx, _rx) = tokio::sync::broadcast::channel::<String>(8);
     let (kill_tx, kill_rx) = tokio::sync::oneshot::channel();
     let watcher = crate::codex::spawn_exit_watcher(
@@ -337,7 +403,7 @@ async fn unrequested_exit_arm_removes_the_record() {
     let guard = TrackingStoreGuard::install();
     let mut child = spawn_sleep_child();
     let pid = child.id().expect("spawned pid");
-    record_spawned_sidecar("codex-sidecar-wfah-t3-crash", pid, "ws://127.0.0.1:1").await;
+    let _ = record_spawned_sidecar("codex-sidecar-wfah-t3-crash", pid, "ws://127.0.0.1:1").await;
     assert_eq!(
         guard.records().len(),
         1,

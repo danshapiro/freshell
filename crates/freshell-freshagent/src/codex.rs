@@ -56,8 +56,9 @@ use axum::{
 use serde_json::{json, Map, Value};
 use tokio::sync::{oneshot, Mutex as TokioMutex};
 
-use freshell_codex::launch_lifecycle::{allocate_loopback_port, SIDECAR_START_BUDGET};
+use freshell_codex::launch_lifecycle::SIDECAR_START_BUDGET;
 use freshell_codex::launch_plan::{codex_sidecar_spawn_spec, CodexSidecarLaunchContext};
+use freshell_codex::sidecar_startup::{drain_child_output, REQUESTED_LISTEN_URL};
 use freshell_codex::transport::{reap_owned_codex_sidecars, TungsteniteTransport};
 use freshell_codex::{
     mint_ownership_id, normalize_codex_thread_status, read_rollout_history_mode,
@@ -470,78 +471,6 @@ fn join_retained_codex_display(snapshot: &mut Value, mut saved: Value) {
 
 /// The codex fresh-agent `sessionType` (`AGENT_SESSION_TYPES.codex`).
 const SESSION_TYPE: &str = "freshcodex";
-
-const CODEX_STARTUP_STDERR_SAMPLE_MAX_BYTES: usize = 4096;
-
-struct CodexStartupStderr {
-    sample: Arc<StdMutex<Vec<u8>>>,
-    drained: oneshot::Receiver<()>,
-}
-
-impl CodexStartupStderr {
-    async fn safe_category_after_exit(self) -> &'static str {
-        let mut drained = self.drained;
-        // Process exit closes the pipe. Keep the failure path bounded if a
-        // wrapper accidentally leaves another writer open.
-        let _ = tokio::time::timeout(Duration::from_millis(100), &mut drained).await;
-        let sample = self
-            .sample
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        classify_codex_startup_stderr(&sample)
-    }
-}
-
-/// Drain Codex startup output while retaining only a short stderr tail for
-/// classification. Provider output is never logged or persisted; callers get
-/// one fixed diagnostic category suitable for a structured failure event.
-fn drain_codex_child_io_with_startup_diagnostics(
-    child: &mut tokio::process::Child,
-) -> CodexStartupStderr {
-    use tokio::io::AsyncReadExt;
-
-    if let Some(mut stdout) = child.stdout.take() {
-        tokio::spawn(async move {
-            let _ = tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await;
-        });
-    }
-
-    let sample = Arc::new(StdMutex::new(Vec::with_capacity(
-        CODEX_STARTUP_STDERR_SAMPLE_MAX_BYTES,
-    )));
-    let (drained_tx, drained_rx) = oneshot::channel();
-    if let Some(mut stderr) = child.stderr.take() {
-        let sample_for_task = Arc::clone(&sample);
-        tokio::spawn(async move {
-            let mut chunk = [0_u8; 1024];
-            loop {
-                let count = match stderr.read(&mut chunk).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(count) => count,
-                };
-                let mut tail = sample_for_task
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let overflow = tail
-                    .len()
-                    .saturating_add(count)
-                    .saturating_sub(CODEX_STARTUP_STDERR_SAMPLE_MAX_BYTES);
-                if overflow > 0 {
-                    let drain_len = overflow.min(tail.len());
-                    tail.drain(..drain_len);
-                }
-                tail.extend_from_slice(&chunk[..count]);
-            }
-            let _ = drained_tx.send(());
-        });
-    } else {
-        let _ = drained_tx.send(());
-    }
-    CodexStartupStderr {
-        sample,
-        drained: drained_rx,
-    }
-}
 
 fn classify_codex_startup_stderr(stderr: &[u8]) -> &'static str {
     if stderr.is_empty() {
@@ -10098,12 +10027,11 @@ impl FreshCodexState {
     > {
         use std::process::Stdio;
 
-        let port = allocate_loopback_port()?;
-        let ws_url = format!("ws://127.0.0.1:{port}");
+        let ws_url = REQUESTED_LISTEN_URL;
         let ownership_id = mint_ownership_id();
         // The canonical argv + env: `-c features.apps=false app-server --listen <ws_url>`
         // plus the ownership tag the /proc reaper keys on (S5.d.1 unification).
-        let spec = codex_sidecar_spawn_spec(&ws_url, &ownership_id, &self.sidecar_launch_context);
+        let spec = codex_sidecar_spawn_spec(ws_url, &ownership_id, &self.sidecar_launch_context);
         let codex_cmd = std::env::var("CODEX_CMD").unwrap_or_else(|_| "codex".to_string());
         // Whitespace-split so a test fixture can point `CODEX_CMD` at an interpreter plus
         // script (e.g. `CODEX_CMD="node /path/fake-app-server.mjs"`) without needing the
@@ -10182,31 +10110,80 @@ impl FreshCodexState {
         // Drain child output so verbose app-server logs cannot back-pressure it.
         // Retain only a bounded stderr tail in memory, classify it to a fixed
         // category on startup failure, and never expose the provider's text.
-        let startup_stderr = drain_codex_child_io_with_startup_diagnostics(&mut child);
+        let mut startup_stderr = drain_child_output(&mut child);
 
         // wfah: durable tracking BEFORE the handshake — the record must exist
         // even while this sidecar's 45s startup budget is still running, or an
         // unclean server death would leave the child untracked.
-        if let Some(pid) = child.id() {
-            crate::codex_sidecar_tracking::record_spawned_sidecar(&ownership_id, pid, &ws_url)
-                .await;
+        let tracked_sidecar = if let Some(pid) = child.id() {
+            let record =
+                crate::codex_sidecar_tracking::record_spawned_sidecar(&ownership_id, pid, ws_url)
+                    .await;
             // b8ke focused episode-2 round-2 F4: arm the watchdog's
             // mid-startup evidence the instant the child exists.
             if let Some(on_spawned) = on_spawned {
                 on_spawned(pid);
             }
-        }
+            record
+        } else {
+            None
+        };
 
         let deadline = Instant::now() + SIDECAR_START_BUDGET;
+        let startup_deadline = tokio::time::Instant::from_std(deadline);
+        let ws_url = match startup_stderr.wait_for_endpoint(startup_deadline).await {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                let _ = child.start_kill();
+                reap_owned_codex_sidecars(&ownership_id);
+                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
+                let diagnostic =
+                    classify_codex_startup_stderr(&startup_stderr.stderr_tail_after_exit().await);
+                tracing::warn!(
+                    event = "freshagent.codex.endpoint_unavailable",
+                    pid = child.id(),
+                    startup_diagnostic = diagnostic,
+                    "The owned Codex endpoint was not announced"
+                );
+                return Err(format!("{error} (startup diagnostic: {diagnostic})"));
+            }
+        };
+        if let Some(record) = tracked_sidecar {
+            if let Err(error) = record.record_announced_endpoint(&ws_url) {
+                let _ = child.start_kill();
+                reap_owned_codex_sidecars(&ownership_id);
+                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
+                return Err(error);
+            }
+        }
 
         // Connect the WS as soon as the listener is up (the app-server binds it after startup).
         let transport = loop {
-            match TungsteniteTransport::connect(&ws_url).await {
-                Ok(transport) => break Arc::new(transport),
-                Err(err) => {
+            match tokio::time::timeout_at(startup_deadline, TungsteniteTransport::connect(&ws_url))
+                .await
+            {
+                Ok(Ok(transport)) => {
+                    if child
+                        .try_wait()
+                        .map_err(|error| error.to_string())?
+                        .is_some()
+                    {
+                        crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
+                        return Err("codex app-server exited after announcing its endpoint".into());
+                    }
+                    break Arc::new(transport);
+                }
+                attempt => {
+                    let err = match attempt {
+                        Ok(Err(error)) => error.to_string(),
+                        Err(_) => "startup deadline expired".into(),
+                        Ok(Ok(_)) => unreachable!(),
+                    };
                     if let Ok(Some(status)) = child.try_wait() {
                         crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
-                        let diagnostic = startup_stderr.safe_category_after_exit().await;
+                        let diagnostic = classify_codex_startup_stderr(
+                            &startup_stderr.stderr_tail_after_exit().await,
+                        );
                         tracing::warn!(target: "freshell_freshagent::codex",
                             exit_status = %status,
                             startup_diagnostic = diagnostic,
@@ -10218,14 +10195,20 @@ impl FreshCodexState {
                         let _ = child.start_kill();
                         reap_owned_codex_sidecars(&ownership_id);
                         crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
-                        let diagnostic = startup_stderr.safe_category_after_exit().await;
+                        let diagnostic = classify_codex_startup_stderr(
+                            &startup_stderr.stderr_tail_after_exit().await,
+                        );
                         tracing::warn!(target: "freshell_freshagent::codex",
                             startup_diagnostic = diagnostic,
                             "freshagent.codex.app_server_listener_timeout"
                         );
                         return Err(format!("codex app-server WS never came up: {err} (startup diagnostic: {diagnostic})"));
                     }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tokio::time::sleep_until(
+                        startup_deadline
+                            .min(tokio::time::Instant::now() + Duration::from_millis(100)),
+                    )
+                    .await;
                 }
             }
         };
@@ -10236,9 +10219,25 @@ impl FreshCodexState {
         // initialize → initialized. Single-flight caches ONLY on success, so a transient
         // failure (socket up before the server can answer) is safely retried until the deadline.
         loop {
-            match client.initialize().await {
-                Ok(_) => break,
-                Err(err) => {
+            match tokio::time::timeout_at(startup_deadline, client.initialize()).await {
+                Ok(Ok(_)) => {
+                    if child
+                        .try_wait()
+                        .map_err(|error| error.to_string())?
+                        .is_some()
+                    {
+                        client.close().await;
+                        crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
+                        return Err("codex app-server exited during initialization".into());
+                    }
+                    break;
+                }
+                attempt => {
+                    let err = match attempt {
+                        Ok(Err(error)) => error.to_string(),
+                        Err(_) => "startup deadline expired".into(),
+                        Ok(Ok(_)) => unreachable!(),
+                    };
                     if Instant::now() >= deadline {
                         client.close().await;
                         let _ = child.start_kill();
@@ -10246,8 +10245,11 @@ impl FreshCodexState {
                         crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                         return Err(format!("codex app-server initialize failed: {err}"));
                     }
-                    tokio::time::sleep(freshell_codex::launch_plan::SIDECAR_INITIALIZE_RETRY_DELAY)
-                        .await;
+                    tokio::time::sleep_until(startup_deadline.min(
+                        tokio::time::Instant::now()
+                            + freshell_codex::launch_plan::SIDECAR_INITIALIZE_RETRY_DELAY,
+                    ))
+                    .await;
                 }
             }
         }
@@ -30770,10 +30772,9 @@ pub(crate) mod tests {
     /// (`test/unit/port/oracle/freshagent-wireshape-differential.test.ts`, ~1-in-3):
     /// `finish_create` used to spawn the notification consumer BEFORE broadcasting
     /// `freshAgent.created` -- a genuine race between the consumer task processing an
-    /// already-arrived `ThreadStarted` notification (the fake app-server broadcasts it
-    /// synchronously right after the `thread/start` RPC response,
-    /// `fake-app-server.mjs:506-511`, so it can already be buffered on the notification
-    /// channel by the time the consumer starts) and the main task's own
+    /// already-arrived native status notification (the fixture explicitly emits
+    /// `thread/status/changed` after `thread/start`, so it can already be buffered
+    /// on the notification channel by the time the consumer starts) and the main task's own
     /// `broadcast(FreshAgentCreated)` a few lines later. Legacy structurally cannot
     /// exhibit this: the per-session lifecycle listener that would translate
     /// `thread_started` into a status snapshot is attached (`ensureFreshAgentSubscription`
@@ -30787,52 +30788,75 @@ pub(crate) mod tests {
         let _guard = ENV_LOCK.lock().await;
         let (st, mut rx) = state_with_bus();
 
-        for i in 0..30 {
+        let mut concrete_snapshots = 0;
+        for i in 0..=30 {
             let request_id = format!("req-order-{i}");
-            configure_fake_codex_cmd(&format!(r#"{{"threadStartThreadId":"thread-order-{i}"}}"#));
+            let expected_id = format!("thread-order-{i}");
+            // Thirty real snapshots, followed by one metadata-only control.
+            let expect_snapshot = i < 30;
+            configure_fake_codex_cmd(
+                &json!({
+                    "threadStartThreadId":expected_id,
+                    "notificationsAfterMethods":{"thread/start":if expect_snapshot {vec![json!({
+                        "method":"thread/status/changed",
+                        "params":{"threadId":expected_id,"status":{"type":"idle"}}
+                    })]} else {vec![]}}
+                })
+                .to_string(),
+            );
             st.handle_create(create_msg(&request_id), None).await;
 
-            // Settle window: give the (possibly-racing) consumer task a chance to run
-            // and broadcast its first status-snapshot event, if it's going to.
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-            let mut created_seen = false;
-            let mut violation: Option<Value> = None;
-            let mut session_id: Option<String> = None;
-            while let Ok(frame) = rx.try_recv() {
-                let wire: Value = serde_json::from_str(&frame).unwrap();
-                if wire["type"] == "freshAgent.created" && wire["requestId"] == request_id {
-                    created_seen = true;
-                    session_id = wire["sessionId"].as_str().map(|s| s.to_string());
-                } else if !created_seen && wire["type"] == "freshAgent.event" {
-                    violation = Some(wire);
+            // Require the owned native status event to actually arrive. Otherwise
+            // an opted-out or missing notification could make this ordering check
+            // pass without exercising the consumer/created publication barrier.
+            let observed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut created_seen = false;
+                loop {
+                    let wire: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                    if wire["type"] == "freshAgent.created" && wire["requestId"] == request_id {
+                        assert_eq!(wire["sessionId"], expected_id);
+                        created_seen = true;
+                    } else if wire["type"] == "freshAgent.event" && wire["sessionId"] == expected_id {
+                        assert!(created_seen, "iteration {i}: a session event arrived before freshAgent.created: {wire}");
+                        if wire["event"]["type"] == "freshAgent.session.snapshot"
+                            && wire["event"]["status"] == "idle"
+                        {
+                            break;
+                        }
+                    }
                 }
+            }).await;
+            if expect_snapshot {
+                observed.expect("both created and its native idle snapshot must arrive");
+                concrete_snapshots += 1;
+            } else {
+                assert!(
+                    observed.is_err(),
+                    "settings metadata must never satisfy the missing native snapshot barrier"
+                );
             }
-            assert!(
-                created_seen,
-                "iteration {i}: freshAgent.created must have been broadcast for {request_id}"
-            );
-            assert!(
-                violation.is_none(),
-                "iteration {i}: a freshAgent.event arrived BEFORE freshAgent.created: \
-                 {violation:?}"
-            );
 
-            if let Some(session_id) = session_id {
-                st.handle_kill(FreshAgentKill {
-                    observed_epoch: None,
-                    observed_generation: None,
-                    provider: freshell_protocol::AgentProvider::Codex,
-                    session_id,
-                    session_type: freshell_protocol::SessionType::Freshcodex,
-                    cwd: None,
-                })
-                .await;
-                // Drain the killed frame (+ any trailing notification) so the next
-                // iteration starts from an empty buffer.
-                while rx.try_recv().is_ok() {}
-            }
+            st.handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
+                provider: freshell_protocol::AgentProvider::Codex,
+                session_id: expected_id,
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                cwd: None,
+            })
+            .await;
+            // Drain the killed frame (+ any trailing notification) so the next
+            // iteration starts from an empty buffer.
+            while rx.try_recv().is_ok() {}
         }
+        assert_eq!(
+            concrete_snapshots, 30,
+            "all thirty owned native snapshots were witnessed"
+        );
+        eprintln!(
+            "{}",
+            json!({"severity":"info","event":"codex.create_ordering.snapshots_verified","snapshots":concrete_snapshots,"metadataOnlyRejected":true})
+        );
     }
 
     // -- freshAgent.create resume (CODEX-FIRST triage Finding 1) --
@@ -32085,12 +32109,23 @@ pub(crate) mod tests {
         st.leases.clear_binding(PROVIDER, session_id);
     }
 
+    /// Explicitly produce a real native status observation for the two recovery
+    /// tests that must reject a stale create-time snapshot. Thread/started is
+    /// correctly opted out by the client; thread/status/changed remains active.
+    fn configure_fake_codex_with_create_snapshot() {
+        configure_fake_codex_cmd(
+            &json!({"notificationsAfterMethods":{"thread/start":[{
+                "method":"thread/status/changed",
+                "params":{"threadId":"thread-new-1","status":{"type":"idle"}}
+            }]}})
+            .to_string(),
+        );
+    }
+
     /// Drain the CREATE-TIME `freshAgent.session.snapshot` event for
-    /// `session_id` off `rx`. Every [`create_real_fake_session`] create leaves
-    /// one behind: the fake answers `thread/start`, broadcasts
-    /// `thread/started` (fake-app-server.mjs:930-940), and the create's
-    /// consumer — released only after `freshAgent.created` — turns it into a
-    /// `freshAgent.event{freshAgent.session.snapshot}` for the created id.
+    /// `session_id` off `rx`. The fixture explicitly emits a native idle status
+    /// after thread/start, and the create's consumer publishes the snapshot
+    /// only after freshAgent.created. This is an owned-state ordering barrier.
     ///
     /// Recovery-flow tests that assert a POST-recovery snapshot (the attach
     /// recovery tests) MUST drain this frame first: [`simulate_unrequested_crash`]
@@ -33060,7 +33095,7 @@ pub(crate) mod tests {
         // D8 r2: the create keeps its sidecar ALIVE; the crashed state is
         // produced by hand (see `simulate_unrequested_crash`) so the resume
         // never depends on the runner-failing reap-confirmation machinery.
-        configure_fake_codex_cmd("{}");
+        configure_fake_codex_with_create_snapshot();
         let thread_id = create_real_fake_session(&st, &mut rx).await;
         simulate_unrequested_crash(&st, &thread_id).await;
 
@@ -33416,7 +33451,7 @@ pub(crate) mod tests {
         // D8: the create keeps its sidecar ALIVE; the crashed state is produced
         // by hand (see `simulate_unrequested_crash`) so the attach's recovery
         // never depends on the runner-failing reap-confirmation machinery.
-        configure_fake_codex_cmd("{}");
+        configure_fake_codex_with_create_snapshot();
         let thread_id = create_real_fake_session(&st, &mut rx).await;
         assert_eq!(
             spawn_count(&capture),

@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
@@ -1965,6 +1965,11 @@ async fn ensure_ready_persists_a_verified_sidecar_record() {
         record.ws_url, ready.ws_url,
         "record ws_url is the returned one"
     );
+    assert!(record
+        .cmdline
+        .windows(2)
+        .any(|args| args == ["--listen", "ws://127.0.0.1:0"]));
+    assert_ne!(ready.ws_url, "ws://127.0.0.1:0");
     assert_eq!(
         verify_sidecar_identity(record),
         IdentityVerdict::Verified,
@@ -1975,6 +1980,178 @@ async fn ensure_ready_persists_a_verified_sidecar_record() {
         .shutdown()
         .await
         .expect("shutdown cleans up the child");
+}
+
+#[tokio::test]
+async fn spawned_runtime_uses_its_own_announced_listener() {
+    struct RivalGuard(std::path::PathBuf, String);
+    impl Drop for RivalGuard {
+        fn drop(&mut self) {
+            let Ok(bytes) = std::fs::read(&self.0) else {
+                return;
+            };
+            let Ok(row) = serde_json::from_slice::<Value>(&bytes) else {
+                return;
+            };
+            let Some(pid) = row["pid"].as_u64() else {
+                return;
+            };
+            let Ok(environment) = std::fs::read(format!("/proc/{pid}/environ")) else {
+                return;
+            };
+            let needle = format!("FRESHELL_CODEX_SIDECAR_ID={}", self.1);
+            if environment
+                .split(|byte| *byte == 0)
+                .any(|entry| entry == needle.as_bytes())
+            {
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
+    }
+    let (dir, store) = temp_sidecar_store();
+    let rival = dir.path().join("rival");
+    std::fs::create_dir_all(&rival).unwrap();
+    let ready_path = rival.join("ready.json");
+    let rival_id = format!(
+        "rival-{}",
+        dir.path().file_name().unwrap().to_string_lossy()
+    );
+    let _guard = RivalGuard(ready_path.clone(), rival_id.clone());
+    let behavior_path = dir.path().join("behavior.json");
+    std::fs::write(
+        &behavior_path,
+        json!({"startupCompetingListener":{
+            "home":rival,"readyPath":ready_path,"releasePath":rival.join("release"),
+            "ownershipId":rival_id,"requestsPath":rival.join("requests.jsonl"),
+            "eventsPath":rival.join("events.jsonl"),
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let runtime = SpawnedCodexAppServerRuntime::with_command_and_store(
+        format!(
+            "{} --fixture-behavior-file {}",
+            fake_app_server_command(),
+            behavior_path.display()
+        ),
+        store.clone(),
+    );
+    let ready = runtime
+        .ensure_ready(None)
+        .await
+        .expect("own listener starts");
+    let rival_ready: Value = serde_json::from_slice(&std::fs::read(&ready_path).unwrap()).unwrap();
+    assert_ne!(
+        ready.ws_url,
+        rival_ready["url"].as_str().unwrap(),
+        "readiness must never use a competing listener"
+    );
+    let row = store.load_all().pop().unwrap();
+    assert_eq!(row.ws_url, ready.ws_url);
+    assert_eq!(verify_sidecar_identity(&row), IdentityVerdict::Verified);
+    runtime.shutdown().await.unwrap();
+    let requests: Vec<Value> = std::fs::read_to_string(rival.join("requests.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the rival only receives its intentional warmup: {requests:?}"
+    );
+    assert_eq!(requests[0]["method"], "initialize");
+}
+
+#[tokio::test]
+async fn native_fixture_notification_opt_out_is_per_connection() {
+    async fn receive(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> Value {
+        loop {
+            let frame = timeout(RECV_TIMEOUT, socket.next())
+                .await
+                .expect("native frame arrives")
+                .expect("socket stays open")
+                .unwrap();
+            if let Message::Text(text) = frame {
+                return serde_json::from_str(&text).unwrap();
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let behavior = dir.path().join("behavior.json");
+    std::fs::write(&behavior, json!({"notificationsAfterMethods":{"thread/start":[{
+        "method":"thread/status/changed","params":{"threadId":"thread-new-1","status":{"type":"idle"}}
+    }]}}).to_string()).unwrap();
+    let runtime = SpawnedCodexAppServerRuntime::with_command_and_store(
+        format!(
+            "{} --fixture-behavior-file {}",
+            fake_app_server_command(),
+            behavior.display()
+        ),
+        Arc::new(CodexSidecarStore::disabled()),
+    );
+    let ready = runtime.ensure_ready(None).await.unwrap();
+    let (mut opted_out, _) = connect_async(&ready.ws_url).await.unwrap();
+    let (mut control, _) = connect_async(&ready.ws_url).await.unwrap();
+    opted_out.send(Message::Text(json!({"id":"opt-init","method":"initialize","params":{"capabilities":{"optOutNotificationMethods":["thread/started"]}}}).to_string())).await.unwrap();
+    control
+        .send(Message::Text(
+            json!({"id":"control-init","method":"initialize","params":{}}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(receive(&mut opted_out).await["id"], "opt-init");
+    assert_eq!(receive(&mut control).await["id"], "control-init");
+    control
+        .send(Message::Text(
+            json!({"id":"control-start","method":"thread/start","params":{}}).to_string(),
+        ))
+        .await
+        .unwrap();
+    let response = receive(&mut control).await;
+    let opted_notification = receive(&mut opted_out).await;
+    let control_started = receive(&mut control).await;
+    let control_status = receive(&mut control).await;
+    // A same-connection RPC response is an ordering witness after the native
+    // notification batch; no timer-based negative assertion is needed.
+    opted_out
+        .send(Message::Text(
+            json!({"id":"opt-barrier","method":"configRequirements/read","params":{}}).to_string(),
+        ))
+        .await
+        .unwrap();
+    let mut opted_notifications = vec![opted_notification];
+    loop {
+        let frame = receive(&mut opted_out).await;
+        if frame["id"] == "opt-barrier" {
+            break;
+        }
+        opted_notifications.push(frame);
+    }
+    opted_out.close(None).await.unwrap();
+    control.close(None).await.unwrap();
+    runtime.shutdown().await.unwrap();
+    assert_eq!(response["id"], "control-start", "responses remain intact");
+    assert_eq!(
+        control_started["method"], "thread/started",
+        "default client retains the notification"
+    );
+    assert_eq!(control_status["method"], "thread/status/changed");
+    assert_eq!(
+        opted_notifications.len(),
+        1,
+        "the opted-out method must not arrive before the response barrier: {opted_notifications:?}"
+    );
+    assert_eq!(
+        opted_notifications[0]["method"], "thread/status/changed",
+        "other notifications remain intact"
+    );
 }
 
 #[tokio::test]

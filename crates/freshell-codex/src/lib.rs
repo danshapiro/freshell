@@ -60,6 +60,8 @@ pub mod runtime_select;
 #[cfg(feature = "real-transport")]
 pub mod sidecar_reconcile;
 #[cfg(feature = "real-transport")]
+pub mod sidecar_startup;
+#[cfg(feature = "real-transport")]
 pub mod sidecar_store;
 #[cfg(feature = "real-transport")]
 pub mod sidecar_sweep;
