@@ -602,16 +602,27 @@ fn validate_claude_fork_state(
     context: &ClaudeForkState,
     profile: &FreshAgentProfile,
 ) -> Result<(), ActorError> {
+    // Each refusal names exactly the fields its own check compared: the
+    // provider check reads the profile's provider, the native-root check
+    // reads the profile's native session id, and the size check reads no
+    // launch-profile field at all. The closed enum has no value for the
+    // serialized size, so the size refusal carries the honest empty set —
+    // the `native_identity_mismatch` subtype still names the check class.
+    let mut identity_fields = Vec::new();
     if !matches!(
         profile.provider,
         FreshProvider::Claude | FreshProvider::Kilroy
-    ) || profile.native_session_id.as_deref() != Some(&context.native_session_id)
-        || serde_json::to_vec(context).map_err(persist)?.len() > 32 * 1024 * 1024
-    {
-        return Err(ActorError::identity_mismatch(&[
-            FreshAgentIdentityMismatchField::Provider,
-            FreshAgentIdentityMismatchField::NativeSessionId,
-        ]));
+    ) {
+        identity_fields.push(FreshAgentIdentityMismatchField::Provider);
+    }
+    if profile.native_session_id.as_deref() != Some(&context.native_session_id) {
+        identity_fields.push(FreshAgentIdentityMismatchField::NativeSessionId);
+    }
+    if !identity_fields.is_empty() {
+        return Err(ActorError::identity_mismatch(&identity_fields));
+    }
+    if serde_json::to_vec(context).map_err(persist)?.len() > 32 * 1024 * 1024 {
+        return Err(ActorError::identity_mismatch(&[]));
     }
     if let Some(recipe) = &context.recipe {
         recipe.validate(&context.native_session_id).map_err(|_| {

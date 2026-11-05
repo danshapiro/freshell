@@ -2751,6 +2751,66 @@ async fn profile_mismatch_names_the_compared_field_without_its_value() {
     );
 }
 
+/// Round-2 finding 5: each native-identity refusal names exactly the fields
+/// its own check compared. The oversized fork-state check is a size check
+/// over the serialized record — it compares no launch-profile field, so a
+/// fork state whose provider and native session both match must carry the
+/// honest empty mismatched-field set (the closed native_identity_mismatch
+/// subtype still names the check class), never the names of fields that
+/// match.
+#[test]
+fn claude_fork_state_validation_names_only_the_fields_the_check_compared() {
+    let claude = profile(
+        FreshProvider::Claude,
+        "claude-store",
+        Some("claude-native-1"),
+    );
+    let matching = ClaudeForkState {
+        native_session_id: "claude-native-1".into(),
+        recipe: None,
+        rollback: None,
+    };
+    validate_claude_fork_state(&matching, &claude).expect("a matching claude fork state validates");
+
+    let wrong_provider = profile(
+        FreshProvider::Codex,
+        "claude-store",
+        Some("claude-native-1"),
+    );
+    assert_eq!(
+        validate_claude_fork_state(&matching, &wrong_provider),
+        Err(ActorError::identity_mismatch(&[
+            FreshAgentIdentityMismatchField::Provider
+        ])),
+        "a non-claude provider must name only the provider field"
+    );
+
+    let wrong_native = profile(
+        FreshProvider::Claude,
+        "claude-store",
+        Some("claude-native-2"),
+    );
+    assert_eq!(
+        validate_claude_fork_state(&matching, &wrong_native),
+        Err(ActorError::identity_mismatch(&[
+            FreshAgentIdentityMismatchField::NativeSessionId
+        ])),
+        "a foreign native session must name only the native session field"
+    );
+
+    let oversized = ClaudeForkState {
+        rollback: Some(serde_json::json!({
+            "padding": "x".repeat(32 * 1024 * 1024 + 1024),
+        })),
+        ..matching.clone()
+    };
+    assert_eq!(
+        validate_claude_fork_state(&oversized, &claude),
+        Err(ActorError::identity_mismatch(&[])),
+        "the size check compares no launch-profile field; provider and native_session_id both match, so the honest payload is the empty set"
+    );
+}
+
 #[tokio::test]
 async fn current_provider_preparation_reopens_the_same_fresh_conversation() {
     use freshell_runtime_protocol::{
