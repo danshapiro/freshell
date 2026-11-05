@@ -154,6 +154,7 @@ assets/
 /.runtime-build/
 
 # Caches and temp files
+/.test-tmp/*
 .eslintcache
 .cache/
 .npm/

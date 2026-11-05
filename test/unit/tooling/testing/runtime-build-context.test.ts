@@ -12,6 +12,7 @@ describe.each(['.dockerignore', '.gcloudignore'])('%s keeps private runtime mate
   const policy = () => ignore().add(fs.readFileSync(path.join(root, filename), 'utf8'))
 
   it.each([
+    '.test-tmp/cloud-source-staging/sentinel.txt',
     '.runtime-evidence/commit/run/provider-native-state.json',
     '.runtime-evidence/commit/run/browser/trace.zip',
     '.runtime-build/run/private-provider-home/state.json',
