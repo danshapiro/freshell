@@ -39,6 +39,43 @@ async function waitFor<T>(label: string, probe: () => T | undefined | Promise<T 
   throw new Error(`timed out waiting for ${label}`)
 }
 
+// Strict assertion-time reader for the supervisor's evidence lifecycle
+// stream (round-2 finding 3). The observer is still appending while the
+// assertions below run, so a swallowed read or parse failure would let a
+// `some(...)` scan pass vacuously. The supervisor appends each record as
+// ONE complete newline-terminated line in a single write and syncs it
+// (freshell-supervisor service.rs append_event -> RotatingJsonlWriter
+// .write_line), so the honest strictness is total: a failed read, a
+// non-empty file whose final byte is not a newline (a torn in-flight
+// append), or any non-empty line that is not valid JSON fails the test,
+// naming the file and the offending line. Only a genuinely empty stream
+// (a freshly rotated active file) reads as []. The incremental poll
+// reader inside the crash case stays lenient — transient emptiness is
+// legitimate while polling.
+function readSupervisorLifecycleStrict(lifecyclePath: string): any[] {
+  let contents: string
+  try {
+    contents = fs.readFileSync(lifecyclePath, 'utf8')
+  } catch (error) {
+    throw new Error(`supervisor lifecycle stream is unreadable (strict evidence read): ${lifecyclePath}: ${String(error)}`)
+  }
+  if (contents.length > 0 && !contents.endsWith('\n')) {
+    throw new Error(`supervisor lifecycle stream ends in a torn record (strict evidence read): ${lifecyclePath}: the final byte is not a newline`)
+  }
+  const records: any[] = []
+  const lines = contents.split('\n')
+  for (let index = 0; index < lines.length - 1; index += 1) {
+    const line = lines[index]
+    if (!line) continue
+    try {
+      records.push(JSON.parse(line))
+    } catch (error) {
+      throw new Error(`supervisor lifecycle stream line ${index + 1} is not valid JSON (strict evidence read): ${lifecyclePath}: ${line.slice(0, 200)}: ${String(error)}`)
+    }
+  }
+  return records
+}
+
 class FreshWire {
   readonly frames: any[] = []
   readonly sentControls: any[] = []
@@ -1033,14 +1070,7 @@ tool_timeout_sec = 120
       } catch { return [] }
     }
     let classifiedExit: any
-    const readAllSupervisorLifecycle = (): any[] => {
-      if (!fs.existsSync(supervisorLifecyclePath)) return []
-      try {
-        const contents = fs.readFileSync(supervisorLifecyclePath, 'utf8').trim()
-        if (!contents) return []
-        return contents.split('\n').filter(Boolean).map(line => JSON.parse(line))
-      } catch { return [] }
-    }
+    const readAllSupervisorLifecycle = (): any[] => readSupervisorLifecycleStrict(supervisorLifecyclePath)
     const preCrashLifecycleHighWater = readAllSupervisorLifecycle()
       .reduce((max: number, row: any) => Math.max(max, Number(row.sequence) || 0), 0)
     // Kill only this receipt-owned, inspected release native PID. Archive its
@@ -1188,4 +1218,40 @@ tool_timeout_sec = 120
       classification, frames: wire.frames.slice(-30) })
 
   }, 360_000)
+})
+
+// Round-2 finding 3: the assertion-time lifecycle reader must be strict.
+// A swallowed read or parse failure would make the crash case's
+// no-replacement scan pass vacuously, so this demonstration proves the
+// reader fails the test on exactly the states that would have been
+// silently empty before: a missing file, a torn trailing record, and an
+// unparseable line.
+describe('strict supervisor lifecycle evidence reader', () => {
+  it('fails the test on a missing or torn stream instead of returning an empty list', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-strict-lifecycle-'))
+    try {
+      const lifecyclePath = path.join(directory, 'lifecycle.jsonl')
+      // A missing file is a failed read, never an empty stream: the
+      // supervisor boots its lifecycle log before serving anything, so a
+      // missing file means the evidence path itself is wrong and an
+      // assertion over it must not pass vacuously.
+      expect(() => readSupervisorLifecycleStrict(lifecyclePath)).toThrow(/unreadable \(strict evidence read\)/)
+      // The writer appends whole newline-terminated lines in one write; a
+      // torn trailing record (final byte not a newline) is genuinely
+      // corrupt evidence and must fail the test.
+      fs.writeFileSync(lifecyclePath, '{"sequence":1,"event":"a"}\n{"sequence":2,"ev', 'utf8')
+      expect(() => readSupervisorLifecycleStrict(lifecyclePath)).toThrow(/torn record \(strict evidence read\)/)
+      // Any non-empty line that is not valid JSON fails naming the line.
+      fs.writeFileSync(lifecyclePath, '{"sequence":1,"event":"a"}\nnot-json\n{"sequence":3}\n', 'utf8')
+      expect(() => readSupervisorLifecycleStrict(lifecyclePath)).toThrow(/line 2 is not valid JSON \(strict evidence read\)/)
+      // A complete stream parses every record in order.
+      fs.writeFileSync(lifecyclePath, '{"sequence":1,"event":"a"}\n{"sequence":2,"event":"b"}\n', 'utf8')
+      expect(readSupervisorLifecycleStrict(lifecyclePath)).toEqual([
+        { sequence: 1, event: 'a' },
+        { sequence: 2, event: 'b' },
+      ])
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
 })
