@@ -98,6 +98,24 @@ function writeRollout(threadId, firstPrompt) {
     }))
   }
   fs.writeFileSync(file, `${lines.join('\n')}\n`)
+  return file
+}
+
+function appendRolloutPrompt(file, prompt) {
+  const now = new Date().toISOString()
+  const lines = [
+    JSON.stringify({
+      timestamp: now,
+      type: 'response_item',
+      payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: prompt }] },
+    }),
+    JSON.stringify({
+      timestamp: now,
+      type: 'event_msg',
+      payload: { type: 'user_message', message: prompt, kind: 'plain' },
+    }),
+  ]
+  fs.appendFileSync(file, `${lines.join('\n')}\n`)
 }
 
 // Best-effort managed-topology handshake; resolves the app-server's thread
@@ -180,9 +198,19 @@ if (resumeIndex !== -1) {
   const startupThread = process.env.FAKE_CODEX_TERMINAL_PARITY_STARTUP === '1'
     ? managedThread() : null
   let wrote = false
+  let activeThreadId
+  let activeRolloutFile
   process.stdin.on('data', (chunk) => {
-    if (wrote) return
     const s = String(chunk)
+    if (wrote) {
+      if (process.env.FAKE_CODEX_TERMINAL_REPEAT_TURNS !== '1'
+        || (!s.includes('\r') && !s.includes('\n'))) return
+      const prompt = s.replace(/[\r\n]+$/, '').trim()
+      if (!prompt || !activeRolloutFile || !activeThreadId) return
+      appendRolloutPrompt(activeRolloutFile, prompt)
+      process.stdout.write(`FAKE_CODEX_REPLY:${activeThreadId}:${prompt.toUpperCase()}\r\n`)
+      return
+    }
     // Enter-anchored, like real codex (Premise 7): typing alone must not
     // create the rollout — only the first Enter does.
     if (!s.includes('\r') && !s.includes('\n')) return
@@ -194,7 +222,8 @@ if (resumeIndex !== -1) {
     const firstPrompt = s.replace(/[\r\n]+$/, '').trim()
     const finish = (maybeThreadId) => {
       const threadId = maybeThreadId ?? crypto.randomUUID()
-      writeRollout(threadId, firstPrompt)
+      activeThreadId = threadId
+      activeRolloutFile = writeRollout(threadId, firstPrompt)
       process.stdout.write(`codex: session ${threadId} started\r\n`)
     }
     const gate = process.env.FAKE_CODEX_TERMINAL_ROLLOUT_GATE_PATH

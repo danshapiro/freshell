@@ -13,37 +13,45 @@
 //! first-bind and rebind, with no separate fork-watch lane:
 //!
 //! A tick considers ONLY transcripts whose
-//! - ownership record (`session_start`) carries a `conversationId` whose
-//!   `workspacePaths` CONTAIN the pane's cwd (normalized), and whose
-//! - LATEST user-authored record (`user_message`) text EQUALS the pane's
-//!   captured submit payload (normalized, bounded comparison — the FULL
-//!   multi-line buffer a Ctrl+J prompt flushed at Enter, never just its
-//!   last line), and whose
+//! - ownership record (`session_start` — the LABELED FAKE-CONTRACT
+//!   anchor the e2e/rebind fakes append; real transcripts carry no
+//!   ownership or workspace evidence, so transcript-driven identity
+//!   binding does not engage on real-format sessions — a recorded
+//!   limitation) carries a `conversationId` whose `workspacePaths`
+//!   CONTAIN the pane's cwd (normalized), and whose
+//! - LATEST user-authored record (`USER_INPUT{source:USER_EXPLICIT}` —
+//!   the real binary v1.4.12 vocabulary; no `user_message` record
+//!   exists) `content` EQUALS the pane's captured submit payload
+//!   (normalized, bounded comparison — the FULL multi-line buffer a
+//!   Ctrl+J prompt flushed at Enter, never just its last line), and
+//!   whose
 //! - MATCHING user record was written AT/AFTER that submit within a
 //!   bounded BACKWARD tolerance (recency is proven by the matching
-//!   record's OWN `at` — a later record of another type, e.g. an
-//!   assistant record still streaming after the submit, never vouches
+//!   record's OWN `created_at` — a later record of another type, e.g.
+//!   a PLANNER_RESPONSE still streaming after the submit, never vouches
 //!   for a user record written before it; a transcript whose matching
 //!   record predates the submit by more than the tolerance can never
 //!   match, which is what rejects re-typed old prompts and dead-launch
 //!   late writes alike; unprovable timestamps fail toward refusal).
 //!
-//!   // Stage-1 candidate contract (the backward tolerance,
+//!   // The backward tolerance,
 //!   // `ANTIGRAVITY_RECENCY_BACKWARD_TOLERANCE_MS` = 5 s — whole-delta
-//!   // review round 3, Major 1): the registry writes input to the PTY
+//!   // review round 3, Major 1: the registry writes input to the PTY
 //!   // BEFORE timestamping the `ActivityEvent::Input` it feeds the
 //!   // association (registry.rs writes, then stamps `at`), so the CLI
 //!   // child — scheduled on another core — can process the prompt and
-//!   // append its `user_message` record between those two operations,
-//!   // with an `at` that legitimately PRECEDES our captured submit
-//!   // timestamp. The strict `at >= submit` rule rejected the pane's
-//!   // own conversation on every retry (the record can never get newer).
-//!   // The tolerance is sized for the CROSS-PROCESS/CROSS-CLOCK skew
-//!   // between the CLI's own timestamps and ours, not for the race
+//!   // append its `USER_INPUT` record between those two operations,
+//!   // with a `created_at` that legitimately PRECEDES our captured
+//!   // submit timestamp. The strict `at >= submit` rule rejected the
+//!   // pane's own conversation on every retry (the record can never get
+//!   // newer). The tolerance is sized for the CROSS-PROCESS/CROSS-CLOCK
+//!   // skew between the CLI's own timestamps and ours, not for the race
 //!   // alone (which is µs–ms of write→stamp latency):
-//!   //   - the same-host clock is shared, but the CLI's `at` granularity
-//!   //     is a Stage-1 UNKNOWN (A2): a second-granularity stamp can
-//!   //     predate the true write instant by up to ~1 s;
+//!   //   - the same-host clock is shared, and the CLI's `created_at`
+//!   //     granularity is BINARY-EVIDENCED at RFC3339 SECONDS (agy
+//!   //     1.4.12; real-binary-transcript-evidence.md): a
+//!   //     second-granularity stamp can predate the true write instant
+//!   //     by up to ~1 s;
 //!   //   - NTP slew/step adjustments between the two stamping instants
 //!   //     add up to seconds in pathological cases;
 //!   //   - 5 s covers both with wide margin (~50× the observed race
@@ -51,7 +59,8 @@
 //!   //     lifetime, so "awaiting the first record" ends long before
 //!   //     the retry bound, and minutes/hours-old conversations remain
 //!   //     decisively rejected — the tolerance covers skew, never
-//!   //     history.
+//!   //     history. The 5 s size is now evidence-backed, no longer a
+//!   //     Stage-1 unknown.
 //!
 //! Outcomes per tick per pane: exactly one matching candidate == current id
 //! ⇒ no-op (the ws association decides; the locator has no current-id
@@ -68,15 +77,19 @@
 //! {reason:"ambiguous"}` — never a guess. Refusal never disarms: a later
 //! solo submit re-opens the window and re-evaluates.
 //!
-//! // Stage-1 candidate contract: the transcript PATH and the hook inputs
-//! (`conversationId`, `workspacePaths`, `transcriptPath`) are
-//! documented+probe-validated facts; the on-disk RECORD SCHEMA this module
-//! reads (`session_start` ownership record; `user_message`/other records
-//! with `at` timestamps) is validated ONLY against the committed fixtures
-//! (`test/fixtures/coding-cli/antigravity/*.sanitized.jsonl`, pinned by
-//! `tests/antigravity_fixture_parity.rs`) — the A2 named blocker. No
-//! capability flag or recovery claim may be enabled on this candidate
-//! evidence.
+//! REAL-BINARY record contract (corrected 2026-11-02 against real agy
+//! 1.2.11 + 1.4.12 transcripts; evidence:
+//! `.worktrees/.the-usual-logs/antigravity-transcript-validation/reports/
+//! real-binary-transcript-evidence.md`): the transcript PATH and the
+//! user-record vocabulary this module reads (`USER_INPUT` with
+//! `content` + a SECOND-granularity RFC3339 `created_at`) are
+//! real-binary-validated. The `session_start` ownership record it
+//! anchors cwd/id evidence on is a LABELED FAKE-CONTRACT extension the
+//! e2e/rebind fakes append — real transcripts carry no ownership or
+//! workspace evidence, so transcript-driven identity binding does not
+//! engage on real-format sessions (recorded limitation; the resume path
+//! itself consults the path-anchored by-id locator, which parses no
+//! records).
 //!
 //! Deliberate deviations from the codex locator, with rationale:
 //! - NO file-set (known-files) baseline: codex's candidates are a
@@ -226,17 +239,18 @@ fn pending_rescan_delay(age_ms: i64) -> i64 {
 /// round 3, Major 1; whole-delta review round 4, Minor 1 moved the
 /// CANONICAL constant to `freshell_protocol` so the activity tracker's
 /// attach-baseline classification references the SAME number instead of
-/// forking it): a matching user record whose own `at` is within this
-/// window BEFORE the captured submit timestamp still counts as
+/// forking it): a matching user record whose own `created_at` is within
+/// this window BEFORE the captured submit timestamp still counts as
 /// at/after-that-submit. The registry writes input to the PTY BEFORE
 /// timestamping the `ActivityEvent::Input` (registry.rs:3890,3931), so the
-/// CLI child — on another core — can append its `user_message` record
-/// between the write and our stamp, with an `at` that precedes the submit.
-/// The bound covers cross-process/cross-clock skew (the CLI's own `at`
-/// granularity is a Stage-1 unknown; NTP slew adds seconds), NOT history:
-/// it is 12× below the 60 s pending lifetime, so minutes-old conversations
-/// stay rejected. Full rationale in the module header and at the canonical
-/// definition (`freshell_protocol::ANTIGRAVITY_RECENCY_BACKWARD_TOLERANCE_MS`).
+/// CLI child — on another core — can append its `USER_INPUT` record
+/// between the write and our stamp, with a `created_at` that precedes the
+/// submit. The bound covers cross-process/cross-clock skew (the CLI's own
+/// `created_at` granularity is binary-evidenced at RFC3339 SECONDS — agy
+/// 1.4.12, real-binary-transcript-evidence.md; NTP slew adds seconds), NOT
+/// history: it is 12× below the 60 s pending lifetime, so minutes-old
+/// conversations stay rejected. Full rationale in the module header and at
+/// the canonical definition (`freshell_protocol::ANTIGRAVITY_RECENCY_BACKWARD_TOLERANCE_MS`).
 /// The mtime prefilter uses the SAME constant — a prefilter tighter than
 /// the tolerance would veto matches the recency rule itself accepts (never
 /// authoritative in the wrong direction).
@@ -629,11 +643,13 @@ impl AntigravityLocator {
             reason = reason,
             event = "antigravity_association_unmatched",
             "antigravity_association_unmatched: a clean captured submit matched \
-             no transcript and was dropped — likely causes: the candidate \
-             record schema mismatching (the A2 blocker), the store root not \
-             holding the conversation (see antigravity_store_root_resolved), \
-             or no session_start workspacePath matching the pane's cwd; the \
-             pane re-arms on its next clean submit"
+             no transcript and was dropped — likely causes: the transcript's \
+             ownership anchor missing from the store (real-format sessions \
+             carry none, so binding never engages; see the module header), \
+             the store root not holding the conversation (see \
+             antigravity_store_root_resolved), or no session_start \
+             workspacePath matching the pane's cwd; the pane re-arms on its \
+             next clean submit"
         );
     }
 
@@ -685,8 +701,9 @@ fn mtime_could_be_recent(path: &Path, submit_at_ms: i64) -> bool {
 /// bounded reads; see module doc).
 #[derive(Debug, Clone)]
 struct TranscriptSummary {
-    /// The FIRST `session_start` record's `conversationId` (the parser's
-    /// determinism rule — later ownership records never reassign it).
+    /// The FIRST `session_start` record's `conversationId` (the labeled
+    /// fake-contract ownership anchor's id; the parser's determinism
+    /// rule — later ownership records never reassign it).
     conversation_id: String,
     /// The `workspacePaths` of EVERY `session_start` record across the
     /// bounded head+tail windows (round 7, Minor 2: a resumed
@@ -696,12 +713,14 @@ struct TranscriptSummary {
     /// normalized.
     workspace_paths: Vec<String>,
     /// The LATEST user-authored record's text (normalized+bounded the same
-    /// way the captured submit was).
+    /// way the captured submit was) — read from the real `USER_INPUT`
+    /// record's `content` (binary v1.4.12; no `user_message`/`text`
+    /// record exists).
     latest_user_text: String,
-    /// That SAME record's own `at` timestamp — recency is proven by the
-    /// MATCHING record, never by a later record of another type (a
-    /// still-streaming assistant record written after the submit must not
-    /// vouch for a user record written before it). `None` when the
+    /// That SAME record's own `created_at` timestamp — recency is proven
+    /// by the MATCHING record, never by a later record of another type
+    /// (a still-streaming PLANNER_RESPONSE written after the submit must
+    /// not vouch for a user record written before it). `None` when the
     /// matching record's own timestamp is unparseable — fails toward
     /// refusal.
     latest_user_at: Option<i64>,
@@ -780,7 +799,7 @@ fn probe_transcript(path: &Path) -> Option<TranscriptSummary> {
             continue; // malformed / truncated mid-write tail lands here
         };
         let at = obj
-            .get("at")
+            .get("created_at")
             .or_else(|| obj.get("startedAt"))
             .and_then(parse_timestamp_ms);
         if obj.get("type").and_then(|v| v.as_str()) == Some("session_start") {
@@ -795,12 +814,10 @@ fn probe_transcript(path: &Path) -> Option<TranscriptSummary> {
                 }
             }
         }
-        if obj.get("type").and_then(|v| v.as_str()) == Some("user_message") {
-            if let Some(text) = obj.get("text").and_then(serde_json::Value::as_str) {
-                // Text and its OWN timestamp move together: recency is
-                // proven by the matching record, so the two facts must
-                // describe the same record (a later record of another
-                // type never vouches for an earlier user record).
+        if obj.get("type").and_then(|v| v.as_str()) == Some("USER_INPUT") {
+            if let Some(text) = obj.get("content").and_then(serde_json::Value::as_str) {
+                // Text and its OWN timestamp move together (unchanged
+                // rule): recency is proven by the matching record.
                 latest_user_text = Some(normalize_prompt_text(text));
                 latest_user_at = at;
             }
@@ -839,14 +856,17 @@ mod tests {
         (AntigravityLocator::new(root.clone()), root)
     }
 
-    /// Write a transcript in the fixture format: an ownership record plus
-    /// user records (numeric epoch-ms `at` — the shared timestamp
-    /// coercion's second accepted form).
+    /// Write a transcript in the corrected record vocabulary: the
+    /// labeled fake-contract `session_start` ownership anchor plus
+    /// real-shaped `USER_INPUT` user records (binary v1.4.12 discipline:
+    /// `source`/`status`/`step_index` + a `created_at` timestamp —
+    /// numeric epoch-ms, the shared timestamp coercion's second accepted
+    /// form; each record's step_index is unique per transcript).
     fn write_transcript(
         root: &Path,
         conv: &str,
         cwd: &str,
-        records: &[(&str, i64)], // (text, at) user records
+        records: &[(&str, i64)], // (content, created_at) USER_INPUT records
     ) -> PathBuf {
         let path = root
             .join(conv)
@@ -860,9 +880,9 @@ mod tests {
             cwd = cwd,
             start = records.first().map(|r| r.1).unwrap_or(0),
         );
-        for (text, at) in records {
+        for (step, (text, at)) in records.iter().enumerate() {
             body.push_str(&format!(
-                "\n{{\"type\":\"user_message\",\"conversationId\":\"{conv}\",\"text\":\"{text}\",\"at\":{at}}}",
+                "\n{{\"type\":\"USER_INPUT\",\"source\":\"USER_EXPLICIT\",\"status\":\"DONE\",\"step_index\":{step},\"created_at\":{at},\"content\":\"{text}\"}}",
             ));
         }
         body.push('\n');
@@ -1033,17 +1053,17 @@ mod tests {
             .join("transcript.jsonl");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         // The foreign transcript: its latest user record (the matching
-        // text) was written at T0, and an assistant record written at
-        // T0+60_050 keeps the file live AFTER the pane's submit.
+        // text) was written at T0, and a PLANNER_RESPONSE record written
+        // at T0+60_050 keeps the file live AFTER the pane's submit.
         std::fs::write(
             &path,
             format!(
                 concat!(
                     r#"{{"type":"session_start","conversationId":"conv-foreign","workspacePaths":["{cwd}"],"startedAt":{t0}}}"#,
                     "\n",
-                    r#"{{"type":"user_message","conversationId":"conv-foreign","text":"identical prompt text","at":{t0}}}"#,
+                    r#"{{"type":"USER_INPUT","source":"USER_EXPLICIT","status":"DONE","step_index":0,"created_at":{t0},"content":"identical prompt text"}}"#,
                     "\n",
-                    r#"{{"type":"assistant_message","conversationId":"conv-foreign","text":"a reply still streaming","at":{after}}}"#,
+                    r#"{{"type":"PLANNER_RESPONSE","source":"MODEL","status":"DONE","step_index":1,"created_at":{after},"content":"a reply still streaming"}}"#,
                     "\n",
                 ),
                 cwd = cwd,
@@ -1140,7 +1160,7 @@ mod tests {
                 concat!(
                     r#"{{"type":"session_start","conversationId":"conv-multi","workspacePaths":["{primary}","{secondary}"],"startedAt":{t0}}}"#,
                     "\n",
-                    r#"{{"type":"user_message","conversationId":"conv-multi","text":"secondary prompt","at":{t0}}}"#,
+                    r#"{{"type":"USER_INPUT","source":"USER_EXPLICIT","status":"DONE","step_index":0,"created_at":{t0},"content":"secondary prompt"}}"#,
                     "\n",
                 ),
                 primary = primary,
@@ -1158,15 +1178,16 @@ mod tests {
     /// Round 7, Minor 2: the pane-cwd match considers EVERY
     /// `session_start` record's `workspacePaths`, not only the FIRST
     /// one. A resumed conversation APPENDS a later `session_start`
-    /// record (`resumed.sanitized.jsonl`'s `{source:"resume"}` shape)
-    /// whose `workspacePaths` name the RESUME cwd — which can differ
-    /// from the first record's workspace (a CLI/MCP resume with a
-    /// different `cwd`, an in-CLI `/resume` across workspaces). Pre-fix
-    /// the head probe `break`ed at the first ownership record, so a
-    /// pane whose cwd matched only a LATER record never bound (no
-    /// activity lane, no in-CLI-switch rebind). The parser's
-    /// first-record-as-primary DISPLAY rule is untouched — only the
-    /// LOCATOR's match widens.
+    /// record (the fake-contract ownership anchor's
+    /// `{source:"resume"}` shape — real transcripts carry no ownership
+    /// records at all; the fakes append them) whose `workspacePaths`
+    /// name the RESUME cwd — which can differ from the first record's
+    /// workspace (a CLI/MCP resume with a different `cwd`, an in-CLI
+    /// `/resume` across workspaces). Pre-fix the head probe `break`ed
+    /// at the first ownership record, so a pane whose cwd matched only
+    /// a LATER record never bound (no activity lane, no
+    /// in-CLI-switch rebind). The parser's first-record-as-primary
+    /// DISPLAY rule is untouched — only the LOCATOR's match widens.
     ///
     /// Both directions: (a) a first-record workspace match still binds
     /// (pinned); (b) an ONLY-later-record workspace match now binds
@@ -1229,10 +1250,12 @@ mod tests {
 
     /// The resumed-conversation transcript shape for
     /// [`a_later_session_start_workspace_still_matches_the_pane_cwd`]:
-    /// an original `session_start` (workspace `first_cwd`), a >64 KiB
-    /// filler user record (pushing the resume past the head window), a
-    /// LATER `session_start {source:"resume"}` (workspace
-    /// `resumed_cwd`), and the matching latest user record.
+    /// the fake-contract ownership anchor (workspace `first_cwd`), an
+    /// over-64 KiB filler USER_INPUT record (pushing the resume past the
+    /// head window), a LATER `session_start {source:"resume"}` anchor
+    /// (workspace `resumed_cwd`), and the matching latest user record —
+    /// all user records in the real binary vocabulary (step_index +
+    /// created_at).
     fn write_resumed_transcript(
         root: &Path,
         conv: &str,
@@ -1252,11 +1275,11 @@ mod tests {
             concat!(
                 r#"{{"type":"session_start","conversationId":"{conv}","workspacePaths":["{first}"],"startedAt":{t0}}}"#,
                 "\n",
-                r#"{{"type":"user_message","conversationId":"{conv}","text":"{filler}","at":{t0a}}}"#,
+                r#"{{"type":"USER_INPUT","source":"USER_EXPLICIT","status":"DONE","step_index":0,"created_at":{t0a},"content":"{filler}"}}"#,
                 "\n",
                 r#"{{"type":"session_start","conversationId":"{conv}","workspacePaths":["{resumed}"],"startedAt":{t0b},"source":"resume"}}"#,
                 "\n",
-                r#"{{"type":"user_message","conversationId":"{conv}","text":"{latest}","at":{t0c}}}"#,
+                r#"{{"type":"USER_INPUT","source":"USER_EXPLICIT","status":"DONE","step_index":1,"created_at":{t0c},"content":"{latest}"}}"#,
                 "\n",
             ),
             conv = conv,
@@ -1727,12 +1750,13 @@ mod tests {
     /// race: the registry writes input to the PTY BEFORE timestamping the
     /// `ActivityEvent::Input` (registry.rs writes, then stamps `at`), so
     /// the CLI child — scheduled on another core — can process the prompt
-    /// and record its `user_message` between those two operations. The
-    /// transcript's matching record then carries an `at` that PRECEDES the
-    /// captured submit timestamp by the write→stamp latency, and the old
-    /// strict `at >= submit` rule rejected the pane's own conversation on
-    /// every retry. The backward tolerance accepts that race: a matching
-    /// record stamped within the tolerance BEFORE the submit binds.
+    /// and record its `USER_INPUT` between those two operations. The
+    /// transcript's matching record then carries a `created_at` that
+    /// PRECEDES the captured submit timestamp by the write→stamp latency,
+    /// and the old strict `at >= submit` rule rejected the pane's own
+    /// conversation on every retry. The backward tolerance accepts that
+    /// race: a matching record stamped within the tolerance BEFORE the
+    /// submit binds.
     #[test]
     fn a_record_stamped_slightly_before_the_submit_binds_within_the_tolerance() {
         let (locator, root) = locator_for("race-tolerance");
@@ -1897,5 +1921,45 @@ mod tests {
             "only the layout's transcript chain qualifies"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn user_input_content_and_created_at_drive_the_latest_user_match() {
+        // Real binary v1.4.12 vocabulary: the latest user record is a
+        // USER_INPUT{source:USER_EXPLICIT, content, created_at} — no
+        // user_message/text/at record exists (binary evidence). The
+        // ownership anchor (session_start) stays the fake-contract cwd/id
+        // evidence; the USER-record arm is real vocabulary.
+        let dir = unique_temp_dir("user-input-record");
+        let conv = "11111111-2222-3333-4444-555555555555";
+        let logs = dir
+            .join("brain")
+            .join(conv)
+            .join(".system_generated")
+            .join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let transcript = logs.join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"session_start","conversationId":"11111111-2222-3333-4444-555555555555","workspacePaths":["/w"]}"#,
+                "\n",
+                r#"{"type":"GENERIC","source":"MODEL","status":"DONE","step_index":1,"created_at":"2026-10-29T20:00:02Z","content":"<noise>"}"#,
+                "\n",
+                r#"{"type":"USER_INPUT","source":"USER_EXPLICIT","status":"DONE","step_index":2,"created_at":"2026-10-29T20:00:03Z","content":"the real submitted prompt"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let summary = probe_transcript(&transcript).expect("the transcript binds");
+        assert_eq!(summary.conversation_id, conv);
+        // The tiny file sits inside BOTH bounded windows, so the anchor's
+        // workspacePaths are collected once per window (the head+tail
+        // overlap; the pane-cwd matcher's `.any()` is duplicate-tolerant).
+        // The pin: the anchor's workspace IS surfaced for the cwd match.
+        assert!(summary.workspace_paths.contains(&"/w".to_string()));
+        assert_eq!(summary.latest_user_text, "the real submitted prompt");
+        assert_eq!(summary.latest_user_at, Some(1_793_304_003_000));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

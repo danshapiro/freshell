@@ -162,9 +162,12 @@ test.describe('fresh-agent checkpoint availability', () => {
         .toBe('before checkpoint\n')
       const notices = reloadedPane.getByRole('status', { name: 'Agent notices' })
       await expect(notices).toBeVisible({ timeout: 10_000 })
-      await notices.locator('summary').click()
-      await expect(notices.getByText(`Code rewound to before: "${marker}"`))
-        .toBeVisible({ timeout: 10_000 })
+      const noticeSummary = notices.locator('summary')
+      const noticeBody = notices.locator('.fresh-agent-diagnostic-body')
+      const message = `Code rewound to before: "${marker}"`
+      await expect(noticeSummary).toContainText(message)
+      await noticeSummary.click()
+      await expect(noticeBody).toContainText(message, { timeout: 10_000 })
     } finally {
       await context?.close().catch(() => {})
       await server?.stop().catch(() => {})

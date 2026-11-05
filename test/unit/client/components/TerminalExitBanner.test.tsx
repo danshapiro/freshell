@@ -63,6 +63,41 @@ describe('TerminalExitBanner', () => {
     expect(onDismiss).toHaveBeenCalledTimes(1)
   })
 
+  // Focused repair round 3, Major 2 — the FreshUnbound stale-id notice
+  // (the setPaneCrashTrace pattern's sibling): the gate's notice naming the
+  // lost conversation, carried on terminal.replaced (the path the pane
+  // actually consumes) and surfaced as a pane-level DISMISSIBLE notice.
+  it('renders the stale-session notice (role=status, NOT alert) naming the lost conversation, with a dismiss button', () => {
+    const onDismiss = vi.fn()
+    const notice = 'Saved antigravity session 11111111-2222-3333-4444-555555555555 could not be found on disk — started a fresh session instead.'
+    render(<TerminalExitBanner {...baseProps} mode="antigravity" exitCode={null} notice={null} settledDead={false}
+      staleSessionNotice={notice}
+      onDismissStaleSessionNotice={onDismiss} />)
+    expect(screen.queryByRole('alert')).toBeNull()
+    const banner = screen.getByTestId('stale-session-notice')
+    expect(banner).toHaveAttribute('role', 'status')
+    expect(banner).toHaveTextContent(notice)
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss antigravity stale session notice' }))
+    expect(onDismiss).toHaveBeenCalledTimes(1)
+  })
+
+  // Both notices ride the same replaced fold (crash trace + stale-session
+  // notice): the stale-session notice — the explanation of what happened
+  // to the conversation — takes priority; the generic crash trace shows
+  // after it is dismissed.
+  it('renders the stale-session notice ahead of the crash trace when both are set', () => {
+    const onDismissStale = vi.fn()
+    const notice = 'Saved antigravity session stale-conv could not be found on disk — started a fresh session instead.'
+    render(<TerminalExitBanner {...baseProps} mode="antigravity" exitCode={null} notice={null} settledDead={false}
+      crashTrace={{ exitCode: 137, resumedAtMs: new Date(2026, 6, 29, 9, 5).getTime() }}
+      staleSessionNotice={notice}
+      onDismissStaleSessionNotice={onDismissStale} />)
+    expect(screen.getByTestId('stale-session-notice')).toHaveTextContent(notice)
+    expect(screen.queryByTestId('crash-trace')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss antigravity stale session notice' }))
+    expect(onDismissStale).toHaveBeenCalledTimes(1)
+  })
+
   it('renders nothing when there is no notice, no settled death, and no trace', () => {
     const { container } = render(
       <TerminalExitBanner {...baseProps} mode="claude" exitCode={null} notice={null} settledDead={false} />

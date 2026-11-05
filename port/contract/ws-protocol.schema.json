@@ -2,7 +2,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `pnpm run contract:generate`. Each entry in `schemas` is a self-contained JSON Schema for one exported Zod schema. The wire contract is frozen for the Rust port — changing it is out of scope.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "schemaCount": 89,
+  "schemaCount": 94,
   "schemas": {
     "AmplifierActivityListResponseSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -148,6 +148,193 @@
         },
         "type": {
           "const": "amplifier.activity.updated",
+          "type": "string"
+        },
+        "upsert": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "phase": {
+                "enum": [
+                  "idle",
+                  "busy"
+                ],
+                "type": "string"
+              },
+              "sessionId": {
+                "type": "string"
+              },
+              "terminalId": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "updatedAt": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "terminalId",
+              "phase",
+              "updatedAt"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "type",
+        "upsert",
+        "remove"
+      ],
+      "type": "object"
+    },
+    "AntigravityActivityListResponseSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "latestTurnCompletions": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "at": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "completionSeq": {
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991,
+                "type": "integer"
+              },
+              "terminalId": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "terminalId",
+              "at",
+              "completionSeq"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "requestId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "terminals": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "phase": {
+                "enum": [
+                  "idle",
+                  "busy"
+                ],
+                "type": "string"
+              },
+              "sessionId": {
+                "type": "string"
+              },
+              "terminalId": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "updatedAt": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "terminalId",
+              "phase",
+              "updatedAt"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "antigravity.activity.list.response",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "requestId",
+        "terminals"
+      ],
+      "type": "object"
+    },
+    "AntigravityActivityListSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "requestId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "antigravity.activity.list",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "requestId"
+      ],
+      "type": "object"
+    },
+    "AntigravityActivityRecordSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "phase": {
+          "enum": [
+            "idle",
+            "busy"
+          ],
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "terminalId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "updatedAt": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "terminalId",
+        "phase",
+        "updatedAt"
+      ],
+      "type": "object"
+    },
+    "AntigravityActivityUpdatedSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "remove": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "antigravity.activity.updated",
           "type": "string"
         },
         "upsert": {
@@ -543,6 +730,10 @@
                   "type": "boolean"
                 },
                 "paneReconcileV1": {
+                  "const": true,
+                  "type": "boolean"
+                },
+                "sessionIndexReadyV1": {
                   "const": true,
                   "type": "boolean"
                 },
@@ -1481,6 +1672,24 @@
             },
             "type": {
               "const": "amplifier.activity.list",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "requestId"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "requestId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "antigravity.activity.list",
               "type": "string"
             }
           },
@@ -5713,6 +5922,10 @@
               "const": true,
               "type": "boolean"
             },
+            "sessionIndexReadyV1": {
+              "const": true,
+              "type": "boolean"
+            },
             "terminalInterestV1": {
               "const": true,
               "type": "boolean"
@@ -8513,6 +8726,14 @@
               "duplicate": {
                 "type": "string"
               },
+              "identityDisposition": {
+                "enum": [
+                  "resumed",
+                  "minted_replacement",
+                  "fresh_unbound"
+                ],
+                "type": "string"
+              },
               "paneKey": {
                 "minLength": 1,
                 "type": "string"
@@ -8537,6 +8758,9 @@
                   "sessionId"
                 ],
                 "type": "object"
+              },
+              "staleSessionNotice": {
+                "type": "string"
               },
               "terminalId": {
                 "minLength": 1,
@@ -8583,6 +8807,14 @@
         "duplicate": {
           "type": "string"
         },
+        "identityDisposition": {
+          "enum": [
+            "resumed",
+            "minted_replacement",
+            "fresh_unbound"
+          ],
+          "type": "string"
+        },
         "paneKey": {
           "minLength": 1,
           "type": "string"
@@ -8607,6 +8839,9 @@
             "sessionId"
           ],
           "type": "object"
+        },
+        "staleSessionNotice": {
+          "type": "string"
         },
         "terminalId": {
           "minLength": 1,
@@ -8711,6 +8946,10 @@
           "type": "boolean"
         },
         "paneReconcileV1": {
+          "const": true,
+          "type": "boolean"
+        },
+        "sessionIndexReadyV1": {
           "const": true,
           "type": "boolean"
         },
@@ -8828,6 +9067,20 @@
       "required": [
         "provider",
         "sessionId"
+      ],
+      "type": "object"
+    },
+    "SessionsIndexReadySchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "sessions.index.ready",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
       ],
       "type": "object"
     },
@@ -9805,7 +10058,8 @@
             "opencode",
             "claude",
             "codex",
-            "amplifier"
+            "amplifier",
+            "antigravity"
           ],
           "type": "string"
         },

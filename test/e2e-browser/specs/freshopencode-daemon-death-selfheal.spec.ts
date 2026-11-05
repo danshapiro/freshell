@@ -8,7 +8,7 @@ import { TestHarness } from '../helpers/test-harness.js'
 import { RustServer } from '../helpers/rust-server.js'
 
 /**
- * The 2026-09-20 daemon-death incident class, end to end on the LOCAL lane:
+ * The 2026-09-20 daemon-death incident class, end to end:
  * a REAL spawned Rust server + a REAL fake `opencode serve` daemon process.
  * The daemon dies an UNREQUESTED death — the fixture child consumes the
  * FAKE_OPENCODE_SELF_EXIT_MARKER file and exits ON ITS OWN (the spec never
@@ -34,11 +34,7 @@ import { RustServer } from '../helpers/rust-server.js'
  * pattern this spec consumes): installFakeOpencode on the spawned server's
  * PATH, the RustServer + TestHarness helpers, the fake's
  * FAKE_OPENCODE_AUDIT_LOG JSONL for spawn/event assertions, and deterministic
- * waits on harness state. The cloud lane cannot guarantee daemon-death +
- * backoff-respawn timing under 2-CPU/2-worker contention (the same
- * provider-lifecycle class as its model), so the spec is registered in
- * CLOUD_SKIP_SPECS; cloud-backend PR coverage is carried by the cloud-legal
- * freshopencode-snapshot-409-recovery.spec.ts.
+ * waits on harness state.
  */
 
 const __filename = fileURLToPath(import.meta.url)
@@ -253,7 +249,7 @@ async function waitForSettledPane(page: Page, sessionId: string): Promise<void> 
   })
 }
 
-test.describe('Freshopencode daemon-death self-heal (local lane)', () => {
+test.describe('Freshopencode daemon-death self-heal', () => {
   test.setTimeout(240_000)
 
   test('daemon self-exit self-heals end to end: loss banner, backoff respawn, revival refetch, no chime', async ({ page }) => {
@@ -315,7 +311,7 @@ test.describe('Freshopencode daemon-death self-heal (local lane)', () => {
 
       // (3) The pane shows the OPENCODE_DAEMON_LOST "Agent error:" banner.
       const daemonLostBanner = page.locator('[data-agent-error="session"]')
-      await expect(daemonLostBanner.getByRole('alert')).toHaveText('Agent error', { timeout: 30_000 })
+      await expect(daemonLostBanner.locator('summary')).toContainText('The opencode serve daemon was lost unexpectedly', { timeout: 30_000 })
       await daemonLostBanner.locator('summary').click()
       await expect(daemonLostBanner).toContainText('The opencode serve daemon was lost unexpectedly')
       await expect(daemonLostBanner).toContainText('Agent error:')

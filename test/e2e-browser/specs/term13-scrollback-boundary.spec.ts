@@ -75,21 +75,12 @@ test.describe('TERM-13 -- scrollback honors the configured cap at the Unicode/se
   }
 
   async function patchScrollback(page: any, serverInfo: any, lines: number): Promise<void> {
-    const result = await page.evaluate(
-      async ({ baseUrl, token, lines }: { baseUrl: string; token: string; lines: number }) => {
-        const response = await fetch(`${baseUrl}/api/settings`, {
-          method: 'PATCH',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-auth-token': token,
-          },
-          body: JSON.stringify({ terminal: { scrollback: lines } }),
-        })
-        return { ok: response.ok, status: response.status }
-      },
-      { baseUrl: serverInfo.baseUrl, token: serverInfo.token, lines },
-    )
-    expect(result.ok).toBe(true)
+    // Set the server's creation policy before navigation can create a shell.
+    const response = await page.request.patch(`${serverInfo.baseUrl}/api/settings`, {
+      headers: { 'x-auth-token': serverInfo.token },
+      data: { terminal: { scrollback: lines } },
+    })
+    expect(response.ok()).toBe(true)
   }
 
   /** `GET /api/terminals/{id}/search?query=...` -- the mirror-search endpoint. */
@@ -140,7 +131,7 @@ test.describe('TERM-13 -- scrollback honors the configured cap at the Unicode/se
   const EMOJI = '\u{1F600}'
   const REPLACEMENT_CHAR = '\uFFFD'
 
-  function buildFlood(needle: string, doneMarker: string): string {
+  function buildFlood(needle: string, doneSuffix: string): string {
     const filler = 'x'.repeat(10)
     // POSIX `sh`-compatible (no bash-only brace expansion, matching
     // `settings-live-reload.spec.ts`'s proven-safe flood shape): line 0
@@ -154,7 +145,7 @@ test.describe('TERM-13 -- scrollback honors the configured cap at the Unicode/se
       `i=0; while [ $i -lt ${FLOOD_LINE_COUNT} ]; do ` +
       `if [ $i -eq 0 ]; then echo "NEEDLELINE-${needle} ${EMOJI} ${filler}"; ` +
       `else echo "line-$i-${EMOJI}-${filler}"; fi; ` +
-      `i=$((i+1)); done; echo "${doneMarker}"`
+      `i=$((i+1)); done; printf 'flood-done-marker-%s\\n' '${doneSuffix}'`
     )
   }
 
@@ -165,32 +156,35 @@ test.describe('TERM-13 -- scrollback honors the configured cap at the Unicode/se
     serverInfo: any,
     scrollbackLines: number,
   ): Promise<{ terminalId: string; visibleText: string; needle: string; doneMarker: string }> {
+    await patchScrollback(page, serverInfo, scrollbackLines)
     await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     await harness.waitForHarness()
     await harness.waitForConnection()
 
-    // The knob change happens BEFORE the terminal exists (documented scope
-    // limit: applies to terminals created after the call -- same rule
-    // `settings-live-reload.spec.ts` exercises).
-    await patchScrollback(page, serverInfo, scrollbackLines)
-
     await selectShell(page)
     await terminal.waitForTerminal()
+    await harness.waitForTerminalStatus('running')
+    const tabId = await harness.getActiveTabId()
+    expect(tabId).toBeTruthy()
+    const layout = await harness.getPaneLayout(tabId!)
+    expect(layout?.type).toBe('leaf')
+    const terminalId: string = layout?.content?.terminalId
+    expect(terminalId).toBeTruthy()
+    // A mounted xterm is not proof that the shell can consume our input.
+    await terminal.waitForPrompt({ terminalId })
 
     const needle = `TERM13-${scrollbackLines}-${Math.random().toString(36).slice(2, 10)}`
     // Independent of `needle` (see `buildFlood`'s doc comment) so the
     // SMALL-cap "needle was evicted" assertion below can't be defeated by
     // the always-newest done marker itself echoing the needle text.
-    const doneMarker = `flood-done-marker-${Math.random().toString(36).slice(2, 10)}`
-
-    await terminal.executeCommand(buildFlood(needle, doneMarker))
-    await terminal.waitForOutput(doneMarker, { timeout: 30_000 })
-
-    const tabId = await harness.getActiveTabId()
-    expect(tabId).toBeTruthy()
-    const layout = await harness.getPaneLayout(tabId!)
-    const terminalId: string = layout?.content?.terminalId
-    expect(terminalId).toBeTruthy()
+    const doneSuffix = Math.random().toString(36).slice(2, 10)
+    const doneMarker = `flood-done-marker-${doneSuffix}`
+    const command = buildFlood(needle, doneSuffix)
+    // The echoed command cannot satisfy completion: printf constructs this
+    // marker only after every flood line has actually been emitted.
+    expect(command).not.toContain(doneMarker)
+    await terminal.executeCommandInserted(command)
+    await terminal.waitForOutput(doneMarker, { timeout: 30_000, terminalId })
 
     // Force a fresh WS attach: the terminal keeps running detached
     // (background session), and the client re-attaches on load and replays

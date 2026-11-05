@@ -276,6 +276,7 @@ async fn spawn_server_with(
     registry.set_scrollback_max_bytes(ring_chars);
 
     let state = WsState {
+        session_index_ready: None,
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
         layout: Default::default(),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),

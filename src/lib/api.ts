@@ -977,6 +977,8 @@ export async function setSessionMetadata(
  */
 export const SessionHandoffErrorCodeSchema = z.enum([
   'HANDOFF_IN_PROGRESS',
+  /** The shared host-agent admission gate is closed for maintenance or shutdown. */
+  'HOST_AGENT_MAINTENANCE',
   'REAP_TIMEOUT',
   'TARGET_SPAWN_FAILED',
   'STALE_GENERATION',

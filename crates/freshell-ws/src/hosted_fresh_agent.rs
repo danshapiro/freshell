@@ -124,16 +124,8 @@ pub(crate) async fn retained_attention_marks() -> Vec<freshell_protocol::FreshAg
     }
 }
 
-pub(crate) fn dispatch_if_installed(message: &ClientMessage) -> bool {
-    let Some(gateway) = GATEWAY.get() else {
-        return false;
-    };
-    let HostedRoute::Gateway(command) = hosted_route(message) else {
-        return false;
-    };
-    let task = Arc::clone(gateway).dispatch(*command);
-    tokio::spawn(task);
-    true
+pub(crate) fn installed_gateway() -> Option<Arc<dyn HostedFreshAgentGateway>> {
+    GATEWAY.get().map(Arc::clone)
 }
 
 #[cfg(test)]

@@ -33,10 +33,14 @@
 //!      its owner pane is live. (b) `/resume <existing id>` — the fake
 //!      switches the active transcript to the EXISTING conversation and
 //!      the pane's next prompt is appended as that transcript's LATEST
-//!      user record → rebind to the existing id.
+//!      user record → rebind to the existing id; the resumed
+//!      transcript's steps CONTINUE from the planted max (a
+//!      discriminating pin: the process counter sits past it).
 //!   4. Restart resume adjacency: a restarted server (fresh in-memory
 //!      state, same antigravity home) restores the pane with the adjacent
-//!      `--conversation <bound id>` argv and identity persists.
+//!      `--conversation <bound id>` argv and identity persists; the
+//!      resumed process CONTINUES the conversation's steps from the
+//!      transcript's max (the sh fake's BOOT-arm seeding pin).
 //!
 //!      4b. Stale resume id — the PROBED missing-id contract (round 7,
 //!      Major 1): a restore create carrying an id that is NOT on disk
@@ -87,6 +91,20 @@
 //! runs inside the disposable Docker sandbox
 //! (`scripts/sandbox-test.sh "cargo test -p freshell-ws --test antigravity_session_rebind"`),
 //! never bare on the host.
+//!
+//! Sibling test `antigravity_crash_respawn_with_deleted_conversation_\
+//! releases_the_stale_identity` (focused repair round 1, Major 1): the
+//! GC3 recovery-path discipline — a bound pane whose conversation is
+//! deleted from disk and then crashes still respawns (bare, identity-less,
+//! Recovering notice naming the stale id), the stale ledger row stays
+//! retired, the hub releases the stale locator's claim (a later restore
+//! create answers the typed SESSION_MISSING refusal, never an adoption),
+//! and the natural rebind binds the fresh conversation on the next clean
+//! typed prompt — the FAKE-CONTRACT machinery this suite drives (its
+//! fake agy appends the ownership records the locator consumes;
+//! real-format antigravity sessions never re-bind per-pane). It runs its
+//! own server with a disk-wired existence probe (the suite above runs
+//! the fail-open NoIndexProbe).
 
 mod common;
 
@@ -95,6 +113,8 @@ use std::time::Duration;
 
 use common::log_capture::{self, CapturedEvent};
 use common::next_frame_of_type;
+use freshell_ws::existence::{SessionExistence, SessionExistenceProbe};
+use freshell_ws::pane_ledger::{RetiredReason, RowState};
 use freshell_ws::WsState;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -122,6 +142,36 @@ fn transcript_path(home: &std::path::Path, conv: &str) -> std::path::PathBuf {
         .join("transcript.jsonl")
 }
 
+/// Every `step_index` in a transcript, in file order (the fake's records
+/// are single-line JSON; records without a step_index — the ownership
+/// anchor — are skipped). Absent transcript ⇒ empty. The resume-path
+/// step-continuation pins assert on this: a resumed conversation's
+/// records CONTINUE past every step already on disk — the real binary's
+/// evidenced cross-process continuation — with in-file uniqueness.
+fn transcript_step_indexes(path: &std::path::Path) -> Vec<i64> {
+    let raw = std::fs::read_to_string(path).unwrap_or_default();
+    raw.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|value| value.get("step_index").and_then(serde_json::Value::as_i64))
+        .collect()
+}
+
+/// Poll the transcript's step list until `pred` is satisfied (10 s
+/// budget — the fake appends its record asynchronously to the test's
+/// PTY write, and a same-id continuation emits NO association frame
+/// to synchronize on), returning the last observed list. Mirrors
+/// `wait_argv_rows`.
+async fn wait_transcript_steps(path: &std::path::Path, pred: impl Fn(&[i64]) -> bool) -> Vec<i64> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let steps = transcript_step_indexes(path);
+        if pred(&steps) || tokio::time::Instant::now() >= deadline {
+            return steps;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Write one fake `agy`: a contract-faithful `#!/bin/sh` reader that
 /// models the transcript behavior the locator consumes.
 ///
@@ -140,9 +190,18 @@ fn transcript_path(home: &std::path::Path, conv: &str) -> std::path::PathBuf {
 ///   the requested dead id (the pre-round-7 fake invented one, a
 ///   contract no real binary has; scenario 4b pins the rebind that
 ///   follows).
-/// - Per stdin line: appends a `user_message` record (ms-precision ISO
-///   `at` — the parser's documented timestamp shape) carrying the line
-///   text and the active conversation id.
+/// - Per stdin line: appends a `USER_INPUT` record (real binary v1.4.12
+///   vocabulary: `source`/`status`/`step_index` + a `created_at`
+///   ms-precision ISO stamp — the shared coercion's documented shape)
+///   carrying the line text in `content`. A per-conversation STEP
+///   counter gives every record a unique step_index — the real binary's
+///   per-record identity the tracker's dedupe keys on: a MINT resets it
+///   (a fresh conversation starts at step 0) while a RESUME (the
+///   `--conversation` argv pair and the `/resume <id>` verb) seeds it
+///   from the transcript's max existing step_index, modeling the
+///   evidenced cross-process continuation (real-binary receipts:
+///   USER_INPUT steps 0→2→5 across three separate processes — no
+///   per-process reset).
 /// - `/switch:<id>` (the documented new-conversation switch) mints a NEW
 ///   conversation: initializes its ownership record and makes it active —
 ///   the NEXT stdin line lands as that conversation's first user record.
@@ -151,7 +210,11 @@ fn transcript_path(home: &std::path::Path, conv: &str) -> std::path::PathBuf {
 ///   stdin line is appended as that transcript's LATEST user record.
 /// - `settle:<text>` (Task 8's activity phase) appends the user record AND
 ///   a `turn_settled{outcome:"completed",fullyIdle:true}` record — a turn
-///   that fully settles.
+///   that fully settles. The settle record is the LABELED FAKE-CONTRACT
+///   settle (real transcripts carry no settle record — binary evidence,
+///   real-binary-transcript-evidence.md); it keeps the real-shaped field
+///   discipline (`step_index` + `created_at`) so the tracker's
+///   identity-pair dedupe is exercised end to end.
 /// - `async:<text>` (Task 8's activity phase) appends the user record AND a
 ///   `turn_settled{fullyIdle:false}` record — invocation completion with
 ///   outstanding async work (NOT turn completion).
@@ -178,16 +241,44 @@ fn transcript_path(home: &std::path::Path, conv: &str) -> std::path::PathBuf {
 ///
 /// Prompt texts driven through this fake avoid JSON metacharacters (the
 /// fixture records are hand-serialized in sh).
-fn write_fake_agy() -> std::path::PathBuf {
+///
+/// `tag` makes the script path unique PER TEST (cargo runs this file's
+/// tests in parallel threads sharing one pid — a shared path would have
+/// one test's cleanup `remove_file` the script out from under the other's
+/// live panes).
+fn write_fake_agy(tag: &str) -> std::path::PathBuf {
     let script_path = std::env::temp_dir().join(format!(
-        "freshell-antigravity-rebind-fake-{}.sh",
+        "freshell-antigravity-rebind-fake-{tag}-{}.sh",
         std::process::id()
     ));
     let script = r#"#!/bin/sh
 AGY_BRAIN="$AGY_HOME/brain"
 CONV="conv-$FRESHELL_TERMINAL_ID"
 AGY_CWD="$(pwd)"
+# Per-conversation record counter modeling the real binary's step_index
+# identity: unique per record, strictly increasing across turns AND across
+# processes (binary evidence: USER_INPUT steps 0→2→5 across three separate
+# resumed processes — no per-process reset). A MINT resets it (fresh
+# conversation; first record step 0) and a RESUME seeds it from the
+# transcript's max existing step_index via seed_step — the evidenced
+# cross-process continuation. Synthetic ms-precision created_at stamps for
+# the recency tests; the real binary writes second-granularity stamps,
+# which the shared coercion also accepts.
+STEP=-1
 now() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }
+next_step() { STEP=$((STEP + 1)); }
+# Seed the step counter from the transcript's max existing step_index —
+# the evidenced cross-process continuation (see the STEP comment above):
+# a resumed process CONTINUES the conversation's steps; only a mint
+# (mint_conversation resets STEP) starts fresh. The pipeline takes the
+# numeric max across every step-bearing record line.
+seed_step() {
+  STEP=-1
+  if [ -f "$TRANSCRIPT" ]; then
+    m=$(grep -o '"step_index":[0-9]*' "$TRANSCRIPT" | grep -o '[0-9][0-9]*' | sort -n | tail -1)
+    if [ -n "$m" ]; then STEP=$m; fi
+  fi
+}
 if [ -n "$AGY_ARGV_CAPTURE" ]; then
   printf '%s\n' "$*" >> "$AGY_ARGV_CAPTURE"
 fi
@@ -229,6 +320,22 @@ case "$prev" in
 esac
 transcript_of() { printf '%s/%s/.system_generated/logs/transcript.jsonl' "$AGY_BRAIN" "$CONV"; }
 TRANSCRIPT="$(transcript_of)"
+mint_conversation() {
+  mkdir -p "$(dirname "$TRANSCRIPT")"
+  printf '{"type":"session_start","conversationId":"%s","workspacePaths":["%s"],"startedAt":"%s"}\n' \
+    "$CONV" "$AGY_CWD" "$(now)" > "$TRANSCRIPT"
+  STEP=-1
+}
+append_user_record() {
+  next_step
+  printf '{"type":"USER_INPUT","source":"USER_EXPLICIT","status":"DONE","step_index":%s,"created_at":"%s","content":"%s"}\n' \
+    "$STEP" "$(now)" "$1" >> "$TRANSCRIPT"
+}
+append_settle_record() {
+  next_step
+  printf '{"type":"turn_settled","step_index":%s,"created_at":"%s","outcome":"completed","fullyIdle":%s}\n' \
+    "$STEP" "$(now)" "$1" >> "$TRANSCRIPT"
+}
 if [ ! -f "$TRANSCRIPT" ]; then
   if [ "$RESUMED" = "1" ]; then
     # The PROBED missing-id contract (round 7, Major 1; real binaries
@@ -243,10 +350,12 @@ if [ ! -f "$TRANSCRIPT" ]; then
     CONV="conv-$FRESHELL_TERMINAL_ID"
     TRANSCRIPT="$(transcript_of)"
   fi
-  mkdir -p "$(dirname "$TRANSCRIPT")"
-  printf '{"type":"session_start","conversationId":"%s","workspacePaths":["%s"],"startedAt":"%s"}\n' \
-    "$CONV" "$AGY_CWD" "$(now)" > "$TRANSCRIPT"
+  mint_conversation
 else
+  # A resumed process CONTINUES the conversation's steps (binary
+  # evidence: USER_INPUT steps 0→2→5 across three separate resumed
+  # processes) — seed the counter from the records already on disk.
+  seed_step
   printf 'agy-resumed:%s\n' "$CONV"
 fi
 while IFS= read -r line; do
@@ -254,28 +363,25 @@ while IFS= read -r line; do
     "/switch:"*)
       CONV="${line#/switch:}"
       TRANSCRIPT="$(transcript_of)"
-      mkdir -p "$(dirname "$TRANSCRIPT")"
-      printf '{"type":"session_start","conversationId":"%s","workspacePaths":["%s"],"startedAt":"%s"}\n' \
-        "$CONV" "$AGY_CWD" "$(now)" > "$TRANSCRIPT"
+      mint_conversation
       ;;
     "/resume "*)
       CONV="${line#/resume }"
       TRANSCRIPT="$(transcript_of)"
+      # The in-CLI resume CONTINUES the conversation's steps too (the
+      # same evidenced cross-process continuation as the argv arm).
+      seed_step
       ;;
     "settle:"*)
       # The user record's text is the FULL input line (the locator
       # content-matches the pane's captured submit line — a stripped prefix
       # could never associate); the settle record follows it.
-      printf '{"type":"user_message","conversationId":"%s","text":"%s","at":"%s"}\n' \
-        "$CONV" "$line" "$(now)" >> "$TRANSCRIPT"
-      printf '{"type":"turn_settled","conversationId":"%s","at":"%s","outcome":"completed","fullyIdle":true}\n' \
-        "$CONV" "$(now)" >> "$TRANSCRIPT"
+      append_user_record "$line"
+      append_settle_record true
       ;;
     "async:"*)
-      printf '{"type":"user_message","conversationId":"%s","text":"%s","at":"%s"}\n' \
-        "$CONV" "$line" "$(now)" >> "$TRANSCRIPT"
-      printf '{"type":"turn_settled","conversationId":"%s","at":"%s","outcome":"completed","fullyIdle":false}\n' \
-        "$CONV" "$(now)" >> "$TRANSCRIPT"
+      append_user_record "$line"
+      append_settle_record false
       ;;
     "/crash")
       exit 1
@@ -284,8 +390,7 @@ while IFS= read -r line; do
       exit 0
       ;;
     *)
-      printf '{"type":"user_message","conversationId":"%s","text":"%s","at":"%s"}\n' \
-        "$CONV" "$line" "$(now)" >> "$TRANSCRIPT"
+      append_user_record "$line"
       ;;
   esac
 done
@@ -358,6 +463,25 @@ async fn spawn_antigravity_server(
     home: &std::path::Path,
     ledger_dir: &std::path::Path,
 ) -> AntigravityServer {
+    spawn_antigravity_server_with_probe(
+        cli_commands,
+        home,
+        ledger_dir,
+        Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+    )
+    .await
+}
+
+/// [`spawn_antigravity_server`] with a caller-chosen existence probe —
+/// the disk-wired gate scenarios need a probe that answers the brain
+/// tree's real disk truth (the `resume_validation_gate.rs` harness
+/// shape) instead of the suite-wide fail-open `NoIndexProbe`.
+async fn spawn_antigravity_server_with_probe(
+    cli_commands: Vec<freshell_platform::CliCommandSpec>,
+    home: &std::path::Path,
+    ledger_dir: &std::path::Path,
+    probe: Arc<dyn SessionExistenceProbe>,
+) -> AntigravityServer {
     let auth_token = Arc::new(common::AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let settings = Arc::new(
@@ -377,6 +501,7 @@ async fn spawn_antigravity_server(
     let (auto_resume_tx, auto_resume_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let state = WsState {
+        session_index_ready: None,
         layout: Default::default(),
         terminal_meta: Default::default(),
         pane_ledger: Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
@@ -423,7 +548,7 @@ async fn spawn_antigravity_server(
         opencode_locator: None,
         codex_locator: None,
         activity: Some(activity_hub.clone()),
-        session_existence: Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+        session_existence: probe,
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
         ownership: None,
@@ -457,10 +582,11 @@ async fn spawn_antigravity_server(
 }
 
 /// Plant an UNBOUND transcript (the concurrently-appearing / decoy /
-/// late-write shapes the tests fabricate): the fixture-format ownership
-/// record plus ONE user record with the given text, timestamped at `at_ms`
-/// (numeric epoch-ms `at` — the shared timestamp coercion's documented
-/// second form, `freshell_sessions::time::parse_timestamp_ms`).
+/// late-write shapes the tests fabricate): the fake-contract ownership
+/// anchor plus ONE real-shaped user record with the given text,
+/// timestamped at `at_ms` (numeric epoch-ms `created_at` — the shared
+/// timestamp coercion's documented second form,
+/// `freshell_sessions::time::parse_timestamp_ms`).
 fn plant_transcript(
     home: &std::path::Path,
     conv: &str,
@@ -474,7 +600,7 @@ fn plant_transcript(
         concat!(
             r#"{{"type":"session_start","conversationId":"{conv}","workspacePaths":["{cwd}"],"startedAt":{at}}}"#,
             "\n",
-            r#"{{"type":"user_message","conversationId":"{conv}","text":"{text}","at":{at}}}"#,
+            r#"{{"type":"USER_INPUT","source":"USER_EXPLICIT","status":"DONE","step_index":0,"created_at":{at},"content":"{text}"}}"#,
             "\n",
         ),
         conv = conv,
@@ -570,6 +696,69 @@ async fn send_resume_create(
     ))
     .await
     .expect("send terminal.create (resume)");
+}
+
+/// Send the resume create and await its ANSWER — whichever shape arrives
+/// first, the `terminal.created` success or the correlated `error`
+/// refusal (the discriminating gate probe: an adoption-shaped success
+/// fails the caller's refusal assertions with the full frame in the
+/// panic message, never a bare timeout).
+async fn create_resume_await_answer(
+    ws: &mut common::TestWs,
+    cwd: &str,
+    request_id: &str,
+    session_id: &str,
+) -> serde_json::Value {
+    send_resume_create(ws, cwd, request_id, session_id).await;
+    let deadline = tokio::time::Instant::now() + common::FRAME_BUDGET;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining.max(Duration::from_millis(1)), ws.next()).await {
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                    let matches_request = value["requestId"] == request_id;
+                    if matches_request
+                        && (value["type"] == "terminal.created" || value["type"] == "error")
+                    {
+                        return value;
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            other => panic!("ws ended/errored awaiting resume answer: {other:?}"),
+        }
+    }
+    panic!("no created/error answer for {request_id} within the frame budget");
+}
+
+/// A gate probe wired to the suite's brain tree — the production by-id
+/// walk's shape (`antigravity_transcript_on_disk`): exists+readable ⇒
+/// Present, any missing path component ⇒ Absent, anything else ⇒
+/// Unknown. `ever_observed_on_disk` answers true (antigravity's gate has
+/// no zero-turn carve-out — Absent is SpawnFresh either way).
+struct DiskWiredAntigravityProbe {
+    brain_root: std::path::PathBuf,
+}
+impl SessionExistenceProbe for DiskWiredAntigravityProbe {
+    fn exists(&self, _provider: &str, session_id: &str) -> SessionExistence {
+        match std::fs::File::open(
+            self.brain_root
+                .join(session_id)
+                .join(".system_generated")
+                .join("logs")
+                .join("transcript.jsonl"),
+        ) {
+            Ok(_) => SessionExistence::Present,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => SessionExistence::Absent,
+            Err(_) => SessionExistence::Unknown,
+        }
+    }
+    fn ever_observed(&self, _: &str, _: &str) -> bool {
+        true
+    }
+    fn ever_observed_on_disk(&self, _: &str, _: &str) -> bool {
+        true
+    }
 }
 
 /// Type a prompt and submit it: the text chunk, then the Enter byte.
@@ -729,7 +918,7 @@ async fn antigravity_exact_live_identity_rebind_suite() {
     let logs = log_capture::install();
     // The fake `agy` script (written once; both servers point at it, and
     // the cleanup block removes it — it must not outlive the suite).
-    let fake_agy = write_fake_agy();
+    let fake_agy = write_fake_agy("suite");
 
     let server = spawn_antigravity_server(
         vec![antigravity_fake_spec(home.path(), &argv_capture, &fake_agy)],
@@ -949,6 +1138,15 @@ async fn antigravity_exact_live_identity_rebind_suite() {
         "the earlier conversation own prompt",
         now_ms() - 60_000,
     );
+    // One more prompt stamped on the SWITCH conversation first, so the
+    // step-continuation pin below is DISCRIMINATING (round-2 review,
+    // Minor 1): the pane's process counter now sits at 1 (the switch
+    // conversation holds steps [0, 1]) while the planted conversation's
+    // max step is 0 — in the old flow the counter sat AT the planted
+    // max, so the pin passed even with the resume seeding removed. The
+    // extra prompt lands on the switch conversation (same-id: the
+    // locator no-ops it, no frame).
+    submit_prompt(&mut ws, &tid1, "switch conversation second prompt november").await;
     submit_prompt(&mut ws, &tid1, &format!("/resume {resume_conv}")).await;
     submit_prompt(&mut ws, &tid1, "prompt landed in the resumed conversation").await;
     let resumed = next_associated_frame(&mut ws, &tid1, "sc3-resume-rebind").await;
@@ -962,6 +1160,23 @@ async fn antigravity_exact_live_identity_rebind_suite() {
     );
     // The rebind's transcript path really is the resumed conversation's.
     let _ = rebound_log;
+
+    // The resumed conversation's records CONTINUE the conversation's
+    // steps — the real binary's evidenced cross-process continuation
+    // (Task 1's receipts: USER_INPUT steps 0→2→5 across three separate
+    // resumed processes, no per-process reset). The pane's prompt lands
+    // with a step_index strictly past every record already on disk, so
+    // in-file step_index uniqueness holds. Discriminating (the extra
+    // switch-conversation prompt above): the process counter sat at 1
+    // when the /resume landed, so an un-seeded per-process counter
+    // would append step 2 here ([0, 2]), never the continuation step 1.
+    let steps_3c = transcript_step_indexes(&transcript_path(home.path(), resume_conv));
+    assert_eq!(
+        steps_3c,
+        vec![0, 1],
+        "the resumed conversation continues the planted step 0 with step 1 — \
+         never a per-process reset"
+    );
 
     // ── Scenario 4: restart resume adjacency ────────────────────────────
     // Kill the pane, then "restart the server" the way a restart actually
@@ -1020,6 +1235,26 @@ async fn antigravity_exact_live_identity_rebind_suite() {
             .session_ref_for(&tid4)
             .is_some_and(|r| r.provider == "antigravity" && r.session_id == resume_conv),
         "identity persists across the restart (create-time reseed from the sessionRef)"
+    );
+
+    // The sh fake's OTHER seeding arm — the boot `--conversation`
+    // resume: the restored process CONTINUES the conversation's steps
+    // from the transcript's max (the same evidenced cross-process
+    // continuation the in-CLI /resume pinned in 3c). The pane's first
+    // prompt lands strictly past every step already on disk — an
+    // un-seeded fresh-process counter would re-append the planted step
+    // 0 ([0, 1, 0]), the duplicate the pin rejects (round-2 review,
+    // Minor 1: the boot arm previously had NO step assertion at all).
+    submit_prompt(&mut ws2, &tid4, "restored pane continuing prompt oscar").await;
+    let steps_4 = wait_transcript_steps(&transcript_path(home.path(), resume_conv), |steps| {
+        steps.len() >= 3
+    })
+    .await;
+    assert_eq!(
+        steps_4,
+        vec![0, 1, 2],
+        "the boot --conversation resume continues the planted step 0 and 3c's \
+         step 1 with step 2 — never a per-process reset"
     );
 
     // ── Scenario 4b: stale resume id — the PROBED missing-id contract ──
@@ -1428,5 +1663,403 @@ async fn antigravity_exact_live_identity_rebind_suite() {
     server2.registry.kill(&tid4b);
     let _ = std::fs::remove_file(&argv_capture);
     let _ = std::fs::remove_file(&argv_capture_2);
+    let _ = std::fs::remove_file(&fake_agy);
+}
+
+/// GC3 recovery-path closure (focused review round 1, Major 1): a bound
+/// pane whose conversation is DELETED from disk and then crashes must
+/// still come back — recovery is not refused — but the STALE identity
+/// must not survive over the fresh conversation the respawn starts:
+/// the gate refuses the deleted id at the respawn door (the stale ledger
+/// row stays retired, the stale id never reaches a respawn argv, the
+/// Recovering notice names it), the hub RELEASES the stale locator's
+/// claim instead of completing it against the fresh terminal, so NO live
+/// registry claim/bind exists for the stale id — proven behaviorally by
+/// a later restore create carrying the stale id, which answers the typed
+/// SESSION_MISSING refusal exactly like the direct create door, NEVER
+/// the BoundElsewhere adoption of the identity-less fresh terminal (the
+/// silent replacement this test forbids). The pane has NO saved identity
+/// until its next clean typed prompt, when the natural rebind (the
+/// fake-contract machinery this suite's fake agy exercises; real-format
+/// antigravity sessions never re-bind per-pane) binds the FRESH
+/// conversation the CLI minted.
+#[tokio::test(flavor = "multi_thread")]
+async fn antigravity_crash_respawn_with_deleted_conversation_releases_the_stale_identity() {
+    let home = tempfile::tempdir().expect("antigravity home tempdir");
+    let cwd_dir = tempfile::tempdir().expect("pane cwd tempdir");
+    let ledger_dir = tempfile::tempdir().expect("pane ledger tempdir");
+    let cwd = cwd_dir.path().to_string_lossy().into_owned();
+    let argv_capture = std::env::temp_dir().join(format!(
+        "freshell-antigravity-rebind-argv-stale-crash-{}.txt",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&argv_capture);
+    let fake_agy = write_fake_agy("stale-crash");
+
+    let probe = Arc::new(DiskWiredAntigravityProbe {
+        brain_root: home.path().join("brain"),
+    });
+    let server = spawn_antigravity_server_with_probe(
+        vec![antigravity_fake_spec(home.path(), &argv_capture, &fake_agy)],
+        home.path(),
+        ledger_dir.path(),
+        probe.clone(),
+    )
+    .await;
+    let mut ws = common::connect_and_capture_inventory(&server.url).await.0;
+
+    // 1. Bind a conversation the normal way: create, clean prompt, adopt.
+    let tid = create_pane(&mut ws, &cwd, "req-agy-stale-crash").await;
+    submit_prompt(&mut ws, &tid, "stale crash phase prompt november").await;
+    let adopted = next_associated_frame(&mut ws, &tid, "stale-crash-adopt").await;
+    let conv = conv_of(&tid);
+    assert_eq!(
+        adopted["sessionRef"]["sessionId"], conv,
+        "the pane adopts its own conversation first: {adopted}"
+    );
+    assert!(
+        server
+            .state
+            .pane_ledger
+            .lookup_by_session("antigravity", &conv)
+            .is_some_and(|r| r.row.live_terminal_id.as_deref() == Some(tid.as_str())),
+        "the durable binding row names the live pane"
+    );
+
+    // 2. The conversation is deleted from disk (the data-loss shape) —
+    //    the disk-wired gate probe now answers positive absence for it.
+    std::fs::remove_dir_all(home.path().join("brain").join(&conv))
+        .expect("delete the conversation directory");
+    assert_eq!(
+        probe.exists("antigravity", &conv),
+        SessionExistence::Absent,
+        "precondition: the deleted conversation is positively absent on disk"
+    );
+
+    // 3. The pane crashes (spontaneous exit 1) on a second connection.
+    let mut ws2 = common::connect_and_capture_inventory(&server.url).await.0;
+    common::send_input(&mut ws2, &tid, "/crash").await;
+    common::send_input(&mut ws2, &tid, "\r").await;
+
+    // 4. Recovery is NOT refused: the pane comes back — the replaced
+    //    frame names the new terminal.
+    let replaced = next_frame_of_type(&mut ws, "terminal.replaced").await;
+    assert_eq!(replaced["oldTerminalId"], tid.as_str(), "{replaced}");
+    let new_tid = replaced["newTerminalId"]
+        .as_str()
+        .expect("new terminal id")
+        .to_string();
+
+    // 4b. Focused repair round 3, Major 2: the replaced frame — the path
+    //     the pane ACTUALLY consumes — carries the gate's stale-id notice.
+    //     The Recovering frame below (step 5) names the stale id too, but
+    //     it is addressed to the NEW terminal id, which the pane cannot
+    //     know yet (it learns the id only from THIS frame), and the
+    //     replaced fold clears the pane's recovery notice — so without
+    //     the carried notice the fresh pane would show no explanation
+    //     naming the lost conversation.
+    assert_eq!(
+        replaced["identityDisposition"], "fresh_unbound",
+        "the FreshUnbound replacement announces its identity disposition: {replaced}"
+    );
+    let stale_notice = replaced["staleSessionNotice"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the replaced frame must carry staleSessionNotice: {replaced}"));
+    assert!(
+        stale_notice.contains(conv.as_str()),
+        "the carried notice names the stale conversation id: {stale_notice}"
+    );
+    assert!(
+        stale_notice.contains("could not be found"),
+        "the carried notice explains the fresh replacement: {stale_notice}"
+    );
+
+    // 5. The Recovering notice naming the stale id was broadcast (the
+    //    respawn's gate block) — the user is informed, on the record.
+    assert!(
+        frame_seen_within(&mut ws2, Duration::from_secs(10), |v| {
+            v["type"] == "terminal.status"
+                && v["status"] == "recovering"
+                && v["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.contains(conv.as_str()))
+        })
+        .await,
+        "the respawn's Recovering frame must name the refused stale id"
+    );
+
+    // 6. The stale id never reached a respawn argv (the gate refused it):
+    //    the original spawn plus the bare respawn — two rows, neither
+    //    carrying the deleted conversation pair.
+    let rows = wait_argv_rows(&argv_capture, |rows| rows.len() >= 2).await;
+    assert_eq!(
+        rows.len(),
+        2,
+        "exactly the original spawn + the respawn: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .all(|r| conversation_pair_position(r, &conv).is_none()),
+        "the deleted conversation id must never reach a respawn argv: {rows:?}"
+    );
+
+    // 7. The new terminal is IDENTITY-LESS: no resume id, no identity
+    //    row — the pane has no saved identity for the stale conversation.
+    assert_eq!(
+        registry_resume_id(&server.registry, &new_tid),
+        None,
+        "the respawned pane carries no resume id"
+    );
+    assert!(
+        server.state.identity.session_ref_for(&new_tid).is_none(),
+        "the respawned pane seeds no identity row"
+    );
+
+    // 8. The stale ledger row stays retired SessionMissing — the respawn
+    //    gate retired it and nothing re-minted it.
+    let stale_row = server
+        .state
+        .pane_ledger
+        .load_binding("antigravity", &conv)
+        .expect("stale row still exists (retired, not deleted)");
+    assert_eq!(stale_row.state, RowState::Retired);
+    assert_eq!(
+        stale_row.retired_reason,
+        Some(RetiredReason::SessionMissing)
+    );
+
+    // 9. NO live registry claim/bind for the stale id — the behavioral
+    //    proof: a negotiated (paneReconcileV1) restore create carrying the
+    //    stale id answers the typed SESSION_MISSING refusal exactly like
+    //    the direct create door. A surviving session-ref binding would
+    //    instead ADOPT the fresh terminal via BoundElsewhere
+    //    (terminal.created naming the identity-less replacement) — the
+    //    silent replacement over a fresh conversation this test forbids.
+    //    (The claim runs only for negotiated connections —
+    //    terminal.rs's pane_reconcile_v1 gate — so the probe MUST
+    //    negotiate, or the binding would be invisible to it.)
+    let (mut ws_v1, _inv) = common::connect_with_hello(
+        &server.url,
+        serde_json::json!({
+            "type": "hello",
+            "token": common::AUTH_TOKEN,
+            "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
+            "capabilities": { "paneReconcileV1": true },
+        }),
+    )
+    .await;
+    let answer =
+        create_resume_await_answer(&mut ws_v1, &cwd, "req-agy-stale-crash-refuse", &conv).await;
+    assert_eq!(
+        answer["type"], "error",
+        "the stale id must answer the typed refusal, never an adoption: {answer}"
+    );
+    assert_eq!(answer["code"], "SESSION_MISSING", "{answer}");
+    assert!(
+        answer["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(conv.as_str()),
+        "the refusal names the stale id: {answer}"
+    );
+
+    // 10. The natural rebind: the pane's next clean typed prompt lands in
+    //     the CLI's FRESH conversation and the locator binds it — the
+    //     documented path by which the identity-less pane regains an
+    //     identity, never the stale id.
+    submit_prompt(
+        &mut ws,
+        &new_tid,
+        "fresh conversation after the stale crash oscar",
+    )
+    .await;
+    let rebound = next_associated_frame(&mut ws, &new_tid, "stale-crash-fresh-rebind").await;
+    let fresh_conv = conv_of(&new_tid);
+    assert_ne!(fresh_conv, conv);
+    assert_eq!(
+        rebound["sessionRef"]["sessionId"], fresh_conv,
+        "the natural rebind binds the CLI's fresh conversation: {rebound}"
+    );
+    assert!(
+        server
+            .state
+            .identity
+            .session_ref_for(&new_tid)
+            .is_some_and(|r| r.provider == "antigravity" && r.session_id == fresh_conv),
+        "the identity row follows the natural rebind"
+    );
+
+    server.registry.kill(&new_tid);
+    let _ = std::fs::remove_file(&argv_capture);
+    let _ = std::fs::remove_file(&fake_agy);
+}
+
+/// Focused repair round 5, Major — the cap-round hole: the live
+/// `terminal.replaced` fold clears the pane's stale session identity, but
+/// a browser DISCONNECTED during the server-side auto-resume (or reloaded
+/// after it) never sees that transient frame. Its reconnection reconciles
+/// by createRequestId carrying the pane's PRE-replacement view — the dead
+/// predecessor's terminal id and the stale sessionRef the gate refused —
+/// and the attach verdict must carry the SAME identity-clearing signal
+/// (`identityDisposition: fresh_unbound`), or the pane retains the
+/// deleted conversation id across the reconnection and the later re-bind
+/// association (the fake-contract machinery this suite exercises; a
+/// fresh id with no previousSessionId) folds as a conflict
+/// forever. End-to-end: real crash, real gate refusal, real FreshUnbound
+/// respawn, real reconnect, real verdict.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(unix)]
+async fn antigravity_fresh_unbound_reconnect_reconcile_carries_the_clearing_disposition() {
+    let home = tempfile::tempdir().expect("antigravity home tempdir");
+    let cwd_dir = tempfile::tempdir().expect("pane cwd tempdir");
+    let ledger_dir = tempfile::tempdir().expect("pane ledger tempdir");
+    let cwd = cwd_dir.path().to_string_lossy().into_owned();
+    let argv_capture = std::env::temp_dir().join(format!(
+        "freshell-antigravity-rebind-argv-fu-reconnect-{}.txt",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&argv_capture);
+    let fake_agy = write_fake_agy("fu-reconnect");
+
+    let probe = Arc::new(DiskWiredAntigravityProbe {
+        brain_root: home.path().join("brain"),
+    });
+    let server = spawn_antigravity_server_with_probe(
+        vec![antigravity_fake_spec(home.path(), &argv_capture, &fake_agy)],
+        home.path(),
+        ledger_dir.path(),
+        probe.clone(),
+    )
+    .await;
+    let mut ws = common::connect_and_capture_inventory(&server.url).await.0;
+
+    // 1. Bind a conversation the normal way: create, clean prompt, adopt.
+    let create_request_id = "req-agy-fu-reconnect";
+    let tid = create_pane(&mut ws, &cwd, create_request_id).await;
+    submit_prompt(&mut ws, &tid, "reconnect stale crash prompt quebec").await;
+    let adopted = next_associated_frame(&mut ws, &tid, "fu-reconnect-adopt").await;
+    let conv = conv_of(&tid);
+    assert_eq!(
+        adopted["sessionRef"]["sessionId"], conv,
+        "the pane adopts its own conversation first: {adopted}"
+    );
+
+    // 2. The conversation is deleted from disk (the data-loss shape).
+    std::fs::remove_dir_all(home.path().join("brain").join(&conv))
+        .expect("delete the conversation directory");
+
+    // 3. THE BROWSER DISCONNECTS (this connection is gone — it never sees
+    //    the replaced frame), and the pane crashes on a second connection.
+    //    The server-side auto-resume then runs to completion while the
+    //    browser is away.
+    drop(ws);
+    let mut ws2 = common::connect_and_capture_inventory(&server.url).await.0;
+    common::send_input(&mut ws2, &tid, "/crash").await;
+    common::send_input(&mut ws2, &tid, "\r").await;
+
+    // 4. Wait for the FreshUnbound respawn to complete server-side: a NEW
+    //    live terminal under the SAME createRequestId, identity-less, and
+    //    stamped with the replacement marker (the in-memory mirror the
+    //    reconcile derive reads).
+    let new_tid = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            if let Some(candidate) = server
+                .registry
+                .newest_live_by_create_request_id(create_request_id)
+                .filter(|t| t != &tid)
+            {
+                return candidate;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the FreshUnbound respawn completes within the budget");
+    assert_eq!(
+        registry_resume_id(&server.registry, &new_tid),
+        None,
+        "the replacement is identity-less"
+    );
+    assert!(
+        server.state.identity.session_ref_for(&new_tid).is_none(),
+        "the replacement seeds no identity row"
+    );
+    assert!(
+        server.state.identity.is_fresh_unbound_replacement(&new_tid),
+        "the respawn stamps the fresh_unbound replacement marker"
+    );
+
+    // 5. The browser comes back — a FRESH negotiated connection (it missed
+    //    every frame broadcast before this point, the replaced frame
+    //    included) — and reconciles the pane with its PRE-replacement
+    //    view: the dead predecessor's terminal handle and the stale
+    //    sessionRef the gate refused.
+    let (mut ws3, _inv) = common::connect_with_hello(
+        &server.url,
+        serde_json::json!({
+            "type": "hello",
+            "token": common::AUTH_TOKEN,
+            "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
+            "capabilities": { "paneReconcileV1": true },
+        }),
+    )
+    .await;
+    ws3.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "pane.reconcile.request",
+            "reconcileId": "rec-fu-reconnect",
+            "panes": [{
+                "paneKey": "tab1:p1",
+                "kind": "terminal",
+                "mode": "antigravity",
+                "createRequestId": create_request_id,
+                "terminalId": tid,
+                "sessionRef": { "provider": "antigravity", "sessionId": conv },
+            }],
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send pane.reconcile.request");
+    let result = next_frame_of_type(&mut ws3, "pane.reconcile.result").await;
+
+    // 6. The verdict attaches the identity-less replacement AND carries
+    //    the clearing disposition — the reconnect-path mirror of the
+    //    terminal.replaced frame the pane never saw. RED pre-fix: the
+    //    verdict carried no disposition and the pane's stale id survived
+    //    the reconnection.
+    let verdict = &result["verdicts"][0];
+    assert_eq!(verdict["paneKey"], "tab1:p1", "{result}");
+    assert_eq!(verdict["verdict"], "attach", "{result}");
+    assert_eq!(verdict["terminalId"], new_tid.as_str(), "{result}");
+    assert!(
+        verdict.get("sessionRef").is_none(),
+        "the replacement is identity-less: {result}"
+    );
+    assert_eq!(
+        verdict["identityDisposition"], "fresh_unbound",
+        "the reconnect verdict carries the identity-clearing signal: {result}"
+    );
+
+    // 7. Final-delta review round 2, Fix 1 — the verdict carries the
+    //    stale-id NOTICE too: the missed terminal.replaced frame was
+    //    also the only carrier of the visible explanation naming the
+    //    lost conversation, so the reconnect verdict must relay it
+    //    (`staleSessionNotice`) or the reconnected pane clears its id
+    //    with no explanation at all. RED pre-fix: no notice key.
+    let reconnect_notice = verdict["staleSessionNotice"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the reconnect verdict must carry staleSessionNotice: {result}"));
+    assert!(
+        reconnect_notice.contains(conv.as_str()),
+        "the reconnect verdict's notice names the stale conversation id: {reconnect_notice}"
+    );
+    assert!(
+        reconnect_notice.contains("could not be found"),
+        "the reconnect verdict's notice explains the fresh replacement: {reconnect_notice}"
+    );
+
+    server.registry.kill(&new_tid);
+    let _ = std::fs::remove_file(&argv_capture);
     let _ = std::fs::remove_file(&fake_agy);
 }

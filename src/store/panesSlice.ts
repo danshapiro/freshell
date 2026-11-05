@@ -33,7 +33,7 @@ import { loadPersistedPanes, loadPersistedTabs } from './persistMiddleware.js'
 import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
 import { mergeHydratedPaneMetadata, mergeCrossWindowPaneTitles, paneTitleMetadataEquals, type HydratePanesMeta } from './hydrate-pane-metadata-merge.js'
 import { createLogger } from '@/lib/client-logger'
-import { isDeadSessionReconcileNotice } from '@/lib/dead-session-notice'
+import { isDurableRestoreNoticeMint } from '@/lib/dead-session-notice'
 import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
 import { sanitizeRestoreError, sanitizeCrashTrace, sanitizeSessionRef, type RestoreError } from '@shared/session-contract'
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
@@ -132,6 +132,13 @@ function normalizePaneContent(
     const codexDurability = sanitizeCodexDurabilityRef(input.codexDurability)
     const restoreError = sanitizeRestoreError((input as { restoreError?: unknown }).restoreError)
     const crashTrace = sanitizeCrashTrace((input as { crashTrace?: unknown }).crashTrace)
+    // Focused repair round 3, Major 2: the stale-session notice rides the
+    // whitelist like crashTrace (a plain string — the reconcileNotice
+    // typeof pattern) so it survives hydrate/merges; persistence is a
+    // denylist and persistMiddleware keeps it.
+    const staleSessionNotice = typeof (input as { staleSessionNotice?: unknown }).staleSessionNotice === 'string'
+      ? (input as { staleSessionNotice?: string }).staleSessionNotice
+      : undefined
     const launchFailure = normalizeLaunchFailure((input as { launchFailure?: unknown }).launchFailure)
     const handoffError = normalizeHandoffError((input as { handoffError?: unknown }).handoffError)
     return {
@@ -169,6 +176,9 @@ function normalizePaneContent(
       // "survives reload" property silently dies here even though the
       // persistMiddleware strip and persistedState load both keep it).
       ...(crashTrace ? { crashTrace } : {}),
+      // Focused repair round 3, Major 2: the FreshUnbound stale-session
+      // notice survives the same way (persistent until dismissed).
+      ...(staleSessionNotice ? { staleSessionNotice } : {}),
       // kata b8ke typed failure surfaces (VOLATILE): survive identity-preserving
       // merges; a wholesale content swap omits them and clears them.
       ...(launchFailure ? { launchFailure } : {}),
@@ -711,12 +721,14 @@ function foldLiveTerminalAttach(content: TerminalPaneContent, terminalId: string
   if (!sameTerminal) content.streamId = undefined
   content.status = 'running'
   content.restoreError = undefined
-  // No-modal contract (delta review round 4, finding 1): the dead-copy
-  // mint is the DURABLE notice copy source — it lives exactly as long as
-  // the dead latch it explains. This fold clears the latch, so a resident
-  // dead mint goes with it; a NON-dead notice (corrected/duplicate/
-  // invalid copies) keeps its own one-shot lifecycle at the anchors.
-  if (isDeadSessionReconcileNotice(content.reconcileNotice)) {
+  // No-modal contract (delta review round 4, finding 1; widened by the
+  // auto-restore-warming delta fix finding 1): the DURABLE notice mints
+  // (the dead copy and the unreadable-store copy) are the RESIDENT notice
+  // copy sources — each lives exactly as long as the restoreError latch it
+  // explains. This fold clears the latch, so a resident durable mint goes
+  // with it; a NON-durable notice (corrected/duplicate/invalid copies)
+  // keeps its own one-shot lifecycle at the anchors.
+  if (isDurableRestoreNoticeMint(content.reconcileNotice)) {
     content.reconcileNotice = undefined
   }
   // kata b8ke: anchoring onto a live terminal resolves any typed launch
@@ -2007,6 +2019,10 @@ export const panesSlice = createSlice({
         content.pendingReconcile = undefined
         content.reconcileEpoch = undefined
         content.crashTrace = undefined
+        // Round 3, Major 2: the new conversation has its own identity — the
+        // stale-session notice about the abandoned one must not leak onto it
+        // (the crashTrace rule's sibling).
+        content.staleSessionNotice = undefined
         content.launchFailure = undefined
         content.handoffError = undefined
         content.namingHandle = undefined
@@ -2535,6 +2551,10 @@ export const panesSlice = createSlice({
     /**
      * Fold a pane.reconcile attach/duplicate verdict into pane content.
      * Council rule 2: never mints a createRequestId — the existing one is preserved.
+     * Stale-verdict identity guard (auto-restore-warming round-2 finding 2):
+     * `expectedCreateRequestId` is the createRequestId the REQUEST observed;
+     * on a mismatch the pane was replaced since (Replace pane keeps the
+     * paneId but re-keys the content) and this fold no-ops.
      */
     applyReconcileAttach: (
       state,
@@ -2546,12 +2566,34 @@ export const panesSlice = createSlice({
         sessionRef?: SessionLocator
         corrected?: boolean
         duplicate?: boolean
+        /**
+         * FreshUnbound replacement fold (focused repair round 2, Major 2):
+         * the server released the stale claim and the replacement terminal is
+         * identity-less — clear the pane's saved sessionRef (and the dead
+         * resume intent) so the pane mirrors the server and a later re-bind
+         * association (an association with a fresh id and no
+         * previousSessionId, emitted only by providers whose association
+         * machinery re-binds) folds without a conflict. Set by BOTH the live
+         * terminal.replaced fold and the reconcile attach verdict's
+         * fresh_unbound fold (focused repair round 5).
+         */
+        clearSessionIdentity?: boolean
+        expectedCreateRequestId?: string
       }>
     ) => {
-      const { tabId, paneId, terminalId, serverInstanceId, corrected, duplicate } = action.payload
+      const { tabId, paneId, terminalId, serverInstanceId, corrected, duplicate, clearSessionIdentity, expectedCreateRequestId } = action.payload
       if (!terminalId) return
       const content = findReconcileTerminalContent(state, tabId, paneId)
       if (!content) return
+      if (expectedCreateRequestId !== undefined && content.createRequestId !== expectedCreateRequestId) {
+        log.warn('ignoring a stale-verdict attach for replaced pane content', {
+          tabId,
+          paneId,
+          expectedCreateRequestId,
+          currentCreateRequestId: content.createRequestId ?? null,
+        })
+        return
+      }
 
       const sessionRef = sanitizeSessionRef(action.payload.sessionRef)
       // Goal-4 no-op gate (task-009b): a verdict that CONFIRMS the pane's
@@ -2570,6 +2612,11 @@ export const panesSlice = createSlice({
         && content.serverInstanceId === serverInstanceId
         && !corrected
         && !duplicate
+        // A clear-demanding fold (the FreshUnbound replacement) always
+        // runs: a reconcile verdict may have already adopted the
+        // replacement terminal id, and the no-change gate must not keep
+        // the stale sessionRef alive on the identity-less terminal.
+        && !clearSessionIdentity
         && content.status === 'running'
         && content.restoreError === undefined
         && content.launchFailure === undefined
@@ -2589,6 +2636,13 @@ export const panesSlice = createSlice({
       content.serverInstanceId = serverInstanceId
       if (sessionRef) {
         content.sessionRef = sessionRef
+        content.resumeSessionId = undefined
+      } else if (clearSessionIdentity) {
+        // FreshUnbound replacement (focused repair round 2, Major 2): the
+        // server released the stale claim — the pane mirrors the
+        // identity-less replacement terminal. The dead resume intent goes
+        // with it: the gate refused that id.
+        content.sessionRef = undefined
         content.resumeSessionId = undefined
       }
       content.pendingReconcile = undefined
@@ -2696,6 +2750,9 @@ export const panesSlice = createSlice({
      * Fold a pane.reconcile respawn/fresh verdict: clear live handles so
      * TerminalView re-creates, PRESERVING createRequestId (D4 — the
      * load-bearing difference from clearTerminalContentForRecreate).
+     * Stale-verdict identity guard (auto-restore-warming round-2 finding 2):
+     * `expectedCreateRequestId` mismatch (pane replaced since the request)
+     * no-ops the fold.
      */
     resetPaneForReconcileCreate: (
       state,
@@ -2706,11 +2763,21 @@ export const panesSlice = createSlice({
         sessionRef?: SessionLocator
         reason?: string
         corrected?: boolean
+        expectedCreateRequestId?: string
       }>
     ) => {
-      const { tabId, paneId, corrected } = action.payload
+      const { tabId, paneId, corrected, expectedCreateRequestId } = action.payload
       const content = findReconcileTerminalContent(state, tabId, paneId)
       if (!content) return
+      if (expectedCreateRequestId !== undefined && content.createRequestId !== expectedCreateRequestId) {
+        log.warn('ignoring a stale-verdict reconcile create for replaced pane content', {
+          tabId,
+          paneId,
+          expectedCreateRequestId,
+          currentCreateRequestId: content.createRequestId ?? null,
+        })
+        return
+      }
       let intent = action.payload.intent
       let reason = action.payload.reason
       const sessionRef = sanitizeSessionRef(action.payload.sessionRef)
@@ -2752,6 +2819,9 @@ export const panesSlice = createSlice({
         // trace belongs to the retired session and must not leak onto it.
         // The 'respawn' branch deliberately KEEPS it (same conversation).
         content.crashTrace = undefined
+        // Round 3, Major 2: same rule for the FreshUnbound stale-session
+        // notice — the fresh conversation is not the refused one.
+        content.staleSessionNotice = undefined
       }
       content.pendingReconcile = intent
       // A1 fix: same-createRequestId folds are only observable via the epoch bump.
@@ -2760,11 +2830,13 @@ export const panesSlice = createSlice({
         content.reconcileNotice = RECONCILE_NOTICE_CORRECTED
       } else if (intent === 'fresh' && reason) {
         content.reconcileNotice = reconcileFreshNotice(reason)
-      } else if (isDeadSessionReconcileNotice(content.reconcileNotice)) {
-        // No-modal contract (delta review round 4, finding 1): the reset
-        // cleared the dead latch above, so the durable dead-copy mint —
-        // retained precisely while that latch holds — goes with it
-        // (unless this fold's own corrected/fresh copy replaced it).
+      } else if (isDurableRestoreNoticeMint(content.reconcileNotice)) {
+        // No-modal contract (delta review round 4, finding 1; widened by
+        // the auto-restore-warming delta fix finding 1): the reset cleared
+        // the restoreError latch above, so the durable notice mint — dead
+        // or unreadable-store, retained precisely while its latch holds —
+        // goes with it (unless this fold's own corrected/fresh copy
+        // replaced it).
         content.reconcileNotice = undefined
       }
       clearRestoreFallbackAttemptForPane(state, tabId, paneId)
@@ -2778,6 +2850,9 @@ export const panesSlice = createSlice({
      * providers (codex/opencode key live sessions by durable id; claude gains
      * server-side durable→live resolution in Task 10b).
      * Council rule 2: never mints a createRequestId.
+     * Stale-verdict identity guard (auto-restore-warming round-2 finding 2):
+     * `expectedCreateRequestId` mismatch (pane replaced since the request)
+     * no-ops the fold.
      */
     applyFreshAgentReconcileAttach: (
       state,
@@ -2788,11 +2863,21 @@ export const panesSlice = createSlice({
         serverInstanceId?: string
         corrected?: boolean
         duplicate?: boolean
+        expectedCreateRequestId?: string
       }>
     ) => {
-      const { tabId, paneId, sessionRef, serverInstanceId, corrected, duplicate } = action.payload
+      const { tabId, paneId, sessionRef, serverInstanceId, corrected, duplicate, expectedCreateRequestId } = action.payload
       const content = findReconcilePaneContent(state, tabId, paneId)
       if (!content || content.kind !== 'fresh-agent') return
+      if (expectedCreateRequestId !== undefined && content.createRequestId !== expectedCreateRequestId) {
+        log.warn('ignoring a stale-verdict fresh-agent attach for replaced pane content', {
+          tabId,
+          paneId,
+          expectedCreateRequestId,
+          currentCreateRequestId: content.createRequestId ?? null,
+        })
+        return
+      }
       if (!sessionRef?.sessionId || sessionRef.provider !== content.provider) return // malformed verdict — no-op
       content.sessionId = sessionRef.sessionId
       content.sessionRef = { provider: sessionRef.provider, sessionId: sessionRef.sessionId }
@@ -2813,6 +2898,9 @@ export const panesSlice = createSlice({
      * clear live handles so FreshAgentView re-creates, PRESERVING
      * createRequestId (council rule 2 — folds re-fire via reconcileEpoch).
      * Respawn provider mismatch degrades loudly to fresh.
+     * Stale-verdict identity guard (auto-restore-warming round-2 finding 2):
+     * `expectedCreateRequestId` mismatch (pane replaced since the request)
+     * no-ops the fold.
      */
     resetFreshAgentPaneForReconcileCreate: (
       state,
@@ -2823,12 +2911,22 @@ export const panesSlice = createSlice({
         sessionRef?: SessionLocator
         reason?: string
         corrected?: boolean
+        expectedCreateRequestId?: string
       }>
     ) => {
-      const { tabId, paneId, sessionRef, reason, corrected } = action.payload
+      const { tabId, paneId, sessionRef, reason, corrected, expectedCreateRequestId } = action.payload
       let { intent } = action.payload
       const content = findReconcilePaneContent(state, tabId, paneId)
       if (!content || content.kind !== 'fresh-agent') return
+      if (expectedCreateRequestId !== undefined && content.createRequestId !== expectedCreateRequestId) {
+        log.warn('ignoring a stale-verdict fresh-agent reconcile create for replaced pane content', {
+          tabId,
+          paneId,
+          expectedCreateRequestId,
+          currentCreateRequestId: content.createRequestId ?? null,
+        })
+        return
+      }
       // A missing web-runtime observation does not erase an owned conversation.
       // Preserve only its saved locator; the live handle must still clear so
       // the original-request bootstrap runs. Invalid respawn is never this case.
@@ -2946,6 +3044,26 @@ export const panesSlice = createSlice({
     ) => {
       const content = findReconcileTerminalContent(state, action.payload.tabId, action.payload.paneId)
       if (content && content.crashTrace) delete content.crashTrace
+    },
+
+    // Focused repair round 3, Major 2 (the setPaneCrashTrace pattern's
+    // sibling): the FreshUnbound stale-session notice — written on the
+    // terminal.replaced fold when the frame carries staleSessionNotice
+    // (the path the pane actually consumes), cleared by user dismissal.
+    // Resumed/MintedReplacement frames never write it.
+    setPaneStaleSessionNotice: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string; staleSessionNotice: string }>
+    ) => {
+      const content = findReconcileTerminalContent(state, action.payload.tabId, action.payload.paneId)
+      if (content) content.staleSessionNotice = action.payload.staleSessionNotice
+    },
+    clearPaneStaleSessionNotice: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string }>
+    ) => {
+      const content = findReconcileTerminalContent(state, action.payload.tabId, action.payload.paneId)
+      if (content && content.staleSessionNotice) delete content.staleSessionNotice
     },
 
     setReconcileWarming: (state, action: PayloadAction<ReconcileWarmingState>) => {
@@ -3118,6 +3236,8 @@ export const {
   clearPaneCloseError,
   setPaneCrashTrace,
   clearPaneCrashTrace,
+  setPaneStaleSessionNotice,
+  clearPaneStaleSessionNotice,
   setReconcileWarming,
   clearReconcileWarming,
   setReconcilePendingPanes,

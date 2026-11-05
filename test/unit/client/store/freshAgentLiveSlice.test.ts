@@ -23,6 +23,7 @@ import freshAgentLiveReducer, {
 } from '@/store/freshAgentLiveSlice'
 import { FreshAgentSnapshotSchema } from '@shared/fresh-agent-contract'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
+import { mergeFreshAgentTranscriptProjection } from '@/lib/fresh-agent-transcript-projection'
 import { LIVE_STREAM_FLUSH_MS, streamBatcherFor } from '@/lib/fresh-agent-stream-batcher'
 import type { LiveStreamOp } from '@/store/freshAgentLiveTypes'
 
@@ -91,6 +92,99 @@ describe('freshAgentLive slice (transcript-live D3)', () => {
     expect(tail(store, codexKey).projection?.turns[0].outputState?.diagnostic).not.toBe('interrupted')
     store.dispatch(markSessionLost(codexLocator))
     expect(tail(store, codexKey).projection?.turns[0]).toMatchObject({ error: { message: 'The native turn failed' }, outputState: { diagnostic: 'unsaved', refreshPending: false } })
+  })
+
+  it.each([false, true])('retains a late failure across an older final snapshot (snapshot first: %s)', (snapshotFirst) => {
+    const store = createStore()
+    const failure = { id: 't', turnId: 't', role: 'assistant', summary: '', items: [], error: { name: 'CodexError', message: 'Provider failed' } }
+    const finalSnapshot = (revision: number, turns: unknown[]) => FreshAgentSnapshotSchema.parse({
+      ...codexSnapshot(revision), turns,
+      extensions: { codex: { projection: { id: 'p', historyGeneration: 0, eventRevision: revision, eventOwnedTurnIds: [], nativePreviewTurnIds: [], nativeFinalTurnIds: ['t'], turnRows: { t: ['t'] }, turnOutputStates: {} } } },
+    })
+    const older = finalSnapshot(2, [{ id: 't', turnId: 't', role: 'assistant', summary: '', items: [] }])
+    const authoritative = finalSnapshot(3, [{ ...failure, summary: 'Saved turn' }])
+    const receive = (ops: unknown[]) => handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event', ...codexLocator,
+      event: { type: 'freshAgent.transcript.patch', sessionId: codexLocator.sessionId, projectionId: 'p', historyGeneration: 0, ops },
+    })
+    store.dispatch(transcriptProjectionSnapshotReceived({ ...codexLocator, snapshot: codexSnapshot(1) }))
+    handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...codexLocator, event: { type: 'freshAgent.status', status: 'exited' } })
+    if (snapshotFirst) store.dispatch(transcriptProjectionSnapshotReceived({ ...codexLocator, snapshot: older }))
+    receive([{ op: 'resetTurn', nativeTurnId: 't', correctSettled: true, turns: [failure], revision: 3 }])
+    if (!snapshotFirst) store.dispatch(transcriptProjectionSnapshotReceived({ ...codexLocator, snapshot: older }))
+
+    expect(mergeFreshAgentTranscriptProjection(older, tail(store, codexKey).projection).map((turn) => turn.error?.message).filter(Boolean)).toEqual(['Provider failed'])
+    store.dispatch(transcriptProjectionSnapshotReceived({ ...codexLocator, snapshot: authoritative }))
+    expect(mergeFreshAgentTranscriptProjection(authoritative, tail(store, codexKey).projection)).toEqual(authoritative.turns)
+  })
+
+  it('settles the corrected turn after a system error snapshot, even without a separate settle patch', () => {
+    const store = createStore()
+    const failure = { id: 't', turnId: 't', role: 'assistant', summary: '', items: [], error: { name: 'CodexError', message: 'Provider failed' } }
+    store.dispatch(transcriptProjectionSnapshotReceived({ ...codexLocator, snapshot: codexSnapshot(1) }))
+    handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...codexLocator, event: { type: 'freshAgent.session.snapshot', latestTurnId: null, status: 'exited' } })
+    handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...codexLocator, event: { type: 'freshAgent.transcript.patch', sessionId: codexLocator.sessionId, projectionId: 'p', historyGeneration: 0, ops: [{ op: 'resetTurn', nativeTurnId: 't', correctSettled: true, turns: [failure], revision: 2 }] } })
+    handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...codexLocator, event: { type: 'freshAgent.transcript.patch', sessionId: codexLocator.sessionId, projectionId: 'p', historyGeneration: 0, ops: [{ op: 'resetTurn', nativeTurnId: 't', turns: codexSnapshot().turns, revision: 3 }] } })
+    expect(tail(store, codexKey).projection?.turns).toEqual([failure])
+  })
+
+  it.each([false, true])('retains an ordinary failed completion when an older final snapshot races it (snapshot first: %s)', (snapshotFirst) => {
+    const store = createStore()
+    const initial = codexSnapshot(1)
+    const failure = { ...initial.turns[0], error: { name: 'CodexError', message: 'Model is at capacity' } }
+    const finalSnapshot = (revision: number, turn: unknown) => FreshAgentSnapshotSchema.parse({
+      ...initial, turns: [turn],
+      extensions: { codex: { projection: { id: 'p', historyGeneration: 0, eventRevision: revision, eventOwnedTurnIds: [], nativePreviewTurnIds: [], nativeFinalTurnIds: ['t'], turnRows: { t: ['t'] }, turnOutputStates: {} } } },
+    })
+    const older = finalSnapshot(1, initial.turns[0])
+    const saved = finalSnapshot(3, { ...failure, summary: 'Saved failure' })
+    const receive = (ops: unknown[]) => handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event', ...codexLocator,
+      event: { type: 'freshAgent.transcript.patch', sessionId: codexLocator.sessionId, projectionId: 'p', historyGeneration: 0, ops },
+    })
+
+    store.dispatch(transcriptProjectionSnapshotReceived({ ...codexLocator, snapshot: initial }))
+    if (snapshotFirst) store.dispatch(transcriptProjectionSnapshotReceived({ ...codexLocator, snapshot: older }))
+    receive([
+      { op: 'resetTurn', nativeTurnId: 't', turns: [failure], completedItemIds: [], nonAppendableItemIds: [], correctSettled: true, revision: 2 },
+      { op: 'settleTurn', nativeTurnId: 't', status: 'failed', revision: 3 },
+    ])
+    if (!snapshotFirst) store.dispatch(transcriptProjectionSnapshotReceived({ ...codexLocator, snapshot: older }))
+    receive([
+      { op: 'appendItem', nativeTurnId: 't', rowId: 't', itemId: 'a', field: 'text', text: 'late', revision: 4 },
+      { op: 'resetTurn', nativeTurnId: 't', turns: initial.turns, revision: 5 },
+    ])
+
+    const shown = mergeFreshAgentTranscriptProjection(older, tail(store, codexKey).projection)
+    expect(shown).toHaveLength(1)
+    expect(shown[0]).toMatchObject({ error: { message: 'Model is at capacity' }, items: [{ id: 'a', text: 'Hel' }] })
+    store.dispatch(transcriptProjectionSnapshotReceived({ ...codexLocator, snapshot: saved }))
+    expect(mergeFreshAgentTranscriptProjection(saved, tail(store, codexKey).projection)).toEqual(saved.turns)
+  })
+
+  it('shows a failure from a newer generation while waiting for its history snapshot', () => {
+    const store = createStore()
+    const older = codexSnapshot(1)
+    const failure = { ...older.turns[0], error: { name: 'CodexError', message: 'Provider failed' } }
+    store.dispatch(transcriptProjectionSnapshotReceived({ ...codexLocator, snapshot: older }))
+    handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...codexLocator, event: {
+      type: 'freshAgent.transcript.patch', sessionId: codexLocator.sessionId, projectionId: 'p', historyGeneration: 1, afterRevision: 9,
+      ops: [{ op: 'resetTurn', nativeTurnId: 't', correctSettled: true, turns: [failure], revision: 10 }, { op: 'settleTurn', nativeTurnId: 't', status: 'failed', revision: 11 }],
+    } })
+    expect(mergeFreshAgentTranscriptProjection(older, tail(store, codexKey).projection)).toMatchObject([{ error: { message: 'Provider failed' } }])
+    expect(tail(store, codexKey).projection?.needsResnapshot).toBe(true)
+
+    // A delayed older response must not remove the failure or clear the gap.
+    store.dispatch(transcriptProjectionSnapshotReceived({ ...codexLocator, snapshot: older }))
+    expect(mergeFreshAgentTranscriptProjection(older, tail(store, codexKey).projection)).toMatchObject([{ error: { message: 'Provider failed' } }])
+    expect(tail(store, codexKey).projection?.needsResnapshot).toBe(true)
+    const saved = FreshAgentSnapshotSchema.parse({
+      ...older, turns: [{ ...failure, summary: 'Saved failure' }],
+      extensions: { codex: { projection: { id: 'p', historyGeneration: 1, eventRevision: 11, eventOwnedTurnIds: [], nativePreviewTurnIds: [], nativeFinalTurnIds: ['t'], turnRows: { t: ['t'] }, turnOutputStates: {} } } },
+    })
+    store.dispatch(transcriptProjectionSnapshotReceived({ ...codexLocator, snapshot: saved }))
+    expect(tail(store, codexKey).projection?.needsResnapshot).toBe(false)
+    expect(mergeFreshAgentTranscriptProjection(saved, tail(store, codexKey).projection)).toEqual(saved.turns)
   })
   it('binds each assistant message to the first unbound streamed block of its message id and kind', () => {
     const store = createStore()
@@ -386,6 +480,61 @@ describe('websocket routing into the live tail (transcript-live D3)', () => {
     expect(tail(store).notice?.seq).toBe(2)
     // A notice never ends the turn or touches the session (P4).
     expect(store.getState().freshAgent.sessions).toBe(sessionsBefore)
+  })
+
+  it.each(['error-first', 'feedback-first'] as const)(
+    'retains error and non-error notices independently through materialization (%s)',
+    (order) => {
+      const store = createStore()
+      const error = { type: 'freshAgent.notice', level: 'error', code: 'PROVIDER_ERROR', message: 'Model at capacity' }
+      const feedback = { type: 'freshAgent.notice', level: 'warning', code: 'FOLLOWUP', message: 'Later feedback' }
+      for (const event of order === 'error-first' ? [error, feedback] : [feedback, error]) {
+        handleFreshAgentMessage(store.dispatch, frame(event))
+      }
+
+      const expectedError = { seq: order === 'error-first' ? 1 : 2, level: 'error', code: 'PROVIDER_ERROR', message: 'Model at capacity' }
+      const expectedFeedback = { seq: order === 'error-first' ? 2 : 1, level: 'warning', code: 'FOLLOWUP', message: 'Later feedback' }
+      expect(tail(store).errorNotice).toEqual(expectedError)
+      expect(tail(store).notice).toEqual(expectedFeedback)
+
+      store.dispatch(materializeSession({ ...locator, previousSessionId: 'live-1', sessionId: 'live-real' }))
+      expect(tail(store)).toBeUndefined()
+      expect(tail(store, 'freshclaude:claude:live-real')).toMatchObject({
+        errorNotice: expectedError,
+        notice: expectedFeedback,
+      })
+    },
+  )
+
+  it.each([
+    ['CODEX_UNATTRIBUTED_PROVIDER_ERROR', 'warning'],
+    ['CODEX_UNATTRIBUTED_PROVIDER_ERROR_CLEARED', 'info'],
+    ['CODEX_PENDING_PROVIDER_ERROR', 'warning'],
+    ['CODEX_PENDING_PROVIDER_ERROR_CLEARED', 'info'],
+  ] as const)('keeps user-facing feedback when %s follows in the same batch', (code, level) => {
+    const store = createStore()
+    const codex = { sessionId: 'codex-notice', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    const codexFrame = (event: Record<string, unknown>) => ({
+      type: 'freshAgent.event', ...codex, event: { sessionId: codex.sessionId, ...event },
+    })
+    const warning = { type: 'freshAgent.notice', level: 'warning', code: 'CLI_WARNING', message: 'Check the configured provider.' }
+    expect(handleFreshAgentMessage(store.dispatch, codexFrame(warning))).toBe(true)
+    expect(handleFreshAgentMessage(store.dispatch, codexFrame({
+      type: 'freshAgent.notice', level, code, turnId: 'turn-1', message: 'Retained diagnostic changed.',
+    }))).toBe(true)
+    expect(tail(store, 'freshcodex:codex:codex-notice')?.notice).toMatchObject({
+      level: 'warning', code: warning.code, message: warning.message,
+    })
+  })
+
+  it('preserves notices with a matching code from another provider', () => {
+    const store = createStore()
+    expect(handleFreshAgentMessage(store.dispatch, frame({
+      type: 'freshAgent.notice', level: 'warning', code: 'CODEX_PENDING_PROVIDER_ERROR', message: 'Provider feedback',
+    }))).toBe(true)
+    expect(tail(store)?.notice).toMatchObject({
+      level: 'warning', code: 'CODEX_PENDING_PROVIDER_ERROR', message: 'Provider feedback',
+    })
   })
 
   it('applies a session\'s pending stream events before a stopped recovery removes it, leaving no tail behind', () => {

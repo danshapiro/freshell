@@ -52,6 +52,7 @@ async fn spawn_server() -> String {
         Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
 
     let state = WsState {
+        session_index_ready: None,
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
         layout: Default::default(),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
@@ -456,6 +457,8 @@ async fn capability_free_ready_frame_raw_text_is_byte_identical_to_the_pre_branc
         "terminalLifetimeClaimV1",
         "runtimeOwners",
         "oldestRetainedSeq",
+        "sessionIndexReadyV1",
+        "sessionIndexReady",
     ] {
         assert!(
             !text.contains(forbidden),
@@ -487,7 +490,12 @@ async fn sibling_negotiation_ready_capabilities_raw_text_is_byte_identical() {
         "the echoed capabilities object must be the literal pre-branch bytes \
          (key order, separators, no new keys): {text}"
     );
-    for forbidden in ["pacedTerminalReplayV1", "terminalLifetimeClaimV1"] {
+    for forbidden in [
+        "pacedTerminalReplayV1",
+        "terminalLifetimeClaimV1",
+        "sessionIndexReadyV1",
+        "sessionIndexReady",
+    ] {
         assert!(
             !text.contains(forbidden),
             "a non-opting client's ready must not mention {forbidden}: {text}"
@@ -522,4 +530,57 @@ async fn combined_negotiation_ready_carries_both_the_paced_and_sibling_keys() {
         text.contains(r#""capabilities":{"paneReconcileV1":true,"pacedTerminalReplayV1":true}"#),
         "the combined echo must keep the frozen literal byte order: {text}"
     );
+}
+
+/// Session-index readiness (auto-restore-warming Task 2): a hello WITH
+/// `sessionIndexReadyV1: true` gets the echo advertised back in
+/// `ready.capabilities` AND the `ready.sessionIndexReady` state field. The
+/// test state wires no readiness watch, which reads as `false` — the honest
+/// cold-index answer, exactly the value a boot without a session index
+/// reports.
+#[tokio::test]
+async fn negotiated_hello_gets_session_index_ready_echo_and_state_in_ready() {
+    let url = spawn_server().await;
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("ws connect");
+
+    let ready = hello_ready(&mut ws, serde_json::json!({ "sessionIndexReadyV1": true })).await;
+    assert_eq!(
+        ready["capabilities"],
+        serde_json::json!({ "sessionIndexReadyV1": true }),
+        "a negotiated hello must get exactly the session-index-ready echo: {ready}"
+    );
+    assert_eq!(
+        ready["sessionIndexReady"], false,
+        "no readiness watch wired reads as a cold index: {ready}"
+    );
+}
+
+/// The frozen-wire twin: a hello that negotiates OTHER capabilities but NOT
+/// `sessionIndexReadyV1` gets a `ready` whose raw text mentions NEITHER the
+/// echo key NOR the state field — the negotiation never leaks to a
+/// non-opting client's handshake.
+#[tokio::test]
+async fn non_session_index_negotiation_keeps_ready_byte_identical() {
+    let url = spawn_server().await;
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("ws connect");
+
+    let text = hello_ready_text(
+        &mut ws,
+        serde_json::json!({ "paneReconcileV1": true, "pacedTerminalReplayV1": true }),
+    )
+    .await;
+    assert!(
+        text.contains(r#""capabilities":{"paneReconcileV1":true,"pacedTerminalReplayV1":true}"#),
+        "a non-opting negotiation keeps today's capabilities shape: {text}"
+    );
+    for forbidden in ["sessionIndexReadyV1", "sessionIndexReady"] {
+        assert!(
+            !text.contains(forbidden),
+            "a client that did not opt into session-index readiness must not see {forbidden}: {text}"
+        );
+    }
 }

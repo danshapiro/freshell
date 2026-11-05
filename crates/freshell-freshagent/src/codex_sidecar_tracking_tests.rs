@@ -409,7 +409,13 @@ async fn handle_kill_leaves_no_record() {
 /// sidecar lifecycle is guarding a writer tree rather than only a direct `sleep` child.
 #[tokio::test]
 async fn durable_writer_fixture_exposes_live_witness_and_stops_with_the_sidecar() {
-    let _env = ENV_LOCK.lock().await;
+    for defer_cleanup in [false, true] {
+        let _env = ENV_LOCK.lock().await;
+        assert_durable_writer_stops_after_completion(defer_cleanup).await;
+    }
+}
+
+async fn assert_durable_writer_stops_after_completion(defer_cleanup: bool) {
     std::env::set_var("CODEX_CMD", fake_codex_cmd());
     let guard = TrackingStoreGuard::install();
     let dir = tempfile::tempdir().expect("fixture witness directory");
@@ -435,19 +441,46 @@ async fn durable_writer_fixture_exposes_live_witness_and_stops_with_the_sidecar(
     let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
     st.set_ownership(Arc::clone(&registry));
 
-    let session_id = create_tracked_session(&st, &mut rx, "req-wfah-durable-writer").await;
-    for _ in 0..100 {
-        if ready_path.exists() && port_path.exists() && pid_path.exists() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    // Exercise the deferred contract deterministically, without trying to exhaust a
+    // wall-clock budget. The real cleanup remains blocked until the test observes
+    // the pending response, then performs the same physical tree reap as production.
+    let release_cleanup = Arc::new(tokio::sync::Semaphore::new(0));
+    if defer_cleanup {
+        let first_probe = Arc::new(AtomicBool::new(true));
+        let release_cleanup = Arc::clone(&release_cleanup);
+        st.set_sidecar_cleanup_probe(Arc::new(move |recorded| {
+            let first_probe = Arc::clone(&first_probe);
+            let release_cleanup = Arc::clone(&release_cleanup);
+            Box::pin(async move {
+                if first_probe.swap(false, Ordering::SeqCst) {
+                    return Ok(false);
+                }
+                let _released = release_cleanup
+                    .acquire()
+                    .await
+                    .expect("cleanup gate stays open");
+                Ok(crate::session_lease::kill_and_confirm_recorded_tree_dead(
+                    &recorded,
+                    "FRESHELL_CODEX_SIDECAR_ID",
+                )
+                .await)
+            })
+        }));
     }
+
+    // The fixture does not accept app-server requests until its writer has sent
+    // the readiness acknowledgement, so all three witness files already exist.
+    let session_id = create_tracked_session(&st, &mut rx, "req-wfah-durable-writer").await;
     assert!(ready_path.exists(), "writer readiness witness must land");
     let port: u16 = std::fs::read_to_string(&port_path)
         .expect("writer port witness")
         .trim()
         .parse()
         .expect("numeric loopback port");
+    let initial_lines = std::fs::read_to_string(&output_path)
+        .expect("durable writer output")
+        .lines()
+        .count();
     let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .expect("durable writer loopback port remains reachable");
@@ -457,29 +490,27 @@ async fn durable_writer_fixture_exposes_live_witness_and_stops_with_the_sidecar(
         .await
         .expect("read writer response");
     assert!(String::from_utf8_lossy(&response).contains("durable writer"));
-    let initial_lines = std::fs::read_to_string(&output_path)
-        .expect("durable writer output")
-        .lines()
-        .count();
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let later_lines = std::fs::read_to_string(&output_path)
-        .expect("durable writer output after interval")
+        .expect("durable writer output after acknowledgement")
         .lines()
         .count();
-    assert!(later_lines > initial_lines, "writer must append repeatedly");
+    assert!(
+        later_lines > initial_lines,
+        "writer acknowledges a completed append"
+    );
     let writer_pid: u32 = std::fs::read_to_string(&pid_path)
         .expect("writer pid witness")
         .trim()
         .parse()
         .expect("numeric writer pid");
     assert!(
-        std::path::Path::new(&format!("/proc/{writer_pid}")).exists(),
-        "the durable writer is a child distinct from the app-server"
+        proc_starttime(writer_pid as i32).is_some(),
+        "the durable writer is live before teardown"
     );
 
     st.handle_kill(freshell_protocol::FreshAgentKill {
         provider: freshell_protocol::AgentProvider::Codex,
-        session_id,
+        session_id: session_id.clone(),
         session_type: freshell_protocol::SessionType::Freshcodex,
         cwd: None,
         observed_epoch: None,
@@ -487,13 +518,63 @@ async fn durable_writer_fixture_exposes_live_witness_and_stops_with_the_sidecar(
     })
     .await;
 
+    let killed: Value = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let frame: Value = serde_json::from_str(&rx.recv().await.expect("kill response"))
+                .expect("valid kill frame");
+            if frame["type"] == "freshAgent.killed"
+                && frame["sessionId"].as_str() == Some(session_id.as_str())
+            {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("kill response");
+    if defer_cleanup {
+        assert_eq!(
+            killed["success"], false,
+            "the cleanup barrier must be exercised"
+        );
+        assert!(
+            matches!(
+                registry.observe("codex", &session_id).state,
+                freshell_ownership::OwnershipState::Stopping { .. }
+            ),
+            "the pending teardown retains its ownership fence"
+        );
+        assert!(
+            proc_starttime(writer_pid as i32).is_some(),
+            "the writer stays alive until the test releases the cleanup barrier"
+        );
+    }
+    if killed["success"] != true {
+        assert_eq!(
+            killed["code"], "TEARDOWN_NOT_CONFIRMED",
+            "only a pending teardown may complete asynchronously: {killed}"
+        );
+        release_cleanup.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while !matches!(
+                registry.observe("codex", &session_id).state,
+                freshell_ownership::OwnershipState::Vacant
+            ) {
+                rx.recv()
+                    .await
+                    .expect("ownership completion stream stays open");
+            }
+        })
+        .await
+        .expect("pending teardown publishes its ownership release");
+    }
+
     assert!(
         proc_starttime(writer_pid as i32).is_none(),
-        "the owned writer child must stop with the app-server (a zombie may remain until PID 1 reaps it)"
+        "reported teardown completion must mean the owned writer is dead"
     );
     assert!(
         guard.records().is_empty(),
-        "all owned writer records are scrubbed"
+        "all owned writer records are scrubbed after completion"
     );
 }
 

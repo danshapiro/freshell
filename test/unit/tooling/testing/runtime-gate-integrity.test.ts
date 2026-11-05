@@ -108,7 +108,7 @@ describe('self-contained runtime evidence', () => {
 
 describe('candidate-bound runtime qualification', () => {
   function git(...args: string[]) {
-    return execFileSync('git', args, { cwd: root, encoding: 'utf8', env: {
+    return execFileSync('git', args, { timeout: 30_000, killSignal: 'SIGKILL', cwd: root, encoding: 'utf8', env: {
       ...process.env,
       GIT_AUTHOR_NAME: 'Runtime Test', GIT_AUTHOR_EMAIL: 'runtime-test@example.invalid',
       GIT_COMMITTER_NAME: 'Runtime Test', GIT_COMMITTER_EMAIL: 'runtime-test@example.invalid',

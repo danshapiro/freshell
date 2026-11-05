@@ -62,4 +62,11 @@ export const ReadyMessageSchema = z.object({
     // `aliasOf` carries the navigation to the canonical key.
     aliasOf: z.string().min(1).optional(),
   })).optional().catch(undefined),
+  // Session-index readiness state (auto-restore-warming Task 2): present
+  // iff this connection's hello negotiated `sessionIndexReadyV1` (old
+  // servers and non-negotiating clients omit it entirely). Same
+  // ready-frame doctrine: `.catch(undefined)` degrades a malformed value to
+  // "unknown" — never failing the WHOLE ready frame, which would silently
+  // disable restart detection.
+  sessionIndexReady: z.boolean().optional().catch(undefined),
 })

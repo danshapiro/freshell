@@ -1441,6 +1441,35 @@ describe('requestSessionHandoff()', () => {
     })
   })
 
+  it('parses a retryable maintenance refusal from the handoff route', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(503, {
+      ok: false,
+      error: {
+        code: 'HOST_AGENT_MAINTENANCE',
+        message: 'host coding-agent starts are paused for maintenance',
+        retryable: true,
+        ownerGeneration: 4,
+      },
+    }))
+
+    const result = await requestSessionHandoff({
+      provider: 'claude',
+      sessionId: 'sid-maintenance',
+      targetKind: 'terminal',
+      mode: 'claude',
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        code: 'HOST_AGENT_MAINTENANCE',
+        message: 'host coding-agent starts are paused for maintenance',
+        retryable: true,
+        ownerGeneration: 4,
+      },
+    })
+  })
+
   // b8ke delta round-3 F5: the StaleStart-fence ordinary-retry refusal
   // (the acknowledged force-clear is the only recovery) parses through
   // the same integration path.
@@ -1456,6 +1485,7 @@ describe('requestSessionHandoff()', () => {
   it('accepts EVERY server-emitted handoff failure code (the locked contract list)', () => {
     const SERVER_EMITTED_FAILURE_CODES = [
       'BAD_REQUEST',
+      'HOST_AGENT_MAINTENANCE',
       'STALE_GENERATION',
       'SESSION_FENCED',
       'HANDOFF_IN_PROGRESS',

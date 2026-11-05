@@ -836,6 +836,49 @@ async fn lane_noop_does_not_report_a_submitted_turn() {
     assert!(body["data"].get("submittedTurnId").is_none(), "{body}");
 }
 
+struct LaneWithoutTurnIdentity;
+
+#[async_trait::async_trait]
+impl FreshAgentRestLane for LaneWithoutTurnIdentity {
+    async fn create_agent(
+        self: Arc<Self>,
+        _: RestLaneCreate,
+    ) -> Result<RestLaneCreated, RestLaneError> {
+        unreachable!("the test sends to an existing pane")
+    }
+
+    async fn send_agent(&self, request: RestLaneSend) -> Result<RestLaneSendResult, RestLaneError> {
+        Ok(RestLaneSendResult {
+            session_id: request.session_id,
+            completed: false,
+            submitted_turn_id: None,
+            noop: false,
+        })
+    }
+}
+
+#[tokio::test]
+async fn lane_with_unknown_turn_identity_does_not_report_the_request_id_as_a_turn() {
+    let state = state_with_registry();
+    let (tab, pane_id) = state.layout.create_tab(None);
+    state.layout.attach_pane_content(&tab, &pane_id, json!({
+        "kind":"fresh-agent", "provider":"codex", "sessionType":"freshcodex", "sessionId":"durable-codex",
+    }));
+    state
+        .set_hosted_rest_gateway(Arc::new(LaneWithoutTurnIdentity))
+        .unwrap();
+    let (status, body) = post(
+        app(state),
+        &format!("/api/panes/{pane_id}/send-keys"),
+        json!({"data":"hello\r", "requestId":"request-is-not-a-turn"}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["status"], "approx");
+    assert!(body["data"].get("submittedTurnId").is_none(), "{body}");
+}
+
 #[tokio::test]
 async fn lane_controls_use_the_current_layout_identity_after_a_rest_created_pane_is_replaced() {
     const CURRENT_ID: &str = "67cebd37-9576-4de0-93bb-8f286f5fc499";

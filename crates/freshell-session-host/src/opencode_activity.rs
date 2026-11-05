@@ -53,7 +53,7 @@ impl OpencodeInputReadiness {
                     NativeReadiness::Ready => return Ok(()),
                     NativeReadiness::Connecting => {}
                     NativeReadiness::Disconnected | NativeReadiness::Exited => {
-                        return Err(disconnected_error())
+                        return Err(disconnected_error());
                     }
                 }
                 self.0.changed().await.map_err(|_| disconnected_error())?;

@@ -909,6 +909,32 @@ impl FreshClaudeState {
         self.test_holds.hold_fork_child()
     }
 
+    /// Replace a live writer while keeping the original stdin open. This lets
+    /// the hosted actor exercise ambiguous writes without stopping its sidecar.
+    #[cfg(feature = "test-support")]
+    pub async fn replace_sidecar_writer_for_tests<W>(
+        &self,
+        session_id: &str,
+        writer: W,
+    ) -> Option<Box<dyn Send>>
+    where
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let key = self.resolve_session_key(session_id).await?;
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions.get_mut(&key)?;
+        let (writer, _fault) = crate::claude_sidecar_io::SidecarWriter::spawn(
+            writer,
+            crate::claude_sidecar_io::SidecarLogLabels::new(
+                "hosted-write-test",
+                "freshclaude",
+                None,
+            ),
+            Duration::from_secs(1),
+        );
+        Some(Box::new(std::mem::replace(&mut session.stdin, writer)))
+    }
+
     /// Spawn one claude sidecar process (create, attach-resume and rollback all
     /// come through here) for a session of `session_type`.
     async fn spawn_sidecar_process(&self, session_type: &str) -> Result<SpawnedSidecar, String> {
@@ -4116,9 +4142,27 @@ impl FreshClaudeState {
         if let Some(images) = msg.images {
             send_req["images"] = json!(images);
         }
-        if let Err(err) = writer.write(&send_req).await {
-            // The write never went out: take back exactly this send (whatever
-            // else is owed stays).
+        if let Err(err) = writer.write_tracked(&send_req).await {
+            if err.possibly_delivered {
+                // A full line can have reached the sidecar before a failed or
+                // timed-out flush. Keep the ledger reservation and tell only
+                // clients that understand an uncertain send.
+                let message = "FRESH_AGENT_DELIVERY_AMBIGUOUS: Claude could not confirm whether the message was delivered.".to_string();
+                tracing::warn!(provider = PROVIDER, session_id = %session_id,
+                    request_id = request_id.as_deref(), "freshagent.claude.send_delivery_ambiguous");
+                self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                    provider: PROVIDER.to_string(),
+                    session_id: session_id.clone(),
+                    session_type: session_type.to_string(),
+                    event: json!({"type":"freshAgent.send.uncertain", "sessionId":session_id,
+                        "requestId":request_id, "message":message}),
+                }));
+                return ClaudeSendOutcome::Ambiguous {
+                    message,
+                    submitted_turn_id,
+                };
+            }
+            // The writer was already closed before it could accept this line.
             self.take_back_unwritten_send(
                 &ledger,
                 &quiet,
@@ -4126,7 +4170,7 @@ impl FreshClaudeState {
                 session_type,
                 &submitted_turn_id,
             );
-            return self.refuse_send(&request_id, "CLAUDE_SEND_FAILED", &err);
+            return self.refuse_send(&request_id, "CLAUDE_SEND_FAILED", &err.message);
         }
         drop(ownership_guard);
 
@@ -7262,6 +7306,8 @@ pub(crate) mod tests {
     mod recovery_tests;
     mod refusal_tests;
     mod settings_persistence_tests;
+    mod settlement_receipt_tests;
+    mod sidecar_send_ambiguity_tests;
 
     fn state() -> FreshClaudeState {
         let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
@@ -18736,6 +18782,7 @@ rl.on('line', (line) => {
             pid,
             start_time: Some(u64::MAX / 2),
             tree: Vec::new(),
+            root_parent: None,
             ownership_id: sid.clone(),
             capture_complete: true,
         };

@@ -1,12 +1,33 @@
+import type { Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
+
+/** Populate only the tab-strip geometry. Opening 19 real tabs one at a time
+ * repeatedly mounts pickers and makes unrelated setup dominate this resize
+ * test under load. Inactive picker tabs need no terminal or provider I/O. */
+async function seedResizeTabs(page: Page, count: number): Promise<void> {
+  await page.evaluate((total) => {
+    const harness = window.__FRESHELL_TEST_HARNESS__
+    if (!harness) throw new Error('Freshell test harness is unavailable')
+    const initialCount = harness.getState().tabs.tabs.length
+    for (let i = initialCount; i < total; i++) {
+      const tabId = `resize-fixture-tab-${i}`
+      harness.dispatch({
+        type: 'tabs/addTab',
+        payload: { id: tabId, title: `Resize tab ${i + 1}`, activate: false },
+      })
+      harness.dispatch({
+        type: 'panes/initLayout',
+        payload: { tabId, paneId: `resize-fixture-pane-${i}`, content: { kind: 'picker' } },
+      })
+    }
+  }, count)
+}
 
 test.describe('Tab bar height resize', () => {
   test('defaults to 3 visible rows and drags to reveal more', async ({ freshellPage: page, harness }) => {
     // Create enough tabs to wrap into 3+ rows at any desktop viewport width
     // (20 tabs x >=150px basis is >= 3000px of tabs).
-    for (let i = 0; i < 19; i++) {
-      await page.locator('[data-context="tab-add"]').click()
-    }
+    await seedResizeTabs(page, 20)
     await harness.waitForTabCount(20)
 
     const tabStrip = page.getByTestId('tab-strip')
@@ -31,9 +52,7 @@ test.describe('Tab bar height resize', () => {
   })
 
   test('keyboard arrows resize one row at a time (fewer than default)', async ({ freshellPage: page, harness }) => {
-    for (let i = 0; i < 9; i++) {
-      await page.locator('[data-context="tab-add"]').click()
-    }
+    await seedResizeTabs(page, 10)
     await harness.waitForTabCount(10)
 
     const tabStrip = page.getByTestId('tab-strip')
