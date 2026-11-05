@@ -4726,7 +4726,10 @@ export class RuntimeHarness {
 
 function brokerRequestStatus(socketPath: string, method: 'GET' | 'DELETE', url: string): Promise<number> {
   return new Promise((resolve, reject) => {
-    const request = http.request({ socketPath, path: url, method }, response => {
+    // Cleanup crosses synchronous Docker operations. A pooled connection can
+    // have expired while this process was busy; each exact deletion/absence
+    // check owns a fresh connection so a stale socket cannot defeat teardown.
+    const request = http.request({ socketPath, path: url, method, agent: false }, response => {
       response.resume()
       response.once('error', reject)
       response.once('end', () => resolve(response.statusCode ?? 0))

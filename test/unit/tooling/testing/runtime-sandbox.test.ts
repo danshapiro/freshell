@@ -909,7 +909,7 @@ describe('runtime harness indexed input cleanup', () => {
 })
 
 describe('runtime harness candidate scratch cleanup', () => {
-  it.each(['removed', 'already-gone', 'foreign-label'] as const)(
+  it.each(['removed', 'already-gone', 'foreign-label', 'idle-peer-close'] as const)(
     'removes the Claude candidate scratch volumes the broker saw created: %s', async outcome => {
       const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'frs-candidate-cleanup-'))
       const calls: { method: string; url: string }[] = []
@@ -952,6 +952,15 @@ describe('runtime harness candidate scratch cleanup', () => {
       try {
         await new Promise<void>(resolve => daemon.listen(path.join(directory, 'daemon.sock'), resolve))
         await broker.start()
+        if (outcome === 'idle-peer-close') {
+          // A completed deletion can retire its keep-alive connection before
+          // the caller observes the FIN. Absence verification still needs a
+          // successful independent request, not a reused closed socket.
+          const server = (broker as unknown as { server: http.Server }).server
+          server.on('request', (incoming, response) => {
+            if (incoming.method === 'DELETE') response.once('finish', () => incoming.socket.end())
+          })
+        }
         // Exercise cleanup's actual live-broker lifecycle without image/build preparation.
         ;(harness as unknown as { brokerStarted: boolean }).brokerStarted = true
         const installationId = 'installation-cleanup', soulId = 'soul-cleanup'

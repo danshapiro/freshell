@@ -1686,7 +1686,18 @@ fn stage_provider_root(
         .ok_or("managed provider stage has no parent")?;
     private_directory(parent)?;
     let temporary = parent.join(format!("{grant_id}.tmp-{}", uuid::Uuid::new_v4()));
-    private_directory(&temporary)?;
+    // Ordinary generations have no mounted output yet. Keep scratch inputs
+    // separate so the copier can publish their complete tree in one rename,
+    // retaining every file flush without journaling thousands of live-tree
+    // updates. OpenCode's source plan still precreates its exact-file mounts.
+    let scratch_sources = (provider != "opencode" && opencode_input.source_plan.is_none())
+        .then(|| tempfile::tempdir_in(parent))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let preparation_root = scratch_sources
+        .as_ref()
+        .map_or(temporary.as_path(), |sources| sources.path());
+    private_directory(preparation_root)?;
     let result = (|| {
         let (source, source_boundary) = if provider == "opencode" {
             let config_home = std::env::var_os("XDG_CONFIG_HOME")
@@ -1728,7 +1739,7 @@ fn stage_provider_root(
         use freshell_platform::provider_environment::{
             copy_environment, CopyLimits, CopySelection,
         };
-        let resource_root = temporary.join(".freshell/resources");
+        let resource_root = preparation_root.join(".freshell/resources");
         private_directory(&resource_root)?;
         let mut selections = vec![CopySelection {
             source: resource_root,
@@ -2003,7 +2014,7 @@ fn stage_provider_root(
                 selections.push(selection);
             }
             if ordinary_resources.is_some() {
-                let projected = temporary.join(amplifier_stage::PROJECTED);
+                let projected = preparation_root.join(amplifier_stage::PROJECTED);
                 private_directory(&projected)?;
                 selections.push(CopySelection {
                     source: projected,
@@ -10461,6 +10472,106 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             let output = std::process::Command::new(&consume).output().unwrap();
             assert!(output.status.success());
             assert_eq!(output.stdout, b"frozen-resource:frozen-dependency");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ordinary_provider_generation_is_published_as_one_complete_tree() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+
+        for provider in ["claude", "codex", "amplifier"] {
+            let owned = tempfile::tempdir().unwrap();
+            let home = owned.path().join("home");
+            let source = home.join(format!(".{provider}/plugins"));
+            std::fs::create_dir_all(&source).unwrap();
+            for index in 0..64 {
+                std::fs::write(source.join(index.to_string()), format!("resource-{index}"))
+                    .unwrap();
+            }
+            let directory = owned.path().join("control/mcp-capabilities");
+            std::fs::create_dir_all(&directory).unwrap();
+            let parent = directory.parent().unwrap().join("provider-roots");
+            std::fs::create_dir(&parent).unwrap();
+            let descriptor = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+            assert!(descriptor >= 0);
+            let observer = unsafe { OwnedFd::from_raw_fd(descriptor) };
+            let watched = std::ffi::CString::new(parent.as_os_str().as_bytes()).unwrap();
+            assert!(
+                unsafe {
+                    libc::inotify_add_watch(
+                        observer.as_raw_fd(),
+                        watched.as_ptr(),
+                        libc::IN_CREATE | libc::IN_MOVED_TO,
+                    )
+                } >= 0
+            );
+            let grant = "grant-ordinary-publication";
+            let stage = stage_provider_root(
+                &directory,
+                grant,
+                provider,
+                &home,
+                &[ProviderConfigReference {
+                    root: ProviderConfigRoot::UserProvider,
+                    relative_path: "plugins".into(),
+                    provider_relative_path: format!(".{provider}/plugins"),
+                    format: "directory".into(),
+                }],
+                OpencodeEphemeralInput::default(),
+                None,
+            )
+            .unwrap();
+            for index in 0..64 {
+                assert_eq!(
+                    std::fs::read_to_string(stage.join(format!("plugins/{index}"))).unwrap(),
+                    format!("resource-{index}")
+                );
+            }
+            // Observe actual filesystem publication, rather than wall-clock
+            // speed: a new generation must arrive by rename with its complete
+            // copied tree. Precreating it invokes per-leaf live-tree journaling
+            // and can exhaust recovery while no provider has launched.
+            let mut buffer = [0_u8; 16_384];
+            let count = unsafe {
+                libc::read(
+                    observer.as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            assert!(count > 0);
+            let mut offset = 0;
+            let mut published = 0;
+            while offset < count as usize {
+                let event = unsafe {
+                    std::ptr::read_unaligned(
+                        buffer.as_ptr().add(offset).cast::<libc::inotify_event>(),
+                    )
+                };
+                let start = offset + std::mem::size_of::<libc::inotify_event>();
+                let name = std::ffi::CStr::from_bytes_until_nul(
+                    &buffer[start..start + event.len as usize],
+                )
+                .unwrap()
+                .to_str()
+                .unwrap();
+                if name.starts_with(&format!("{grant}.tmp-")) {
+                    assert_eq!(event.mask & libc::IN_CREATE, 0, "{provider} precreated an output generation instead of publishing its complete tree");
+                    published += usize::from(event.mask & libc::IN_MOVED_TO != 0);
+                }
+                offset = start + event.len as usize;
+            }
+            assert_eq!(
+                published, 1,
+                "{provider} must publish exactly one complete output generation"
+            );
+            assert_eq!(
+                std::fs::read_dir(&parent).unwrap().count(),
+                1,
+                "private preparation sources must be removed"
+            );
         }
     }
 
