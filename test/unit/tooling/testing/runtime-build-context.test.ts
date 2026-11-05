@@ -8,6 +8,13 @@ import { pathToFileURL } from 'node:url'
 
 const root = path.resolve(__dirname, '../../../..')
 
+const writeFakeMise = (home: string, source: string) => {
+  const binDirectory = path.join(home, '.local/bin')
+  fs.mkdirSync(binDirectory, { recursive: true })
+  fs.writeFileSync(path.join(binDirectory, 'package.json'), JSON.stringify({ type: 'commonjs' }))
+  fs.writeFileSync(path.join(binDirectory, 'mise'), `#!${process.execPath}\n${source}`, { mode: 0o755 })
+}
+
 describe.each(['.dockerignore', '.gcloudignore'])('%s keeps private runtime material out of uploaded build contexts', (filename) => {
   const policy = () => ignore().add(fs.readFileSync(path.join(root, filename), 'utf8'))
 
@@ -62,9 +69,7 @@ describe('managed builders copy the actual Cargo target artifacts', () => {
       }
     }
     const home = path.join(directory, 'builder-home')
-    const mise = path.join(home, '.local/bin/mise')
-    fs.mkdirSync(path.dirname(mise), { recursive: true })
-    fs.writeFileSync(mise, `#!${process.execPath}\n
+    writeFakeMise(home, `
         const fs = require('node:fs'); const path = require('node:path');
         const args = process.argv.slice(2);
         if (args.join(' ') === 'exec rust@1.96.0 -- rustc --version') {
@@ -78,7 +83,7 @@ describe('managed builders copy the actual Cargo target artifacts', () => {
         if (${JSON.stringify(kind)} !== 'missing') for (const bin of bins) {
           fs.writeFileSync(path.join(target, profile, bin), 'current:' + profile + ':' + bin);
         }
-      `, { mode: 0o755 })
+      `)
     const env: NodeJS.ProcessEnv = { ...process.env, HOME: home }
     if (configured) env.CARGO_TARGET_DIR = configured
     else delete env.CARGO_TARGET_DIR
@@ -147,16 +152,14 @@ describe('managed builders copy the actual Cargo target artifacts', () => {
     execFileSync('git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
       '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '--quiet', '-m', 'fixture'], { cwd: repo })
     const home = path.join(directory, 'builder-home')
-    const mise = path.join(home, '.local/bin/mise')
-    fs.mkdirSync(path.dirname(mise), { recursive: true })
-    fs.writeFileSync(mise, `#!${process.execPath}\n
+    writeFakeMise(home, `
       const fs = require('node:fs'); const path = require('node:path');
       const args = process.argv.slice(2);
       fs.appendFileSync('dispatch.jsonl', JSON.stringify(args) + '\\n');
       const bin = args[args.indexOf('-p') + 1];
       fs.mkdirSync('target/release', { recursive: true });
       fs.writeFileSync(path.join('target/release', bin), 'controlled-current-artifact');
-    `, { mode: 0o755 })
+    `)
     const env = { ...process.env, HOME: home }
     delete env.CARGO_TARGET_DIR
     const outcome = JSON.parse(execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', `
