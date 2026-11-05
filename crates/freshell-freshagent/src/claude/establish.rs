@@ -889,7 +889,11 @@ impl FreshClaudeState {
         // A created session is already a durable identity, including before
         // its first prompt. Write lineage/genesis while the ownership claim
         // still fences the registration, before Live or the acknowledgement.
-        {
+        // Rollback has its own superseding binding transaction after this
+        // replacement is boot-verified. Writing the generic row here would
+        // split that transaction and, on the Adopt arm, would try to authorize
+        // the freshly minted id with the old runtime's live-owner stamp.
+        if lane != EstablishLane::Rollback {
             let settings_update = match (lane, recorded_settings) {
                 (EstablishLane::AttachResume, None) => crate::identity_sink::SettingsUpdate::Keep,
                 (_, Some(settings)) => crate::identity_sink::SettingsUpdate::Replace(settings),
@@ -927,30 +931,30 @@ impl FreshClaudeState {
                 }
                 return Err(EstablishError::Binding(error.to_string()));
             }
-            if let Some(claim) = claim.as_ref() {
-                if self.claim_dead_state_advanced(&claim.durable, claim.dead_state) {
-                    let repaired = binding_write_guard
-                        .as_mut()
-                        .expect("binding write guard is present")
-                        .repair_now()
-                        .await;
-                    if repaired {
-                        *own_ticket = binding_write_guard.take().and_then(|guard| guard.finish());
-                    } else {
-                        drop(binding_write_guard.take());
-                    }
-                    return Err(EstablishError::ClosedInFlight);
-                }
-            }
-            naming_projection = self
-                .bind_create_name(
-                    &map_key,
-                    &spec.session_type,
-                    naming.and_then(|msg| msg.naming_handle.as_deref()),
-                )
-                .await
-                .or(naming_projection);
         }
+        if let Some(claim) = claim.as_ref() {
+            if self.claim_dead_state_advanced(&claim.durable, claim.dead_state) {
+                let repaired = binding_write_guard
+                    .as_mut()
+                    .expect("binding write guard is present")
+                    .repair_now()
+                    .await;
+                if repaired {
+                    *own_ticket = binding_write_guard.take().and_then(|guard| guard.finish());
+                } else {
+                    drop(binding_write_guard.take());
+                }
+                return Err(EstablishError::ClosedInFlight);
+            }
+        }
+        naming_projection = self
+            .bind_create_name(
+                &map_key,
+                &spec.session_type,
+                naming.and_then(|msg| msg.naming_handle.as_deref()),
+            )
+            .await
+            .or(naming_projection);
 
         // Task 12/13: bind the durable id to the live session and release the
         // lease in one lock scope. A revoked lease (an expired handle-less
