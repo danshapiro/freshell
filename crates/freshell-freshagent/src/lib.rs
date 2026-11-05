@@ -61,6 +61,8 @@ pub(crate) mod claude_turns;
 pub mod codex;
 pub mod codex_rest_lane;
 pub(crate) mod codex_sidecar_tracking;
+#[cfg(windows)]
+mod codex_windows_guard;
 pub(crate) mod delegation;
 pub mod host_agent_admission;
 pub mod identity_sink;
