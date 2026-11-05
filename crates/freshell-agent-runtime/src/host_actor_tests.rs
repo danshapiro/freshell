@@ -4293,6 +4293,49 @@ async fn codex_native_readiness_receipt_replays_after_actor_restart_only_for_its
 }
 
 #[tokio::test]
+async fn codex_native_readiness_accepts_newer_registry_fence_than_launch_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let launch = readiness_launch();
+    let mut source_fence = readiness_fence(&launch);
+    source_fence.evidence_revision += 1;
+    let transport = Arc::new(NativeReadinessTransport {
+        initial_launch: launch.clone(),
+        launch: std::sync::Mutex::new(launch.clone()),
+        root: std::sync::Mutex::new("codex-native-old".into()),
+        fault: ReadinessEvidenceFault::None,
+        dispatches: AtomicUsize::new(0),
+        readiness_calls: AtomicUsize::new(0),
+    });
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(
+            FreshProvider::Codex,
+            "codex-readiness-store",
+            Some("codex-native-old"),
+        ),
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+
+    let receipt = actor
+        .prepare_native_readiness_with_receipt(&launch, &source_fence)
+        .await
+        .unwrap()
+        .expect("the accepted Codex root transition must produce a durable receipt");
+
+    assert!(receipt.is_valid());
+    assert_eq!(receipt.source_fence, source_fence);
+    assert_eq!(receipt.source_launch, launch);
+    assert_eq!(
+        receipt.next_launch.evidence_revision,
+        receipt.source_launch.evidence_revision + 1
+    );
+    assert_eq!(receipt.identity.native_session_id, "codex-native-recovered");
+    assert_eq!(transport.readiness_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn current_provider_preparation_reopens_the_same_fresh_conversation() {
     use freshell_runtime_protocol::{
         McpCapabilityReference, ProviderLaunchContext, ProviderPreparation, ProviderSecretProfile,

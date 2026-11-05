@@ -3100,6 +3100,93 @@ impl Supervisor {
         }
     }
 
+    async fn reconcile_failed_manual_retry_readiness(
+        &self,
+        soul_id: &SoulId,
+        before_retry: &RecoveryContext,
+        readiness_error: RuntimeError,
+    ) -> Result<(), RuntimeError> {
+        // If host status cannot be read, its durable receipt state is unknown
+        // and advancing the intent would be unsafe.
+        let host = match self
+            .authenticate_host(
+                before_retry.prior_handle.incarnation_id(),
+                before_retry.prior_handle.runtime_dir(),
+            )
+            .await
+        {
+            Ok(host) => host,
+            Err(_) => return Err(readiness_error),
+        };
+        let status = match self
+            .host_status(
+                before_retry.prior_handle.incarnation_id().clone(),
+                before_retry.prior_handle.runtime_dir(),
+                &host,
+            )
+            .await
+        {
+            Ok(status) => status,
+            Err(_) => return Err(readiness_error),
+        };
+        if status.native_readiness_receipt.is_some() {
+            // Retry the durable handoff once while its original ownership
+            // and intent fence are still current.
+            let supervisor = self.clone();
+            let soul_id = soul_id.clone();
+            let prior_handle = before_retry.prior_handle.clone();
+            tokio::spawn(async move {
+                supervisor
+                    .authenticate_current_codex_recovery_host(&soul_id, &prior_handle)
+                    .await
+            })
+            .await
+            .map_err(|_| {
+                RuntimeError::new(
+                    RuntimeErrorCode::RecoveryBlocked,
+                    "Codex readiness receipt reconciliation task did not complete",
+                )
+            })??;
+            return Ok(());
+        }
+
+        let current = self
+            .registry
+            .recovery_context(soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        if current.desired_state != DesiredState::Running
+            || current.recovery_state == freshell_runtime_protocol::RecoveryState::Lost
+            || current.prior_handle.incarnation_id() != before_retry.prior_handle.incarnation_id()
+        {
+            return Err(readiness_error);
+        }
+        let next_revision = self
+            .registry
+            .rearm_recovery_retry(soul_id.clone(), current.intent_revision)
+            .await
+            .map_err(map_registry)?;
+        crate::service::append_event(
+            &self.config.lifecycle_log,
+            "supervisor.recovery_retry.cancelled",
+            serde_json::json!({
+                "severity":"info",
+                "soulId":soul_id,
+                "incarnationId":current.prior_handle.incarnation_id(),
+                "attemptId":current.recovery_attempt_id,
+                "intentRevision":current.intent_revision,
+                "nextIntentRevision":next_revision,
+                "controlEpoch":self.registry.control_epoch(),
+                "reason":"manual_rearm_after_readiness_failure",
+                "readinessErrorCode":format!("{:?}", readiness_error.code),
+                "nativeReadinessReceiptPending":false,
+            }),
+        );
+        // The scheduled retry now owns the next classification. Report the
+        // failed readiness check instead of entering another recovery path.
+        Err(readiness_error)
+    }
+
     pub(crate) async fn recover(
         &self,
         request: RecoverRequest,
@@ -3247,15 +3334,22 @@ impl Supervisor {
                 .await
                 .is_ok_and(|inspection| inspection.state == BackendRuntimeState::Running)
         {
-            // Do readiness before ManualRetry advances intent. A durable
-            // receipt from an earlier exact provider check can then be
-            // reconciled under its original write fence; afterward the
-            // retry's new intent can safely classify the now-current root.
-            self.authenticate_current_codex_recovery_host(
-                &request.soul_id,
-                &before_retry.prior_handle,
-            )
-            .await?;
+            // A successful readiness check can advance registry evidence.
+            // Reconcile it before ManualRetry advances user intent.
+            if let Err(readiness_error) = self
+                .authenticate_current_codex_recovery_host(
+                    &request.soul_id,
+                    &before_retry.prior_handle,
+                )
+                .await
+            {
+                Box::pin(self.reconcile_failed_manual_retry_readiness(
+                    &request.soul_id,
+                    &before_retry,
+                    readiness_error,
+                ))
+                .await?;
+            }
             before_retry = self
                 .registry
                 .recovery_context(request.soul_id.clone())

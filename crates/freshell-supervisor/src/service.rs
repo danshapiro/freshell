@@ -2794,10 +2794,10 @@ impl Supervisor {
                 ..
             }) => {
                 if let Some(identity) = native_identity {
-                    let prior_native = active
+                    let prior_native = handle
                         .fresh_agent()
                         .and_then(|spec| spec.native_session_id.as_deref());
-                    if active.fresh_agent().is_none_or(|spec| {
+                    if handle.fresh_agent().is_none_or(|spec| {
                         spec.provider != freshell_runtime_protocol::FreshProvider::Codex
                     }) || prior_native != Some(identity.previous_native_session_id.as_str())
                         || native_session_id.as_deref() != Some(identity.native_session_id.as_str())
@@ -2815,7 +2815,8 @@ impl Supervisor {
                         self.registry
                             .record_codex_dispatch_recovery_identity(source.clone(), identity)
                             .await
-                    } else {
+                            .map_err(map_registry)?;
+                    } else if update == FreshAgentNativeIdentityUpdate::Transition {
                         self.registry
                             .record_fresh_agent_dispatch_identity(
                                 soul_id.clone(),
@@ -2823,8 +2824,8 @@ impl Supervisor {
                                 identity,
                             )
                             .await
+                            .map_err(map_registry)?;
                     }
-                    .map_err(map_registry)?;
                     tracing::info!(soul_id=%soul_id,incarnation_id=%handle.incarnation_id(),previous_native_session_id=prior_native,native_session_id=native_session_id.as_deref(),native_identity_update=?update,"freshagent.native_dispatch_identity_committed");
                 } else if recovery_source.is_some() {
                     self.registry
@@ -3183,7 +3184,11 @@ impl Supervisor {
                         && launch.launch_nonce == active.launch_nonce().as_str()
                         && launch.execution_generation > 0
                         && launch.execution_generation == status.max_execution_generation
-                        && launch.evidence_revision == current.evidence_revision
+                        // Resume evidence can advance the soul's general
+                        // evidence fence without changing the launch-bound
+                        // native identity proof. Never admit a future launch
+                        // revision, but allow that proof to be older.
+                        && launch.evidence_revision <= current.evidence_revision
                         && launch
                             .requested_native_session_id
                             .as_deref()
