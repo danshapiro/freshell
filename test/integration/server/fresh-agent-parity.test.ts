@@ -1805,9 +1805,29 @@ tool_timeout_sec = 120
       const observerSettled = (await rig.inventory()).find(row => row.containerId === providerContainerId)
       expect(observerSettled).toMatchObject({ launchState: 'running', recoveryState: 'blocked',
         recoveryReason: 'IMPLEMENTATION_UNAVAILABLE', nativeSessionId: view.nativeSessionId })
+      const responsesBeforeBlockedSend = (await model!.readTraffic())
+        .filter((row: any) => row.path === '/v1/responses').length
+      const blockedRequestId = `send-${randomUUID()}`
+      wire.send({ type: 'freshAgent.send', sessionType: 'freshcodex', provider: 'codex',
+        sessionId: created.sessionId, requestId: blockedRequestId, text: 'AWAITED_PLAN_RECOVERY' })
+      const blockedSend = await wire.wait(frame => frame.requestId === blockedRequestId
+        && ['freshAgent.send.accepted', 'error'].includes(frame.type))
+      expect(blockedSend.type, JSON.stringify(blockedSend)).toBe('error')
+      expect(blockedSend.message).toContain('IMPLEMENTATION_UNAVAILABLE')
+      const responsesAfterBlockedSend = (await model!.readTraffic())
+        .filter((row: any) => row.path === '/v1/responses').length
+      expect(responsesAfterBlockedSend).toBe(responsesBeforeBlockedSend)
+      const blockedView = await rig.runningViewForFreshSession(created.sessionId)
+      expect(blockedView).toMatchObject({ incarnationId: beforeCrash.view!.incarnationId,
+        hostBootId: beforeCrash.view!.hostBootId, nativeSessionId: view.nativeSessionId })
       rig.runtime.writeIncident('freshcodex-managed-native-observer-settled-loss', {
-        userRef: created.sessionId, observerRecovery, observerSettled, archiveManifest,
+        userRef: created.sessionId, observerRecovery, observerSettled, blockedSend,
+        modelResponsesBefore: responsesBeforeBlockedSend, modelResponsesAfter: responsesAfterBlockedSend,
+        blockedView, archiveManifest,
       })
+      // Legacy mode must keep this conversation blocked; the cold case below
+      // exercises positive recovery through a replacement conversation.
+      return
     } else {
       const beforeColdHostRetirement = await rig.runningViewForFreshSession(created.sessionId)
       expect(beforeColdHostRetirement?.incarnationId).toBe(beforeCrash.view!.incarnationId)
@@ -1829,7 +1849,8 @@ tool_timeout_sec = 120
           const trigger = rows.find(row => row.sequence > supervisorSequenceBeforeHostPause
             && row.event === 'supervisor.runtime_observer.recovery_scheduled'
             && row.data?.soulId === beforeCrash.view!.soulId
-            && row.data?.trigger === 'provider_exit')
+            // Polling can observe the exact host kill before or after exit.
+            && ['host_unreachable', 'provider_exit'].includes(row.data?.trigger))
           if (!trigger) return undefined
           const settlements = rows.filter(row => row.sequence > trigger.sequence
             && row.data?.soulId === beforeCrash.view!.soulId
@@ -1858,7 +1879,7 @@ tool_timeout_sec = 120
       }
       const coldRecoveryDiagnostic = coldRecoveryDiagnostics()
       rig.runtime.writeIncident('freshcodex-managed-native-cold-recovery-settlement', coldRecoveryDiagnostic)
-      expect(settledColdRecovery.trigger.data.trigger).toBe('provider_exit')
+      expect(['host_unreachable', 'provider_exit']).toContain(settledColdRecovery.trigger.data.trigger)
       expect(settledColdRecovery.settled.event).toBe('supervisor.recovery_retry.settled')
       expect(settledColdRecovery.settled.data.reason).toBe('recovered')
       expect(settledColdRecovery.settled.data.incarnationId).not.toBe(beforeCrash.view!.incarnationId)
@@ -1885,12 +1906,7 @@ tool_timeout_sec = 120
     }
     const recoveryAccepted = await send('AWAITED_PLAN_RECOVERY')
     recovered = await rig.runningViewForFreshSession(created.sessionId)
-    if (recoveryOwner === 'warm host') {
-      expect(recovered?.incarnationId).toBe(beforeCrash.view!.incarnationId)
-      expect(recovered?.hostBootId).toBe(beforeCrash.view!.hostBootId)
-    } else {
-      expect(recovered?.incarnationId).toBe(coldRecovery!.settled.data.incarnationId)
-    }
+    expect(recovered?.incarnationId).toBe(coldRecovery!.settled.data.incarnationId)
     rig.runtime.writeIncident('freshcodex-managed-native-crash-first-send', { userRef: created.sessionId, beforeCrash,
       archive: archiveManifestDiagnostics, nativeExit, recoveryAccepted, recovered, recoveryOwner,
       coldRecovery: coldRecovery ? {
