@@ -89,15 +89,6 @@ const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// discoverable, allowance intact.
 const CAPABILITY_REPROBE_DELAY: Duration = Duration::from_secs(2);
 
-// These refusals dispatch no native operation. Keep their retries within the
-// same phase/receipt, with at most three seconds of paced waiting PER PHASE
-// (nine per cycle). Exhaustion uses the existing finite cycle/backoff budget;
-// each adapter retains its own request deadline and cleanup ownership.
-#[cfg(any(feature = "managed-runtime-v1", test))]
-const LIFECYCLE_RETRY_ATTEMPTS: usize = 16;
-#[cfg(any(feature = "managed-runtime-v1", test))]
-const LIFECYCLE_RETRY_DELAY: Duration = Duration::from_millis(25);
-
 /// The bounded window a FAILED on-demand route discovery backs the series
 /// off for: a permanently-missing transcript (deleted after indexing, an
 /// off-machine session id) otherwise re-walks the whole projects tree every
@@ -122,16 +113,15 @@ const DISCOVERY_RETRY_WINDOW: Duration = Duration::from_secs(30);
 /// post-send error); `Unsupported` is a diagnosed capability failure
 /// (unsupported/archived/ephemeral/missing). Native error classification is
 /// preserved here — never reduced to a generic timeout.
-/// `LifecycleBusy` proves that no host/native operation was dispatched. Its
-/// bounded phase retries reuse the same claim and receipt; persistent
-/// contention then releases only the exact pre-dispatch reservation into the
+/// `LifecycleBusy` proves that no host/native operation was dispatched. The
+/// caller immediately releases the exact pre-dispatch reservation into the
 /// durable lifecycle backoff, preserving any real read or acknowledged write.
 #[derive(Clone, Debug, PartialEq)]
 pub enum NativeCallResult<T> {
     Confirmed(T),
     /// The supervisor's per-soul lifecycle fence was busy. No provider work
-    /// was dispatched, so the same claim may be retried before a durable
-    /// deferral releases it for a fresh claim.
+    /// was dispatched, so the caller records a durable deferral and lets
+    /// another ready series use the worker before this one is tried again.
     #[cfg(any(feature = "managed-runtime-v1", test))]
     LifecycleBusy,
     Undelivered(String),
@@ -332,7 +322,7 @@ pub(crate) enum NativeLifecycleDeferralResult {
         deferral_count: u32,
         retry_in_ms: i64,
     },
-    /// The fast retry window was exhausted and a durable cooldown was scheduled.
+    /// The bounded durable deferral budget was exhausted and a cooldown was scheduled.
     CooldownScheduled {
         deferral_count: u32,
         retry_in_ms: i64,
@@ -374,53 +364,35 @@ enum NativeLifecyclePhase {
 }
 
 #[cfg(any(feature = "managed-runtime-v1", test))]
-async fn native_call_with_lifecycle_retry<T>(
+async fn native_call_if_claim_is_current<T>(
     names: &Arc<SessionNames>,
     claim: &NativeCycleClaim,
     phase: NativeLifecyclePhase,
-    mut call: impl FnMut() -> NativeFuture<T>,
+    call: impl FnOnce() -> NativeFuture<T>,
 ) -> Option<NativeCallResult<T>> {
-    for attempt in 0..LIFECYCLE_RETRY_ATTEMPTS {
-        match names.native_claim_is_current(claim.clone()).await {
-            Ok(true) => {}
-            Ok(false) => {
-                tracing::info!(target: "freshell_server::session_names",
-                    event = "session_names.native_claim_superseded", ?phase,
-                    revision = claim.desired_revision, receipt_id = %claim.receipt_id,
-                    "native naming cycle no longer owns the current series or route");
-                return None;
-            }
-            Err(error) => {
-                tracing::warn!(op = "native_claim_is_current", revision = claim.desired_revision,
-                    class = %error.code(), "session_names.operation_failed: {error}");
-                return None;
-            }
+    match names.native_claim_is_current(claim.clone()).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(target: "freshell_server::session_names",
+                event = "session_names.native_claim_superseded", ?phase,
+                revision = claim.desired_revision, receipt_id = %claim.receipt_id,
+                "native naming cycle no longer owns the current series or route");
+            return None;
         }
-        let outcome = call().await;
-        if !matches!(outcome, NativeCallResult::LifecycleBusy) {
-            if attempt > 0 {
-                tracing::info!(event = "session_names.native_lifecycle_resumed", ?phase,
-                    attempts = attempt + 1, revision = claim.desired_revision,
-                    receipt_id = %claim.receipt_id);
-            }
-            return Some(outcome);
+        Err(error) => {
+            tracing::warn!(op = "native_claim_is_current", revision = claim.desired_revision,
+                class = %error.code(), "session_names.operation_failed: {error}");
+            return None;
         }
-        let delay = LIFECYCLE_RETRY_DELAY * (attempt as u32 + 1);
-        if attempt + 1 == LIFECYCLE_RETRY_ATTEMPTS {
-            tracing::warn!(event = "session_names.native_lifecycle_exhausted", ?phase,
-                attempts = attempt + 1, revision = claim.desired_revision,
-                receipt_id = %claim.receipt_id);
-            return Some(NativeCallResult::LifecycleBusy);
-        }
-        // The serial worker guard stays owned during this short, bounded
-        // in-phase retry; no document or supervisor lifecycle lock is held.
-        tokio::time::sleep(delay).await;
     }
-    unreachable!("the finite retry loop returns on its final attempt")
+    // A typed lifecycle refusal is folded by the caller into the existing
+    // persisted backoff. Do not keep the serial worker guard while polling
+    // the supervisor again; another ready session needs a turn.
+    Some(call().await)
 }
 
 #[cfg(not(any(feature = "managed-runtime-v1", test)))]
-async fn native_call_with_lifecycle_retry<T>(
+async fn native_call_if_claim_is_current<T>(
     names: &Arc<SessionNames>,
     claim: &NativeCycleClaim,
     _phase: NativeLifecyclePhase,
@@ -965,7 +937,7 @@ async fn run_cycle_with_item(
         return;
     }
     let Some(outcome) =
-        native_call_with_lifecycle_retry(names, &claim, NativeLifecyclePhase::PreRead, || {
+        native_call_if_claim_is_current(names, &claim, NativeLifecyclePhase::PreRead, || {
             native.read(claim.native_target())
         })
         .await
@@ -1057,7 +1029,7 @@ async fn run_cycle_with_item(
     // diagnose it through their error paths as an explicit native failure.
     // 2. At most one write per cycle, bounded to 20 seconds by the adapter.
     let Some(outcome) =
-        native_call_with_lifecycle_retry(names, &claim, NativeLifecyclePhase::Write, || {
+        native_call_if_claim_is_current(names, &claim, NativeLifecyclePhase::Write, || {
             native.write(claim.attempt())
         })
         .await
@@ -1112,7 +1084,7 @@ async fn run_cycle_with_item(
             .await;
         return;
     }
-    let Some(outcome) = native_call_with_lifecycle_retry(
+    let Some(outcome) = native_call_if_claim_is_current(
         names,
         &claim,
         NativeLifecyclePhase::ConfirmationRead,
@@ -1137,7 +1109,7 @@ async fn run_cycle_with_item(
         #[cfg(any(feature = "managed-runtime-v1", test))]
         NativeCallResult::LifecycleBusy => {
             // The acknowledged write has already happened. Keep its cycle
-            // charge and retry only the fenced confirmation read.
+            // charge and defer a fenced confirmation-only claim.
             defer_lifecycle_busy(names, &claim, "confirm_read", false, true).await;
         }
         NativeCallResult::Undelivered(reason) => {
@@ -1212,9 +1184,11 @@ async fn defer_lifecycle_busy(
             retry_in_ms,
             "session_names.native_cycle_cooldown_scheduled"
         ),
-        Ok(NativeLifecycleDeferralResult::Stale) => tracing::debug!(
-            target: "freshell_server::session_name_native",
+        Ok(NativeLifecycleDeferralResult::Stale) => tracing::info!(
+            target: "freshell_server::session_names",
+            event = "session_names.native_claim_superseded",
             op = "defer_native_lifecycle_busy",
+            receipt_id = %claim.receipt_id,
             name_ref = %name_ref,
             revision = claim.desired_revision,
             series_epoch = claim.series_epoch,

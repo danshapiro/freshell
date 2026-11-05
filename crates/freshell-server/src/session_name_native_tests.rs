@@ -30,6 +30,8 @@ use super::{
 };
 use crate::session_names::SessionNames;
 
+const LIFECYCLE_BUSY_CALLS_PER_PHASE: usize = 1;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -458,15 +460,51 @@ impl NativeNameBackend for ScriptedBackend {
 }
 
 fn lifecycle_busy_read_steps() -> Vec<ReadStep> {
-    (0..super::LIFECYCLE_RETRY_ATTEMPTS)
-        .map(|_| ReadStep::LifecycleBusy)
-        .collect()
+    vec![ReadStep::LifecycleBusy]
 }
 
 fn lifecycle_busy_write_steps() -> Vec<WriteStep> {
-    (0..super::LIFECYCLE_RETRY_ATTEMPTS)
-        .map(|_| WriteStep::LifecycleBusy)
-        .collect()
+    vec![WriteStep::LifecycleBusy]
+}
+
+struct OneSeriesBusyBackend {
+    busy_target: SessionNameRef,
+    busy_reads: AtomicU32,
+    other_write_started: Arc<tokio::sync::Notify>,
+    delegate: Arc<ScriptedBackend>,
+}
+
+impl OneSeriesBusyBackend {
+    fn new(busy_target: SessionNameRef) -> Arc<Self> {
+        let delegate = ScriptedBackend::new(vec![WriteStep::Confirm]);
+        delegate.set_title(Some("Different"));
+        Arc::new(Self {
+            busy_target,
+            busy_reads: AtomicU32::new(0),
+            other_write_started: Arc::new(tokio::sync::Notify::new()),
+            delegate,
+        })
+    }
+}
+
+impl NativeNameBackend for OneSeriesBusyBackend {
+    fn read(&self, target: NativeNameTarget) -> super::NativeFuture<NativeNameReadback> {
+        if target.name_ref == self.busy_target {
+            self.busy_reads.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { NativeCallResult::LifecycleBusy })
+        } else {
+            self.delegate.read(target)
+        }
+    }
+
+    fn write(&self, attempt: super::NativeNameAttempt) -> super::NativeFuture<()> {
+        self.other_write_started.notify_one();
+        self.delegate.write(attempt)
+    }
+
+    fn route_available(&self, _target: NativeNameTarget) -> super::NativeProbeFuture {
+        Box::pin(async { super::NativeProbeResult::Available })
+    }
 }
 
 fn append_lifecycle_busy_read_steps(steps: &mut Vec<ReadStep>) {
@@ -792,39 +830,41 @@ impl NativeNameBackend for LifecycleContentionBackend {
 }
 
 #[tokio::test(start_paused = true)]
-async fn lifecycle_contention_retries_only_the_undispatched_phase() {
+async fn lifecycle_contention_defers_after_one_undispatched_phase_call() {
     for phase in 0..3 {
         let dir = temp_data_dir();
+        let now = 1_700_000_000_000_i64;
+        freeze_native_clock(dir.path(), now);
         let store = open_store(dir.path());
         let target = armed_pending(&store, "h-contention", "/h/.claude").await;
         let mut busy = [0; 3];
-        busy[phase] = 3;
+        busy[phase] = LIFECYCLE_BUSY_CALLS_PER_PHASE as u32;
         let backend = LifecycleContentionBackend::new(busy);
         super::run_cycle(&store, backend.as_ref(), &target).await;
 
         let sync = native_sync_of(&store, target.clone()).await.unwrap();
-        assert_eq!(sync.status, NativeSyncStatus::Synced, "phase {phase}");
-        assert_eq!(backend.actual.reads(), 2, "only two actual native reads");
-        assert_eq!(
-            backend.actual.writes(),
-            1,
-            "confirmation retry never rewrites"
-        );
+        assert_eq!(sync.status, NativeSyncStatus::Pending, "phase {phase}");
         let document = document_json(dir.path());
         let state = native_entry_of(&document);
-        assert_eq!(state["cyclesConsumed"], 1);
-        assert_eq!(state["readsConsumed"], 2);
-        let receipts = backend.receipts.lock().unwrap();
-        assert!(receipts.iter().all(|receipt| receipt == &receipts[0]));
+        assert_eq!(state["cyclesConsumed"], u32::from(phase == 2));
+        assert_eq!(state["readsConsumed"], u32::from(phase != 0));
+        assert_eq!(backend.actual.reads(), u32::from(phase != 0));
+        assert_eq!(backend.actual.writes(), u32::from(phase == 2));
+        assert_eq!(state["nextDue"], now + 1_000);
         let attempts = backend.attempts.lock().unwrap();
-        let retried: Vec<_> = attempts.iter().filter(|(step, _)| *step == phase).collect();
-        assert_eq!(retried.len(), 4, "three refusals then actual dispatch");
-        assert!(
-            retried
-                .windows(2)
-                .all(|pair| pair[1].1.duration_since(pair[0].1) >= Duration::from_millis(25)),
-            "contention retries must be paced"
+        let refused: Vec<_> = attempts.iter().filter(|(step, _)| *step == phase).collect();
+        assert_eq!(refused.len(), LIFECYCLE_BUSY_CALLS_PER_PHASE);
+        assert_eq!(
+            attempts.len(),
+            phase + 1,
+            "only the calls needed to reach this phase are issued"
         );
+        assert_eq!(
+            backend.receipts.lock().unwrap().len(),
+            usize::from(phase != 0),
+            "the write call is reached only after the pre-read"
+        );
+        assert!(store.native_work_snapshot().is_empty());
     }
 }
 
@@ -834,6 +874,8 @@ async fn lifecycle_contention_mid_bind_keeps_the_cycle_and_receipt() {
         (0..3).flat_map(|phase| [false, true].map(|observed| (phase, observed)))
     {
         let dir = temp_data_dir();
+        let start_ms = 1_700_000_000_050_i64;
+        freeze_native_clock(dir.path(), start_ms);
         let store = open_store(dir.path());
         let target = armed_pending(&store, "h-mid-bind", "/h/.claude").await;
         let durable = session(
@@ -893,19 +935,37 @@ async fn lifecycle_contention_mid_bind_keeps_the_cycle_and_receipt() {
             .await
             .expect("the bound cycle settles")
             .unwrap();
+        let deferred_document = document_json(dir.path());
+        let deferred = native_entry_of(&deferred_document);
+        let next_due = deferred["nextDue"].as_i64().unwrap_or(start_ms);
+        freeze_native_clock(dir.path(), next_due);
+        super::run_cycle(&store, backend.as_ref(), &durable).await;
         assert_eq!(
             native_sync_of(&store, durable).await.unwrap().status,
             NativeSyncStatus::Synced,
-            "phase {phase}, observed target {observed_target}: a binding is not a new name decision"
+            "phase {phase}, observed target {observed_target}: the bound series resumes after the refusal"
         );
-        assert_eq!(backend.actual.reads(), 2);
+        assert_eq!(backend.actual.reads(), if phase == 1 { 3 } else { 2 });
         assert_eq!(backend.actual.writes(), 1);
         let document = document_json(dir.path());
         let state = native_entry_of(&document);
-        assert_eq!(state["cyclesConsumed"], 1);
-        assert_eq!(state["readsConsumed"], 2);
-        assert_eq!(state["lastConfirmedReceipt"], receipt);
+        assert_eq!(
+            state["cyclesConsumed"],
+            if phase == 2 { 2 } else { 1 },
+            "phase {phase}, observed target {observed_target}: {state:?}"
+        );
+        assert_eq!(state["readsConsumed"], if phase == 1 { 3 } else { 2 });
         assert_eq!(state["attemptedReceipts"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            state["lastConfirmedReceipt"], state["attemptedReceipts"][0],
+            "the current confirmation belongs to the receipt that was actually written"
+        );
+        if phase == 2 {
+            assert_eq!(
+                state["lastConfirmedReceipt"], receipt,
+                "a refused confirmation must preserve its acknowledged write receipt"
+            );
+        }
     }
 }
 
@@ -1005,7 +1065,7 @@ async fn lifecycle_contention_exhaustion_preserves_backoff_and_eventual_sync() {
         let store = open_store(dir.path());
         let target = armed_pending(&store, "h-exhaustion", "/h/.claude").await;
         let mut busy = [0; 3];
-        busy[phase] = super::LIFECYCLE_RETRY_ATTEMPTS as u32;
+        busy[phase] = LIFECYCLE_BUSY_CALLS_PER_PHASE as u32;
         let backend = LifecycleContentionBackend::new(busy);
         super::run_cycle(&store, backend.as_ref(), &target).await;
         let document = document_json(dir.path());
@@ -1046,10 +1106,7 @@ async fn lifecycle_contention_exhaustion_preserves_backoff_and_eventual_sync() {
         {
             let attempts = backend.attempts.lock().unwrap();
             let refused: Vec<_> = attempts.iter().filter(|(step, _)| *step == phase).collect();
-            assert_eq!(refused.len(), super::LIFECYCLE_RETRY_ATTEMPTS);
-            assert!(refused
-                .windows(2)
-                .all(|pair| pair[1].1.duration_since(pair[0].1) >= Duration::from_millis(25)));
+            assert_eq!(refused.len(), LIFECYCLE_BUSY_CALLS_PER_PHASE);
         }
         drop(store);
         let store = open_store(dir.path());
@@ -1129,7 +1186,7 @@ async fn lifecycle_contention_exhaustion_stays_bounded_across_restarts_and_bindi
     }
     assert_eq!(
         backend.attempts.lock().unwrap().len(),
-        3 * super::LIFECYCLE_RETRY_ATTEMPTS
+        3 * LIFECYCLE_BUSY_CALLS_PER_PHASE
     );
     assert_eq!(backend.actual.reads(), 0);
     assert_eq!(backend.actual.writes(), 0);
@@ -1173,7 +1230,7 @@ async fn lifecycle_contention_second_deferral_recovers_after_persisted_backoff()
     let store = open_store(dir.path());
     let target = armed_pending(&store, "h-third-cycle", "/h/.claude").await;
     let backend =
-        LifecycleContentionBackend::new([2 * super::LIFECYCLE_RETRY_ATTEMPTS as u32, 0, 0]);
+        LifecycleContentionBackend::new([2 * LIFECYCLE_BUSY_CALLS_PER_PHASE as u32, 0, 0]);
     for delay in [0, 1_000] {
         now += delay;
         freeze_native_clock(dir.path(), now);
@@ -1206,7 +1263,7 @@ async fn lifecycle_contention_changed_binding_source_preserves_budget_and_backof
     freeze_native_clock(dir.path(), now);
     let store = open_store(dir.path());
     let target = armed_pending(&store, "h-changed-bind", "/h/.claude").await;
-    let backend = LifecycleContentionBackend::new([super::LIFECYCLE_RETRY_ATTEMPTS as u32, 0, 0]);
+    let backend = LifecycleContentionBackend::new([LIFECYCLE_BUSY_CALLS_PER_PHASE as u32, 0, 0]);
     super::run_cycle(&store, backend.as_ref(), &target).await;
     let durable = session(
         freshell_protocol::session_names::NamedProvider::Claude,
@@ -1445,7 +1502,7 @@ async fn lifecycle_busy_pre_read_defers_without_spending_native_budgets() {
 
     assert_eq!(
         backend.reads(),
-        super::LIFECYCLE_RETRY_ATTEMPTS as u32 + 2,
+        LIFECYCLE_BUSY_CALLS_PER_PHASE as u32 + 2,
         "bounded busy retries, fresh pre-read, confirmation"
     );
     assert_eq!(backend.writes(), 1);
@@ -1494,7 +1551,7 @@ async fn lifecycle_busy_write_refunds_cycle_but_keeps_the_real_pre_read() {
     assert_eq!(backend.reads(), 1);
     assert_eq!(
         backend.writes(),
-        super::LIFECYCLE_RETRY_ATTEMPTS as u32,
+        LIFECYCLE_BUSY_CALLS_PER_PHASE as u32,
         "each write request is refused before provider dispatch"
     );
     assert_eq!(backend.confirmed_writes(), 0);
@@ -1505,13 +1562,13 @@ async fn lifecycle_busy_write_refunds_cycle_but_keeps_the_real_pre_read() {
     assert_eq!(backend.reads(), 3, "both pre-reads and one confirmation");
     assert_eq!(
         backend.writes(),
-        super::LIFECYCLE_RETRY_ATTEMPTS as u32 + 1,
+        LIFECYCLE_BUSY_CALLS_PER_PHASE as u32 + 1,
         "bounded refusals and one fresh write"
     );
     assert_eq!(backend.confirmed_writes(), 1, "only one write is applied");
     assert_eq!(
         backend.write_titles(),
-        vec!["Manual Title".to_string(); super::LIFECYCLE_RETRY_ATTEMPTS + 1]
+        vec!["Manual Title".to_string(); LIFECYCLE_BUSY_CALLS_PER_PHASE + 1]
     );
     let state = native_entry_for_target(&document_json(dir.path()), &target);
     assert_eq!(state["cyclesConsumed"].as_u64(), Some(1));
@@ -1563,7 +1620,7 @@ async fn lifecycle_busy_after_write_ack_retries_confirmation_without_rewriting()
 
     assert_eq!(
         backend.reads(),
-        super::LIFECYCLE_RETRY_ATTEMPTS as u32 + 2,
+        LIFECYCLE_BUSY_CALLS_PER_PHASE as u32 + 2,
         "pre-read, bounded refused confirmations, fresh confirmation"
     );
     assert_eq!(
@@ -1761,7 +1818,7 @@ async fn final_cycle_busy_confirmation_gets_read_only_retry_without_extra_write(
 
     assert_eq!(backend.writes(), 3);
     assert_eq!(backend.confirmed_writes(), 1);
-    assert_eq!(backend.reads(), super::LIFECYCLE_RETRY_ATTEMPTS as u32 + 4);
+    assert_eq!(backend.reads(), LIFECYCLE_BUSY_CALLS_PER_PHASE as u32 + 4);
     let state = native_entry_for_target(&document_json(dir.path()), &target);
     assert_eq!(state["cyclesConsumed"].as_u64(), Some(3));
     assert_eq!(state["readsConsumed"].as_u64(), Some(4));
@@ -1818,7 +1875,7 @@ async fn persistent_lifecycle_busy_deferrals_schedule_a_durable_cooldown() {
 
     assert_eq!(
         backend.reads(),
-        MAX_BUSY_DEFERRALS as u32 * super::LIFECYCLE_RETRY_ATTEMPTS as u32
+        MAX_BUSY_DEFERRALS as u32 * LIFECYCLE_BUSY_CALLS_PER_PHASE as u32
     );
     assert_eq!(backend.writes(), 0);
     assert_eq!(backend.confirmed_writes(), 0);
@@ -2938,7 +2995,7 @@ async fn binding_pending_ack_to_same_acquired_location_preserves_read_only_confi
     assert_eq!(backend.writes(), 1, "bind confirmation is read-only");
     assert_eq!(
         backend.read_locations(),
-        vec![acquired_route.clone(); super::LIFECYCLE_RETRY_ATTEMPTS + 2]
+        vec![acquired_route.clone(); LIFECYCLE_BUSY_CALLS_PER_PHASE + 2]
     );
     let after_confirmation = native_entry_for_target(&document_json(dir.path()), &durable);
     assert!(after_confirmation["confirmationPendingReceipt"].is_null());
@@ -3239,7 +3296,7 @@ async fn route_change_preserves_busy_cooldown_until_due_before_rearming_on_new_r
     assert_eq!(backend.reads(), MAX_BUSY_DEFERRALS as u32);
     assert_eq!(
         backend.writes(),
-        MAX_BUSY_DEFERRALS as u32 * super::LIFECYCLE_RETRY_ATTEMPTS as u32
+        MAX_BUSY_DEFERRALS as u32 * LIFECYCLE_BUSY_CALLS_PER_PHASE as u32
     );
 
     record_acquisition(
@@ -3283,7 +3340,7 @@ async fn route_change_preserves_busy_cooldown_until_due_before_rearming_on_new_r
     assert_eq!(backend.reads(), 6);
     assert_eq!(
         backend.writes(),
-        MAX_BUSY_DEFERRALS as u32 * super::LIFECYCLE_RETRY_ATTEMPTS as u32
+        MAX_BUSY_DEFERRALS as u32 * LIFECYCLE_BUSY_CALLS_PER_PHASE as u32
     );
     let after_idle_cycle = native_entry_for_target(&document_json(dir.path()), &target);
     assert_eq!(
@@ -3320,7 +3377,7 @@ async fn route_change_preserves_busy_cooldown_until_due_before_rearming_on_new_r
     assert_eq!(backend.reads(), 8, "one fresh pre-read and confirmation");
     assert_eq!(
         backend.writes(),
-        MAX_BUSY_DEFERRALS as u32 * super::LIFECYCLE_RETRY_ATTEMPTS as u32 + 1,
+        MAX_BUSY_DEFERRALS as u32 * LIFECYCLE_BUSY_CALLS_PER_PHASE as u32 + 1,
         "only the deferred claim's write applies"
     );
     assert_eq!(backend.confirmed_writes(), 1);
@@ -3773,6 +3830,30 @@ async fn the_worker_loop_converges_an_armed_series() {
     worker.abort();
     assert_eq!(backend.writes(), 1);
     assert_eq!(backend.reads(), 2);
+}
+
+#[tokio::test]
+async fn a_busy_native_series_does_not_stall_another_ready_series() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let busy_target = armed_pending(&store, "a-busy", "/h/a-busy").await;
+    let _ready_target = armed_pending(&store, "z-ready", "/h/z-ready").await;
+    let backend = OneSeriesBusyBackend::new(busy_target);
+    let other_write_started = backend.other_write_started.notified();
+    let worker = SessionNameWorker::start(
+        Arc::clone(&store),
+        backend.clone(),
+        inert_generation(dir.path()),
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), other_write_started)
+        .await
+        .expect("the ready series reaches its write while the other series backs off");
+    worker.abort();
+    let _ = worker.await;
+
+    assert_eq!(backend.busy_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.delegate.writes(), 1);
 }
 
 /// The selector prefers ready manual-name projection, then the stable
@@ -4949,7 +5030,7 @@ impl NativeNameBackend for SwappableDispatch {
 }
 
 /// A supervisor that keeps refusing only the lifecycle probe. The worker
-/// must apply the finite lifecycle-contention budget without consuming any
+/// must apply the bounded durable lifecycle-contention budget without consuming any
 /// provider read/write allowance.
 struct LifecycleBusyProbeBackend {
     scripted: Arc<ScriptedBackend>,
@@ -5068,7 +5149,7 @@ async fn an_absent_native_capability_pauses_before_consuming_a_cycle() {
 }
 
 /// Typed lock refusals from the route probe are lifecycle contention, not
-/// missing capability: after the finite fast-retry budget the series enters
+/// missing capability: after the bounded deferral budget the series enters
 /// a durable cooldown, survives a store reopen, and resumes when contention
 /// clears.
 #[tokio::test(start_paused = true)]
@@ -5283,7 +5364,7 @@ async fn lifecycle_busy_write_retries_after_cooldown_with_fresh_read_window() {
     assert_eq!(backend.reads(), MAX_BUSY_DEFERRALS);
     assert_eq!(
         backend.writes(),
-        MAX_BUSY_DEFERRALS * super::LIFECYCLE_RETRY_ATTEMPTS as u32
+        MAX_BUSY_DEFERRALS * LIFECYCLE_BUSY_CALLS_PER_PHASE as u32
     );
     assert_eq!(backend.confirmed_writes(), 0);
     assert_eq!(state["cyclesConsumed"].as_u64(), Some(0));
@@ -5319,14 +5400,14 @@ async fn lifecycle_busy_write_retries_after_cooldown_with_fresh_read_window() {
     assert_eq!(backend.reads(), MAX_BUSY_DEFERRALS + 2);
     assert_eq!(
         backend.writes(),
-        MAX_BUSY_DEFERRALS * super::LIFECYCLE_RETRY_ATTEMPTS as u32 + 1
+        MAX_BUSY_DEFERRALS * LIFECYCLE_BUSY_CALLS_PER_PHASE as u32 + 1
     );
     assert_eq!(backend.confirmed_writes(), 1);
     assert_eq!(
         backend.write_titles(),
         vec![
             "Manual Title".to_string();
-            MAX_BUSY_DEFERRALS as usize * super::LIFECYCLE_RETRY_ATTEMPTS + 1
+            MAX_BUSY_DEFERRALS as usize * LIFECYCLE_BUSY_CALLS_PER_PHASE + 1
         ]
     );
     let resumed = native_entry_for_target(&document_json(dir.path()), &target);
