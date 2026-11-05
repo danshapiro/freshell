@@ -107,6 +107,8 @@ export type FreshAgentLiveSession = {
 
 export type FreshAgentLiveState = {
   bySession: Record<string, FreshAgentLiveSession>
+  /** Native source announcements are scoped to the current WebSocket connection. */
+  announcedNativeBySession: Record<string, string>
   noticeSeq: number
   /**
    * How many visible panes settle each session's tail (land its blocks and

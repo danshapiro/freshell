@@ -3,6 +3,7 @@ import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import { isLiveBlockLanded, landedTranscript, type LandedTranscript } from '@/lib/fresh-agent-landed-transcript'
 import { applyFreshAgentTranscriptPatch, bindTranscriptProjection, freezeTranscriptProjection, hydrateTranscriptProjection, readTranscriptProjection } from '@/lib/fresh-agent-transcript-projection'
 import type { FreshAgentSnapshot, FreshAgentTranscriptPatch } from '@shared/fresh-agent-contract'
+import { setStatus as setConnectionStatus } from './connectionSlice'
 import {
   markSessionLost,
   materializeSession,
@@ -25,6 +26,7 @@ import type {
 
 const initialState: FreshAgentLiveState = {
   bySession: {},
+  announcedNativeBySession: {},
   noticeSeq: 0,
   viewers: {},
 }
@@ -44,6 +46,10 @@ function sessionFor(state: FreshAgentLiveState, locator: FreshAgentSessionLocato
   const key = makeFreshAgentSessionKey(locator)
   state.bySession[key] ??= emptySession()
   return state.bySession[key]
+}
+
+function clearNativeSourceAnnouncements(state: FreshAgentLiveState): void {
+  state.announcedNativeBySession = {}
 }
 
 function retireRetainedSource(session: FreshAgentLiveSession): void {
@@ -201,12 +207,21 @@ const freshAgentLiveSlice = createSlice({
       const { awaitingNativeSessionId, ...locator } = action.payload
       const session = sessionFor(state, locator)
       retireLiveProjection(session)
+      delete state.announcedNativeBySession[makeFreshAgentSessionKey(locator)]
       session.awaitingNativeSessionId = awaitingNativeSessionId
     },
     nativeSourceAnnounced(state, action: PayloadAction<FreshAgentSessionLocator & { nativeSessionId: string }>) {
       const { nativeSessionId, ...locator } = action.payload
-      const session = state.bySession[makeFreshAgentSessionKey(locator)]
+      const key = makeFreshAgentSessionKey(locator)
+      state.announcedNativeBySession[key] = nativeSessionId
+      const session = state.bySession[key]
       if (session?.awaitingNativeSessionId === nativeSessionId) delete session.awaitingNativeSessionId
+    },
+    nativeSourceAnnouncementCleared(state, action: PayloadAction<FreshAgentSessionLocator>) {
+      delete state.announcedNativeBySession[makeFreshAgentSessionKey(action.payload)]
+    },
+    resetNativeSourceAnnouncements(state) {
+      clearNativeSourceAnnouncements(state)
     },
     /** Authoritative init/snapshot binding; arbitrary patches cannot change incarnation. */
     transcriptProjectionBound(state, action: PayloadAction<FreshAgentSessionLocator & { projectionId: string; historyGeneration: number }>) {
@@ -414,10 +429,18 @@ const freshAgentLiveSlice = createSlice({
   },
   extraReducers: (builder) => {
     builder
+      .addCase(setConnectionStatus, (state, action) => {
+        if (action.payload !== 'ready') clearNativeSourceAnnouncements(state)
+      })
       .addCase(materializeSession, (state, action) => {
         const { previousSessionId, sessionId, sessionType, provider } = action.payload
         const previousKey = makeFreshAgentSessionKey({ sessionId: previousSessionId, sessionType, provider })
         const nextKey = makeFreshAgentSessionKey({ sessionId, sessionType, provider })
+        if (previousKey !== nextKey) {
+          // A route change alone does not prove the new route's native source.
+          delete state.announcedNativeBySession[previousKey]
+          delete state.announcedNativeBySession[nextKey]
+        }
         const previous = state.bySession[previousKey]
         if (!previous) return
         if (previousKey === nextKey) {
@@ -430,6 +453,12 @@ const freshAgentLiveSlice = createSlice({
       })
       .addCase(removeSession, (state, action) => {
         for (const key of tailKeysFor(state, action.payload)) delete state.bySession[key]
+        const { sessionId, sessionType, provider } = action.payload
+        for (const key of Object.keys(state.announcedNativeBySession)) {
+          if (sessionType && provider
+            ? key === makeFreshAgentSessionKey({ sessionId, sessionType, provider })
+            : sessionIdOfKey(key) === sessionId) delete state.announcedNativeBySession[key]
+        }
       })
       .addCase(sessionExited, (state, action) => clearTailsFor(state, action.payload))
       .addCase(markSessionLost, (state, action) => clearTailsFor(state, action.payload))
@@ -450,6 +479,8 @@ const freshAgentLiveSlice = createSlice({
 export const {
   nativeProjectionRetired,
   nativeSourceAnnounced,
+  nativeSourceAnnouncementCleared,
+  resetNativeSourceAnnouncements,
   transcriptProjectionBound,
   transcriptPatchApplied,
   transcriptProjectionSnapshotReceived,

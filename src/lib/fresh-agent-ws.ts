@@ -14,7 +14,19 @@ import { revokeFreshAgentAttention } from '@/store/turnCompletionAttention'
 import type { ObservedOwnerFence } from '@/store/selectors/runtimeOwner'
 import { streamBatcherFor } from '@/lib/fresh-agent-stream-batcher'
 import type { LiveBlockKind, LiveNotice, LiveNoticeLevel, LiveRateLimit, LiveRetry, LiveStreamOp } from '@/store/freshAgentLiveTypes'
-import { assistantBlockBound, liveNoticeReceived, liveRetrySet, nativeSourceAnnounced, transcriptAnnounced, transcriptProjectionBound, transcriptPatchApplied, codexMetadataReceived, transcriptProjectionSnapshotReceived } from '@/store/freshAgentLiveSlice'
+import {
+  assistantBlockBound,
+  codexMetadataReceived,
+  liveNoticeReceived,
+  liveRetrySet,
+  nativeSourceAnnounced,
+  nativeSourceAnnouncementCleared,
+  resetNativeSourceAnnouncements,
+  transcriptAnnounced,
+  transcriptPatchApplied,
+  transcriptProjectionBound,
+  transcriptProjectionSnapshotReceived,
+} from '@/store/freshAgentLiveSlice'
 import { FreshAgentSnapshotSchema, FreshAgentTranscriptPatchSchema } from '@shared/fresh-agent-contract'
 import {
   addPermissionRequest,
@@ -246,10 +258,11 @@ export function handleFreshAgentMessage(
       if (materialized.provider === 'codex') dispatch((_innerDispatch, getState) => {
         awaitingNativeSessionId = getState().freshAgentLive?.bySession[makeFreshAgentSessionKey(locator)]?.awaitingNativeSessionId
       })
+      const announcedNative = materialized.provider === 'codex' && materialized.sessionRef?.provider === 'codex'
+        ? materialized.sessionRef.sessionId : undefined
       if (awaitingNativeSessionId) {
-        const announcedNative = materialized.sessionRef?.provider === 'codex' ? materialized.sessionRef.sessionId : undefined
         if (materialized.sessionId !== materialized.previousSessionId || announcedNative !== awaitingNativeSessionId) return true
-        dispatch(nativeSourceAnnounced({ ...locator, nativeSessionId: announcedNative }))
+        dispatch(nativeSourceAnnounced({ ...locator, nativeSessionId: awaitingNativeSessionId }))
       }
       dispatch(rekeyFreshAgentAttention(materialized))
       // Stream events queued under the old id land before the re-key moves them.
@@ -288,6 +301,11 @@ export function handleFreshAgentMessage(
           replaceLiveProjection,
         }))
       })
+      if (materialized.provider === 'codex' && !awaitingNativeSessionId) {
+        const currentLocator = { ...locator, sessionId: materialized.sessionId }
+        if (announcedNative) dispatch(nativeSourceAnnounced({ ...currentLocator, nativeSessionId: announcedNative }))
+        else dispatch(nativeSourceAnnouncementCleared(currentLocator))
+      }
       dispatch(materializeFreshAgentPaneSession({
         previousSessionId: materialized.previousSessionId,
         sessionId: materialized.sessionId,
@@ -381,6 +399,7 @@ export function foldReadyRuntimeOwners(
   owners: ReadyMessage['runtimeOwners'],
 ): void {
   dispatch(resetRuntimeOwners())
+  dispatch(resetNativeSourceAnnouncements())
   for (const owner of owners ?? []) {
     const fenced = owner.state === 'fenced'
     const inProgress = owner.state === 'starting'

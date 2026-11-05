@@ -1,4 +1,4 @@
-import { resolveFreshAgentRuntimeProvider } from '@shared/fresh-agent'
+import { makeFreshAgentSessionKey, resolveFreshAgentRuntimeProvider } from '@shared/fresh-agent'
 import { managedTerminalPaneStatus } from '../managed-terminal.js'
 import type { AppStore, RootState } from '@/store/store'
 import { addTab, updateTab } from '@/store/tabsSlice'
@@ -478,17 +478,18 @@ export function applyManagedRuntimeMergePlan(
     if (previous?.kind === 'fresh-agent' && next.kind === 'fresh-agent'
       && previous.provider === 'codex' && next.provider === 'codex'
       && previous.sessionId && previous.sessionId === next.sessionId && next.sessionRef?.provider === 'codex') {
-      store.dispatch(memoryWarningSourceChanged({ sessionId: previous.sessionId, sessionType: previous.sessionType,
-        provider: previous.provider, nativeSessionId: next.sessionRef.sessionId, soulId: next.soulId }))
-    }
-    if (previous?.kind === 'fresh-agent' && next.kind === 'fresh-agent'
-      && previous.provider === 'codex' && next.provider === 'codex'
-      && previous.sessionId && previous.sessionId === next.sessionId
-      && previous.sessionRef?.provider === 'codex' && next.sessionRef?.provider === 'codex'
-      && previous.sessionRef.sessionId !== next.sessionRef.sessionId) {
       const locator = { sessionId: previous.sessionId, sessionType: previous.sessionType, provider: previous.provider }
-      streamBatcherFor(store.dispatch).flush(locator)
-      store.dispatch(nativeProjectionRetired({ ...locator, awaitingNativeSessionId: next.sessionRef.sessionId }))
+      store.dispatch(memoryWarningSourceChanged({ ...locator, nativeSessionId: next.sessionRef.sessionId, soulId: next.soulId }))
+      // A public route without a native ref does not identify its source.
+      // Inventory can overtake an older announcement even on that first bind.
+      const previousNative = previous.sessionRef?.provider === 'codex' ? previous.sessionRef.sessionId : undefined
+      const announced = store.getState().freshAgentLive?.announcedNativeBySession?.[makeFreshAgentSessionKey(locator)]
+      // Another view of this public route may already have received the
+      // current source announcement; its output must stay live.
+      if (previousNative !== next.sessionRef.sessionId && announced !== next.sessionRef.sessionId) {
+        streamBatcherFor(store.dispatch).flush(locator)
+        store.dispatch(nativeProjectionRetired({ ...locator, awaitingNativeSessionId: next.sessionRef.sessionId }))
+      }
     }
     store.dispatch(updatePaneContent({
       tabId: update.tabId,
