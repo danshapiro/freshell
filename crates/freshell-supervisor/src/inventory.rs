@@ -22,12 +22,17 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{sync::Semaphore, task::JoinSet};
+use tokio::{sync::Semaphore, task::JoinSet, time::Instant};
 
 pub const DEFAULT_STARTUP_RECOVERY_CONCURRENCY: usize = 4;
 const MAX_STARTUP_RECOVERY_CONCURRENCY: usize = 16;
 const DEFAULT_STARTUP_SOUL_TIMEOUT: Duration = Duration::from_secs(180);
 const DEFAULT_OBSERVER_INTERVAL: Duration = Duration::from_secs(1);
+/// Bounds the recorded send-recoverable classification edges. A key is one
+/// dead native session of one incarnation, so entries only accumulate per
+/// distinct native exit; under pathological pressure an evicted key may
+/// record one extra line, never a per-pass duplicate stream.
+const NATIVE_EXIT_CLASSIFICATION_EDGE_MAX_ENTRIES: usize = 1_024;
 
 /// Classification of an observed fresh-agent provider exit. Pure over the
 /// three facts every gate on the send path already holds: the managed
@@ -398,17 +403,30 @@ impl Supervisor {
                                         // the actor's recover-on-send — so no
                                         // whole-host replacement is scheduled.
                                         // The typed observation is the honest
-                                        // record of the classification.
-                                        append_event(
-                                            &supervisor.config.lifecycle_log,
-                                            "supervisor.runtime_observer.native_exit_send_recoverable",
-                                            serde_json::json!({
-                                                "soulId": view.soul_id,
-                                                "incarnationId": handle.incarnation_id(),
-                                                "provider": view.provider,
-                                                "nativeSessionId": view.native_session_id,
-                                            }),
-                                        );
+                                        // record of the classification, and it
+                                        // is an edge: recorded once per (soul,
+                                        // incarnation, native session)
+                                        // native-exit transition, not once per
+                                        // observer pass.
+                                        if supervisor
+                                            .native_exit_classification_edge_due(
+                                                &view.soul_id,
+                                                handle.incarnation_id().as_str(),
+                                                &view.native_session_id,
+                                            )
+                                            .await
+                                        {
+                                            append_event(
+                                                &supervisor.config.lifecycle_log,
+                                                "supervisor.runtime_observer.native_exit_send_recoverable",
+                                                serde_json::json!({
+                                                    "soulId": view.soul_id,
+                                                    "incarnationId": handle.incarnation_id(),
+                                                    "provider": view.provider,
+                                                    "nativeSessionId": view.native_session_id,
+                                                }),
+                                            );
+                                        }
                                         None
                                     } else if status.exited {
                                         Some(RecoveryTrigger::ProviderExit)
@@ -502,6 +520,43 @@ impl Supervisor {
             }
         }
         Ok(())
+    }
+
+    /// Round-2 finding 4: the send-recoverable classification record is an
+    /// edge, not a level — the codebase's 0→≥1 attention-edge convention.
+    /// Returns true exactly once per (soul, incarnation, native session)
+    /// native-exit transition: while the one-second observer pass keeps
+    /// re-deriving the same classification for a crashed session idling
+    /// before its next send, only the first pass records the typed
+    /// observation. A recovered native session (the recover-on-send commit
+    /// of a new native id) or a new incarnation is a new key and records
+    /// again. Mirrors the bounded `live_resume_evidence_attempts` cache.
+    async fn native_exit_classification_edge_due(
+        &self,
+        soul_id: &SoulId,
+        incarnation_id: &str,
+        native_session_id: &Option<String>,
+    ) -> bool {
+        let key = (
+            soul_id.as_str().to_string(),
+            incarnation_id.to_string(),
+            native_session_id.clone(),
+        );
+        let mut edges = self.native_exit_classification_edges.lock().await;
+        if edges.contains_key(&key) {
+            return false;
+        }
+        if edges.len() >= NATIVE_EXIT_CLASSIFICATION_EDGE_MAX_ENTRIES {
+            if let Some(oldest_key) = edges
+                .iter()
+                .min_by_key(|(_, recorded_at)| **recorded_at)
+                .map(|(key, _)| key.clone())
+            {
+                edges.remove(&oldest_key);
+            }
+        }
+        edges.insert(key, Instant::now());
+        true
     }
 
     async fn continue_pending_stop(
@@ -1086,6 +1141,35 @@ mod tests {
                 .lifecycle()
                 .contains("supervisor.recovery.native_exit_send_recoverable"),
             "the pipeline must record its send-recoverable classification"
+        );
+    }
+
+    /// Round-2 finding 4: the send-recoverable classification record is an
+    /// edge, not a level. While a crashed native session idles before its
+    /// next send, the one-second observer pass re-derives the same
+    /// classification every pass; the typed observation must be recorded
+    /// exactly once per native-exit transition, not once per pass — a
+    /// level-triggered loop rotates useful lifecycle diagnostics with
+    /// duplicates.
+    #[tokio::test]
+    async fn observer_records_the_send_recoverable_classification_once_across_repeated_passes() {
+        let fixture = ObserverFixture::new(true).await;
+        fixture.observe().await;
+        fixture.assert_captured().await;
+        fixture.exited.store(true, Ordering::SeqCst);
+        for _ in 0..3 {
+            fixture.observe().await;
+        }
+        let lifecycle = fixture.lifecycle();
+        let recorded = lifecycle
+            .lines()
+            .filter(|line| {
+                line.contains("supervisor.runtime_observer.native_exit_send_recoverable")
+            })
+            .count();
+        assert_eq!(
+            recorded, 1,
+            "one native-exit classification must be recorded exactly once while the observer keeps re-deriving it: {lifecycle}"
         );
     }
 }

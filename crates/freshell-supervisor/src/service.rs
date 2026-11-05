@@ -181,6 +181,9 @@ type ProviderPathInputBindings = HashMap<
     ),
 >;
 pub(crate) type LiveResumeEvidenceKey = (String, String, Option<String>);
+/// (soul id, incarnation id, native session id) of a send-recoverable
+/// native-exit classification the observer already recorded.
+pub(crate) type NativeExitClassificationKey = (String, String, Option<String>);
 
 #[derive(Clone)]
 pub struct Supervisor {
@@ -197,6 +200,14 @@ pub struct Supervisor {
     pub(crate) recovery_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     /// Bounds repeated provider-store probes for an unchanged live identity.
     pub(crate) live_resume_evidence_attempts: Arc<Mutex<HashMap<LiveResumeEvidenceKey, Instant>>>,
+    /// Send-recoverable native-exit classifications the observer already
+    /// recorded, keyed by [`NativeExitClassificationKey`]. The one-second
+    /// observer pass re-derives the same classification every pass while a
+    /// crashed session idles before its next send; this edge set keeps the
+    /// typed lifecycle observation a transition record (once per soul /
+    /// incarnation / native session), not a per-pass duplicate.
+    pub(crate) native_exit_classification_edges:
+        Arc<Mutex<HashMap<NativeExitClassificationKey, Instant>>>,
     auth_lookup_authorities: Arc<StdMutex<HashMap<String, AuthLookupAuthority>>>,
     provider_path_inputs: Arc<StdMutex<ProviderPathInputBindings>>,
     /// Reply budgets for supervisor→session-host commands, read once.
@@ -259,6 +270,7 @@ impl Supervisor {
             opencode_transfer_lifecycle_lock: Arc::new(Mutex::new(())),
             recovery_locks: Arc::new(Mutex::new(HashMap::new())),
             live_resume_evidence_attempts: Arc::new(Mutex::new(HashMap::new())),
+            native_exit_classification_edges: Arc::new(Mutex::new(HashMap::new())),
             auth_lookup_authorities: Arc::new(StdMutex::new(HashMap::new())),
             provider_path_inputs: Arc::new(StdMutex::new(HashMap::new())),
             host_command_budgets: HostCommandBudgets::from_env(),
