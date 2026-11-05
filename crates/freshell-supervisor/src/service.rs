@@ -2924,14 +2924,25 @@ impl Supervisor {
             && self
                 .retained_codex_host_eligible(&current, &host, &status)
                 .await?;
+        let supports_codex_same_root_readiness = host
+            .capabilities
+            .iter()
+            .any(|capability| capability == "fresh-agent-codex-same-root-readiness-v1");
         let codex_same_root_prepare = admission == FreshNativeAdmission::CodexCompactReadiness
-            && host
-                .capabilities
-                .iter()
-                .any(|capability| capability == "fresh-agent-codex-same-root-readiness-v1")
+            && supports_codex_same_root_readiness
             && self
                 .retained_codex_host_eligible(&current, &host, &status)
                 .await?;
+        if readiness_needed
+            && admission == FreshNativeAdmission::CodexCompactReadiness
+            && current.provider == "codex"
+            && !supports_codex_same_root_readiness
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::RecoveryBlocked,
+                "Codex Compact requires a host with same-root native readiness support",
+            ));
+        }
         if readiness_needed && can_prepare_claude {
             let before = current.write_fence();
             let expected_launch = current

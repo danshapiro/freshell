@@ -16,6 +16,10 @@ const scheduled: RetryEvent = { event: 'supervisor.recovery_retry.scheduled', da
 afterEach(() => { vi.useRealTimers() })
 
 describe('provider replacement observation', () => {
+  it('accepts an identity-fenced running replacement before its retry event is observed', () => {
+    expect(selectProviderReplacement([pending, ready], before, [])).toEqual(ready)
+  })
+
   it('observes a valid bounded preparation retry through the same native replacement', async () => {
     vi.useFakeTimers()
     const read = vi.fn()

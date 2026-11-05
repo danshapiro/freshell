@@ -56,6 +56,10 @@ export function selectProviderReplacement<T extends ReplacementView>(
     || row.nativeSessionId !== before.nativeSessionId)) {
     throw new Error('provider replacement identity fence changed')
   }
+  const replacement = matching.find(row => row.launchState === 'running'
+    && row.recoveryState === 'live' && row.containerId && row.incarnationId !== before.incarnationId)
+  if (replacement) return replacement
+
   const blocked = matching.find(row => row.recoveryState === 'blocked')
   if (blocked) {
     if (blocked.recoveryReason !== 'CAPABILITY_PENDING' || !preparationRetryIsActive(events, before)) {
@@ -63,8 +67,7 @@ export function selectProviderReplacement<T extends ReplacementView>(
     }
     return undefined
   }
-  return matching.find(row => row.launchState === 'running'
-    && row.recoveryState === 'live' && row.containerId && row.incarnationId !== before.incarnationId)
+  return undefined
 }
 
 export async function waitForProviderReplacement<T extends ReplacementView>(

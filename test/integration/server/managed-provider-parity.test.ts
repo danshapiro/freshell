@@ -189,7 +189,6 @@ async function waitForOpenCodeReplacement(
   deadline: number,
 ): Promise<OpenCodeReplacementInventoryRow> {
   let pendingSinceMs: number | undefined
-  let replacementWithoutRetrySinceMs: number | undefined
   return waitForUntil('replacement OpenCode incarnation', async () => {
     const rows = (await source.inventory()).filter(row => row.terminalId === before.terminalId)
     if (rows.some(row => row.soulId !== before.soulId
@@ -203,20 +202,8 @@ async function waitForOpenCodeReplacement(
     const events = source.retryEventsForSoul(before.soulId)
     const latest = events.at(-1)
     const replacement = rows.find(row => row.launchState === 'running'
-      && row.containerId && row.incarnationId !== before.incarnationId)
-    if (replacement) {
-      // There is no longer a blocked row whose state can predate a completed
-      // retry. Evaluate the latest event directly; only a missing/stale event
-      // may use the bounded append/read grace below.
-      const retryStatus = recoveryRetryStatus(latest, before, 0)
-      if (hasMatchingPreparationRetryEvent(events, before)
-        && (retryStatus === 'eligible' || retryStatus === 'recovered')) return replacement
-      if (retryStatus === 'unobserved') {
-        replacementWithoutRetrySinceMs ??= Date.now()
-        if (Date.now() - replacementWithoutRetrySinceMs < 1_500) return undefined
-      }
-      throw new Error(`OpenCode replacement has no matching preparation retry event; retry=${retryStatus}`)
-    }
+      && row.recoveryState === 'live' && row.containerId && row.incarnationId !== before.incarnationId)
+    if (replacement) return replacement
     const blocked = rows.find(row => row.recoveryState === 'blocked')
     if (blocked) {
       if (blocked.recoveryReason !== 'CAPABILITY_PENDING') {
@@ -242,6 +229,18 @@ describe('OpenCode replacement readiness wait', () => {
   const priorIncarnationId = 'incarnation-before-retry'
   const before = { terminalId, soulId, incarnationId: priorIncarnationId, intentRevision: 1, controlEpoch: 7 }
 
+  it('accepts the exact running replacement before its retry event is observed', async () => {
+    const replacement = await waitForOpenCodeReplacement({
+      inventory: async () => [
+        { ...before, recoveryState: 'blocked', recoveryReason: 'CAPABILITY_PENDING' },
+        { ...before, incarnationId: 'incarnation-after-retry', recoveryState: 'live', launchState: 'running', containerId: 'container-after-retry' },
+      ],
+      retryEventsForSoul: () => [],
+    }, before, Date.now() + 1_000)
+
+    expect(replacement.incarnationId).toBe('incarnation-after-retry')
+  })
+
   it('waits through a retryable capability-pending state until the replacement is running', async () => {
     let inventoryReads = 0
     const source = {
@@ -250,7 +249,7 @@ describe('OpenCode replacement readiness wait', () => {
         if (inventoryReads === 1) {
           return [{ ...before, recoveryState: 'blocked', recoveryReason: 'CAPABILITY_PENDING', evidenceRevision: 2 }]
         }
-        return [{ ...before, launchState: 'running', containerId: 'container-replacement', incarnationId: 'incarnation-after-retry' }]
+        return [{ ...before, recoveryState: 'live', launchState: 'running', containerId: 'container-replacement', incarnationId: 'incarnation-after-retry' }]
       },
       retryEventsForSoul: (requestedSoulId: string): RecoveryRetryLifecycleEvent[] => requestedSoulId === soulId
         ? [{ event: 'supervisor.recovery_retry.scheduled', at: Date.now(), data: {

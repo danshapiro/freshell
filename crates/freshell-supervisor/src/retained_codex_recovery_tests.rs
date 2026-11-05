@@ -707,6 +707,20 @@ async fn public_compact_prepares_retained_codex_same_root_without_input_or_repla
 }
 
 #[tokio::test]
+async fn public_compact_fails_closed_when_host_lacks_same_root_readiness() {
+    let fixture = ControlledCodex::new().await;
+    fixture.capability.store(false, Ordering::SeqCst);
+
+    let error = fixture.compact().await.unwrap_err();
+
+    assert_eq!(error.code, RuntimeErrorCode::RecoveryBlocked);
+    assert!(error.message.contains("same-root native readiness support"));
+    assert_eq!(fixture.prepares.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.compacts.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.inputs.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn observer_retains_eligible_codex_actor_without_attempts_then_host_loss_uses_supervisor() {
     let fixture = ControlledCodex::new().await;
     assert!(matches!(

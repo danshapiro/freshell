@@ -154,10 +154,10 @@ fn exact_resume_candidate_base(
                 "stored resume specification is not bound to the current soul identity".into(),
             ));
         }
-        // The cached proof pins native history. Accepted launch settings can
-        // change after that capture and remain authoritative for fresh actors.
+        // The cached proof pins the original launch location and native
+        // history. Current accepted provider settings are applied after the
+        // exact native thread has been resumed.
         if let Some(agent) = context.fresh_agent.as_ref() {
-            candidate.cwd = agent.cwd.clone();
             candidate.model = agent.model.clone();
             candidate.reasoning_effort = agent.effort.clone();
             candidate.permission_mode = agent.permission_mode.clone();
@@ -670,7 +670,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn cached_fresh_resume_uses_current_accepted_launch_settings() {
+    fn cached_fresh_resume_keeps_saved_cwd_and_uses_current_provider_settings() {
         let mut context = fixture_context(Some("native-exact"));
         context.provider = "codex".into();
         context.fresh_agent = Some(
@@ -704,7 +704,7 @@ pub(crate) mod tests {
             let resumed = exact_resume_candidate(&context, Some("native-exact"))
                 .unwrap()
                 .unwrap();
-            assert_eq!(resumed.cwd, "/workspace/recovery-cwd");
+            assert_eq!(resumed.cwd, captured.cwd);
             assert_eq!(resumed.model.as_deref(), model);
             assert_eq!(resumed.reasoning_effort.as_deref(), effort);
             assert_eq!(resumed.permission_mode.as_deref(), Some("never"));

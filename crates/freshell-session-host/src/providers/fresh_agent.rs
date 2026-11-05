@@ -5549,6 +5549,7 @@ await import(parameters.source)
             child: Mutex::new(None),
             pty: Mutex::new(None),
             fresh_agent: Mutex::new(None),
+            fresh_agent_starting: Mutex::new(None),
             fresh_native_command: Mutex::new(()),
             provider_config_paths: crate::ProviderConfigPaths::default(),
             opencode_transfer_mount: std::path::PathBuf::from(crate::OPENCODE_TRANSFER_MOUNT),
@@ -5922,7 +5923,7 @@ await import(parameters.source)
                 .await;
             match mode {
                 "missing" => {
-                    behavior["overrides"] = json!({"thread/resume":{"error":{"code":-32600,"message":"no rollout found for thread id original-native"}}})
+                    behavior["overrides"] = json!({"thread/resume":{"error":{"code":-32600,"message":format!("no rollout found for thread id {original}")}}})
                 }
                 "transient" => {
                     behavior["overrides"] = json!({"thread/resume":{"error":{"code":-32000,"message":"temporarily unavailable"}}})
@@ -6390,7 +6391,7 @@ await import(parameters.source)
         assert!(!rows
             .iter()
             .any(|row| row["method"] == "thread/compact/start"));
-        behavior["overrides"] = json!({"thread/resume":{"error":{"code":-32600,"message":"no rollout found for thread id original-native"}}});
+        behavior["overrides"] = json!({"thread/resume":{"error":{"code":-32600,"message":format!("no rollout found for thread id {original}")}}});
         behavior["threadStartThreadId"] = json!(replacement);
         std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR", behavior.to_string());
         native_mint_input(

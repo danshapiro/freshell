@@ -217,8 +217,6 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
         "closed",
         "transport",
         "invalid-response",
-        "lifecycle-busy",
-        "lifecycle-busy-source-changes",
         "lifecycle-busy-write",
         "lifecycle-busy-source-changes-write",
     ] {
@@ -296,7 +294,9 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
                             }),
                             "lifecycle-busy"
                             | "lifecycle-busy-source-changes"
-                            | "lifecycle-busy-postflight-fails" => {
+                            | "lifecycle-busy-postflight-fails"
+                            | "lifecycle-busy-write"
+                            | "lifecycle-busy-source-changes-write" => {
                                 Reply::Failed(Error::LifecycleBusy)
                             }
                             "unsupported" => Reply::Failed(Error::Rpc {
@@ -315,9 +315,6 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
                             "invalid-response" => Reply::Failed(Error::InvalidResponse {
                                 detail: "malformed metadata".into(),
                             }),
-                            value if value.starts_with("lifecycle-busy") => {
-                                Reply::Failed(Error::LifecycleBusy)
-                            }
                             _ => unreachable!(),
                         })
                     }
@@ -382,14 +379,6 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
             "ok" => assert!(
                 matches!(reply,NativeCallResult::Confirmed(value) if value.title.as_deref()==Some("Native title"))
             ),
-            "lifecycle-busy"
-            | "lifecycle-busy-source-changes"
-            | "lifecycle-busy-postflight-fails" => {
-                assert!(
-                    matches!(reply, NativeCallResult::LifecycleBusy),
-                    "{scenario}: {reply:?}"
-                )
-            }
             "missing" | "unavailable" | "refused" | "transport" => assert!(
                 matches!(reply, NativeCallResult::Undelivered(_)),
                 "{scenario}: {reply:?}"

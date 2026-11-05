@@ -888,7 +888,6 @@ async fn dispatch_with_effects(
                     "provider-store-probe-v1".into(),
                     "opencode-adoption-observation-v1".into(),
                     "native-identity-observation-v1".into(),
-                    "fresh-agent-native-readiness-v1".into(),
                     "fresh-agent-codex-recovery-source-v1".into(),
                     "fresh-agent-codex-same-root-readiness-v1".into(),
                     HOST_CAPABILITY_NATIVE_READINESS_RECEIPT_V1.into(),
@@ -1395,27 +1394,14 @@ async fn dispatch_with_effects(
                         .await
                         .clone()
                         .ok_or_else(unsupported_fresh_agent)?;
-                    let prior_native = actor.profile().await.native_session_id;
-                    let command_state = actor
-                        .semantic_operation(
-                            request_id,
-                            freshell_agent_runtime::host_actor::FreshAgentOperation::Compact {
-                                instructions,
-                                cwd,
-                            },
-                        )
-                        .await
-                        .map_err(map_actor_error)?;
-                    let after = actor.profile().await;
-                    if retained_root.as_deref().is_some_and(|root| {
-                        prior_native.as_deref() != Some(root)
-                            || after.native_session_id.as_deref() != Some(root)
-                    }) {
-                        return Err(RuntimeError::new(
-                            RuntimeErrorCode::RecoveryWrongIdentity,
-                            "Codex Compact changed its retained native root",
-                        ));
-                    }
+                    let (prior_native, command_state) = compact_fresh_agent_actor(
+                        &actor,
+                        retained_root.as_deref(),
+                        request_id,
+                        instructions,
+                        cwd,
+                    )
+                    .await?;
                     commit_fresh_native_transition(state, &actor, prior_native.as_deref()).await?;
                     Ok(HostResult::FreshAgentCommand {
                         native_identity: None,
@@ -1806,6 +1792,39 @@ fn map_actor_error(error: freshell_agent_runtime::host_actor::ActorError) -> Run
     // Provider error strings may contain request bodies, environment values,
     // or credentials. Keep the control payload typed and deliberately opaque.
     RuntimeError::new(code, "hosted fresh-agent command failed")
+}
+
+async fn compact_fresh_agent_actor(
+    actor: &Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>,
+    retained_root: Option<&str>,
+    request_id: freshell_runtime_protocol::RequestId,
+    instructions: Option<String>,
+    cwd: Option<String>,
+) -> Result<(Option<String>, freshell_runtime_protocol::CommandState), RuntimeError> {
+    let prior_native = actor.profile().await.native_session_id;
+    if retained_root.is_some_and(|root| prior_native.as_deref() != Some(root)) {
+        return Err(RuntimeError::new(
+            RuntimeErrorCode::RecoveryWrongIdentity,
+            "Codex Compact requires the retained native root before dispatch",
+        ));
+    }
+    let command_state = actor
+        .semantic_operation(
+            request_id,
+            freshell_agent_runtime::host_actor::FreshAgentOperation::Compact { instructions, cwd },
+        )
+        .await
+        .map_err(map_actor_error)?;
+    let after = actor.profile().await;
+    if retained_root.is_some_and(|root| {
+        prior_native.as_deref() != Some(root) || after.native_session_id.as_deref() != Some(root)
+    }) {
+        return Err(RuntimeError::new(
+            RuntimeErrorCode::RecoveryWrongIdentity,
+            "Codex Compact changed its retained native root",
+        ));
+    }
+    Ok((prior_native, command_state))
 }
 
 fn map_fresh_agent_open_error(
@@ -12501,6 +12520,72 @@ mod tests {
                 serde_json::json!(value["launch"]["evidenceRevision"].as_u64().unwrap() + 1);
             value["launch"]["requestedNativeSessionId"] = serde_json::json!("fixture-native-child");
         }
+    }
+
+    #[tokio::test]
+    async fn compact_refuses_a_mismatched_actor_root_before_provider_dispatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let incarnation_id = freshell_runtime_protocol::IncarnationId::new();
+        let launch = freshell_runtime_protocol::NativeIdentityLaunch {
+            incarnation_id,
+            launch_nonce: "compact-root-fence".into(),
+            evidence_revision: 7,
+            execution_generation: 1,
+            requested_native_session_id: Some("fixture-native-thread".into()),
+        };
+        let transport = Arc::new(RpcFixtureTransport {
+            native_evidence: std::sync::Mutex::new(Some(serde_json::json!({
+                "launch": launch,
+                "nativeSessionId": "fixture-native-thread"
+            }))),
+            dispatches: AtomicUsize::new(0),
+            checkpoint_attempts: std::sync::Mutex::new(Vec::new()),
+            decisions: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            captures: AtomicUsize::new(0),
+            stops: AtomicUsize::new(0),
+        });
+        let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+            directory.path().join("compact-root-fence-agent"),
+            FreshAgentProfile {
+                naming_handle: None,
+                collaboration_mode: None,
+                provider: FreshProvider::Codex,
+                runtime_variant: "codex-app-server".into(),
+                cwd: "/workspace".into(),
+                model: None,
+                effort: None,
+                permission_mode: None,
+                sandbox: None,
+                provider_store_id: "codex-store".into(),
+                native_session_id: Some("fixture-native-thread".into()),
+                plugins: None,
+                model_selection: None,
+                session_ref: None,
+                provider_launch_context: None,
+                provider_secret_references: Vec::new(),
+            },
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+
+        let error = super::compact_fresh_agent_actor(
+            &actor,
+            Some("retained-native-root"),
+            RequestId::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.code,
+            freshell_runtime_protocol::RuntimeErrorCode::RecoveryWrongIdentity
+        );
+        assert_eq!(transport.operations.load(Ordering::SeqCst), 0);
+        actor.stop().await.unwrap();
     }
 
     #[tokio::test]
