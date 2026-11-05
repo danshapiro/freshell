@@ -19,6 +19,7 @@ import type { InitialProviderVolumeAuthorization } from '../../../scripts/testin
 // @ts-expect-error The native model-wire fixture is also used by the offline Node runner.
 import { startInManagedContext } from '../providers/codex-local-provider.mjs'
 import { cleanupProviderParity } from '../../helpers/provider-parity-cleanup.js'
+import { waitFor, waitForFreshAgentFrame } from '../../helpers/fresh-agent-wait.js'
 
 const root = path.resolve(import.meta.dirname, '../../..')
 const runFile = promisify(execFile)
@@ -32,17 +33,7 @@ const providers = [
 // 30s after the first two failed cycles. Include one 20s Codex metadata
 // request and worker scheduling margin for the final attempt.
 const NATIVE_NAME_SYNC_TIMEOUT_MS = 60_000
-
-async function waitFor<T>(label: string, probe: () => T | undefined | Promise<T | undefined>, timeoutMs = 90_000): Promise<T> {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    const value = await probe()
-    if (value !== undefined) return value
-    // Pace one-read observation callbacks; other API calls share the budget.
-    await new Promise(resolve => setTimeout(resolve, 250))
-  }
-  throw new Error(`timed out waiting for ${label}`)
-}
+const HOSTED_PROVIDER_CASE_TIMEOUT_MS = 240_000
 
 class FreshWire {
   readonly frames: any[] = []
@@ -71,10 +62,8 @@ class FreshWire {
     this.socket.send(JSON.stringify(frame))
   }
 
-  wait(predicate: (frame: any) => boolean): Promise<any> {
-    return waitFor('fresh-agent frame', () => this.frames.find(predicate)).catch(error => {
-      throw new Error(`${String(error)}; recent frames: ${JSON.stringify(this.frames.slice(-12))}`)
-    })
+  wait(predicate: (frame: any) => boolean, deadline?: number): Promise<any> {
+    return waitForFreshAgentFrame(this.frames, predicate, deadline)
   }
 
   async close(): Promise<void> {
@@ -210,6 +199,11 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   }), 180_000)
 
   it.each(providers)('$sessionType retains create settings and exact native resume', async row => {
+    // Managed input preparation and native startup have separate bounds. Let
+    // the first outcome use the remaining case budget, without renewing it
+    // for handshake or intermediate frames. All later assertions still run
+    // within the same existing test timeout.
+    const deadline = Date.now() + HOSTED_PROVIDER_CASE_TIMEOUT_MS
     const wire = await FreshWire.connect(rig.info)
     wires.push(wire)
     const requestId = `fresh-parity-${randomUUID()}`
@@ -225,7 +219,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     const owner = authorizeFreshRequest(row.provider, requestId)
     wire.send(createRequest)
     const created = await wire.wait(frame => frame.requestId === requestId
-      && (frame.type === 'freshAgent.created' || frame.type === 'freshAgent.create.failed'))
+      && (frame.type === 'freshAgent.created' || frame.type === 'freshAgent.create.failed'), deadline)
     if (created.type === 'freshAgent.create.failed') {
       let providerInputs: unknown[] = []
       try {
@@ -410,7 +404,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
         },
       }))
     }
-  }, 240_000)
+  }, HOSTED_PROVIDER_CASE_TIMEOUT_MS)
 })
 
 describe('installed Codex through the managed gateway and durable actor', () => {
