@@ -2244,17 +2244,30 @@ async fn main() -> ExitCode {
             // check the attach arm (`agy --conversation <id>`) resolves —
             // the index's AntigravitySource drops parse-failed transcripts,
             // so a conversation dir on disk can answer a false warm Absent
-            // while the CLI would still resume it. CHEAP single-open check,
-            // so it joins the sync warm-Absent adjudication path
-            // (amplifier/opencode class, NOT codex's gate-only walk). The
-            // home is resolved with the SAME helper the provider_roots
-            // entry above uses. No resolvable provider home => probe
-            // behaves as today for antigravity.
+            // while the CLI would still resume it. CHEAP checks per query
+            // (the population probe's two brain/ readdirs + the resolved
+            // root's single open — the amplifier/opencode class, NOT
+            // codex's gate-only walk), so it joins the sync warm-Absent
+            // adjudication path.
+            // AUTHORITY LADDER (focused repair round 3, Major 1): the
+            // binary reads only ITS OWN store root, so the gate's by-id
+            // answers are rooted in that store, resolved per the ladder —
+            // the `FRESHELL_ANTIGRAVITY_HOME` override is authoritative
+            // alone; with it unset, the single conversation-bearing
+            // candidate root is the store; with BOTH candidates
+            // populated, Freshell cannot know which root the CLI reads
+            // and DEFERS found ids to the binary (Unknown at the probe —
+            // never a wrong-root Present the CLI would silently replace
+            // with a fresh conversation, and never a false refusal for an
+            // id found nowhere). A dual-root store logs one loud
+            // startup line telling the operator to set the override. The
+            // index source and the provider_roots entry above keep the
+            // seam's single-root selection (history/search parity). No
+            // resolvable provider home => probe behaves as today for
+            // antigravity.
             let probe = match session_directory::provider_home() {
                 Some(h) => probe.with_antigravity_transcript_locator(
-                    existence::antigravity_transcript_locator(
-                        freshell_sessions::provider_layout::antigravity_home(&h),
-                    ),
+                    existence::antigravity_authority_root_locator(&h),
                 ),
                 None => probe,
             };

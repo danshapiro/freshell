@@ -5000,36 +5000,16 @@ export interface RuntimeWebHandle {
   ownedChildPids(): number[]
 }
 export type RuntimeWebFactory = (options: RuntimeWebConstructOptions) => RuntimeWebHandle
-export function runtimeWebStripPrefixes(options: Pick<RuntimeWebConstructOptions, 'stripEnvPrefixes' | 'providerFreeFixture'>
-  & { env?: RuntimeWebConstructOptions['env'] }): string[] {
+export function runtimeWebStripPrefixes(options: Pick<RuntimeWebConstructOptions, 'stripEnvPrefixes' | 'providerFreeFixture'>): string[] {
   return [...options.stripEnvPrefixes ?? [], ...(options.providerFreeFixture ? [
     'ANTHROPIC_', 'OPENAI_', 'GEMINI_', 'ONECLI_', 'FRESHELL_MANAGED_CLAUDE_',
     'FRESHELL_MANAGED_CODEX_', 'FRESHELL_MANAGED_OPENCODE_', 'FRESHELL_MANAGED_AMPLIFIER_',
-  ] : []), ...managedRuntimeAmbientStripPrefixes(options)]
-}
-
-/**
- * The ambient managed-runtime opt-in (`FRESHELL_MANAGED_RUNTIME_V1`) never
- * reaches a spawned test server unless the construction explicitly
- * configures the key in its `env`. The self-hosted server runs as a managed
- * runtime (its systemd drop-in exports the opt-in), so every shell it
- * spawns — every agent terminal driving these tests — inherits it, and a
- * freshell-server built WITHOUT the managed-runtime-v1 feature REFUSES to
- * boot with that value (main.rs `managed_runtime_feature_error`). A
- * construction that explicitly sets the key (the managed-runtime owner's
- * web construct does exactly that) keeps it: the intentional managed
- * fixture seam survives, ambient leakage does not.
- */
-function managedRuntimeAmbientStripPrefixes(options: { env?: Record<string, string> }): string[] {
-  return Object.hasOwn(options.env ?? {}, 'FRESHELL_MANAGED_RUNTIME_V1')
-    ? []
-    : ['FRESHELL_MANAGED_RUNTIME_V1']
+  ] : [])]
 }
 
 /** Fixture isolation keeps only explicitly supplied references; requested scrubs still win. */
 export function stripRuntimeWebEnvironment(env: NodeJS.ProcessEnv,
-  options: Pick<RuntimeWebConstructOptions, 'stripEnvPrefixes' | 'providerFreeFixture' | 'fixtureOnecliReferences'>
-  & { env?: RuntimeWebConstructOptions['env'] }): void {
+  options: Pick<RuntimeWebConstructOptions, 'stripEnvPrefixes' | 'providerFreeFixture' | 'fixtureOnecliReferences'>): void {
   const references = options.providerFreeFixture ? Object.entries(options.fixtureOnecliReferences ?? {}).filter(([key, value]) => (
     /^FRESHELL_MANAGED_(CLAUDE|CODEX|OPENCODE)_ONECLI_(ENV|AUTH|CA)_FILE$/.test(key)
     && typeof value === 'string' && value.trim().length > 0 && env[key] === value

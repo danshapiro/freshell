@@ -440,6 +440,13 @@ async function bootWithHold(
       FRESHELL_TEST_SESSION_INDEX_STARTUP_HOLD_MS: String(options.holdMs ?? HOLD_MS),
     },
     setupHome: options.setupHome,
+    // This spec imports RustServer directly (restart()/restartAbrupt()), so
+    // the external-target factory's default strip does not apply: strip the
+    // ambient managed-runtime opt-in the same way the factory does unless a
+    // test explicitly configures it — a developer shell exporting
+    // FRESHELL_MANAGED_RUNTIME_V1=1 would otherwise fail server boot against
+    // a non-managed-runtime feature build.
+    stripEnvPrefixes: ['FRESHELL_MANAGED_RUNTIME_V1'],
   })
   const info = await server.start()
   await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)

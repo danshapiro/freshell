@@ -110,27 +110,6 @@ describe('owned tunnel executable selection', () => {
   })
 })
 
-describe('runtime web ambient managed-runtime isolation', () => {
-  // The shared runtime-web env scrub strips the ambient managed-runtime
-  // opt-in (FRESHELL_MANAGED_RUNTIME_V1) from every spawned test server
-  // unless the construct explicitly configures the key in its env. Ambient
-  // inheritance breaks boot against a non-feature-built freshell-server
-  // (main.rs managed_runtime_feature_error), and the self-hosted machine
-  // exports the opt-in into every terminal it spawns; a construct that
-  // explicitly sets the key (the managed-runtime owner's web construct)
-  // must keep it.
-  it('strips the ambient opt-in from a construct that does not configure it', () => {
-    const env: Record<string, string> = { FRESHELL_MANAGED_RUNTIME_V1: '1', UNRELATED: 'kept' }
-    stripRuntimeWebEnvironment(env, { stripEnvPrefixes: [] })
-    expect(env).toEqual({ UNRELATED: 'kept' })
-  })
-  it('keeps the opt-in a construct explicitly configures', () => {
-    const env: Record<string, string> = { FRESHELL_MANAGED_RUNTIME_V1: 'ambient' }
-    stripRuntimeWebEnvironment(env, { stripEnvPrefixes: [], env: { FRESHELL_MANAGED_RUNTIME_V1: '1' } })
-    expect(env).toEqual({ FRESHELL_MANAGED_RUNTIME_V1: 'ambient' })
-  })
-})
-
 describe('ordinary smoke failure cleanup', () => {
   it('awaits owned cleanup before returning the operation result', async () => {
     const resource = { released: false }

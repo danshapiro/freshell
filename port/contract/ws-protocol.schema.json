@@ -8726,6 +8726,14 @@
               "duplicate": {
                 "type": "string"
               },
+              "identityDisposition": {
+                "enum": [
+                  "resumed",
+                  "minted_replacement",
+                  "fresh_unbound"
+                ],
+                "type": "string"
+              },
               "paneKey": {
                 "minLength": 1,
                 "type": "string"
@@ -8750,6 +8758,9 @@
                   "sessionId"
                 ],
                 "type": "object"
+              },
+              "staleSessionNotice": {
+                "type": "string"
               },
               "terminalId": {
                 "minLength": 1,
@@ -8796,6 +8807,14 @@
         "duplicate": {
           "type": "string"
         },
+        "identityDisposition": {
+          "enum": [
+            "resumed",
+            "minted_replacement",
+            "fresh_unbound"
+          ],
+          "type": "string"
+        },
         "paneKey": {
           "minLength": 1,
           "type": "string"
@@ -8820,6 +8839,9 @@
             "sessionId"
           ],
           "type": "object"
+        },
+        "staleSessionNotice": {
+          "type": "string"
         },
         "terminalId": {
           "minLength": 1,

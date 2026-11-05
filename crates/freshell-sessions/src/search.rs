@@ -229,19 +229,18 @@ fn extract_codex_message(obj: &Value) -> Option<(&'static str, String)> {
     Some((role, text.trim().to_string()))
 }
 
-/// The antigravity transcript's message records: `type=="user_message"`
-/// and `type=="assistant_message"`, each carrying its text in the
-/// top-level `text` field (the Stage-1 candidate record schema, pinned by
-/// `test/fixtures/coding-cli/antigravity/*.sanitized.jsonl` — see
-/// `parse/antigravity.rs`). Every other record type (session_start,
-/// turn_settled, tool_call, unknown) is not a searchable message.
+/// The antigravity transcript's message records (real binary v1.4.12
+/// contract): `type=="USER_INPUT"` (source USER_EXPLICIT) and
+/// `type=="PLANNER_RESPONSE"`, each carrying its text in the top-level
+/// `content` field. GENERIC/SYSTEM_MESSAGE/CHECKPOINT records are step
+/// or system noise, not searchable messages.
 fn extract_antigravity_message(obj: &Value) -> Option<(&'static str, String)> {
     let role: &'static str = match obj.get("type").and_then(Value::as_str)? {
-        "user_message" => "user",
-        "assistant_message" => "assistant",
+        "USER_INPUT" => "user",
+        "PLANNER_RESPONSE" => "assistant",
         _ => return None,
     };
-    let text = obj.get("text").and_then(Value::as_str)?;
+    let text = obj.get("content").and_then(Value::as_str)?;
     Some((role, text.trim().to_string()))
 }
 
@@ -335,9 +334,9 @@ mod tests {
     // ── extract_antigravity_message ──
 
     #[test]
-    fn antigravity_user_message_is_extracted_for_the_user_role() {
+    fn antigravity_user_input_is_extracted_for_the_user_role() {
         let obj: Value = serde_json::from_str(
-            r#"{"type":"user_message","conversationId":"c1","text":"Fix the flaky test","at":"2026-10-29T20:00:01.000Z"}"#,
+            r#"{"type":"USER_INPUT","source":"USER_EXPLICIT","status":"DONE","step_index":0,"created_at":"2026-10-29T20:00:01Z","content":"Fix the flaky test"}"#,
         )
         .unwrap();
         assert_eq!(
@@ -347,9 +346,9 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_assistant_message_is_extracted_for_the_assistant_role() {
+    fn antigravity_planner_response_is_extracted_for_the_assistant_role() {
         let obj: Value = serde_json::from_str(
-            r#"{"type":"assistant_message","conversationId":"c1","text":"Fixed the test.","at":"2026-10-29T20:00:05.000Z"}"#,
+            r#"{"type":"PLANNER_RESPONSE","source":"MODEL","status":"DONE","step_index":1,"created_at":"2026-10-29T20:00:05Z","content":"Fixed the test."}"#,
         )
         .unwrap();
         assert_eq!(
@@ -359,11 +358,13 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_non_message_and_lifecycle_records_are_none() {
+    fn antigravity_step_and_system_records_are_none() {
         for line in [
             r#"{"type":"session_start","conversationId":"c1","workspacePaths":["/w"],"startedAt":"2026-10-29T20:00:00.000Z"}"#,
-            r#"{"type":"turn_settled","conversationId":"c1","at":"2026-10-29T20:00:05.500Z","outcome":"completed","fullyIdle":true}"#,
-            r#"{"type":"tool_call","conversationId":"c1","toolName":"bash","at":"2026-10-29T20:00:02.000Z"}"#,
+            r#"{"type":"GENERIC","source":"MODEL","status":"DONE","step_index":2,"created_at":"2026-10-29T20:00:02Z","content":"<tool step placeholder>"}"#,
+            r#"{"type":"SYSTEM_MESSAGE","source":"SYSTEM","status":"DONE","step_index":3,"created_at":"2026-10-29T20:00:03Z","content":"<system notice placeholder>"}"#,
+            r#"{"type":"CHECKPOINT","source":"SYSTEM","status":"DONE","step_index":4,"created_at":"2026-10-29T20:00:04Z","content":"<checkpoint summary placeholder>"}"#,
+            r#"{"type":"FUTURE_RECORD","source":"MODEL","status":"DONE","step_index":9,"created_at":"2026-10-29T20:00:09Z","content":"noise"}"#,
         ] {
             let obj: Value = serde_json::from_str(line).unwrap();
             assert_eq!(extract_antigravity_message(&obj), None);
@@ -371,9 +372,9 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_missing_text_field_is_none() {
+    fn antigravity_missing_content_field_is_none() {
         let obj: Value = serde_json::from_str(
-            r#"{"type":"user_message","conversationId":"c1","at":"2026-10-29T20:00:01.000Z"}"#,
+            r#"{"type":"USER_INPUT","source":"USER_EXPLICIT","status":"DONE","step_index":0,"created_at":"2026-10-29T20:00:01Z"}"#,
         )
         .unwrap();
         assert_eq!(extract_antigravity_message(&obj), None);
@@ -381,18 +382,18 @@ mod tests {
 
     // ── search_session_file: antigravity provider ──
 
-    /// The candidate transcript shape for the search arms (the committed
+    /// The real-shaped transcript for the search arms (the committed
     /// `test/fixtures/coding-cli/antigravity/fresh.sanitized.jsonl` record
-    /// schema): a `user_message` turn, an `assistant_message` reply, then a
-    /// turn settle.
+    /// schema, binary v1.4.12): a `USER_INPUT` turn, a `PLANNER_RESPONSE`
+    /// reply, then step noise.
     fn write_antigravity_temp(name: &str) -> std::path::PathBuf {
         write_temp(
             name,
             &format!(
                 "{}\n{}\n{}\n",
-                r#"{"type":"session_start","conversationId":"c1","workspacePaths":["/w"],"startedAt":"2026-10-29T20:00:00.000Z"}"#,
-                r#"{"type":"user_message","conversationId":"c1","text":"Fix the flaky test","at":"2026-10-29T20:00:01.000Z"}"#,
-                r#"{"type":"assistant_message","conversationId":"c1","text":"Fixed the test.","at":"2026-10-29T20:00:05.000Z","usage":{"inputTokens":10,"outputTokens":20,"cachedTokens":0,"totalTokens":30}}"#,
+                r#"{"type":"USER_INPUT","source":"USER_EXPLICIT","status":"DONE","step_index":0,"created_at":"2026-10-29T20:00:01Z","content":"Fix the flaky test"}"#,
+                r#"{"type":"PLANNER_RESPONSE","source":"MODEL","status":"DONE","step_index":1,"created_at":"2026-10-29T20:00:05Z","content":"Fixed the test.","input_tokens":10,"output_tokens":20,"cache_read_tokens":0}"#,
+                r#"{"type":"GENERIC","source":"MODEL","status":"DONE","step_index":2,"created_at":"2026-10-29T20:00:06Z","content":"<tool step placeholder>"}"#,
             ),
         )
     }
@@ -407,7 +408,7 @@ mod tests {
             FileSearchTier::UserMessages,
         )
         .unwrap();
-        let m = result.expect("userMessages tier must match the user_message record");
+        let m = result.expect("userMessages tier must match the USER_INPUT record");
         assert_eq!(m.matched_in, "userMessage");
         assert!(
             m.snippet.to_lowercase().contains("fix the flaky"),
@@ -424,7 +425,7 @@ mod tests {
             )
             .unwrap(),
             None,
-            "userMessages tier must not match assistant_message text"
+            "userMessages tier must not match PLANNER_RESPONSE text"
         );
         std::fs::remove_file(&path).ok();
     }
@@ -439,7 +440,7 @@ mod tests {
             FileSearchTier::FullText,
         )
         .unwrap();
-        let m = result.expect("fullText tier must match the assistant_message record");
+        let m = result.expect("fullText tier must match the PLANNER_RESPONSE record");
         assert_eq!(m.matched_in, "assistantMessage");
         assert!(m.snippet.to_lowercase().contains("fixed the test"));
         std::fs::remove_file(&path).ok();

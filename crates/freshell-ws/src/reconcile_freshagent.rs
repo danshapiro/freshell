@@ -362,6 +362,8 @@ fn base(pane: &ReconcilePane, verdict: ReconcileVerdict) -> PaneVerdict {
         corrected: None,
         reason: None,
         duplicate: None,
+        identity_disposition: None,
+        stale_session_notice: None,
     }
 }
 
