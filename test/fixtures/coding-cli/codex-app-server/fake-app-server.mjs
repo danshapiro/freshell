@@ -1194,6 +1194,18 @@ wss.on('connection', (socket, request) => {
       appendThreadOperation(method, message.params, result)
       maybeWriteRolloutForMethod(method, message.params)
       recordInputFileReads(method, message.params)
+      if (method === 'thread/resume') {
+        const thread = result?.thread || getThreadHandle(message.params?.threadId || 'thread-new-1')
+        if (!activeThreadIds.has(thread.id)) {
+          // Native 0.164 cold resume loads the runtime and publishes its Idle
+          // status before answering. An already-loaded resume has no new edge.
+          activeThreadIds.add(thread.id)
+          broadcastNotification('thread/status/changed', {
+            threadId: thread.id,
+            status: { type: 'idle' },
+          })
+        }
+      }
       socket.send(JSON.stringify({
         id: message.id,
         result,
@@ -1352,13 +1364,6 @@ wss.on('connection', (socket, request) => {
         broadcastNotification('thread/reverted', {
           threadId: message.params?.threadId,
           beforeTurnId: message.params?.beforeTurnId,
-        })
-      }
-      if (method === 'thread/resume') {
-        const thread = result?.thread || getThreadHandle(message.params?.threadId || 'thread-new-1')
-        activeThreadIds.add(thread.id)
-        broadcastNotification('thread/started', {
-          thread,
         })
       }
       if (method === 'fs/watch') {

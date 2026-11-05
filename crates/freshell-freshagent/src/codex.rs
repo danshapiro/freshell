@@ -30169,16 +30169,16 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn handle_attach_single_flights_concurrent_resumes_for_the_same_unknown_thread() {
         let _guard = ENV_LOCK.lock().await;
-        let log_path = std::env::temp_dir().join(format!(
-            "codex-resume-single-flight-{}-{}.jsonl",
-            std::process::id(),
-            now_ms()
-        ));
-        let _ = std::fs::remove_file(&log_path);
+        let logs = tempfile::tempdir().unwrap();
+        let log_path = logs.path().join("operations.jsonl");
+        let notification_path = logs.path().join("native-notifications.jsonl");
+        let request_path = logs.path().join("requests.jsonl");
         configure_fake_codex_cmd(
             &json!({
                 "delayMethodsMs": { "thread/resume": 300 },
-                "appendThreadOperationLogPath": log_path.to_str().unwrap(),
+                "appendThreadOperationLogPath": log_path,
+                "appendNativeNotificationLogPath": notification_path,
+                "appendRequestLogPath": request_path,
             })
             .to_string(),
         );
@@ -30191,39 +30191,72 @@ pub(crate) mod tests {
             st2.handle_attach(attach_msg("racey-thread")),
         );
 
-        let mut idle_snapshots = 0;
+        // Native cold resume emits its own Idle before the RPC response. The
+        // two attach handlers each emit their reply too. Join the queued native
+        // consumer within the existing witness budget, then require exact counts.
+        let idle_snapshots = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut snapshots = 0;
+            while snapshots < 3 {
+                let raw = rx.recv().await.expect("bus stays open");
+                let frame: Value = serde_json::from_str(&raw).unwrap();
+                assert_ne!(
+                    frame["event"]["code"], "INVALID_SESSION_ID",
+                    "neither concurrent attach should be told the thread is lost"
+                );
+                if frame["event"]["type"] == "freshAgent.session.snapshot" {
+                    assert_eq!(frame["sessionId"], "racey-thread");
+                    assert_eq!(frame["event"]["status"], "idle");
+                    snapshots += 1;
+                }
+            }
+            snapshots
+        })
+        .await
+        .expect("the native baseline and both attach snapshots arrive within the budget");
         while let Ok(raw) = rx.try_recv() {
             let frame: Value = serde_json::from_str(&raw).unwrap();
             assert_ne!(
                 frame["event"]["code"], "INVALID_SESSION_ID",
                 "neither concurrent attach should be told the thread is lost"
             );
-            if frame["event"]["type"] == "freshAgent.session.snapshot" {
-                idle_snapshots += 1;
-            }
+            assert_ne!(
+                frame["event"]["type"], "freshAgent.session.snapshot",
+                "no duplicate snapshot: {frame}"
+            );
         }
         assert_eq!(
-            idle_snapshots, 2,
-            "both concurrent attaches observe a real session snapshot"
+            idle_snapshots, 3,
+            "one native cold-load baseline plus one snapshot for each concurrent attach"
         );
 
-        // The fake app-server's log write (`fs.appendFileSync`, a side effect in a
-        // SEPARATE OS process) is not synchronized with this client observing the RPC
-        // response that unblocks `handle_attach` -- the two happen over independent
-        // kernel channels (the TCP response vs. the disk write), so reading the log
-        // exactly once immediately after `join!` returns can observe it before the
-        // write lands. Poll briefly for content instead of asserting on a single read.
-        let log = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let content = std::fs::read_to_string(&log_path).unwrap_or_default();
-                if !content.is_empty() {
-                    return content;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap_or_default();
+        // Both logs are written synchronously before the native response. This is an
+        // independent witness for the extra baseline, not a relaxed event bound.
+        let native_notifications: Vec<Value> = std::fs::read_to_string(notification_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            native_notifications,
+            vec![json!({"method":"thread/status/changed","threadId":"racey-thread"})]
+        );
+        let requests: Vec<Value> = std::fs::read_to_string(request_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|row| row["method"] == "initialize")
+                .count(),
+            1,
+            "exactly one sidecar is initialized"
+        );
+        assert!(!requests
+            .iter()
+            .any(|row| row["method"] == "thread/start" || row["method"] == "thread/fork"));
+        let log = std::fs::read_to_string(log_path).unwrap();
         let resume_count = log
             .lines()
             .filter(|l| l.contains("\"thread/resume\""))
@@ -30232,13 +30265,25 @@ pub(crate) mod tests {
             resume_count, 1,
             "expected exactly one thread/resume RPC to reach the fake app-server, log: {log}"
         );
+        let sessions = st.sessions.lock().await;
         assert_eq!(
-            st.sessions.lock().await.len(),
+            sessions.len(),
             1,
             "only one session is registered for the racing thread id"
         );
-
-        std::fs::remove_file(&log_path).ok();
+        let session = sessions
+            .get("racey-thread")
+            .expect("the requested identity is registered");
+        let operation: Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
+        assert_eq!(operation["threadId"], "racey-thread");
+        assert_eq!(
+            operation["pid"].as_u64(),
+            session.sidecar_pid.map(u64::from)
+        );
+        assert_eq!(
+            operation["sidecarOwnershipId"].as_str(),
+            Some(session.sidecar_ownership_id.as_str())
+        );
     }
 
     /// WIRE-SHAPE PARITY: attaching to a tracked, still-alive session (no crash, no

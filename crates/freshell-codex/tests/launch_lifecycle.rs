@@ -2065,24 +2065,116 @@ async fn spawned_runtime_uses_its_own_announced_listener() {
     assert_eq!(requests[0]["method"], "initialize");
 }
 
-#[tokio::test]
-async fn native_fixture_notification_opt_out_is_per_connection() {
-    async fn receive(
-        socket: &mut tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-    ) -> Value {
-        loop {
-            let frame = timeout(RECV_TIMEOUT, socket.next())
-                .await
-                .expect("native frame arrives")
-                .expect("socket stays open")
-                .unwrap();
-            if let Message::Text(text) = frame {
-                return serde_json::from_str(&text).unwrap();
-            }
+async fn receive_native_fixture_frame(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> Value {
+    loop {
+        let frame = timeout(RECV_TIMEOUT, socket.next())
+            .await
+            .expect("native frame arrives")
+            .expect("socket stays open")
+            .unwrap();
+        if let Message::Text(text) = frame {
+            return serde_json::from_str(&text).unwrap();
         }
     }
+}
+
+#[tokio::test]
+async fn native_fixture_only_cold_resume_emits_idle_before_the_response() {
+    let runtime = SpawnedCodexAppServerRuntime::with_command_and_store(
+        fake_app_server_command(),
+        Arc::new(CodexSidecarStore::disabled()),
+    );
+    let ready = runtime.ensure_ready(None).await.unwrap();
+    let (mut requester, _) = connect_async(&ready.ws_url).await.unwrap();
+    let (mut opted_out, _) = connect_async(&ready.ws_url).await.unwrap();
+    for (socket, id, opt_outs) in [
+        (&mut requester, "requester-init", json!([])),
+        (
+            &mut opted_out,
+            "opted-out-init",
+            json!(["thread/started", "thread/status/changed"]),
+        ),
+    ] {
+        socket.send(Message::Text(json!({"id":id,"method":"initialize","params":{"capabilities":{"optOutNotificationMethods":opt_outs}}}).to_string())).await.unwrap();
+        assert_eq!(receive_native_fixture_frame(socket).await["id"], id);
+    }
+    // A new thread's Idle is in its response, not a separate notification.
+    requester
+        .send(Message::Text(
+            json!({"id":"start","method":"thread/start","params":{}}).to_string(),
+        ))
+        .await
+        .unwrap();
+    let started = receive_native_fixture_frame(&mut requester).await;
+    assert_eq!(started["id"], "start");
+    assert_eq!(started["result"]["thread"]["status"]["type"], "idle");
+    let started_id = started["result"]["thread"]["id"].as_str().unwrap();
+    let started_notification = receive_native_fixture_frame(&mut requester).await;
+    assert_eq!(started_notification["method"], "thread/started");
+    assert_eq!(started_notification["params"]["thread"]["id"], started_id);
+    requester
+        .send(Message::Text(
+            json!({"id":"start-barrier","method":"configRequirements/read","params":{}})
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        receive_native_fixture_frame(&mut requester).await["id"],
+        "start-barrier"
+    );
+
+    requester.send(Message::Text(json!({"id":"cold-resume","method":"thread/resume","params":{"threadId":"cold-native-thread"}}).to_string())).await.unwrap();
+    let cold_status = receive_native_fixture_frame(&mut requester).await;
+    assert_eq!(cold_status["method"], "thread/status/changed");
+    assert_eq!(
+        cold_status["params"],
+        json!({"threadId":"cold-native-thread","status":{"type":"idle"}})
+    );
+    assert_eq!(
+        receive_native_fixture_frame(&mut requester).await["id"],
+        "cold-resume"
+    );
+
+    // Both freshly started and just-resumed threads are now loaded. Repeating
+    // resume must not manufacture another Idle edge. RPC barriers establish
+    // absence without a sleep, including the per-connection opt-out control.
+    for (id, thread_id) in [
+        ("warm-resume", "cold-native-thread"),
+        ("started-resume", started_id),
+    ] {
+        requester
+            .send(Message::Text(
+                json!({"id":id,"method":"thread/resume","params":{"threadId":thread_id}})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(receive_native_fixture_frame(&mut requester).await["id"], id);
+    }
+    for (socket, id) in [
+        (&mut requester, "requester-barrier"),
+        (&mut opted_out, "opted-out-barrier"),
+    ] {
+        socket
+            .send(Message::Text(
+                json!({"id":id,"method":"configRequirements/read","params":{}}).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(receive_native_fixture_frame(socket).await["id"], id);
+    }
+    requester.close(None).await.unwrap();
+    opted_out.close(None).await.unwrap();
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_fixture_notification_opt_out_is_per_connection() {
     let dir = tempfile::tempdir().unwrap();
     let behavior = dir.path().join("behavior.json");
     std::fs::write(&behavior, json!({"notificationsAfterMethods":{"thread/start":[{
@@ -2106,18 +2198,24 @@ async fn native_fixture_notification_opt_out_is_per_connection() {
         ))
         .await
         .unwrap();
-    assert_eq!(receive(&mut opted_out).await["id"], "opt-init");
-    assert_eq!(receive(&mut control).await["id"], "control-init");
+    assert_eq!(
+        receive_native_fixture_frame(&mut opted_out).await["id"],
+        "opt-init"
+    );
+    assert_eq!(
+        receive_native_fixture_frame(&mut control).await["id"],
+        "control-init"
+    );
     control
         .send(Message::Text(
             json!({"id":"control-start","method":"thread/start","params":{}}).to_string(),
         ))
         .await
         .unwrap();
-    let response = receive(&mut control).await;
-    let opted_notification = receive(&mut opted_out).await;
-    let control_started = receive(&mut control).await;
-    let control_status = receive(&mut control).await;
+    let response = receive_native_fixture_frame(&mut control).await;
+    let opted_notification = receive_native_fixture_frame(&mut opted_out).await;
+    let control_started = receive_native_fixture_frame(&mut control).await;
+    let control_status = receive_native_fixture_frame(&mut control).await;
     // A same-connection RPC response is an ordering witness after the native
     // notification batch; no timer-based negative assertion is needed.
     opted_out
@@ -2128,7 +2226,7 @@ async fn native_fixture_notification_opt_out_is_per_connection() {
         .unwrap();
     let mut opted_notifications = vec![opted_notification];
     loop {
-        let frame = receive(&mut opted_out).await;
+        let frame = receive_native_fixture_frame(&mut opted_out).await;
         if frame["id"] == "opt-barrier" {
             break;
         }
