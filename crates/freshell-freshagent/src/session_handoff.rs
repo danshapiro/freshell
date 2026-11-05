@@ -18,6 +18,7 @@
 //! and coordinator, minted in `freshell-server::main`.
 use std::sync::Arc;
 
+use crate::host_agent_admission::HostAgentAdmissionPermit;
 use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use freshell_ownership::{
     BeginOutcome, CommitOutcome, FailOutcome, ObservedFence, OwnerIdentity, RuntimeOwnerKind,
@@ -144,6 +145,18 @@ impl Default for HandoffTestHooks {
 impl HandoffTestHooks {
     fn record(&self, step: &'static str) {
         self.events.lock().expect("handoff hooks lock").push(step);
+    }
+
+    /// Return the terminal published by the currently parked handoff spawn.
+    /// Kept on the existing test hook so cross-crate race tests can observe
+    /// the target without reaching into `HandoffSpawnWatch` internals.
+    #[doc(hidden)]
+    pub fn published_terminal_for_test(&self) -> Option<String> {
+        self.spawn_watch_slot
+            .lock()
+            .ok()?
+            .as_ref()?
+            .published_terminal()
     }
 }
 
@@ -428,9 +441,35 @@ impl SessionHandoffRunner {
     /// uncommitted target runtime).
     pub fn spawn_handoff(self: &Arc<Self>, req: HandoffRequest) -> HandoffHandle {
         let (tx, rx) = oneshot::channel();
+        let admission_permit = if req.action == HandoffAction::ClearStaleBookkeeping {
+            None
+        } else {
+            match self.fresh_agent.host_agent_admission().try_admit() {
+                Ok(permit) => Some(Arc::new(permit)),
+                Err(error) => {
+                    let generation = self
+                        .ownership
+                        .observe(&req.provider, &req.session_id)
+                        .generation;
+                    let result = typed_failure(
+                        "HOST_AGENT_MAINTENANCE",
+                        &error.to_string(),
+                        true,
+                        generation,
+                    );
+                    let task = tokio::spawn(async move {
+                        let _ = tx.send(result);
+                    });
+                    return HandoffHandle {
+                        completion: rx,
+                        task,
+                    };
+                }
+            }
+        };
         let runner = Arc::clone(self);
         let task = tokio::spawn(async move {
-            let result = runner.run(req).await;
+            let result = runner.run(req, admission_permit).await;
             // Err (dropped receiver) is fine: the operation is detached.
             let _ = tx.send(result);
         });
@@ -563,7 +602,11 @@ impl SessionHandoffRunner {
     /// The atomic sequence. See the module doc; every failure branch is a
     /// typed, retryable JSON body and leaves the coordinator in a coherent
     /// state (restored prior, or Vacant — never a stranded Handoff).
-    async fn run(self: &Arc<Self>, req: HandoffRequest) -> Value {
+    async fn run(
+        self: &Arc<Self>,
+        req: HandoffRequest,
+        admission_permit: Option<Arc<HostAgentAdmissionPermit>>,
+    ) -> Value {
         // b8ke focused episode-2 round-2 F1: resolve the wire session id to
         // its CANONICAL coordinator key FIRST. The claude rollback's fork
         // re-keys ownership to the client-visible new durable id; a stale
@@ -645,6 +688,8 @@ impl SessionHandoffRunner {
                 .clear_stale_bookkeeping(&req, &operation_id, &initiator)
                 .await;
         }
+        let admission_permit = admission_permit
+            .expect("every start-capable handoff owns host-agent admission before begin_handoff");
         // An atomic handoff needs a platform capability that can positively
         // confirm the complete prior writer tree is gone. Refuse before
         // `begin_handoff` on platforms without that capability, so this
@@ -1155,6 +1200,7 @@ impl SessionHandoffRunner {
             target_spawn_watch: None,
             target_spawn_begun: false,
             disarmed: false,
+            admission_permit: Arc::clone(&admission_permit),
         };
         // 2. Broadcast the transition (all devices stop old-kind scheduling).
         // Every frame carries the boot epoch; the started frame's
@@ -1184,7 +1230,14 @@ impl SessionHandoffRunner {
         if let Some((owner, _)) = prior.as_ref() {
             guard.prior_stop = PriorStopPhase::KillInFlight;
             match self
-                .stop_runtime(&req, owner, &initiator, &operation_id, generation)
+                .stop_runtime(
+                    &req,
+                    owner,
+                    &initiator,
+                    &operation_id,
+                    generation,
+                    &admission_permit,
+                )
                 .await
             {
                 StopOutcomePriv::Reaped => {
@@ -1477,6 +1530,7 @@ impl SessionHandoffRunner {
                                         &owner,
                                         &operation_id,
                                         generation,
+                                        &admission_permit,
                                     )
                                     .await;
                                 if let StopOutcomePriv::PlatformLimitedFenced = reap_outcome {
@@ -1746,7 +1800,13 @@ impl SessionHandoffRunner {
                     stale @ (CommitOutcome::StaleGeneration { .. }
                     | CommitOutcome::ForeignOperation) => {
                         let reap_outcome = self
-                            .reap_uncommitted_target(&req, &owner, &operation_id, generation)
+                            .reap_uncommitted_target(
+                                &req,
+                                &owner,
+                                &operation_id,
+                                generation,
+                                &admission_permit,
+                            )
                             .await;
                         if let StopOutcomePriv::PlatformLimitedFenced = reap_outcome {
                             // b8ke d4 F1: the typed PlatformLimited fence.
@@ -2176,10 +2236,13 @@ impl SessionHandoffRunner {
         owner: &OwnerIdentity,
         operation_id: &str,
         generation: u64,
+        admission_permit: &Arc<HostAgentAdmissionPermit>,
     ) -> StopOutcomePriv {
         // b8ke d4 F1: the deterministic forced outcome (shared counter
         // budget with stop_runtime — the prior stop consumes the skip).
-        if let Some(outcome) = self.forced_stop_outcome(req, owner, operation_id, generation) {
+        if let Some(outcome) =
+            self.forced_stop_outcome(req, owner, operation_id, generation, admission_permit)
+        {
             return outcome;
         }
         match owner.kind {
@@ -2237,6 +2300,7 @@ impl SessionHandoffRunner {
                                         }
                                         ReapAnswer::Confirmed
                                     },
+                                    Arc::clone(admission_permit),
                                 );
                                 StopOutcomePriv::ReapTimeout { fenced: true }
                             }
@@ -2273,6 +2337,7 @@ impl SessionHandoffRunner {
                                             await_terminal_dead(&registry, &tid).await;
                                             ReapAnswer::Confirmed
                                         },
+                                        Arc::clone(admission_permit),
                                     );
                                     StopOutcomePriv::ReapTimeout { fenced: true }
                                 }
@@ -2294,6 +2359,7 @@ impl SessionHandoffRunner {
                         "handoff-runner-stale-commit",
                         operation_id,
                         generation,
+                        admission_permit,
                     )
                     .await;
                 // b8ke focused ep5 r4 F1: the FAILED-TRANSITION REPAIR —
@@ -2335,6 +2401,7 @@ impl SessionHandoffRunner {
         operation_id: &str,
         generation: u64,
         owner: &OwnerIdentity,
+        admission_permit: &Arc<HostAgentAdmissionPermit>,
     ) {
         let confirmation = async {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -2348,6 +2415,7 @@ impl SessionHandoffRunner {
             owner,
             "REAP_TIMEOUT",
             confirmation,
+            Arc::clone(admission_permit),
         );
     }
 
@@ -2828,6 +2896,7 @@ impl SessionHandoffRunner {
             &probe_target,
             "RUNNER_ABORTED",
             confirmation,
+            Arc::clone(&payload.admission_permit),
         );
     }
 
@@ -2962,7 +3031,13 @@ impl SessionHandoffRunner {
             // lifecycle request could start a second writer.
             let req = self.cleanup_request(provider, session_id, target.kind);
             let outcome = self
-                .reap_uncommitted_target(&req, target, operation_id, *generation)
+                .reap_uncommitted_target(
+                    &req,
+                    target,
+                    operation_id,
+                    *generation,
+                    &payload.admission_permit,
+                )
                 .await;
             match outcome {
                 // Confirmed death (or the pre-kill short-circuit proved
@@ -3232,6 +3307,7 @@ impl SessionHandoffRunner {
         owner: &OwnerIdentity,
         operation_id: &str,
         generation: u64,
+        admission_permit: &Arc<HostAgentAdmissionPermit>,
     ) -> Option<StopOutcomePriv> {
         let hooks = self.test_hooks.as_ref()?;
         if hooks
@@ -3253,7 +3329,7 @@ impl SessionHandoffRunner {
                 .is_err()
         {
             self.broadcast_fenced_reap_timeout(req, owner, operation_id, generation);
-            self.spawn_noop_reap_watcher(req, operation_id, generation, owner);
+            self.spawn_noop_reap_watcher(req, operation_id, generation, owner, admission_permit);
             return Some(StopOutcomePriv::ReapTimeout { fenced: true });
         }
         if hooks
@@ -3287,8 +3363,11 @@ impl SessionHandoffRunner {
         initiator: &str,
         operation_id: &str,
         generation: u64,
+        admission_permit: &Arc<HostAgentAdmissionPermit>,
     ) -> StopOutcomePriv {
-        if let Some(outcome) = self.forced_stop_outcome(req, owner, operation_id, generation) {
+        if let Some(outcome) =
+            self.forced_stop_outcome(req, owner, operation_id, generation, admission_permit)
+        {
             return outcome;
         }
         let budget = std::time::Duration::from_millis(self.reap_timeout_ms);
@@ -3349,6 +3428,7 @@ impl SessionHandoffRunner {
                                         }
                                         ReapAnswer::Confirmed
                                     },
+                                    Arc::clone(admission_permit),
                                 );
                                 StopOutcomePriv::ReapTimeout { fenced: true }
                             }
@@ -3395,6 +3475,7 @@ impl SessionHandoffRunner {
                                         // The registry row is dead — confirmed.
                                         ReapAnswer::Confirmed
                                     },
+                                    Arc::clone(admission_permit),
                                 );
                                 StopOutcomePriv::ReapTimeout { fenced: true }
                             }
@@ -3480,6 +3561,7 @@ impl SessionHandoffRunner {
                                         ReapAnswer::Lost
                                     }
                                 },
+                                Arc::clone(admission_permit),
                             );
                             StopOutcomePriv::ReapTimeout { fenced: true }
                         }
@@ -3536,6 +3618,7 @@ impl SessionHandoffRunner {
                                     Err(_) => ReapAnswer::Lost,
                                 }
                             },
+                            Arc::clone(admission_permit),
                         );
                         StopOutcomePriv::ReapTimeout { fenced: true }
                     }
@@ -3641,6 +3724,7 @@ impl SessionHandoffRunner {
         prior: &OwnerIdentity,
         release_reason: &'static str,
         confirmation: impl std::future::Future<Output = ReapAnswer> + Send + 'static,
+        admission_permit: Arc<HostAgentAdmissionPermit>,
     ) {
         let runner = Arc::clone(self);
         let provider = req.provider.clone();
@@ -3652,6 +3736,7 @@ impl SessionHandoffRunner {
         let broadcast_req = self.cleanup_request(&provider, &session_id, req.target_kind);
         let settled = std::time::Instant::now();
         tokio::spawn(async move {
+            let _admission_permit = admission_permit;
             match confirmation.await {
                 ReapAnswer::Lost => {
                     // R2-1: the confirmation future was lost — FENCE with
@@ -3718,6 +3803,7 @@ impl SessionHandoffRunner {
                         &prior,
                         "WATCHER_FAILED",
                         replacement,
+                        Arc::clone(&_admission_permit),
                     );
                     // The replacement watcher owns the release from here —
                     // this watcher's job ended with the fence (falling
@@ -4487,6 +4573,7 @@ struct AbortPayload {
     target_spawn_begun: bool,
     target: Option<OwnerIdentity>,
     spawn_watch: Option<crate::terminal_tabs::HandoffSpawnWatch>,
+    admission_permit: Arc<HostAgentAdmissionPermit>,
 }
 
 /// b8ke focused round-3 review R3-6: what the abort cleanup's
@@ -4564,6 +4651,7 @@ struct HandoffGuard {
     /// live on that lane).
     target_spawn_begun: bool,
     disarmed: bool,
+    admission_permit: Arc<HostAgentAdmissionPermit>,
 }
 
 impl HandoffGuard {
@@ -4599,6 +4687,7 @@ impl HandoffGuard {
             target_spawn_begun: self.target_spawn_begun,
             target,
             spawn_watch,
+            admission_permit: Arc::clone(&self.admission_permit),
         }
     }
 }
@@ -4686,7 +4775,9 @@ impl Drop for HandoffGuard {
             // b8ke e4r3 F1: the abort's OWN generation — the queued
             // broadcast refuses to publish when the record has moved on.
             let abort_generation = self.generation;
+            let admission_permit = Arc::clone(&self.admission_permit);
             handle.spawn(async move {
+                let _admission_permit = admission_permit;
                 runner
                     .broadcast_post_abort_authority(
                         &provider,
@@ -4895,14 +4986,16 @@ async fn handoff_handler(
     match tokio::time::timeout(std::time::Duration::from_secs(30), &mut completion).await {
         Ok(Ok(value)) => {
             let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
-            (
-                if ok {
-                    StatusCode::OK
-                } else {
-                    StatusCode::CONFLICT
-                },
-                Json(value),
-            )
+            let status = if ok {
+                StatusCode::OK
+            } else if value.pointer("/error/code").and_then(Value::as_str)
+                == Some("HOST_AGENT_MAINTENANCE")
+            {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::CONFLICT
+            };
+            (status, Json(value))
         }
         _ => (
             StatusCode::CONFLICT,

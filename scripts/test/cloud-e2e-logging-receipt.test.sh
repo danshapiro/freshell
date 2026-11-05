@@ -30,6 +30,11 @@ case "$*" in
   *"executions logs read"*)
     count_file="$STUB_CAPTURE/logs.count"
     count="$(cat "$count_file" 2>/dev/null || echo 0)"; count=$((count + 1)); echo "$count" > "$count_file"
+    if [ "${STUB_SCREENSHOT_DISPLAY:-0}" = 1 ]; then
+      cat "$STUB_CAPTURE/screenshot-display.log"
+      echo '{"event":"e2e_playwright_retry_trace_chunk","artifactId":"trace-original","offset":0,"data":"RETRY_TRACE_BYTES_SHOULD_STAY_RAW"}'
+      echo '{"event":"ordinary_diagnostic","message":"keep readable diagnostic"}'
+    fi
     if [ "${STUB_DELAY_PASSED_AFTER_SKIPPED_ONCE:-0}" = 1 ]; then
       echo "[e2e-entrypoint] Shard 1/1 assignment: focused fixture"
       echo "  3 skipped (1.0s)"
@@ -173,6 +178,59 @@ records_no_retry='[
 records_one_task='[
  {"jsonPayload":{"event":"e2e_playwright_task_complete","execution":"exec-json-receipt","taskIndex":0,"taskCount":1,"recoveredRetryCount":0}}
 ]'
+
+node - "$WORK/capture" <<'NODE'
+const fs = require('node:fs')
+const zlib = require('node:zlib')
+const root = process.argv[2]
+function crc32(bytes) {
+  let crc = 0xffffffff
+  for (const byte of bytes) {
+    crc ^= byte
+    for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0)
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+function chunk(type, data) {
+  const name = Buffer.from(type)
+  const length = Buffer.alloc(4); length.writeUInt32BE(data.length)
+  const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(Buffer.concat([name, data])))
+  return Buffer.concat([length, name, data, crc])
+}
+const ihdr = Buffer.alloc(13)
+ihdr.writeUInt32BE(1, 0); ihdr.writeUInt32BE(1, 4); ihdr[8] = 8; ihdr[9] = 6
+const png = Buffer.concat([
+  Buffer.from('89504e470d0a1a0a', 'hex'), chunk('IHDR', ihdr),
+  chunk('tEXt', Buffer.from('review\0' + 'large-review-note-'.repeat(1000))),
+  chunk('IDAT', zlib.deflateSync(Buffer.from([0, 255, 0, 0, 255]))), chunk('IEND', Buffer.alloc(0)),
+])
+const base64 = png.toString('base64')
+const records = []
+for (let offset = 0; offset < base64.length; offset += 12000) {
+  const payload = { event: 'compact_panel_screenshot', severity: 'INFO', path: 'test-results/review.png', offset, data: base64.slice(offset, offset + 12000) }
+  records.push(offset === 0 ? { jsonPayload: payload } : { textPayload: '[chromium] ' + JSON.stringify(payload) })
+}
+const payload = record => record.jsonPayload ?? JSON.parse(record.textPayload.slice(record.textPayload.indexOf('{')))
+const displayedRecords = records.filter(record => record.textPayload)
+fs.writeFileSync(root + '/screenshot-display.log', displayedRecords.map(record => record.textPayload).join('\n') + '\n')
+fs.writeFileSync(root + '/displayed-chunks.txt', displayedRecords.map(record => payload(record).data).join('\n') + '\n')
+NODE
+OUT="$(env PATH="$WORK/bin:$PATH" STUB_CAPTURE="$WORK/capture" STUB_SCREENSHOT_DISPLAY=1 STUB_LOGGING_JSON="$records_no_retry" GCLOUD_IDENT=stub@example.invalid "$SCRIPT" run --cloud --shards=2 2>&1)" || {
+  echo "FAIL: screenshot-display wrapper run failed"; echo "$OUT"; exit 1
+}
+while IFS= read -r chunk; do
+  [ -z "$chunk" ] && continue
+  if grep -Fq "$chunk" <<< "$OUT"; then
+    echo 'FAIL: default wrapper display leaked a screenshot payload chunk'; exit 1
+  fi
+done < "$WORK/capture/displayed-chunks.txt"
+if grep -Fq 'RETRY_TRACE_BYTES_SHOULD_STAY_RAW' <<< "$OUT"; then
+  echo 'FAIL: default wrapper display leaked retry-trace payload bytes'; exit 1
+fi
+for retained in compact_panel_screenshot test-results/review.png offset retained-in-cloud-logging ordinary_diagnostic 'keep readable diagnostic'; do
+  if ! grep -Fq "$retained" <<< "$OUT"; then echo "FAIL: lost display metadata/diagnostic: $retained"; exit 1; fi
+done
+rm -f "$WORK/capture/logs.count" "$WORK/capture/logging.count" "$WORK/capture/task-footers.count" "$WORK/capture/gcloud.args" "$WORK/capture/run-env.yaml"
 
 # --dry-run is an entrypoint diagnostic: it deliberately does not run
 # Playwright and therefore cannot emit a completion receipt. The wrapper must

@@ -26,6 +26,16 @@
 // Both modes stay alive (`stdin.resume()`) so the pane's terminal status
 // remains 'running', matching a real interactive TUI rather than a one-shot
 // process the exit-surfacing path would treat as exited.
+//
+// Delta fix (auto-restore-warming finding 3) adds two faithful behaviors:
+//   - STARTUP STORE CHECK: if <data home>/opencode.db exists but is not a
+//     readable file (e.g. a DIRECTORY seeded by a spec — SQLite open fails
+//     on a directory for any euid), the fake mirrors the real CLI: it
+//     cannot open its session store, prints an error, and exits 1. A
+//     missing db is the normal fresh-machine shape and passes.
+//   - EXIT affordance: typing the literal line `exit` exits cleanly (0) —
+//     the natural "the CLI session ended" shape. No other spec types
+//     `exit`, so this is inert everywhere else.
 
 import fs from 'node:fs'
 import http from 'node:http'
@@ -123,24 +133,46 @@ function ensureSchema(db) {
 // the `message`/`part` rows the server's targeted first-message lookup
 // parses (opencode's naming lane: the session row identifies, the message
 // rows arm). Mirrors the shape the real CLI projects.
-function writeFirstUserMessage(sessionId, prompt) {
+let nativeMessageSequence = 0
+
+function writeNativeMessage(sessionId, role, text, legacyFirstMessageId = false) {
   const dataHome = opencodeDataHome()
   fs.mkdirSync(dataHome, { recursive: true })
   const db = new DatabaseSync(path.join(dataHome, 'opencode.db'))
+  let messageId
   try {
     db.exec('PRAGMA busy_timeout = 5000')
     ensureSchema(db)
     const now = Date.now()
-    const messageId = `msg_e2e_${now}_${process.pid}`
+    const messageSequence = legacyFirstMessageId ? undefined : ++nativeMessageSequence
+    messageId = process.env.FAKE_OPENCODE_NATIVE_IDENTITY_SIGNAL === '1'
+      ? `msg_e2e${now}${process.pid}${messageSequence ?? ''}`
+      : `msg_e2e_${now}_${process.pid}${messageSequence === undefined ? '' : `_${messageSequence}`}`
     db.prepare(
       'INSERT OR REPLACE INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)',
-    ).run(messageId, sessionId, now, now, JSON.stringify({ role: 'user' }))
+    ).run(messageId, sessionId, now, now, JSON.stringify({ role }))
     db.prepare(
       'INSERT OR REPLACE INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)',
-    ).run(`part_${messageId}`, messageId, sessionId, now, now, JSON.stringify({ type: 'text', text: prompt }))
+    ).run(`part_${messageId}`, messageId, sessionId, now, now, JSON.stringify({ type: 'text', text }))
+    db.prepare('UPDATE session SET time_updated = ? WHERE id = ?').run(now, sessionId)
   } finally {
     db.close()
   }
+  return messageId
+}
+
+function writeFirstUserMessage(sessionId, prompt) {
+  // Preserve the original deterministic ID used by existing naming fixtures.
+  return writeNativeMessage(sessionId, 'user', prompt, true)
+}
+
+function writeFollowUpTurn(sessionId, prompt) {
+  const userText = String(prompt ?? '').replace(/[\r\n]+$/, '').trim()
+  if (!userText) return
+  writeNativeMessage(sessionId, 'user', userText)
+  const reply = `FAKE_OPENCODE_REPLY:${userText.toUpperCase()}`
+  writeNativeMessage(sessionId, 'assistant', reply)
+  process.stdout.write(`${reply}\r\n`)
 }
 
 // With a title sequence the row starts with the placeholder title real
@@ -177,18 +209,42 @@ function writeSessionRow(sessionId, cwd) {
   }
 }
 
+function publishNativeIdentitySignal(sessionId, tailMessageId) {
+  const signalDir = process.env.FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR
+  const launchJson = process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH
+  if (!signalDir || !launchJson) {
+    throw new Error('fake OpenCode native identity signal requires launch metadata and a signal directory')
+  }
+  const hasMessage = typeof tailMessageId === 'string'
+  const signal = {
+    launch: JSON.parse(launchJson),
+    native: {
+      source: 'opencode-tui-native-loader',
+      session_id: sessionId,
+      parent_id: null,
+      hydrated: true,
+      messages_read: hasMessage ? 'success' : 'empty_confirmed',
+      active_message_count: hasMessage ? 1 : 0,
+      tail_message_id: hasMessage ? tailMessageId : null,
+    },
+  }
+  fs.mkdirSync(signalDir, { recursive: true })
+  const destination = path.join(signalDir, 'opencode-loaded.json')
+  const temporary = `${destination}.${process.pid}.tmp`
+  fs.writeFileSync(temporary, JSON.stringify(signal))
+  fs.renameSync(temporary, destination)
+}
+
 // Name-reliability Task 4: FAKE_OPENCODE_TITLE_SEQUENCE (pipe-separated
-// titles) turns on a minimal embedded `opencode serve` surface on the
-// pane's `--hostname`/`--port` — exactly what the server's CLI opencode lane
-// attaches to (`crates/freshell-ws/src/opencode_lane.rs`: `/global/health`
-// with a 1.18 version, the `/event` SSE stream acked by `server.connected`,
-// `/session/status`, `/permission`, `/question`). After the first prompt
-// creates the session row, each title is written to the row and emitted as
-// a `session.updated` event (`properties.info.{id,title}`), ~300 ms apart,
-// starting FAKE_OPENCODE_TITLE_SEQUENCE_DELAY_MS (default 2500) after the
-// prompt so the pane's naming binding exists. Like the real serve, the
-// final title is re-reported on later session updates (every 2 s here).
-// Off by default: every other spec keeps the plain terminal fake.
+// titles) enables session title updates in the minimal embedded `opencode
+// serve` surface. FAKE_OPENCODE_ACTIVITY_SERVER=1 enables only the startup
+// activity endpoints for a test that exercises first input before identity.
+// The server uses the pane's `--hostname`/`--port`, matching the endpoints
+// the server's CLI opencode lane attaches to (`crates/freshell-ws/src/opencode_lane.rs`:
+// `/global/health`, `/event`, `/session/status`, `/permission`, `/question`).
+// After the first prompt creates the session row, each configured title is
+// written and emitted as `session.updated` about 300 ms apart. Off by default:
+// other specs keep the plain terminal fake unless they request either lane.
 const titleSequence = (process.env.FAKE_OPENCODE_TITLE_SEQUENCE ?? '')
   .split('|')
   .map((title) => title.trim())
@@ -219,7 +275,8 @@ function setSessionTitle(sessionId, title) {
 function startTitleServer() {
   const hostname = argValue('--hostname') ?? '127.0.0.1'
   const port = Number(argValue('--port'))
-  if (titleSequence.length === 0 || !Number.isFinite(port) || port <= 0) return
+  if ((titleSequence.length === 0 && process.env.FAKE_OPENCODE_ACTIVITY_SERVER !== '1')
+    || !Number.isFinite(port) || port <= 0) return
   const server = http.createServer((req, res) => {
     const url = new URL(req.url ?? '/', `http://${hostname}:${port}`)
     const json = (status, body) => {
@@ -262,6 +319,26 @@ startTitleServer()
 
 const resumeSessionId = argValue('--session')
 
+// Startup store check (delta fix, auto-restore-warming finding 3): the real
+// CLI cannot start when its session store cannot be opened — mirror that
+// honestly so a seeded unreadable store (a directory at opencode.db)
+// surfaces as a dead CLI, never a silently working one.
+{
+  const dbPath = path.join(opencodeDataHome(), 'opencode.db')
+  if (fs.existsSync(dbPath)) {
+    let isReadableFile = false
+    try {
+      isReadableFile = fs.statSync(dbPath).isFile()
+    } catch {
+      isReadableFile = false
+    }
+    if (!isReadableFile) {
+      process.stderr.write('opencode: cannot open session store (unreadable)\r\n')
+      process.exit(1)
+    }
+  }
+}
+
 if (resumeSessionId) {
   process.stdout.write(`opencode: resumed session ${resumeSessionId}\r\n`)
   process.stdin.resume()
@@ -282,25 +359,41 @@ if (resumeSessionId) {
     // Unified agent names (Task 8): the first prompt's user-message rows —
     // the metadata the naming lane's targeted first-message lookup reads.
     const prompt = String(firstPrompt ?? '').trim()
-    if (prompt.length > 0) writeFirstUserMessage(sessionId, prompt)
+    const firstMessageId = prompt.length > 0 ? writeFirstUserMessage(sessionId, prompt) : undefined
+    if (process.env.FAKE_OPENCODE_NATIVE_IDENTITY_SIGNAL === '1') {
+      publishNativeIdentitySignal(sessionId, firstMessageId)
+    }
     process.stdout.write(`opencode: session ${sessionId} started\r\n`)
     runTitleSequence(sessionId)
   }
 
   let sessionCreated = false
+  let activeSessionId
   process.stdin.setEncoding('utf8')
   process.stdin.on('data', (chunk) => {
+    // Exit affordance (delta fix, auto-restore-warming finding 3): runs on
+    // EVERY chunk, before the first-submit handling below.
+    if (String(chunk).trim() === 'exit') {
+      process.stdout.write('opencode: bye\r\n')
+      process.exit(0)
+    }
     // Any input at all counts as "the first submit" for this fixture's
     // purposes -- the real locator arms only on Enter-shaped WS input, and
     // the pty's own cooked-mode line discipline already withholds bytes
     // from this process until the user presses Enter, so the first `data`
     // event this process ever sees IS that submit. The prompt text (minus
     // the Enter) is the durable first user message.
-    if (sessionCreated) return
+    if (sessionCreated) {
+      writeFollowUpTurn(activeSessionId, chunk)
+      return
+    }
     sessionCreated = true
 
     const cwd = process.cwd()
-    const sessionId = `ses_e2e_${Date.now()}_${process.pid}`
+    const sessionId = process.env.FAKE_OPENCODE_NATIVE_IDENTITY_SIGNAL === '1'
+      ? `ses_e2e${Date.now()}${process.pid}`
+      : `ses_e2e_${Date.now()}_${process.pid}`
+    activeSessionId = sessionId
     const firstPrompt = String(chunk ?? '').replace(/[\r\n]+$/, '').trim()
     if (!rowGatePath) {
       commitSessionRow(sessionId, cwd, firstPrompt)

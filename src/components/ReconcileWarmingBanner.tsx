@@ -9,8 +9,13 @@ import { OVERLAY_Z } from '@/components/ui/overlay'
 /**
  * ONE warming banner for ALL panes whose reconcile verdicts came back
  * index_warming (council rule 5) — never one banner per pane. This state
- * is EXPECTED on cold boots: the session index scan can take minutes, so
- * "Retry now" is the prominent recovery path, not an edge case.
+ * is EXPECTED on cold boots: the session index scan can take minutes.
+ * Routine warming now resolves AUTOMATICALLY — the
+ * ReconcileWarmingRecoveryDriver re-issues the reconcile as soon as the
+ * session index publishes readiness (bounded, deduplicated) — so the
+ * banner is a nonblocking progress signal that clears itself. The Retry
+ * button stays as the non-routine escape hatch (genuine failures, ancient
+ * servers) — no longer THE designed recovery path.
  */
 export function ReconcileWarmingBanner() {
   const dispatch = useAppDispatch()

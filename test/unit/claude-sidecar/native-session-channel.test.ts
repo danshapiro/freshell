@@ -23,7 +23,7 @@ async function hook(channel: any, input = native) {
   child.stdin.end(JSON.stringify(input))
   expect(await exited).toBe(0)
 }
-function checkpointSidecar(directory: string, nativeRequestId = 'native-current', delayedTranscript = false, delayedNativeExit = false, providerHome = directory, eagerResume = false, eagerCallbackOnly = false, splitBatch: boolean | 'incomplete' = false) {
+function checkpointSidecar(directory: string, nativeRequestId = 'native-current', delayedTranscript = false, delayedNativeExit = false, providerHome = directory, eagerResume = false, eagerCallbackOnly = false, splitBatch: boolean | 'incomplete' = false, queryEnv: NodeJS.ProcessEnv = {}) {
   const child = spawn(process.execPath, [resolve('crates/freshell-claude-sidecar/index.mjs')], {
     env: { ...process.env, HOME: providerHome, FRESHELL_SIDECAR_TEST_CHECKPOINT: '1',
       FRESHELL_SIDECAR_TEST_NATIVE_REQUEST_ID: nativeRequestId,
@@ -33,10 +33,13 @@ function checkpointSidecar(directory: string, nativeRequestId = 'native-current'
       FRESHELL_SIDECAR_TEST_CHECKPOINT_EAGER_CALLBACK_ONLY: eagerCallbackOnly ? '1' : '0',
       FRESHELL_SIDECAR_TEST_SPLIT_BATCH: splitBatch === 'incomplete' ? splitBatch : splitBatch ? '1' : '0',
       FRESHELL_NATIVE_IDENTITY_LAUNCH: JSON.stringify(launch),
-      FRESHELL_CLAUDE_SDK_QUERY_MODULE: resolve('test/unit/claude-sidecar/fixtures/native-startup-query.mjs') },
+      FRESHELL_CLAUDE_SDK_QUERY_MODULE: resolve('test/unit/claude-sidecar/fixtures/native-startup-query.mjs'),
+      ...queryEnv },
     stdio: ['pipe', 'pipe', 'pipe'],
   })
   const frames: any[] = []
+  const stderrChunks: Buffer[] = []
+  child.stderr.on('data', (chunk) => stderrChunks.push(Buffer.from(chunk)))
   let buffer = ''
   child.stdout.on('data', (chunk) => {
     buffer += chunk
@@ -46,9 +49,9 @@ function checkpointSidecar(directory: string, nativeRequestId = 'native-current'
       buffer = buffer.slice(boundary + 1)
     }
   })
-  const exited = new Promise<void>((resolve, reject) => { child.once('error', reject); child.once('exit', () => resolve()) })
+  const exited = new Promise<number | null>((resolve, reject) => { child.once('error', reject); child.once('exit', resolve) })
   const send = (value: unknown) => child.stdin.write(JSON.stringify(nativeProtocolRequest(value)) + '\n')
-  return { frames, send,
+  return { frames, send, waitExit: () => exited, stderr: () => Buffer.concat(stderrChunks).toString('utf8'),
     wait: async (type: string) => {
       for (let attempt = 0; attempt < 300; attempt++) {
         const frame = frames.find((frame) => frame.type === type)
@@ -63,7 +66,7 @@ function checkpointSidecar(directory: string, nativeRequestId = 'native-current'
       if (child.exitCode === null && !frames.some(frame => frame.type === 'create.failed' || frame.type === 'sdk.stream.ended')) {
         send({ type: 'shutdown', awaitNativeShutdown })
       }
-      await exited
+      return await exited
     },
   }
 }
@@ -185,42 +188,58 @@ describe('managed native startup channel', () => {
     })
   it.each(['freshclaude', 'kilroy'].flatMap(mode => ['missing-native-id', 'placeholder-id'].map(caseId => ({ mode, caseId }))))(
     'executes the production sidecar native init field fault for $mode/$caseId without input', async ({ mode, caseId }) => {
-      const directory = await mkdtemp(join('/tmp', 'finite-native-init-'))
-      const ownedRoot = join('/tmp/frs', randomUUID().slice(0, 12))
-      const workspace = join(ownedRoot, `${mode}-${caseId}-workspace`)
-      await mkdir(workspace, { recursive: true })
-      const modules = (await readdir(resolve('crates/freshell-claude-sidecar'))).filter(name => name.endsWith('.mjs'))
-      const producer = await readFile(resolve('crates/freshell-claude-sidecar/index.mjs'), 'utf8')
-      for (const module of modules) await writeFile(join(directory, module), module === 'index.mjs'
-        ? stageSdkInitFieldFault(producer) : await readFile(resolve('crates/freshell-claude-sidecar', module), 'utf8'))
-      await writeFile(join(workspace, 'native-init-field-fault-control.json'), JSON.stringify({ mode, caseId }))
-      const selectedLaunch = { ...launch, requestedNativeSessionId: null }
-      const child = spawn(process.execPath, [join(directory, 'index.mjs')], {
-        env: { ...process.env, HOME: directory, FRESHELL_NATIVE_IDENTITY_LAUNCH: JSON.stringify(selectedLaunch),
-          FRESHELL_CLAUDE_SDK_QUERY_MODULE: resolve('test/unit/claude-sidecar/fixtures/native-startup-query.mjs') },
-        stdio: ['pipe', 'pipe', 'pipe'],
-      })
-      const frames: any[] = []; let buffered = ''
-      child.stdout.on('data', chunk => {
-        buffered += chunk
-        while (buffered.includes('\n')) { const end = buffered.indexOf('\n'); frames.push(JSON.parse(buffered.slice(0, end))); buffered = buffered.slice(end + 1) }
-      })
-      const closed = new Promise<void>((resolve, reject) => { child.once('error', reject); child.once('close', () => resolve()) })
+      // The fault seam requires /tmp/f<lowercase-or-digit>/<UUID prefix>/...;
+      // own a fresh parent instead of relying on another user's /tmp/frs.
+      const ownedRoot = join('/tmp', `f${randomUUID().replaceAll('-', '')}`)
+      await mkdir(ownedRoot, { mode: 0o700 })
       try {
-        child.stdin.write(JSON.stringify(nativeProtocolRequest({ type: 'create', requestId: 'owned-init-fault', cwd: workspace })) + '\n')
-        for (let attempt = 0; attempt < 300 && !frames.some(frame => frame.type === 'sdk.session.init'); attempt++) {
-          await new Promise(resolve => setTimeout(resolve, 10))
+        const directory = await mkdtemp(join(ownedRoot, 'sidecar-'))
+        const workspace = join(ownedRoot, randomUUID().slice(0, 12), `${mode}-${caseId}-workspace`)
+        await mkdir(workspace, { recursive: true })
+        const modules = (await readdir(resolve('crates/freshell-claude-sidecar'))).filter(name => name.endsWith('.mjs'))
+        const producer = await readFile(resolve('crates/freshell-claude-sidecar/index.mjs'), 'utf8')
+        for (const module of modules) await writeFile(join(directory, module), module === 'index.mjs'
+          ? stageSdkInitFieldFault(producer) : await readFile(resolve('crates/freshell-claude-sidecar', module), 'utf8'))
+        await writeFile(join(workspace, 'native-init-field-fault-control.json'), JSON.stringify({ mode, caseId }))
+        const selectedLaunch = { ...launch, requestedNativeSessionId: null }
+        const child = spawn(process.execPath, [join(directory, 'index.mjs')], {
+          env: { ...process.env, HOME: directory, FRESHELL_NATIVE_IDENTITY_LAUNCH: JSON.stringify(selectedLaunch),
+            FRESHELL_CLAUDE_SDK_QUERY_MODULE: resolve('test/unit/claude-sidecar/fixtures/native-startup-query.mjs') },
+          stdio: ['pipe', 'pipe', 'pipe'],
+        })
+        const frames: any[] = []; let buffered = ''
+        child.stdout.on('data', chunk => {
+          buffered += chunk
+          while (buffered.includes('\n')) { const end = buffered.indexOf('\n'); frames.push(JSON.parse(buffered.slice(0, end))); buffered = buffered.slice(end + 1) }
+        })
+        let childError: Error | undefined
+        let childClosed = false
+        child.once('error', error => { childError = error })
+        child.stdin.on('error', error => { childError ??= error })
+        const closed = new Promise<void>(resolve => {
+          child.once('close', () => { childClosed = true; resolve() })
+        })
+        try {
+          child.stdin.write(JSON.stringify(nativeProtocolRequest({ type: 'create', requestId: 'owned-init-fault', cwd: workspace })) + '\n')
+          for (let attempt = 0; attempt < 300 && !childClosed && !frames.some(frame => frame.type === 'sdk.session.init'); attempt++) {
+            if (childError) throw childError
+            await new Promise(resolve => setTimeout(resolve, 10))
+          }
+          if (childError) throw childError
+          const init = frames.find(frame => frame.type === 'sdk.session.init')
+          expect(init, `received sidecar frame types: ${frames.map(frame => frame.type).join(', ')}`).toBeDefined()
+          expect(init.cliSessionId).toBe(caseId === 'missing-native-id' ? undefined : init.sessionId)
+          const captured = JSON.parse(await readFile(join(workspace, 'native-init-field-fault-observation.json'), 'utf8'))
+          expect(captured.actualNativeSessionId).toBe(root)
+          expect(captured.frame).toEqual(init); expect(captured.frame.nativeIdentityEvidence.launch).toEqual(selectedLaunch)
+          expect(frames.some(frame => frame.type === 'probe.native-input')).toBe(false)
+        } finally {
+          try {
+            if (!childClosed) child.stdin.end(JSON.stringify({ type: 'shutdown' }) + '\n')
+          } finally { await closed }
         }
-        const init = frames.find(frame => frame.type === 'sdk.session.init')
-        expect(init, `received sidecar frame types: ${frames.map(frame => frame.type).join(', ')}`).toBeDefined()
-        expect(init.cliSessionId).toBe(caseId === 'missing-native-id' ? undefined : init.sessionId)
-        const captured = JSON.parse(await readFile(join(workspace, 'native-init-field-fault-observation.json'), 'utf8'))
-        expect(captured.actualNativeSessionId).toBe(root)
-        expect(captured.frame).toEqual(init); expect(captured.frame.nativeIdentityEvidence.launch).toEqual(selectedLaunch)
-        expect(frames.some(frame => frame.type === 'probe.native-input')).toBe(false)
       } finally {
-        child.stdin.end(JSON.stringify({ type: 'shutdown' }) + '\n'); await closed
-        await rm(directory, { recursive: true, force: true }); await rm(ownedRoot, { recursive: true, force: true })
+        await rm(ownedRoot, { recursive: true, force: true })
       }
     },
   )
@@ -390,6 +409,126 @@ describe('production sidecar native checkpoint continuation', () => {
       expect((await worker.wait('probe.batch-hooks')).outcomes).toEqual([{}, {}])
       expect(worker.frames.some((frame) => frame.nativeCheckpoint)).toBe(false)
     } finally { await worker.close(); await rm(directory, { recursive: true, force: true }) }
+  })
+  it('keeps concurrent callbacks for the same native tool-use ID fenced', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'sidecar-native-batch-duplicate-'))
+    await writeFile(join(directory, 'native.jsonl'), JSON.stringify({ type: 'system', sessionId: root }) + '\n')
+    const worker = checkpointSidecar(directory, 'native-batch-duplicate', false, false, directory, false, false,
+      'incomplete', { FRESHELL_SIDECAR_TEST_DUPLICATE_TOOL_USE_ID: '1' })
+    try {
+      worker.send({ type: 'create', requestId: 'batch-duplicate-create', cwd: directory,
+        resumeSessionId: root, permissionMode: 'default' })
+      const created = await worker.wait('created')
+      await worker.wait('sdk.session.init')
+      worker.send({ type: 'send', sessionId: created.sessionId, text: 'duplicate native tool use' })
+      const denied = { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny',
+        permissionDecisionReason: 'Original native checkpoint has no current fenced release' } }
+      expect((await worker.wait('probe.batch-hooks')).outcomes).toEqual([{}, denied])
+      expect(worker.frames.some((frame) => frame.nativeCheckpoint)).toBe(false)
+    } finally { await worker.close(); await rm(directory, { recursive: true, force: true }) }
+  })
+  it('keeps overlapping hooks fenced when checkpoint state is unreadable', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'sidecar-native-batch-fenced-'))
+    await writeFile(join(directory, 'native.jsonl'), JSON.stringify({ type: 'system', sessionId: root }) + '\n')
+    const worker = checkpointSidecar(directory, 'native-batch-fenced', false, false, directory, false, false,
+      'incomplete', { FRESHELL_SIDECAR_TEST_CORRUPT_CHECKPOINT_BEFORE_TOOL: '1' })
+    try {
+      worker.send({ type: 'create', requestId: 'batch-fenced-create', cwd: directory,
+        resumeSessionId: root, permissionMode: 'default' })
+      const created = await worker.wait('created')
+      await worker.wait('sdk.session.init')
+      worker.send({ type: 'send', sessionId: created.sessionId, text: 'two independent operations' })
+      const denied = { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny',
+        permissionDecisionReason: 'Original native checkpoint has no current fenced release' } }
+      expect((await worker.wait('probe.batch-hooks')).outcomes).toEqual([denied, denied])
+      expect(worker.frames.some((frame) => frame.nativeCheckpoint)).toBe(false)
+    } finally { await worker.close(); await rm(directory, { recursive: true, force: true }) }
+  })
+  it('leaves pending native hook callbacks unresolved when their SDK stream ends', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'sidecar-native-stream-end-checkpoint-'))
+    await writeFile(join(directory, 'native.jsonl'), JSON.stringify({ type: 'system', sessionId: root }) + '\n')
+    let worker = checkpointSidecar(directory, 'native-stream-end-seed')
+    try {
+      worker.send({ type: 'create', requestId: 'stream-end-seed', cwd: directory,
+        resumeSessionId: root, permissionMode: 'default' })
+      const seed = await worker.wait('created')
+      await worker.wait('sdk.session.init')
+      worker.send({ type: 'send', sessionId: seed.sessionId, text: 'owned original operation' })
+      const card = await worker.wait('sdk.permission.request')
+      expect(card.nativeCheckpoint.toolUseID).toBe('toolu_original1')
+      const transcriptPath = join(directory, 'native.jsonl')
+      const checkpointPath = join(directory, '.freshell', 'native-checkpoints', 'claude', root + '.json')
+      const transcriptBefore = await readFile(transcriptPath)
+      const checkpointBefore = await readFile(checkpointPath)
+      expect(JSON.parse(checkpointBefore.toString()).checkpoint.toolUseID).toBe(card.nativeCheckpoint.toolUseID)
+      expect(await worker.close()).toBe(0)
+
+      worker = checkpointSidecar(directory, 'native-stream-end-current', false, false, directory, true, false, false,
+        { FRESHELL_SIDECAR_TEST_END_STREAM_AFTER_TWO_HOOKS: '1' })
+      worker.send({ type: 'create', requestId: 'stream-end-current', cwd: directory,
+        resumeSessionId: root, permissionMode: 'default' })
+      await worker.wait('created')
+      await worker.wait('sdk.session.init')
+      await worker.wait('probe.native-hooks-started')
+      const conflict = await worker.wait('probe.native-conflicting-hook-settled')
+      expect(conflict.event).toEqual({ event: 'hook-settled', toolUseID: 'toolu_second1',
+        signalAborted: false, permissionDecision: 'deny' })
+      expect((await worker.wait('sdk.stream.ended')).reason).toBe('stream_eof')
+      expect(await worker.waitExit()).toBe(3)
+      const lifecyclePath = join(directory, 'native-hook-lifecycle.jsonl')
+      const lifecycle = (await readFile(lifecyclePath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
+      expect(lifecycle).toEqual([conflict.event, { event: 'iterator-return', originalOwnerSettled: false }])
+      expect(worker.stderr()).not.toMatch(/UnhandledPromiseRejection|ERR_UNHANDLED_REJECTION/i)
+      expect(await readFile(transcriptPath)).toEqual(transcriptBefore)
+      expect(await readFile(checkpointPath)).toEqual(checkpointBefore)
+      expect(worker.frames.some((frame) => frame.type === 'sdk.permission.request')).toBe(false)
+    } finally {
+      await worker.close()
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+  it('denies a conflicting hook before shutdown and keeps the checkpoint owner parked through teardown', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'sidecar-native-shutdown-checkpoint-'))
+    await writeFile(join(directory, 'native.jsonl'), JSON.stringify({ type: 'system', sessionId: root }) + '\n')
+    let worker = checkpointSidecar(directory, 'native-shutdown-seed')
+    try {
+      worker.send({ type: 'create', requestId: 'shutdown-seed', cwd: directory,
+        resumeSessionId: root, permissionMode: 'default' })
+      const seed = await worker.wait('created')
+      await worker.wait('sdk.session.init')
+      worker.send({ type: 'send', sessionId: seed.sessionId, text: 'owned original operation' })
+      const card = await worker.wait('sdk.permission.request')
+      expect(card.nativeCheckpoint.toolUseID).toBe('toolu_original1')
+      const transcriptPath = join(directory, 'native.jsonl')
+      const checkpointPath = join(directory, '.freshell', 'native-checkpoints', 'claude', root + '.json')
+      const transcriptBefore = await readFile(transcriptPath)
+      const checkpointBefore = await readFile(checkpointPath)
+      expect(await worker.close()).toBe(0)
+
+      worker = checkpointSidecar(directory, 'native-shutdown-current', false, true, directory, true, false, false,
+        { FRESHELL_SIDECAR_TEST_PARK_TWO_HOOKS_UNTIL_SHUTDOWN: '1' })
+      worker.send({ type: 'create', requestId: 'shutdown-current', cwd: directory,
+        resumeSessionId: root, permissionMode: 'default' })
+      const current = await worker.wait('created')
+      await worker.wait('sdk.session.init')
+      await worker.wait('probe.native-child')
+      worker.send({ type: 'send', sessionId: current.sessionId, text: 'resume owned checkpoint' })
+      await worker.wait('probe.native-hooks-parked')
+      const conflict = await worker.wait('probe.native-conflicting-hook-settled')
+      expect(conflict.event).toEqual({ event: 'hook-settled', toolUseID: 'toolu_second1',
+        signalAborted: false, permissionDecision: 'deny' })
+      const lifecyclePath = join(directory, 'native-hook-lifecycle.jsonl')
+      const lifecycle = async () => (await readFile(lifecyclePath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
+      expect(await lifecycle()).toEqual([conflict.event])
+      expect(await worker.close()).toBe(0)
+      expect(await lifecycle()).toEqual([conflict.event, { event: 'transport-abort' }])
+      expect(worker.stderr()).not.toMatch(/UnhandledPromiseRejection|ERR_UNHANDLED_REJECTION/i)
+      expect(await readFile(transcriptPath)).toEqual(transcriptBefore)
+      expect(await readFile(checkpointPath)).toEqual(checkpointBefore)
+    } finally {
+      await worker.close()
+      await rm(directory, { recursive: true, force: true })
+    }
   })
   it('persists managed continuation state outside provider-native project artifacts', async () => {
     const home = await mkdtemp(join(tmpdir(), 'sidecar-native-census-'))

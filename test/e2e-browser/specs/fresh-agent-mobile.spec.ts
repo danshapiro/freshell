@@ -119,7 +119,7 @@ test.describe('Fresh Agent Mobile', () => {
           status: 'idle',
           summary: '',
           capabilities: { send: true, interrupt: true, approvals: true, questions: true, fork: false },
-          settings: { model: 'opus[1m]', permissionMode: 'default', plugins: [] },
+          settings: { model: 'opus[1m]', effort: 'high', permissionMode: 'default', plugins: [] },
           tokenUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, costUsd: 0 },
           pendingApprovals: [],
           pendingQuestions: [],
@@ -168,6 +168,7 @@ test.describe('Fresh Agent Mobile', () => {
             status: 'idle',
             initialCwd: '/home/user/code/freshell',
             model: 'opus[1m]',
+            effort: 'high',
             settingsDismissed: true,
           },
         },
@@ -211,9 +212,9 @@ test.describe('Fresh Agent Mobile', () => {
     await expect(meter).toBeVisible()
     await expect(meter).toHaveAttribute('aria-valuenow', '47')
 
-    // Chip collapses to the SHORT label at ≤520px.
-    await expect(paneRoot.getByText('Claude Opus 5', { exact: true })).toBeVisible()
-    await expect(paneRoot.getByText('Claude Opus 5 (1M context)', { exact: true })).toBeHidden()
+    // The model chip shortens at ≤520px while the explicitly seeded effort remains visible.
+    await expect(paneRoot.getByText('Claude Opus 5 high', { exact: true })).toBeVisible()
+    await expect(paneRoot.getByText('Claude Opus 5 (1M context) high', { exact: true })).toBeHidden()
 
     // The word "context" drops from the strip (rendered label span is
     // display:none), and the combined 'context —' lug is excluded by seeding.
@@ -250,7 +251,7 @@ test.describe('Fresh Agent Mobile', () => {
     expect(turnHeaderFontSize!).toBeGreaterThanOrEqual(13)
 
     await page.setViewportSize({ width: 1280, height: 800 })
-    await expect(paneRoot.getByText('Claude Opus 5 (1M context)', { exact: true })).toBeVisible({ timeout: 10_000 })
+    await expect(paneRoot.getByText('Claude Opus 5 (1M context) high', { exact: true })).toBeVisible({ timeout: 10_000 })
     const desktopClusterBox = await meter.boundingBox()
     expect(desktopClusterBox).not.toBeNull()
     console.log(`[status-strip] mobile cluster width: ${mobileClusterBox!.width}px; desktop cluster width: ${desktopClusterBox!.width}px`)

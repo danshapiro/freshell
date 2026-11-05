@@ -4,7 +4,7 @@ import path from 'path'
 import { promisify } from 'util'
 import type { CDPSession, Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
-import type { TestHarness } from '../helpers/test-harness.js'
+import { selectShellFromPicker, type TestHarness } from '../helpers/test-harness.js'
 import type { TerminalHelper } from '../helpers/terminal-helpers.js'
 
 const execFileAsync = promisify(execFile)
@@ -87,23 +87,6 @@ function timestampsWithinInterval(timestamps: number[], startAtMs: number, endAt
 
 function timestampsAfter(timestamps: number[], atMs: number): number[] {
   return timestamps.filter((timestamp) => timestamp >= atMs)
-}
-
-async function selectShellFromPicker(page: Page): Promise<void> {
-  if (await page.locator('.xterm').first().isVisible().catch(() => false)) return
-  await page.waitForTimeout(500)
-  if (await page.locator('.xterm').first().isVisible().catch(() => false)) return
-
-  for (const name of ['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash']) {
-    const button = page.getByRole('button', { name: new RegExp(`^${name}$`, 'i') })
-    if (await button.first().isVisible().catch(() => false)) {
-      await button.first().click()
-      await page.locator('.xterm').first().waitFor({ state: 'visible', timeout: 30_000 })
-      return
-    }
-  }
-
-  throw new Error('Could not create a terminal from the pane picker')
 }
 
 async function getActiveTerminalId(harness: TestHarness): Promise<string> {

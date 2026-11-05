@@ -475,6 +475,12 @@ export const HelloSchema = z.object({
     // frozen client shape.
     terminalLifetimeClaimV1: z.literal(true).optional(),
     managedRuntimeV1: z.literal(true).optional(),
+    // Session-index readiness (auto-restore-warming Task 2): the client
+    // understands `ready.sessionIndexReady` and the `sessions.index.ready`
+    // boot broadcast. Additive optional — DECLARED here, not just sent
+    // (ws-client), because zod strips undeclared keys (same strip hazard as
+    // above); absent for the frozen client shape.
+    sessionIndexReadyV1: z.literal(true).optional(),
   }).optional(),
   client: z.object({
     mobile: z.boolean().optional(),
@@ -1227,6 +1233,36 @@ export const PaneVerdictSchema = z.object({
   reason: z.string().optional(),
   /** A newer duplicate generation exists for the same createRequestId; flags the duplicate terminalId. */
   duplicate: z.string().optional(),
+  /**
+   * attach only, the fresh_unbound shape (additive/optional — older servers
+   * omit it; older clients ignore it and keep the legacy
+   * preserve-the-recorded-ref fold): the attached terminal is an
+   * identity-less FreshUnbound replacement — the resume gate refused its
+   * predecessor's recorded id and the server RELEASED the stale claim. The
+   * reconnect-path mirror of terminal.replaced's identityDisposition: a
+   * browser that was disconnected during the server-side auto-resume (or
+   * reloaded after it) missed the replaced frame, and this verdict signal
+   * tells it to CLEAR the pane's stale saved sessionRef, so a later re-bind
+   * association (the fresh conversation's terminal.session.associated with a
+   * new session id and NO previousSessionId — emitted only by providers
+   * whose association machinery re-binds; real-format antigravity sessions
+   * never re-bind per-pane) folds instead of conflicting. Only
+   * `fresh_unbound` is ever set, and never beside a sessionRef.
+   */
+  identityDisposition: z.enum(['resumed', 'minted_replacement', 'fresh_unbound']).optional(),
+  /**
+   * attach only, beside identityDisposition: 'fresh_unbound' (additive/
+   * optional — same discipline as the field above): the gate's stale-id
+   * notice naming the REFUSED conversation, carried on the reconnect path
+   * exactly as the live terminal.replaced frame carries it. A pane that
+   * was disconnected during the server-side auto-resume missed the
+   * replaced frame — and with it the ONLY visible explanation naming the
+   * lost conversation — so the verdict carries the same notice and the
+   * fold surfaces the same pane-level dismissible notice. Absent on every
+   * other verdict shape (including fresh_unbound without a recorded
+   * notice). Prose is presentational-only.
+   */
+  staleSessionNotice: z.string().optional(),
 })
 
 export const PaneReconcileResultSchema = z.object({
@@ -1258,6 +1294,11 @@ export const ReadyCapabilitiesSchema = z
     terminalLifetimeClaimV1: z.literal(true).optional(),
     managedRuntimeV1: z.literal(true).optional(),
     freshAgentAttentionReplayV1: z.literal(true).optional(),
+    // Session-index readiness echo (auto-restore-warming Task 2): present
+    // iff the client's hello opted in via capabilities.sessionIndexReadyV1 —
+    // mirrors the Rust `session_index_ready_v1` (serde camelCase). Additive
+    // optional; the frozen shape omits it entirely.
+    sessionIndexReadyV1: z.literal(true).optional(),
   })
   .optional()
 
@@ -1645,6 +1686,33 @@ export type TerminalReplacedMessage = {
   exitCode: number
   attempt: number
   maxAttempts: number
+  /** Auto-resume identity disposition (additive/optional — older servers
+   * omit it; older clients ignore it and keep the legacy
+   * preserve-the-recorded-ref fold): how the replacement terminal's
+   * session identity relates to the pane's RECORDED one.
+   * `fresh_unbound` — the resume gate refused the recorded id and the
+   * respawn launched an identity-less FRESH conversation (the stale
+   * claim was RELEASED server-side) — tells the client to CLEAR the
+   * pane's saved sessionRef, so a later re-bind association (the fresh
+   * conversation's terminal.session.associated with a new session id and
+   * NO previousSessionId) folds instead of conflicting. The re-bind
+   * itself is the provider's own machinery: codex/opencode re-associate
+   * through real session discovery, while antigravity's typed-prompt
+   * rebind engages only on Freshell's fake-contract fixtures
+   * (real-format antigravity sessions never re-bind per-pane). `resumed`
+   * keeps the recorded ref (still correct); `minted_replacement` keeps
+   * it too (the accepted AD-3 shape). */
+  identityDisposition?: 'resumed' | 'minted_replacement' | 'fresh_unbound'
+  /** Focused repair round 3, Major 2 (additive/optional): the gate's
+   * stale-id notice naming the REFUSED conversation, carried ONLY on the
+   * `fresh_unbound` shape — the path the pane actually consumes. The
+   * server also broadcasts the notice as a `terminal.status{recovering}`
+   * frame, but for the NEW terminal id BEFORE this frame, which the pane
+   * (matching by the OLD id it knows) can never see — and this replaced
+   * fold clears the recovery notice. The client surfaces it as a
+   * pane-level dismissible notice. `resumed`/`minted_replacement` frames
+   * omit it. Prose is presentational-only. */
+  staleSessionNotice?: string
 }
 
 export type TerminalOutputMessage = {
@@ -1792,6 +1860,24 @@ export type SessionsChangedMessage = {
   type: 'sessions.changed'
   revision: number
 }
+
+/**
+ * `sessions.index.ready` (auto-restore-warming Task 2): the server emits
+ * this broadcast once per boot when the session index completes its first
+ * sweep. A bare marker — the CURRENT readiness state rides
+ * `ready.sessionIndexReady` at handshake time; this frame only announces
+ * the readiness TRANSITION. Capability-gated at the forward site: a
+ * connection whose hello did not negotiate `sessionIndexReadyV1` never
+ * receives it (frozen-client inertness), so receiving it implies the
+ * negotiation. Additive server→client only; WS_PROTOCOL_VERSION stays 10
+ * (pre-frame servers simply never send it).
+ */
+export const SessionsIndexReadySchema = z.object({
+  type: z.literal('sessions.index.ready'),
+})
+
+export type SessionsIndexReadyMessage = z.infer<typeof SessionsIndexReadySchema>
+export type SessionsIndexReady = z.infer<typeof SessionsIndexReadySchema>
 
 /**
  * Unified agent names (Task 1): the canonical name broadcast. Published only
@@ -2132,6 +2218,7 @@ export type ServerMessage =
   | TerminalStuckMessage
   | SessionNameUpdatedMessage
   | SessionsChangedMessage
+  | SessionsIndexReadyMessage
   | SettingsUpdatedMessage
   | UiCommandMessage
   | PerfLoggingMessage

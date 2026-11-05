@@ -14,6 +14,15 @@ export interface ConnectionState {
   platform: string | null
   availableClis: Record<string, boolean>
   featureFlags: Record<string, boolean>
+  /**
+   * Session-index readiness (auto-restore-warming Task 5): is the server's
+   * session index warm for THIS connection? Ephemeral per-connection state —
+   * set from `ready.sessionIndexReady` at handshake time and from the
+   * `sessions.index.ready` broadcast on the transition; never persisted
+   * (connection-slice state is never persisted). False by default; an old
+   * server or non-negotiating client never leaves false.
+   */
+  sessionIndexReady: boolean
 }
 
 const FATAL_CONNECTION_ERROR_CODES = new Set([4001, 4003, 4010])
@@ -27,6 +36,7 @@ const initialState: ConnectionState = {
   platform: null,
   availableClis: {},
   featureFlags: {},
+  sessionIndexReady: false,
 }
 
 export const connectionSlice = createSlice({
@@ -68,8 +78,18 @@ export const connectionSlice = createSlice({
     setFeatureFlags: (state, action: PayloadAction<Record<string, boolean>>) => {
       state.featureFlags = action.payload
     },
+    /**
+     * Session-index readiness (auto-restore-warming Task 5): idempotent
+     * per-connection state set. Driven by the ready frame's
+     * `sessionIndexReady` state field (which also RESETS it — a server
+     * restart re-folds the new boot's readiness) and by the
+     * `sessions.index.ready` broadcast (which only raises it).
+     */
+    setSessionIndexReady: (state, action: PayloadAction<boolean>) => {
+      state.sessionIndexReady = action.payload
+    },
   },
 })
 
-export const { setStatus, setError, setErrorCode, setServerInstanceId, setBootId, setServerRestarted, setLiveTerminalIds, setPlatform, setAvailableClis, setFeatureFlags } = connectionSlice.actions
+export const { setStatus, setError, setErrorCode, setServerInstanceId, setBootId, setServerRestarted, setLiveTerminalIds, setPlatform, setAvailableClis, setFeatureFlags, setSessionIndexReady } = connectionSlice.actions
 export default connectionSlice.reducer

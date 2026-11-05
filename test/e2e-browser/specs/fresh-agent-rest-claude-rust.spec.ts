@@ -105,14 +105,16 @@ test.describe('external REST/MCP controls the shared Claude runtime', () => {
   test('MCP send and capture work on a pane created through the picker', async ({ browser }) => {
     await withLane(browser, async (lane, mcp) => {
       const pane = await lane.openPane()
+      // The MCP resolver enumerates tabs before their panes. Seeing a pane
+      // in the unfiltered REST layout does not prove that this same resolver
+      // can address it yet; await the exact tab/pane membership over MCP.
       await expect.poll(async () => {
-        const response = await fetch(`${lane.info.baseUrl}/api/panes`, { headers: { 'x-auth-token': lane.info.token } })
-        const body = await response.json()
-        return JSON.stringify(body).includes(pane.paneId)
-      }, { timeout: 15_000, message: 'the browser layout reached the shared server layout' }).toBe(true)
+        const result = await mcp.callFreshellAction('list-panes', { target: pane.tabId })
+        return result.data?.panes?.find((row: { id: string }) => row.id === pane.paneId)?.id
+      }, { timeout: 15_000, message: 'MCP resolves the picker-created pane in its owning tab' }).toBe(pane.paneId)
       const result = await mcp.callFreshellAction('send-keys', { target: pane.paneId, keys: `${UI_PROMPT}\r`, literal: true })
-      expect(result.status).toBe('ok')
-      expect(result.data.status).toBe('idle')
+      expect(result.status, JSON.stringify(result)).toBe('ok')
+      expect(result.data.status, JSON.stringify(result)).toBe('idle')
       await expect(pane.paneRoot).toContainText(UI_REPLY)
       await expect.poll(() => mcp.callFreshellAction('capture-pane', { target: pane.paneId }), {
         timeout: 20_000, message: 'capture reads the browser-created pane’s saved reply',

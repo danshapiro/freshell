@@ -582,6 +582,7 @@ os._exit(0)
                     start_time,
                     ownership_id,
                     tree: vec![(pid as i32, start)],
+                    root_parent: None,
                     capture_complete: true,
                 })
                 .await
@@ -597,6 +598,7 @@ os._exit(0)
                 start_time: Some(start),
                 ownership_id: tag,
                 tree: vec![(pid as i32, start)],
+                root_parent: None,
                 capture_complete: true,
             })
             .await

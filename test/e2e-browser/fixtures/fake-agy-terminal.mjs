@@ -4,18 +4,28 @@
 // on the ANTIgravity store layout: the identity artifact is the conversation
 // transcript at
 //   <antigravity_home>/brain/<conversationId>/.system_generated/logs/transcript.jsonl
-// whose FIRST line is the session_start ownership record (conversationId +
-// workspacePaths are the disk locator's evidence), plus the
-// cache/last_conversations.json sidecar — the weaker workspace-cache mechanism
-// Freshell must NEVER use for identity or resume (plan Global Constraint 2);
-// this fake keeps it written so later specs can prove exactly that.
+// plus the cache/last_conversations.json sidecar — the weaker
+// workspace-cache mechanism Freshell must NEVER use for identity or resume
+// (plan Global Constraint 2); this fake keeps it written so later specs can
+// prove exactly that.
 //
-// // Stage-1 candidate contract: the store layout and the record schema
-// (session_start / user_message / assistant_message / turn_settled) are the
-// fixture-validated candidate contract pinned by
-// test/fixtures/coding-cli/antigravity/*.sanitized.jsonl and parsed by
-// crates/freshell-sessions/src/parse/antigravity.rs (the A2 named blocker
-// stands; this fake claims nothing beyond it).
+// REAL-BINARY record contract (corrected 2026-11-02 against real agy 1.2.11
+// + 1.4.12 transcripts; evidence:
+// .worktrees/.the-usual-logs/antigravity-transcript-validation/reports/
+// real-binary-transcript-evidence.md): the transcript's records are
+// step-indexed — USER_INPUT / PLANNER_RESPONSE / GENERIC / SYSTEM_MESSAGE /
+// CHECKPOINT — every record carrying source/status/step_index and a
+// second-granularity RFC3339 created_at (this fake writes ms-precision
+// stamps — the shared coercion accepts both), with the user text in the
+// top-level `content` field. Real records carry NO conversation id and NO
+// workspace evidence, so this fake additionally appends ONE labeled
+// fake-contract extension the real binary never writes: the
+// `session_start` ownership record (conversationId + workspacePaths — the
+// disk locator's cwd/id evidence), plus the `turn_settled` settle record
+// the attention machinery consumes (real transcripts carry no settle
+// record). Both extensions keep the real-shaped field discipline so the
+// tracker's (created_at, step_index) identity-pair dedupe is exercised
+// end to end.
 //
 // <antigravity_home> resolves exactly like the server's seam
 // (crates/freshell-sessions provider_layout.rs's antigravity_home):
@@ -37,7 +47,7 @@
 //   round 3, Major 3): CR (Enter, 0x0D) is the ONLY submit delimiter; LF
 //   (Ctrl+J, 0x0A) inserts a newline INTO the accumulating prompt — the
 //   CLI's documented multiline form — so `line one`, Ctrl+J, `line two`,
-//   Enter submits ONE turn whose user_message text carries BOTH lines
+//   Enter submits ONE turn whose USER_INPUT content carries BOTH lines
 //   ("line one\nline two"), matching the ws capture's single full
 //   multi-line flush. (Pre-fix this fake treated LF as a delimiter too and
 //   ran two turns against one captured submit, so multi-line prompts never
@@ -77,7 +87,7 @@
 //   spec drives it; Freshell never sends it.
 //
 // Per submitted line (a "turn") the default program runs, in order:
-//   busy marker → user_message record → assistant_message record → bare BEL
+//   busy marker → USER_INPUT record → PLANNER_RESPONSE record → bare BEL
 //   + `turn done.` (the leading-BEL chunk the turn-complete tracker
 //   consumes) → turn_settled{fullyIdle:true} record. A verb line REPLACES
 //   parts of that program:
@@ -104,12 +114,13 @@
 //                    (outstanding async work — the pane stays busy until a
 //                    later turn settles fullyIdle:true).
 //   /^dup:/         appends a byte-faithful COPY of the ACTIVE transcript's
-//                    last turn_settled record (same `at`) — the scripted
-//                    duplicate-settle replay the tracker's dedupe must
-//                    swallow: no double completion, one bell (plan Task
-//                    13's scenario). No user record; with no active
-//                    conversation or no settle yet there is nothing to
-//                    duplicate and the honest marker says so.
+//                    last turn_settled record (same created_at AND
+//                    step_index — BOTH identity components of the tracker's
+//                    dedupe key) — the scripted duplicate-settle replay the
+//                    dedupe must swallow: no double completion, one bell
+//                    (plan Task 13's scenario). No user record; with no
+//                    active conversation or no settle yet there is nothing
+//                    to duplicate and the honest marker says so.
 //
 // FAKE_AGY_STORE_GATE_PATH (the fake-codex rollout-gate copy): when set, the
 // process's FIRST conversation mint blocks on a 50 ms poll until the gate
@@ -254,7 +265,7 @@ function updateLastConversationsCache(conversationId) {
 }
 
 // ── nonce recall (resume-content proof) ─────────────────────────────────────
-// `remember: <nonce>` lines persist in the transcript as user_message text;
+// `remember: <nonce>` lines persist in the transcript as USER_INPUT content;
 // every activation re-reads them, so an echo after a `--conversation <id>`
 // restart proves the conversation CONTENT continued — not just the id.
 
@@ -276,11 +287,38 @@ function loadRememberedNonces(conversationId) {
     } catch {
       continue // malformed tail — skip
     }
-    if (obj?.type !== 'user_message') continue
-    const match = REMEMBER_RE.exec(String(obj.text ?? ''))
+    if (obj?.type !== 'USER_INPUT') continue
+    const match = REMEMBER_RE.exec(String(obj.content ?? ''))
     if (match) nonces.push(match[1])
   }
   return nonces
+}
+
+// ── step-counter seeding (the cross-process continuation) ────────────────────
+// The real binary CONTINUES a conversation's step_index across processes
+// (binary evidence: USER_INPUT steps 0→2→5 across three separate resumed
+// processes — no per-process reset), so a resumed conversation's new
+// records must continue past every record already on disk.
+
+function maxStepIndex(conversationId) {
+  let raw
+  try {
+    raw = fs.readFileSync(transcriptPath(conversationId), 'utf8')
+  } catch {
+    return -1
+  }
+  let max = -1
+  for (const line of raw.split('\n')) {
+    if (line.trim().length === 0) continue
+    let obj
+    try {
+      obj = JSON.parse(line)
+    } catch {
+      continue // malformed tail — skip
+    }
+    if (typeof obj?.step_index === 'number' && obj.step_index > max) max = obj.step_index
+  }
+  return max
 }
 
 // ── interactive conversation state ───────────────────────────────────────────
@@ -288,16 +326,36 @@ function loadRememberedNonces(conversationId) {
 const state = {
   conversationId: null,
   remembered: [],
+  // Per-conversation record counter modeling the real binary's step_index
+  // identity: unique per record, strictly increasing across turns AND
+  // across processes (binary evidence: USER_INPUT steps 0→2→5 across
+  // three separate resumed processes — no per-process reset). Every
+  // activation seeds it from the transcript's max existing step_index,
+  // so a RESUME continues the steps and a MINT (whose fresh transcript
+  // carries no step records yet) starts fresh. The tracker's settle
+  // dedupe keys on (created_at, step_index).
+  step: -1,
+}
+
+function nextStepIndex() {
+  state.step += 1
+  return state.step
 }
 
 function activateConversation(conversationId) {
   state.conversationId = conversationId
   state.remembered = loadRememberedNonces(conversationId)
+  // Seed the step counter from the transcript — the evidenced
+  // cross-process continuation. A mint's just-written transcript
+  // carries no step records yet, so a mint still starts at step 0.
+  state.step = maxStepIndex(conversationId)
   updateLastConversationsCache(conversationId)
 }
 
 // The mint (b): fresh transcript (ownership record as the FIRST line) + the
-// cache sidecar. Silent — the caller owns the stdout marker.
+// cache sidecar. Silent — the caller owns the stdout marker. The step
+// counter re-seeds inside activateConversation from the fresh, step-less
+// transcript — a mint starts at step 0.
 function mintConversation() {
   const conversationId = crypto.randomUUID()
   const file = transcriptPath(conversationId)
@@ -351,38 +409,57 @@ function now() {
   return new Date().toISOString()
 }
 
+// The turn-program record writers. USER_INPUT and PLANNER_RESPONSE are the
+// REAL binary vocabulary (v1.4.12: source/status/step_index/created_at, user
+// text in `content`, flat token fields on the reply); `turn_settled` is the
+// labeled fake-contract settle record (real transcripts carry no settle
+// record — binary evidence) with the real-shaped field discipline so the
+// tracker's (created_at, step_index) identity-pair dedupe is exercised end
+// to end.
 function appendUserMessage(line) {
   appendRecord(state.conversationId, {
-    type: 'user_message',
-    conversationId: state.conversationId,
-    text: line,
-    at: now(),
+    type: 'USER_INPUT',
+    source: 'USER_EXPLICIT',
+    status: 'DONE',
+    step_index: nextStepIndex(),
+    created_at: now(),
+    content: line,
   })
 }
 
 function appendAssistantMessage(text) {
   appendRecord(state.conversationId, {
-    type: 'assistant_message',
-    conversationId: state.conversationId,
-    text,
-    at: now(),
-    usage: { inputTokens: 1, outputTokens: 1, cachedTokens: 0, totalTokens: 2 },
+    type: 'PLANNER_RESPONSE',
+    source: 'MODEL',
+    status: 'DONE',
+    step_index: nextStepIndex(),
+    created_at: now(),
+    content: text,
+    input_tokens: 1,
+    output_tokens: 1,
+    cache_read_tokens: 0,
   })
 }
 
 function appendTurnSettled(fullyIdle) {
+  // The fake-contract settle record: the real binary writes NO settle
+  // record (binary evidence, real-binary-transcript-evidence.md); the
+  // fake appends this extension so the attention machinery has a
+  // settle signal — real-shaped field discipline (created_at +
+  // step_index) so the tracker's identity-pair dedupe is exercised.
   appendRecord(state.conversationId, {
     type: 'turn_settled',
-    conversationId: state.conversationId,
-    at: now(),
-    outcome: 'completed',
+    step_index: nextStepIndex(),
+    created_at: now(),
+    outcome: fullyIdle ? 'completed' : 'async-outstanding',
     fullyIdle,
   })
 }
 
 // Copy source for the /^dup:/ verb: the ACTIVE transcript's last
-// turn_settled RAW line — byte-faithful, same `at`, a true duplicate — or
-// '' when there is no settle to duplicate.
+// turn_settled RAW line — byte-faithful, same created_at AND step_index
+// (both identity components), a true duplicate — or '' when there is no
+// settle to duplicate.
 function lastSettledLine(conversationId) {
   let raw
   try {
@@ -447,10 +524,11 @@ async function handleLine(line) {
     return
   }
   // Duplicate-settle replay: append a byte-faithful copy of the ACTIVE
-  // transcript's last turn_settled record (same `at`) — the scripted
-  // duplicate the tracker's dedupe must swallow (no double completion, one
-  // bell; plan Task 13's scenario). Not a turn line: no user record, no
-  // mint — nothing to duplicate ⇒ the honest marker.
+  // transcript's last turn_settled record (same created_at AND
+  // step_index — both identity components of the tracker's dedupe key) —
+  // the scripted duplicate the dedupe must swallow (no double completion,
+  // one bell; plan Task 13's scenario). Not a turn line: no user record,
+  // no mint — nothing to duplicate ⇒ the honest marker.
   if (/^dup:/.test(line)) {
     const last = state.conversationId ? lastSettledLine(state.conversationId) : ''
     if (last) fs.appendFileSync(transcriptPath(state.conversationId), `${last}\n`)

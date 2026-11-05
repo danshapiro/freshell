@@ -31,10 +31,13 @@ test('Freshcodex observes the exact child read-only and restores the selection a
     { id: 'child-turn', status: 'completed', itemsView: 'full', items: [{ id: 'child-answer', type: 'agentMessage', text: 'Exact observed child answer', delivery: 'async', questions: [{ title: 'Child question?', options: ['Child choice'] }] }] },
     { id: 'preview-turn', status: 'interrupted', itemsView: 'summary', items: [{ id: 'child-preview', type: 'agentMessage', summary: 'Partial child preview' }] },
   ] }
+  // Live parent history now arrives through thread/turns/list; child observation
+  // still names its exact root in thread/read. Seed both actual read surfaces,
+  // never override every thread/read with the parent regardless of its ID.
   const server = new RustServer({ env: {
     CODEX_CMD: wrapper,
     FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES: '1',
-    FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({ threadStartThreadId: parentId, appendThreadOperationLogPath: operations, threadReadResults: { [parentId]: parent, [childId]: child }, overrides: { 'thread/read': { result: { thread: parent } } } }),
+    FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({ threadStartThreadId: parentId, appendThreadOperationLogPath: operations, threadReadResults: { [parentId]: parent, [childId]: child }, threadTurns: parent.turns }),
   }, setupHome: async (home) => {
     await fs.mkdir(path.join(home, '.freshell'), { recursive: true })
     await fs.writeFile(path.join(home, '.freshell/config.json'), JSON.stringify({ version: 1, settings: { freshAgent: { enabled: true }, codingCli: { enabledProviders: ['codex'] } } }))
@@ -76,9 +79,12 @@ test('Freshcodex observes the exact child read-only and restores the selection a
     await expect(observer.getByRole('textbox')).toHaveCount(0)
     await expect(observer.getByRole('button', { name: /send|stop|configure|resume/i })).toHaveCount(0)
     const close = observer.getByRole('button', { name: 'Close child conversation' })
+    const refresh = observer.getByRole('button', { name: 'Refresh child history' })
+    await close.hover()
+    await expect(observer.getByRole('button', { name: 'Copy turn', exact: true })).toHaveCount(0)
     await expect(close).toBeFocused()
     await page.keyboard.press('Shift+Tab')
-    await expect(observer.getByRole('button', { name: 'Copy turn', exact: true }).last()).toBeFocused()
+    await expect(refresh).toBeFocused()
     await page.keyboard.press('Tab')
     await expect(close).toBeFocused()
     await page.keyboard.press('Escape')

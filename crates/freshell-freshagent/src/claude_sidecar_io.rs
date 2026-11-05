@@ -58,6 +58,13 @@ struct WriteRequest {
     answer: oneshot::Sender<Result<(), String>>,
 }
 
+/// Once a request enters the writer, even a failed write or flush may have
+/// delivered some or all of its line to the sidecar.
+pub(crate) struct SidecarWriteError {
+    pub message: String,
+    pub possibly_delivered: bool,
+}
+
 impl SidecarWriter {
     /// The fault receiver fires once on timeout or a broken pipe. Its runtime
     /// owner kills only that incarnation without removing its map entry, letting
@@ -92,16 +99,34 @@ impl SidecarWriter {
     }
 
     pub(crate) async fn write(&self, value: &Value) -> Result<(), String> {
-        let mut line = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+        self.write_tracked(value)
+            .await
+            .map_err(|error| error.message)
+    }
+
+    pub(crate) async fn write_tracked(&self, value: &Value) -> Result<(), SidecarWriteError> {
+        let mut line = serde_json::to_vec(value).map_err(|error| SidecarWriteError {
+            message: error.to_string(),
+            possibly_delivered: false,
+        })?;
         line.push(b'\n');
         let (answer, receipt) = oneshot::channel();
         self.inner
             .requests
             .send(WriteRequest { line, answer })
-            .map_err(|_| "Claude sidecar writer is closed.".to_string())?;
-        receipt.await.unwrap_or_else(|_| {
-            Err("Claude sidecar writer stopped before the write finished.".into())
-        })
+            .map_err(|_| SidecarWriteError {
+                message: "Claude sidecar writer is closed.".to_string(),
+                possibly_delivered: false,
+            })?;
+        receipt
+            .await
+            .unwrap_or_else(|_| {
+                Err("Claude sidecar writer stopped before the write finished.".into())
+            })
+            .map_err(|message| SidecarWriteError {
+                message,
+                possibly_delivered: true,
+            })
     }
 
     /// Ask the sidecar to shut down, then close stdin, within the teardown's

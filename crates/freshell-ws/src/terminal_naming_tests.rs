@@ -297,7 +297,7 @@ async fn adopt_managed_for_reconcile_binds_naming() {
         }))
         .expect("reconcile request");
 
-    assert!(super::handle_pane_reconcile(request, &mut ws_tx, &state, false, true).await);
+    assert!(super::handle_pane_reconcile(request, &mut ws_tx, &state, false, true, 1).await);
 
     assert!(state.registry.is_managed("T-reconciled"));
     assert_bound_to(
@@ -536,7 +536,8 @@ async fn respawned_agent_row_carries_binding_and_saved_name() {
 
     let terminal_id = super::respawn_agent_terminal(&state, &respawn_request("s-survivor", None))
         .await
-        .expect("respawn spawns a replacement");
+        .expect("respawn spawns a replacement")
+        .terminal_id;
 
     assert_bound_to(&state, &terminal_id, &claude("s-survivor"), "Survivor");
     state.registry.kill(&terminal_id);
@@ -569,7 +570,8 @@ async fn respawn_inherits_the_crashed_rows_still_pending_handle() {
     let terminal_id =
         super::respawn_agent_terminal(&state, &respawn_request("s-early", Some("T-crashed")))
             .await
-            .expect("respawn spawns a replacement");
+            .expect("respawn spawns a replacement")
+            .terminal_id;
 
     assert_bound_to(&state, &terminal_id, &pending, "Early name");
     assert_eq!(
@@ -612,7 +614,8 @@ async fn respawn_never_inherits_a_transferred_handle() {
         &respawn_request("s-moved-on", Some("T-crashed-durable")),
     )
     .await
-    .expect("respawn spawns a replacement");
+    .expect("respawn spawns a replacement")
+    .terminal_id;
 
     assert_eq!(
         state.registry.name_ref_of(&terminal_id),

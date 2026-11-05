@@ -75,12 +75,33 @@ export interface FreshellTestHarness {
   unregisterTerminalModes: (terminalId: string) => void
   registerTerminalBuffer: (terminalId: string, accessor: () => string) => void
   unregisterTerminalBuffer: (terminalId: string) => void
+  /**
+   * Pane-scoped buffer registry (delta fix focused review, finding 2): the
+   * same renderer-independent xterm buffer text, addressed by the PANE id so
+   * it stays reachable when the pane holds NO terminalId (the durable-park
+   * shapes: an exited pane's restore-notice line lands exactly when the
+   * cleared terminalId unregisters the terminalId-keyed accessor). Kept in
+   * its OWN registry — getRegisteredTerminalIds keeps returning terminalIds
+   * only, because its consumers treat every key as a terminal id.
+   */
+  getPaneTerminalBuffer?: (paneId: string) => string | null
+  registerPaneTerminalBuffer?: (paneId: string, accessor: () => string) => void
+  unregisterPaneTerminalBuffer?: (paneId: string) => void
   getPerfAuditSnapshot: () => PerfAuditSnapshot | null
   getSentWsMessages?: () => unknown[]
   getSentWsMessagesWithTimestamps?: () => Array<{ __sentAt?: number; type?: string; requestId?: string }>
   clearSentWsMessages?: () => void
   recordSentWsMessage?: (msg: unknown) => void
   getReceivedWsMessages?: () => unknown[]
+  /**
+   * The received-frame ring with its page-clock stamps (delta fix focused
+   * review, findings 3+4): mirrors getSentWsMessagesWithTimestamps — every
+   * retained frame carries __receivedAt (Date.now() at receipt), letting
+   * e2e witnesses scope their search by TIME (e.g. only frames received
+   * after a restart's ready handshake, whose connection.lastReadyAt uses
+   * the same page clock) instead of a boot-agnostic whole-ring type match.
+   */
+  getReceivedWsMessagesWithTimestamps?: () => Array<{ __receivedAt?: number; type?: string }>
   clearReceivedWsMessages?: () => void
   recordReceivedWsMessage?: (msg: unknown) => void
   recordTerminalWrite?: (event: TerminalWriteEvent) => void
@@ -138,6 +159,10 @@ export function installTestHarness(
   const suppressedTerminalPaneIds = new Set<string>()
   const sentWsMessages: unknown[] = []
   const receivedWsMessages: unknown[] = []
+  // Pane-scoped buffer accessors, keyed by paneId (delta fix focused
+  // review, finding 2) — separate from the terminalId-keyed registry above
+  // so getRegisteredTerminalIds never surfaces pane keys.
+  const paneTerminalBuffers = new Map<string, () => string>()
   const terminalWriteEvents: TerminalWriteEvent[] = []
   let terminalWriteEventBytes = 0
   const recordSentWsMessage = (msg: unknown) => {
@@ -204,6 +229,13 @@ export function installTestHarness(
     unregisterTerminalBuffer: (terminalId: string) => {
       terminalBuffers.delete(terminalId)
     },
+    getPaneTerminalBuffer: (paneId: string) => paneTerminalBuffers.get(paneId)?.() ?? null,
+    registerPaneTerminalBuffer: (paneId: string, accessor: () => string) => {
+      paneTerminalBuffers.set(paneId, accessor)
+    },
+    unregisterPaneTerminalBuffer: (paneId: string) => {
+      paneTerminalBuffers.delete(paneId)
+    },
     getTerminalModes: (terminalId?: string) => {
       if (terminalId) {
         const accessor = terminalModes.get(terminalId)
@@ -233,6 +265,7 @@ export function installTestHarness(
       const { __receivedAt, ...rest } = msg as { __receivedAt?: number }
       return rest
     }),
+    getReceivedWsMessagesWithTimestamps: () => [...receivedWsMessages] as Array<{ __receivedAt?: number; type?: string }>,
     clearReceivedWsMessages: () => {
       receivedWsMessages.length = 0
     },

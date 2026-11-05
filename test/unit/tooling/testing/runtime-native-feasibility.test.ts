@@ -2,7 +2,7 @@
 import childProcess, { execFile, execFileSync, spawn } from 'node:child_process'
 import { syncBuiltinESMExports } from 'node:module'
 import { promisify } from 'node:util'
-import { describe, expect, it, vi } from 'vitest'
+import { afterAll, describe, expect, it, vi } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -29,6 +29,29 @@ const imageDigest = `sha256:${'a'.repeat(64)}`
 const candidateSha = 'b'.repeat(40)
 const ownerId = 'unit-finite-child'
 const selection: NativeSelection = { mode: 'freshclaude', case: 'startup' }
+
+let fixtureNamespace: string | undefined
+function nativeFixtureNamespace(): string {
+  if (fixtureNamespace !== undefined) return fixtureNamespace
+  // Match the qualification guards with a short namespace: the longest
+  // fixture's Unix socket path stays at 106 bytes.
+  for (;;) {
+    const candidate = path.join('/tmp', `f${randomUUID().slice(0, 8)}`)
+    try {
+      fs.mkdirSync(candidate, { mode: 0o700 })
+      fixtureNamespace = candidate
+      return candidate
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+    }
+  }
+}
+
+afterAll(() => {
+  // Assigned only after our exclusive mkdir succeeds; never remove a
+  // pre-existing directory. Per-case child shutdown and cleanup stay local.
+  if (fixtureNamespace !== undefined) fs.rmSync(fixtureNamespace, { recursive: true, force: true })
+})
 
 function receiverAccess(mode: string) {
   return { tlsVerifyMode: 2, tlsCheckHostname: true, httpsStatus: mode === 'freshopencode' ? null : 200,
@@ -291,7 +314,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
     ...(['wrong-provider', 'wrong-model', 'tool'] as const).map(fault => ['freshopencode', fault] as const),
   ])('routes actual current native turns through seed, replacement, recall and original capture (%s, %s; controlled fixtures)', async (mode, fault) => {
     const terminal = mode === 'codex' || mode === 'opencode', provider = mode === 'codex' || mode === 'freshcodex' ? 'codex' : 'opencode'
-    const directory = path.join('/tmp/frs', randomUUID().slice(0, 12)), evidenceDir = path.join(directory, 'evidence')
+    const directory = path.join(nativeFixtureNamespace(), randomUUID().slice(0, 12)), evidenceDir = path.join(directory, 'evidence')
     fs.mkdirSync(evidenceDir, { recursive: true, mode: 0o700 })
     const serverPath = path.join(directory, 'controlled-server'); fs.writeFileSync(serverPath, 'fixture server only')
     let root = provider === 'codex' ? randomUUID() : 'ses_ownedNative', launchRequest: any, sourceDatabase: string | undefined, sourceHome = ''
@@ -477,7 +500,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
   it.each(['root-load-error', 'history-load-error'])('damages only the owned exact native %s source while preserving the sealed source (controlled UID driver only)', fault => {
-    const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12))
+    const ownedRoot = path.join(nativeFixtureNamespace(), randomUUID().slice(0, 12))
     fs.mkdirSync(ownedRoot, { recursive: true, mode: 0o700 })
     try {
       const source = prepareOwnedOpenCodeTuiSource(process.cwd(), ownedRoot, fault, randomUUID())
@@ -507,7 +530,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
     } finally { fs.rmSync(ownedRoot, { recursive: true, force: true }) }
   })
   it.each(['foreign-home', 'foreign-workspace', 'foreign-root', 'parent-root', 'wrong-count', 'symlink-database'])('refuses owned native store damage on %s before mutation (controlled UID driver only)', defect => {
-    const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12))
+    const ownedRoot = path.join(nativeFixtureNamespace(), randomUUID().slice(0, 12))
     fs.mkdirSync(ownedRoot, { recursive: true, mode: 0o700 })
     try {
       const source = prepareOwnedOpenCodeTuiSource(process.cwd(), ownedRoot, 'root-load-error', randomUUID())
@@ -531,7 +554,7 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
     ['root-load-error', 'current'], ['history-load-error', 'current'],
     ...['missing', 'stale-incarnation', 'stale-nonce', 'stale-revision', 'stale-generation', 'wrong-root'].map(binding => ['root-load-error', binding]),
   ])('runs the actual producer read refusal after supported lifecycle and owned %s/%s release (controlled APIs only)', async (fault, releaseFault) => {
-    const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12))
+    const ownedRoot = path.join(nativeFixtureNamespace(), randomUUID().slice(0, 12))
     fs.mkdirSync(ownedRoot, { recursive: true, mode: 0o700 })
     const source = prepareOwnedOpenCodeTuiSource(process.cwd(), ownedRoot, fault, randomUUID())
     const home = path.join(ownedRoot, 'provider'), databasePath = path.join(home, '.local/share/opencode/opencode.db')
@@ -630,7 +653,7 @@ print(json.dumps(native_signal_metadata(${JSON.stringify(fault==='foreign-termin
     }finally{fs.rmSync(directory,{recursive:true,force:true})}
   })
   it.each(['current','wrong-root','stale-incarnation','stale-nonce','stale-generation','missing-hydration'])('captures original producer receipt with %s before host consumption without creating an acknowledgement (controlled lifecycle/file IO only)', fault => {
-    const ownedRoot=path.join('/tmp/frs',randomUUID().slice(0,12)),workspace=path.join(ownedRoot,'opencode-stale-observation-workspace'),home=path.join(ownedRoot,'provider')
+    const ownedRoot=path.join(nativeFixtureNamespace(),randomUUID().slice(0,12)),workspace=path.join(ownedRoot,'opencode-stale-observation-workspace'),home=path.join(ownedRoot,'provider')
     fs.mkdirSync(workspace,{recursive:true,mode:0o700});const directory=path.join(home,'.freshell/session-signals/opencode-adoption')
     fs.mkdirSync(directory,{recursive:true});const root='ses_ownedRoot',terminalId='terminal-owned',incarnationId='old-incarnation'
     const raw=JSON.stringify({session_id:fault==='wrong-root'?'ses_other':root,source:'opencode-tui-plugin',adoption_observation:{terminal_id:terminalId,root_session_id:root,
@@ -659,7 +682,7 @@ originalRemoved:!fs.existsSync(file),liveNativeFiles:fs.readdirSync(${JSON.strin
     }finally{fs.rmSync(ownedRoot,{recursive:true,force:true})}
   })
   it.each(['baseline-only-resume', 'stale-observation'])('arms the supported %s observer only for a new native incarnation (controlled API only)', async caseId => {
-    const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12)), home = path.join(ownedRoot, 'provider')
+    const ownedRoot = path.join(nativeFixtureNamespace(), randomUUID().slice(0, 12)), home = path.join(ownedRoot, 'provider')
     const workspace = path.join(ownedRoot, `opencode-${caseId}-workspace`)
     fs.mkdirSync(workspace, { recursive: true, mode: 0o700 })
     const directory = path.join(home, '.freshell/session-signals/opencode-adoption-diagnostics')
@@ -695,7 +718,7 @@ console.log(JSON.stringify({calls,report:fs.existsSync('native-tui-fault-result.
     } finally {fs.rmSync(ownedRoot,{recursive:true,force:true})}
   })
   it.each(['current', 'stale-incarnation', 'stale-nonce', 'stale-generation', 'already-published', 'inactive', 'wrong-requested-root'])('uses the supported plugin manager to dispose a pending owned native read without publishing identity: %s (controlled API only)', async (fault) => {
-    const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12))
+    const ownedRoot = path.join(nativeFixtureNamespace(), randomUUID().slice(0, 12))
     const workspace = path.join(ownedRoot, 'opencode-disposal-workspace'), home = path.join(ownedRoot, 'provider')
     fs.mkdirSync(workspace, { recursive: true, mode: 0o700 })
     const directory = path.join(home, '.freshell/session-signals/opencode-adoption-diagnostics')
@@ -736,7 +759,7 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
     } finally { fs.rmSync(ownedRoot, { recursive: true, force: true }) }
   })
   it('prepares a genuinely empty owned V1 root before native export while preserving related roots', () => {
-    const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12))
+    const ownedRoot = path.join(nativeFixtureNamespace(), randomUUID().slice(0, 12))
     fs.mkdirSync(ownedRoot, { recursive: true, mode: 0o700 })
     try {
       const source = prepareOwnedOpenCodeTuiSource(process.cwd(), ownedRoot, 'v1-empty', randomUUID())
@@ -754,7 +777,7 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
   })
   it.each(['null-slot', 'v2-empty-is-not-v1-empty', 'full-revert', 'part-revert', 'baseline-only-resume'])(
     'prepares the actual owned V1 and saved revert shape for %s without inventing V2 history', caseId => {
-      const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12))
+      const ownedRoot = path.join(nativeFixtureNamespace(), randomUUID().slice(0, 12))
       fs.mkdirSync(ownedRoot, { recursive: true, mode: 0o700 })
       try {
         const source = prepareOwnedOpenCodeTuiSource(process.cwd(), ownedRoot, caseId, randomUUID())
@@ -775,7 +798,7 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
     })
   it.each(['foreign-root', 'symlink-root', 'unknown-case'])(
     'refuses unowned or invalid source preparation before creating a workspace (%s)', fault => {
-      const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12))
+      const ownedRoot = path.join(nativeFixtureNamespace(), randomUUID().slice(0, 12))
       fs.mkdirSync(ownedRoot, { recursive: true, mode: 0o700 })
       const alias = ownedRoot + '-alias'
       if (fault === 'symlink-root') fs.symlinkSync(ownedRoot, alias, 'dir')
@@ -814,7 +837,7 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
     }finally{fs.rmSync(directory,{recursive:true,force:true})}
   })
   it.each(['baseline-only-resume', 'stale-observation'].flatMap(caseId => ['current', 'missing-capability'].map(fault => [caseId, fault])))('issues scoped %s/%s preparation through the owned Unix controller before native launch (controlled transport only)', async (caseId, fault) => {
-    const ownedRoot=path.join('/tmp/frs',randomUUID().slice(0,12)),evidenceDir=path.join(ownedRoot,'evidence')
+    const ownedRoot=path.join(nativeFixtureNamespace(),randomUUID().slice(0,12)),evidenceDir=path.join(ownedRoot,'evidence')
     fs.mkdirSync(evidenceDir,{recursive:true,mode:0o700})
     const stage=path.join(ownedRoot,'stage');fs.writeFileSync(stage,'controlled artifact only',{mode:0o500})
     let root='',sourcePath='',sourceHome='',launched:any,issue:any,selectionRead=false
@@ -866,7 +889,7 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
   })
   it.each(['requested-echo', 'previous-incarnation', 'stale-revision', 'ledger-advanced', 'disposal-already-published', 'disposal-current', 'cancellation-current', 'cancellation-wrong-result', 'cancellation-old-intent', 'root-load-error-current', 'history-load-error-current', 'root-load-error-wrong-pid', 'root-load-error-stale-refusal', 'root-load-error-wrong-reason', 'history-load-error-store-unchanged', 'history-load-error-producer-disabled'])(
     'executes owned import/launch orchestration with %s without inventing qualification', async fault => {
-      const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12))
+      const ownedRoot = path.join(nativeFixtureNamespace(), randomUUID().slice(0, 12))
       const evidenceDir = path.join(ownedRoot, 'evidence')
       fs.mkdirSync(evidenceDir, { recursive: true, mode: 0o700 })
       const stage = path.join(ownedRoot, 'stage-fixture')
@@ -984,7 +1007,7 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
       } finally { fs.rmSync(ownedRoot, { recursive: true, force: true }) }
     })
   it.each(['baseline-only-resume', 'stale-observation'].flatMap(caseId => ['current', 'prior-public-view', 'prior-public-after-stop', 'stopped-current-observation', 'stopped-wrong-incarnation', 'stopped-running', 'stopped-intent-mismatch', 'stopped-changed-public-observation', 'wrong-candidate-receipt', 'changed-public-observation', 'wrong-host-generation', 'wrong-producer-pid', 'canonical-stopped-omission', 'owner-authenticator', 'wrong-native-binary', 'missing-baseline', 'copied-volume', 'changed-history', 'current-observation', 'changed-stale-receipt', 'unconsumed-stale-receipt', 'false-stopped-result'].map(fault => [caseId, fault])))('executes original-volume %s/%s through actual recovery and Stop ordering (controlled orchestration)', async (caseId, fault) => {
-    const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12)), evidenceDir=path.join(ownedRoot,'evidence')
+    const ownedRoot = path.join(nativeFixtureNamespace(), randomUUID().slice(0, 12)), evidenceDir=path.join(ownedRoot,'evidence')
     fs.mkdirSync(evidenceDir,{recursive:true,mode:0o700})
     const source=prepareOwnedOpenCodeTuiSource(process.cwd(),ownedRoot,caseId,randomUUID())
     const root=source.rootId,oldInc='incarnation-'+randomUUID(),newInc='incarnation-'+randomUUID(),terminalId='terminal-owned'
@@ -1786,7 +1809,7 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
   it.each(['valid', 'wrong-proof', 'wrong-status-boot', 'wrong-request', 'oversized'])('executes the owned native host Status authentication/framing (%s; fixture only)', async (form) => {
-    const base = path.join('/tmp/frs', randomUUID().replaceAll('-', '').slice(0, 8) + '-' + randomUUID().slice(0, 3))
+    const base = path.join(nativeFixtureNamespace(), randomUUID().replaceAll('-', '').slice(0, 8) + '-' + randomUUID().slice(0, 3))
     const root = path.join(base, 'r', 'amplif-aaaaaaaa', 'x'), incarnation = 'incarnation-' + randomUUID()
     const directory = path.join(root, incarnation); fs.mkdirSync(directory, { recursive: true, mode: 0o700 })
     const secret = Buffer.from(randomUUID()), boot = 'hostboot-' + randomUUID(), endpoint = path.join(directory, 'host.sock')
@@ -2143,7 +2166,7 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
   })
   it.each(['missing-history', 'load-failure', 'missing-context-restore', 'timeout', 'provider-exit', 'stop-cancellation', 'parent-root', 'old-writer'].flatMap(fault => ['current', 'ordinary', 'wrong-cli-pin', 'wrong-producer-pin', 'missing-launch', 'wrong-root'].map(form => ({ fault, form }))))('executes the fixed owned Amplifier native startup fault $fault/$form', ({ fault, form }) => {
     const pending = ['timeout', 'provider-exit', 'stop-cancellation'].includes(fault)
-    const directory = path.join('/tmp/frs', randomUUID().slice(0, 8) + '-abc')
+    const directory = path.join(nativeFixtureNamespace(), randomUUID().slice(0, 8) + '-abc')
     const workspace = path.join(directory, 'amplifier-' + (form === 'ordinary' ? 'create' : fault) + '-workspace')
     const native = path.join(directory, 'native'), pkg = path.join(native, 'amplifier_app_cli'), root = randomUUID()
     const store = path.join(directory, 'provider', '.amplifier', 'projects', workspace.replaceAll('/', '-'), 'sessions', root)
@@ -2439,7 +2462,7 @@ print(json.dumps({'events':[json.loads(line) for line in capture.getvalue().spli
     expect(nativeResumeRootInArgv(argv,root)).toBe(form==='split'||form==='sdk-inline')
   })
   it.each(['split','sdk-inline'].flatMap(form=>['ordinary-create','ordinary-resume','owned-fork','owned-duplicate','wrong-root','missing-launch','wrong-pin'].map(fault=>({form,fault}))))('executes only the fixed owned SDK resume-fork fault $form/$fault', ({form,fault}) => {
-    const root=path.join('/tmp/frs',randomUUID().slice(0,12));const workspace=path.join(root,'freshclaude-'+(fault==='ordinary-resume'?'exact-resume':'wrong-id')+'-workspace')
+    const root=path.join(nativeFixtureNamespace(),randomUUID().slice(0,12));const workspace=path.join(root,'freshclaude-'+(fault==='ordinary-resume'?'exact-resume':'wrong-id')+'-workspace')
     fs.mkdirSync(workspace,{recursive:true,mode:0o700})
     const native=path.join(root,'native-child'),wrapper=path.join(root,'wrapper.py'),requested=randomUUID()
     fs.writeFileSync(native,'#!/usr/bin/python3\nimport sys,json\nprint(json.dumps(sys.argv[1:]))\n',{mode:0o700});fs.chmodSync(native,0o700)
@@ -2457,7 +2480,7 @@ print(json.dumps({'events':[json.loads(line) for line in capture.getvalue().spli
     } finally {fs.rmSync(root,{recursive:true,force:true})}
   })
   it.each(['ambiguous-root','missing-root','ordinary-malformed'])('fences ambiguous owned SDK resume and preserves ordinary argv (%s)',fault=>{
-    const root=path.join('/tmp/frs',randomUUID().slice(0,12)),workspace=path.join(root,`kilroy-${fault==='ordinary-malformed'?'exact-resume':'wrong-id'}-workspace`)
+    const root=path.join(nativeFixtureNamespace(),randomUUID().slice(0,12)),workspace=path.join(root,`kilroy-${fault==='ordinary-malformed'?'exact-resume':'wrong-id'}-workspace`)
     fs.mkdirSync(workspace,{recursive:true});const child=path.join(root,'child'),wrapper=path.join(root,'wrapper.py'),requested=randomUUID()
     fs.writeFileSync(child,'#!/usr/bin/python3\nimport sys,json\nprint(json.dumps(sys.argv[1:]))\n',{mode:0o700});fs.chmodSync(child,0o700)
     fs.writeFileSync(wrapper,nativeSdkResumeForkWrapper.replaceAll('/opt/freshell-claude-sidecar/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude.native',child).replace('73975167f0108693cf6fd6614994781657ebb8456ebef5d247458734abfb3916',createHash('sha256').update(fs.readFileSync(child)).digest('hex')))
@@ -2471,7 +2494,7 @@ print(json.dumps({'events':[json.loads(line) for line in capture.getvalue().spli
   it.each(['freshclaude','kilroy'].flatMap(mode=>['split','sdk-inline'].flatMap(form=>
     ['valid','wrong-root','missing-launch','invalid-anchor','existing-anchor','ordinary'].map(fault=>({mode,form,fault})))))(
     'executes only the owned supported post-hook SDK resume-anchor fault $mode/$form/$fault',({mode,form,fault})=>{
-      const directory=path.join('/tmp/frs',randomUUID().slice(0,12))
+      const directory=path.join(nativeFixtureNamespace(),randomUUID().slice(0,12))
       const workspace=path.join(directory,`${mode}-${fault==='ordinary'?'exact-resume':'restoration-failure-after-hook'}-workspace`)
       fs.mkdirSync(workspace,{recursive:true})
       const child=path.join(directory,'native-child'),wrapper=path.join(directory,'wrapper.py'),root=randomUUID(),anchor=randomUUID()

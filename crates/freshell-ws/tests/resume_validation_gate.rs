@@ -143,6 +143,7 @@ async fn spawn_server_with_probe(
     let registry = freshell_terminal::TerminalRegistry::new();
 
     let state = WsState {
+        session_index_ready: None,
         layout: Default::default(),
         terminal_meta: Default::default(),
         pane_ledger: Arc::clone(&pane_ledger),
@@ -342,6 +343,7 @@ async fn spawn_managed_codex_server_with_probe(
     let registry = freshell_terminal::TerminalRegistry::new();
 
     let state = WsState {
+        session_index_ready: None,
         layout: Default::default(),
         terminal_meta: Default::default(),
         pane_ledger: Arc::clone(&pane_ledger),
@@ -1076,40 +1078,86 @@ async fn managed_default_legacy_codex_carrier_never_consults_gate_or_plans() {
     assert_never_captured(&capture_path);
 }
 
-// ── Antigravity gate DEFERRAL (plan Task 7, load-bearing A2) ─────────────────
+// ── Antigravity gate ACTIVATION (resume-gate flip, Task 3 of
+// docs/plans/2026-11-02-antigravity-transcript-validation.md) ─────────
 //
-// Antigravity stays OUT of `resume_gate.rs VALIDATED_PROVIDERS` until
-// real-binary transcript-store evidence exists: the record schema is
-// fixture-validated only, and a wrong schema would make REAL conversations
-// answer Absent and visibly refuse/replace every restore with a misleading
-// "not found on disk" notice. Until then a stale antigravity resume id
-// passes through UNGATED (gemini-style) and the CLI's own PROBED behavior
-// surfaces in-pane (round 7, Major 1 — the real binaries v1.4.10 AND
-// v1.4.12 print `warning: conversation "<id>" not found` and CONTINUE
-// INTO A FRESH INTERACTIVE SESSION, never a failure exit): the pane
-// stays ALIVE under its requested id, no replacement conversation is
-// ever spawned by Freshell, and the pane rebinds to the CLI's fresh
-// conversation on its next clean prompt (pinned by the
-// antigravity_session_rebind suite — this gate harness wires no
-// activity hub, so it pins the GATE door only). Both scenarios run
-// against an `AbsentButObservedProbe` — the answer that WOULD gate a
-// validated provider into the typed SESSION_MISSING refusal — so any
-// future gate activation flips these tests red and forces an evidenced
-// decision.
+// Antigravity IS a validated resume provider (activated 2026-11-03 on
+// real-binary transcript evidence (2026-11-02) + a proven
+// settings-conformant real resume (2026-11-03; Provider Contract Record
+// rows 74/75/76; evidence: real-binary-transcript-evidence.md — the
+// "Overlay-conformant receipts (branch 1)" section: API-key auth + the
+// `--settings '{"modelProvider":"gemini"}'` overlay + a real
+// `--conversation` resume with content recall on the same brain/<id>
+// transcript, steps unique and increasing across processes)). The probe
+// IS consulted at the spawn doors: a restore whose brain/<id>/ exists
+// resumes the EXACT id through the ACTIVE gate, and a stale id with
+// positive absence answers the typed SESSION_MISSING refusal (the
+// amplifier refusal shape at :504-530) — ZERO spawns (the CLI never
+// sees the stale id), the ledger row retires as SessionMissing, and the
+// CLI's own probed missing-ID passthrough (which silently CONTINUES
+// INTO a fresh interactive session — round 6/7 PTY receipts, v1.4.10 +
+// v1.4.12) is closed off at the door. Both scenarios run against a
+// DiskWiredAntigravityProbe — the harness's seeded brain tree, the
+// production by-id walk's shape — and assert the consultation count,
+// proving the gate is ACTIVE (the probe is consulted), not
+// passthrough.
 
-/// A fake `agy` for the deferral scenarios: records `"$@"` as ONE line per
+/// A gate probe wired to the harness's seeded brain tree — the
+/// production by-id walk's shape: exists+readable ⇒ Present, missing ⇒
+/// Absent, anything else ⇒ Unknown. Counts consultations so the tests
+/// can prove the gate is ACTIVE (the probe is consulted), not
+/// passthrough.
+struct DiskWiredAntigravityProbe {
+    brain_root: std::path::PathBuf,
+    consulted: std::sync::atomic::AtomicUsize,
+}
+impl DiskWiredAntigravityProbe {
+    fn over(base: &std::path::Path) -> Self {
+        Self {
+            brain_root: base.join("brain"),
+            consulted: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+impl SessionExistenceProbe for DiskWiredAntigravityProbe {
+    // Mirror AbsentButObservedProbe's method set at :68-88 exactly.
+    fn exists(&self, _provider: &str, session_id: &str) -> SessionExistence {
+        self.consulted
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = self
+            .brain_root
+            .join(session_id)
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl");
+        match std::fs::File::open(&path) {
+            Ok(_) => SessionExistence::Present,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => SessionExistence::Absent,
+            Err(_) => SessionExistence::Unknown,
+        }
+    }
+    fn ever_observed(&self, _: &str, _: &str) -> bool {
+        true
+    }
+    fn ever_observed_on_disk(&self, _: &str, _: &str) -> bool {
+        true
+    }
+}
+
+/// A fake `agy` for the gated scenarios: records `"$@"` as ONE line per
 /// invocation to `capture`, then resolves `--conversation <id>` against the
 /// test-seeded brain tree — an existing
 /// `brain/<id>/.system_generated/logs/transcript.jsonl` is resumed (echo +
 /// stay alive); anything else follows the PROBED missing-id contract
 /// (round 7, Major 1; real binaries v1.4.10 AND v1.4.12, the round-6 PTY
 /// receipts): print `warning: conversation "<id>" not found` to stderr and
-/// CONTINUE into the fresh interactive session — NO failure exit, so no
-/// auto-resume respawn cycle ever runs. This gate harness wires no
+/// CONTINUE into the fresh interactive session — the exact contract the
+/// ACTIVE gate closes off at the door (the refusal scenario proves the
+/// fake never runs: zero capture rows). This gate harness wires no
 /// activity hub and its fresh arm models liveness only (`sleep`, no store
 /// writes): the fresh conversation's MINT and the dead→new REBIND are
-/// pinned by the antigravity_session_rebind suite and e2e scenario 8,
-/// which run the full association wiring.
+/// pinned by the antigravity_session_rebind suite, which runs the full
+/// association wiring.
 fn write_fake_agy(path: &std::path::Path, capture: &std::path::Path, brain_root: &std::path::Path) {
     let script = format!(
         "#!/bin/sh\n\
@@ -1190,6 +1238,7 @@ async fn spawn_antigravity_server_with_probe(
     let registry = freshell_terminal::TerminalRegistry::new();
 
     let state = WsState {
+        session_index_ready: None,
         layout: Default::default(),
         terminal_meta: Default::default(),
         pane_ledger: Arc::clone(&pane_ledger),
@@ -1288,13 +1337,17 @@ fn assert_no_extra_spawn_rows(capture: &std::path::Path, want: usize) {
     }
 }
 
-/// A restore whose `brain/<id>/` exists resumes the EXACT id UNGATED: the
-/// create succeeds (never the typed SESSION_MISSING refusal a validated
-/// provider would answer), no notice rides the frame, the exact id reaches
-/// argv and the CLI's own brain check agrees, and the Bound ledger row
-/// survives (no gate fired, nothing retired, nothing substituted).
+/// A restore whose `brain/<id>/` exists resumes the EXACT id THROUGH THE
+/// ACTIVE GATE: the gate consults the probe (the same brain-tree disk
+/// truth production consults), the create succeeds with the exact id
+/// (Present → Proceed — never a refusal, never a substituted fresh id),
+/// no notice rides the frame, the exact id reaches argv and the CLI's
+/// own brain check agrees, and the Bound ledger row survives (nothing
+/// retired, nothing substituted). The consulted-count assertion proves
+/// the gate is ACTIVE for antigravity — the probe is consulted, not
+/// passthrough.
 #[tokio::test(flavor = "multi_thread")]
-async fn antigravity_restore_with_brain_on_disk_resumes_ungated_never_substituted() {
+async fn antigravity_restore_with_brain_on_disk_resumes_through_the_active_gate() {
     let conv = "11111111-2222-3333-4444-555555555555";
     let base = std::env::temp_dir().join(format!(
         "freshell-resume-gate-agy-live-{}-{}",
@@ -1313,8 +1366,9 @@ async fn antigravity_restore_with_brain_on_disk_resumes_ungated_never_substitute
     let _ = std::fs::remove_file(&capture);
     write_fake_agy(&fake, &capture, &base);
 
+    let probe = Arc::new(DiskWiredAntigravityProbe::over(&base));
     let (url, registry, ledger, _state) =
-        spawn_antigravity_server_with_probe(Arc::new(AbsentButObservedProbe), &fake).await;
+        spawn_antigravity_server_with_probe(probe.clone(), &fake).await;
     seed_bound_row(&ledger, "antigravity", conv);
 
     let (mut ws, _inv) = common::connect_and_capture_inventory(&url).await;
@@ -1327,11 +1381,11 @@ async fn antigravity_restore_with_brain_on_disk_resumes_ungated_never_substitute
 
     assert_eq!(
         frame["type"], "terminal.created",
-        "the deferred gate never refuses an antigravity restore: {frame}"
+        "the ACTIVE gate proceeds for a conversation whose transcript is on disk: {frame}"
     );
     assert!(
         notice_of(&frame).is_none(),
-        "no gate notice may ever ride an antigravity create: {frame}"
+        "no gate notice may ride a proceeding antigravity create: {frame}"
     );
     assert_eq!(
         frame["sessionRef"]["sessionId"],
@@ -1384,27 +1438,33 @@ async fn antigravity_restore_with_brain_on_disk_resumes_ungated_never_substitute
             .expect("row present")
             .state,
         RowState::Bound,
-        "no gate fired: the bound row was never retired"
+        "Present → Proceed: the bound row was never retired"
+    );
+
+    // The gate actually consulted the probe (active, not passthrough).
+    assert!(
+        probe.consulted.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "the ACTIVE gate must consult the existence probe for an antigravity restore"
     );
 
     registry.kill_all();
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// The deferral's designed honest failure mode (round 7: the PROBED
-/// contract): an absent id still launches the pane with
-/// `--conversation <absent id>`, and the REAL CLI (argv/PTY probes
-/// v1.4.10 + v1.4.12) prints `warning: conversation "<id>" not found`
-/// and CONTINUES INTO A FRESH INTERACTIVE SESSION — no failure exit, so
-/// no auto-resume respawn cycle ever runs. The pane STAYS ALIVE under
-/// the requested id (exactly one spawn, forever — Freshell never
-/// substitutes a fresh id of its own), the CLI's own warning surfaces
-/// IN-PANE, and the stale row survives untouched. The follow-on tail —
-/// the first clean prompt mints the CLI's fresh conversation and the
-/// pane REBINDS dead→new — is pinned by the antigravity_session_rebind
-/// suite (full association wiring; this harness wires no activity hub).
+/// The gated honest failure mode: a stale id with positive absence is
+/// REFUSED before the CLI ever sees it — the typed SESSION_MISSING
+/// error naming the stale id, the stale-resume notice, ZERO spawns (the
+/// fake never runs — the capture file stays empty), and the ledger row
+/// retired as SessionMissing. The pre-activation contract (the CLI's
+/// own warning surfacing in a live pane — the probed v1.4.10 + v1.4.12
+/// passthrough that CONTINUES INTO a fresh interactive session) is gone
+/// by design: the gate catches the stale id first (GC3's
+/// no-silent-replacement rule). Mirrors
+/// `restore_true_amplifier_absent_answers_the_typed_missing_refusal`
+/// (the typed error frame assertions, the capture-file check, and the
+/// ledger retirement).
 #[tokio::test(flavor = "multi_thread")]
-async fn antigravity_restore_with_absent_id_warns_in_pane_stays_alive_never_replaces() {
+async fn antigravity_restore_with_absent_id_answers_the_typed_missing_refusal() {
     let conv = "00000000-1111-2222-3333-444444444444"; // never seeded
     let base = std::env::temp_dir().join(format!(
         "freshell-resume-gate-agy-gone-{}-{}",
@@ -1417,8 +1477,9 @@ async fn antigravity_restore_with_absent_id_warns_in_pane_stays_alive_never_repl
     let _ = std::fs::remove_file(&capture);
     write_fake_agy(&fake, &capture, &base);
 
+    let probe = Arc::new(DiskWiredAntigravityProbe::over(&base));
     let (url, registry, ledger, _state) =
-        spawn_antigravity_server_with_probe(Arc::new(AbsentButObservedProbe), &fake).await;
+        spawn_antigravity_server_with_probe(probe.clone(), &fake).await;
     seed_bound_row(&ledger, "antigravity", conv);
 
     let (mut ws, _inv) = common::connect_and_capture_inventory(&url).await;
@@ -1429,79 +1490,36 @@ async fn antigravity_restore_with_absent_id_warns_in_pane_stays_alive_never_repl
     .await;
     let frame = next_created_or_error(&mut ws, "req-agy-gone").await;
 
+    // THE TYPED MISSING REFUSAL: nothing was started.
     assert_eq!(
-        frame["type"], "terminal.created",
-        "the pane still launches — the deferred gate never refuses: {frame}"
+        frame["type"], "error",
+        "the gated restore refuses the stale id, never a fresh spawn: {frame}"
     );
-    assert!(notice_of(&frame).is_none(), "no gate notice: {frame}");
-    assert_eq!(
-        frame["sessionRef"]["sessionId"],
-        json!(conv),
-        "the stale id passes through to the CLI — never silently dropped or replaced: {frame}"
-    );
-
-    // The pane carries the CLI's OWN warning (in-pane surfacing) — the
-    // probed byte-faithful line, quotes included.
-    let terminal_id = frame["terminalId"]
-        .as_str()
-        .expect("terminalId")
-        .to_string();
-    let rows = wait_capture_rows(&capture, 1).await;
-    assert_eq!(
-        rows,
-        vec![format!("--conversation {conv}")],
-        "the absent id reaches the CLI argv: {rows:?}"
-    );
-    common::attach_with(
-        &mut ws,
-        &terminal_id,
-        "att-agy-gone",
-        "viewport_hydrate",
-        120,
-        30,
-        None,
-    )
-    .await;
-    common::wait_for_attach_ready(&mut ws, "att-agy-gone").await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let (acc, _gap, _closed) = common::drain_until_marker_or_deadline(
-        &mut ws,
-        &format!("warning: conversation \"{conv}\" not found"),
-        deadline,
-    )
-    .await;
+    assert_eq!(frame["code"], json!("SESSION_MISSING"), "{frame}");
     assert!(
-        acc.contains(&format!("warning: conversation \"{conv}\" not found")),
-        "the CLI's own probed warning must surface in the pane: {acc:?}"
+        frame["message"].as_str().unwrap_or_default().contains(conv),
+        "the refusal names the stale id: {frame}"
     );
 
-    // The pane STAYS ALIVE: the probed contract has NO failure exit, so
-    // the registry keeps the terminal Running through a bounded window
-    // (the pre-round-7 fake exited and drove an auto-resume respawn
-    // cycle the real CLI never produces).
-    let liveness_deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while std::time::Instant::now() < liveness_deadline {
-        let entry = registry
-            .directory()
-            .into_iter()
-            .find(|e| e.terminal_id == terminal_id);
-        assert!(
-            entry.is_some_and(|e| { e.status == freshell_protocol::TerminalRunStatus::Running }),
-            "the stale-resume pane stays ALIVE (the probed fresh session never exits)"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    // ZERO spawns, forever — the CLI never sees the stale id (the
+    // probed missing-ID passthrough that would silently CONTINUE INTO a
+    // fresh interactive session is closed off at the door).
+    assert_no_extra_spawn_rows(&capture, 0);
 
-    // NO fresh replacement conversation spawns — exactly one row, forever
-    // (no gate spawn, and no auto-resume respawn cycle either).
-    assert_no_extra_spawn_rows(&capture, 1);
+    // The stale row is retired as SessionMissing — never retried forever.
+    let stale_row = ledger
+        .load_binding("antigravity", conv)
+        .expect("stale row still exists (retired, not deleted)");
+    assert_eq!(stale_row.state, RowState::Retired);
     assert_eq!(
-        ledger
-            .load_binding("antigravity", conv)
-            .expect("row present")
-            .state,
-        RowState::Bound,
-        "no gate fired: the stale row was never retired as missing"
+        stale_row.retired_reason,
+        Some(RetiredReason::SessionMissing)
+    );
+
+    // The gate actually consulted the probe (active, not passthrough).
+    assert!(
+        probe.consulted.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "the ACTIVE gate must consult the existence probe before refusing an antigravity restore"
     );
 
     registry.kill_all();

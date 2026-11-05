@@ -558,15 +558,47 @@ fn stop_logs(logs: &log_capture::LogCapture, session_id: &str) -> Vec<log_captur
     })
 }
 
+/// Wait until the simulator has entered the exact cold-command boundary. The
+/// cold ledger row is fixture evidence for shapes that have no lifecycle event
+/// before Stop (`empty` and `started`).
+async fn wait_for_sim_cold_boundary(rig: &ClaudeRig, uuid: &str, shape: &str) {
+    let boot = rig
+        .ledger_rows("boot")
+        .into_iter()
+        .next()
+        .expect("the simulator boot row");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if rig.ledger_rows("cold").iter().any(|row| {
+            row["query"] == boot["query"]
+                && row["sessionId"] == boot["sessionId"]
+                && row["uuid"] == json!(uuid)
+                && row["shape"] == json!(shape)
+        }) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no {shape} cold boundary for turn {uuid}; simulator ledger: {:?}",
+            rig.ledger_rows("cold")
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// A cold Stop (T13): the simulator's cold-command knob makes the first
 /// command miss a Stop that arrives while it still starts, with the receipt
 /// shape `shape`. The server sends the Stop again under re-send rule `case`
 /// once the command runs, and the turn ends aborted and silent.
 async fn a_cold_stop_is_aborted_and_silent(shape: &str, case: &str) {
     let logs = log_capture::install();
-    let rig =
-        ClaudeRig::start_with_env(RigKind::Sim, &[("FRESHELL_CLAUDE_SIM_COLD_COMMAND", shape)])
-            .await;
+    let mut env = vec![("FRESHELL_CLAUDE_SIM_COLD_COMMAND", shape)];
+    if shape == "queued" {
+        env.push(("FRESHELL_CLAUDE_SIM_HOLD_QUEUED_COLD", "1"));
+    } else {
+        env.push(("FRESHELL_CLAUDE_SIM_HOLD_COLD", "1"));
+    }
+    let rig = ClaudeRig::start_with_env(RigKind::Sim, &env).await;
     let mut conn = rig.connect().await;
     let session_id = conn.create("create-1").await;
     conn.send_text(&session_id, "send-1", "SLOW cold").await;
@@ -574,7 +606,34 @@ async fn a_cold_stop_is_aborted_and_silent(shape: &str, case: &str) {
         .as_str()
         .expect("submittedTurnId")
         .to_string();
+    if shape == "queued" {
+        logs.wait_for("the queued cold command", |event| {
+            event.message == "freshagent.claude.command"
+                && event.field("session_id") == Some(session_id.as_str())
+                && event.field("uuid") == Some(uuid.as_str())
+                && event.field("state") == Some("queued")
+        })
+        .await;
+    } else {
+        wait_for_sim_cold_boundary(&rig, &uuid, shape).await;
+    }
     stop(&mut conn, &session_id).await;
+    if shape != "queued" {
+        logs.wait_for("the cold command lifecycle after Stop", |event| {
+            event.message == "freshagent.claude.command"
+                && event.field("session_id") == Some(session_id.as_str())
+                && event.field("uuid") == Some(uuid.as_str())
+                && event.field("state") == Some("queued")
+        })
+        .await;
+    }
+    logs.wait_for("the started cold command after Stop", |event| {
+        event.message == "freshagent.claude.command"
+            && event.field("session_id") == Some(session_id.as_str())
+            && event.field("uuid") == Some(uuid.as_str())
+            && event.field("state") == Some("started")
+    })
+    .await;
     wait_for_results(&mut conn, 1, "the stopped turn").await;
     conn.read_for(Duration::from_millis(500)).await;
     assert_stopped_silently(&conn, &session_id);

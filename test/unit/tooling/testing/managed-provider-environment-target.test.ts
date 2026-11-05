@@ -39,10 +39,10 @@ describe('managed provider environment target mode', () => {
     const repository = await fs.mkdtemp(path.join(process.env.TMPDIR ?? '/tmp', 'frs-acceptance-provenance-'))
     try {
       await fs.writeFile(path.join(repository, 'source.txt'), 'committed candidate\n')
-      execFileSync('git', ['init', '-q'], { cwd: repository })
-      execFileSync('git', ['add', 'source.txt'], { cwd: repository })
+      execFileSync('git', ['init', '-q'], { timeout: 30_000, killSignal: 'SIGKILL', cwd: repository })
+      execFileSync('git', ['add', 'source.txt'], { timeout: 30_000, killSignal: 'SIGKILL', cwd: repository })
       execFileSync('git', ['-c', 'user.name=Acceptance Test', '-c', 'user.email=acceptance@example.invalid',
-        'commit', '-q', '-m', 'candidate'], { cwd: repository })
+        'commit', '-q', '-m', 'candidate'], { timeout: 30_000, killSignal: 'SIGKILL', cwd: repository })
 
       const candidate = committedAcceptanceSha(repository)
       expect(candidate).toMatch(/^[a-f0-9]{40}$/)
@@ -343,7 +343,7 @@ setInterval(() => {}, 1000)
       })
       const runProbe = (startTicks: string) => JSON.parse(execFileSync(process.execPath, [
         '-e', workspaceCwdAliasReplacementProcessProbeSource(), String(receipt.pid), receiptPath, nonce, directory, startTicks,
-      ], { cwd: directory, encoding: 'utf8' }))
+      ], { timeout: 30_000, killSignal: 'SIGKILL', cwd: directory, encoding: 'utf8' }))
 
       const liveProbe = runProbe(receipt.processStartTicks)
       expect(liveProbe).toMatchObject({
@@ -358,7 +358,7 @@ setInterval(() => {}, 1000)
       const missingProbe = JSON.parse(execFileSync(process.execPath, [
         '-e', workspaceCwdAliasReplacementProcessProbeSource(), String(Number.MAX_SAFE_INTEGER),
         receiptPath, nonce, directory, receipt.processStartTicks,
-      ], { cwd: directory, encoding: 'utf8' }))
+      ], { timeout: 30_000, killSignal: 'SIGKILL', cwd: directory, encoding: 'utf8' }))
       expect(missingProbe).toMatchObject({ exists: false, processState: null, processName: null, executableName: null })
       expect(missingProbe.readErrors).toContainEqual({ field: 'stat', code: 'ENOENT' })
       expect(JSON.stringify(missingProbe)).not.toContain(nonce)

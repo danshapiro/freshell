@@ -4746,8 +4746,7 @@ impl TerminalRegistry {
             ));
         }
         let title = title_for_mode(&descriptor.mode);
-        self.register_managed(descriptor, title);
-        Ok(true)
+        Ok(self.register_managed_if_absent(descriptor, title))
     }
 
     pub fn managed_descriptor(&self, terminal_id: &str) -> Option<ManagedTerminalDescriptor> {
@@ -4794,6 +4793,29 @@ impl TerminalRegistry {
     /// label (never a hard-coded "Shell" for an agent soul); the naming bind
     /// replaces it with the saved name.
     pub fn register_managed(&self, descriptor: ManagedTerminalDescriptor, title: String) {
+        self.register_managed_inner(descriptor, title, true);
+    }
+
+    /// Insert a reconstructed managed facade only when the registry still has
+    /// no row for its terminal. Inventory lookups happen asynchronously, so a
+    /// concurrent attach or reconciliation may have installed the live facade
+    /// while this caller was waiting. Returning the existing row's ownership
+    /// lets the delayed adopter report success without replacing its subscribers
+    /// or replay buffer.
+    fn register_managed_if_absent(
+        &self,
+        descriptor: ManagedTerminalDescriptor,
+        title: String,
+    ) -> bool {
+        self.register_managed_inner(descriptor, title, false)
+    }
+
+    fn register_managed_inner(
+        &self,
+        descriptor: ManagedTerminalDescriptor,
+        title: String,
+        replace_existing: bool,
+    ) -> bool {
         let created_at = now_ms();
         let created = ActivityEvent::Created {
             terminal_id: descriptor.terminal_id.clone(),
@@ -4847,6 +4869,11 @@ impl TerminalRegistry {
             session_name: None,
         }));
         let mut inner = self.inner.lock().expect("registry lock");
+        if !replace_existing {
+            if let Some(existing) = inner.terminals.get(&descriptor.terminal_id) {
+                return existing.managed.is_some();
+            }
+        }
         inner.terminals.insert(
             descriptor.terminal_id.clone(),
             TerminalHandle {
@@ -4862,6 +4889,7 @@ impl TerminalRegistry {
         inner.revision += 1;
         drop(inner);
         self.notify_activity(created);
+        true
     }
 
     /// Merge one host-spooled output chunk into the ordinary replay/fan-out
@@ -4943,7 +4971,8 @@ impl TerminalRegistry {
         let terminal = self
             .managed_descriptor(terminal_id)
             .ok_or_else(|| "managed terminal not found".to_string())?;
-        if !self.is_pty_running(terminal_id) {
+        let admitted = self.managed_input_lifecycle_admits_controller(terminal_id);
+        if !admitted {
             return Err(ManagedTerminalInputError::RecoveryBlocked);
         }
         let controller = self
@@ -4953,6 +4982,23 @@ impl TerminalRegistry {
             .clone()
             .ok_or_else(|| "managed runtime controller unavailable".to_string())?;
         controller.input(terminal, data).await
+    }
+
+    /// A managed `Blocked` lifecycle is a recovery verdict, not proof that the
+    /// session-host process exited. Let the controller recheck/recover it. An
+    /// `Ended` lifecycle remains fenced here because no managed process is
+    /// expected to accept more input.
+    fn managed_input_lifecycle_admits_controller(&self, terminal_id: &str) -> bool {
+        let Some(shared) = self.shared_for(terminal_id) else {
+            return false;
+        };
+        let state = shared.lock().expect("terminal lock");
+        state.status == TerminalRunStatus::Running
+            || (!state.managed_exit_notified
+                && state
+                    .managed_lifecycle
+                    .as_ref()
+                    .is_some_and(|lifecycle| lifecycle.state == ManagedLifecycleState::Blocked))
     }
 
     /// Reserve a single projection of accepted client geometry to the current
@@ -5926,6 +5972,43 @@ impl TerminalRegistry {
             .is_some_and(|l| l.holder_create_request_id == holder_create_request_id)
         {
             leases.remove(&key);
+        }
+    }
+
+    /// Revocation-aware release for a respawn whose child ALREADY exists
+    /// (the auto-resume FreshUnbound discipline, focused repair round 4,
+    /// Major 2): release the holder's lease ONLY while it is still this
+    /// holder's and NOT revoked — the check and the release are one leases-
+    /// lock acquisition, mirroring [`Self::complete_session_ref_claim`]'s
+    /// own-check (a separate check-then-release pair would reopen the
+    /// atomicity window that primitive exists to close). `true` = the lease
+    /// was still ours and has been released (the caller's spawned child
+    /// stays; the replacement may be announced). `false` = the lease was
+    /// revoked, gone, or held elsewhere — the caller must kill its own
+    /// just-spawned orphan child, confirm the kill, then
+    /// [`Self::force_release_after_confirmed_kill`] (the mirror of
+    /// [`Self::complete_session_ref_claim`]'s false path). A revoked lease
+    /// is never released here: revoked-and-held-closed opens only on holder
+    /// conn death or spawn failure, both of which prove no orphan child
+    /// exists — the caller's confirmed kill is the release path.
+    pub fn release_session_ref_claim_if_held(
+        &self,
+        locator: &SessionLocator,
+        holder_create_request_id: &str,
+    ) -> bool {
+        let key = session_ref_key(locator);
+        let mut leases = self
+            .session_ref_leases
+            .lock()
+            .expect("session-ref lease lock");
+        match leases.get(&key) {
+            Some(lease)
+                if lease.holder_create_request_id == holder_create_request_id && !lease.revoked =>
+            {
+                leases.remove(&key);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -15204,6 +15287,73 @@ mod tests {
         ));
         // The revoked holder's late completion is rejected.
         assert!(!reg.complete_session_ref_claim(&s, "cr-A", "term-late"));
+    }
+
+    /// Revocation-aware release (focused repair round 4, Major 2 — the
+    /// FreshUnbound auto-resume seam): a healthy own lease releases and
+    /// reports true; the NEXT claim then acquires (the release really
+    /// happened, not a phantom true).
+    #[test]
+    fn release_if_held_releases_a_healthy_own_lease() {
+        let reg = test_registry();
+        let s = locator("claude", "s1");
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-A", 1, 1000),
+            SessionRefClaim::Acquired
+        ));
+        assert!(
+            reg.release_session_ref_claim_if_held(&s, "cr-A"),
+            "a lease still held by this createRequestId releases with true"
+        );
+        assert!(
+            !reg.release_session_ref_claim_if_held(&s, "cr-A"),
+            "the second release finds no lease — the first really removed it"
+        );
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-B", 2, 2000),
+            SessionRefClaim::Acquired
+        ));
+    }
+
+    /// Revocation-aware release: a foreign holder's lease and a lease that is
+    /// gone both answer false without touching anything; a REVOKED own lease
+    /// (TTL-expired pid-less — held closed) is NOT released by this seam:
+    /// the caller must kill its own child and force-release instead.
+    #[test]
+    fn release_if_held_refuses_foreign_gone_and_revoked_leases() {
+        let reg = test_registry();
+        let s = locator("claude", "s1");
+        reg.claim_session_ref(&s, "cr-A", 1, 1000);
+        assert!(
+            !reg.release_session_ref_claim_if_held(&s, "cr-B"),
+            "a foreign holder's lease is never released"
+        );
+        assert!(
+            reg.release_session_ref_claim_if_held(&s, "cr-A"),
+            "the owner still releases its own lease"
+        );
+        assert!(
+            !reg.release_session_ref_claim_if_held(&s, "cr-A"),
+            "a gone lease answers false"
+        );
+        // The revoked shape: TTL expiry on a pid-less holder marks the lease
+        // revoked-and-held-closed — the revocation-aware release must refuse
+        // it (the caller's confirmed-kill + force-release is the only path).
+        reg.claim_session_ref(&s, "cr-C", 3, 1000);
+        let late = 1000 + SESSION_REF_LEASE_TTL_MS + 1;
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-D", 4, late),
+            SessionRefClaim::Held { .. }
+        ));
+        assert!(
+            !reg.release_session_ref_claim_if_held(&s, "cr-C"),
+            "a revoked own lease is held closed — never released by this seam"
+        );
+        reg.force_release_after_confirmed_kill(&s);
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-D", 4, late + 1),
+            SessionRefClaim::Acquired
+        ));
     }
 
     /// Fix round 1, finding 1: a KILLED winner must not strand the

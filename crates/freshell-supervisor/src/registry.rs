@@ -5,10 +5,12 @@ use freshell_runtime_protocol::{
     AllocationState, CleanupState, DesiredState, DockerDaemonId, DurabilityState, FixtureKind,
     FreshAgentLaunchSpec, FreshAgentTurnSettings, FreshProvider, GrantId, HostBootId,
     IncarnationId, IncidentId, InstallationId, LaunchNonce, LaunchState, LostSoulRepairTarget,
-    NativeDispatchIdentity, NoticeId, OpenCodeAdoptionBaseline, OpenCodeTransferDescriptor,
-    RecoveryAttemptId, RecoveryBlockReason, RecoveryPath, RecoveryState, RecoveryTrigger,
-    RequestId, RestoreLostSoulsRequest, ResumeSpec, RuntimeLimits, RuntimeProfile, RuntimeView,
-    SoulId, StopOutcome, TerminalLaunchSpec, ViewIntentRequest,
+    NativeDispatchIdentity, NativeIdentityLaunch, NativeIdentityObservation,
+    NativeReadinessReceipt, NativeReadinessRecoveryAuthorization, NoticeId,
+    OpenCodeAdoptionBaseline, OpenCodeTransferDescriptor, RecoveryAttemptId, RecoveryBlockReason,
+    RecoveryPath, RecoveryState, RecoveryTrigger, RequestId, RestoreLostSoulsRequest, ResumeSpec,
+    RuntimeLimits, RuntimeProfile, RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec,
+    ViewIntentRequest,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -22,7 +24,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const SCHEMA_VERSION: u32 = 19;
+pub const SCHEMA_VERSION: u32 = 21;
 mod input_reservation;
 pub(crate) use input_reservation::binary_digest;
 pub use input_reservation::{BoundInputReservation, OwnedInputReservation};
@@ -109,6 +111,49 @@ type StoppedRepairTargetReceiptFenceRow = (
     String,
     String,
 );
+type NativeReadinessAuthorizationSoulRow = (
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    u64,
+    u64,
+    u64,
+    u64,
+    Option<String>,
+    Option<String>,
+);
+type NativeReadinessAuthorizationTargetRow = (
+    String,
+    String,
+    u64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+    u64,
+    String,
+    Option<i64>,
+);
+type NativeReadinessReceiptCommitRow = (
+    String,
+    Option<String>,
+    u64,
+    u64,
+    u64,
+    u64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+);
 
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
@@ -166,6 +211,116 @@ pub enum RegistryError {
     Json(#[from] serde_json::Error),
     #[error("registry blocking task failed: {0}")]
     Join(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceInventoryStatus {
+    VerifiedEmpty,
+    Unresolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoRuntimeInventoryRecord {
+    pub soul_id: String,
+    pub desired_state: String,
+    pub intent_revision: i64,
+    pub status: MaintenanceInventoryStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceInventorySnapshot {
+    pub no_runtime: Vec<NoRuntimeInventoryRecord>,
+}
+
+/// Reads registry-only evidence for souls that have never acquired an
+/// addressable incarnation. This command deliberately does not initialize a
+/// Registry, apply migrations, or inspect the runtime backend.
+pub fn read_maintenance_inventory(
+    database_path: &Path,
+) -> Result<MaintenanceInventorySnapshot, RegistryError> {
+    if !database_path.is_absolute() {
+        return Err(RegistryError::InvalidState(
+            "maintenance inventory requires an absolute database path".into(),
+        ));
+    }
+    let metadata = std::fs::metadata(database_path)?;
+    if !metadata.is_file() {
+        return Err(RegistryError::InvalidState(
+            "maintenance inventory path is not a regular database file".into(),
+        ));
+    }
+
+    let mut conn = Connection::open_with_flags(
+        database_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+
+    // A registry-level dangling reservation has no soul identity to attach to
+    // a particular row. Conservatively make every no-runtime conclusion
+    // unresolved while such unexplained authority exists.
+    let orphaned_admission_reservation: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM admission_reservations a LEFT JOIN incarnations i ON i.incarnation_id=a.incarnation_id WHERE i.incarnation_id IS NULL)",
+        [],
+        |row| row.get(0),
+    )?;
+    let mut statement = tx.prepare(
+        r#"SELECT s.soul_id,s.desired_state,s.intent_revision,
+              CASE WHEN s.intent_revision > 0
+                     AND s.desired_state='stopped'
+                     AND s.recovery_state='stopped'
+                     AND s.recovery_attempt_id IS NULL
+                     AND ?1=0
+                     AND NOT EXISTS(SELECT 1 FROM recovery_attempts r WHERE r.soul_id=s.soul_id AND r.finished_at IS NULL)
+                     AND NOT EXISTS(SELECT 1 FROM provider_input_preparations p WHERE p.soul_id=s.soul_id)
+                     AND NOT EXISTS(SELECT 1 FROM writer_claims w WHERE w.soul_id=s.soul_id)
+                     AND NOT EXISTS(SELECT 1 FROM ordinary_stops p WHERE p.soul_id=s.soul_id)
+                     AND NOT EXISTS(SELECT 1 FROM commands c WHERE c.soul_id=s.soul_id)
+                     AND NOT EXISTS(SELECT 1 FROM input_commands c WHERE c.soul_id=s.soul_id)
+                     AND NOT EXISTS(SELECT 1 FROM native_origin_owners o
+                                    WHERE o.owner_soul_id IS NULL
+                                       OR (o.ownership_state!='owned' AND o.owner_soul_id=s.soul_id))
+                     AND NOT EXISTS(SELECT 1 FROM view_intents v
+                                    WHERE v.soul_id=s.soul_id AND v.kind='automatic_primary'
+                                      AND v.visibility!='hidden')
+                   THEN 'verified_empty' ELSE 'unresolved' END
+         FROM souls s
+         WHERE NOT EXISTS(SELECT 1 FROM incarnations i WHERE i.soul_id=s.soul_id)
+         ORDER BY s.created_at,s.soul_id"#,
+    )?;
+    let rows = statement.query_map([orphaned_admission_reservation], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut no_runtime = Vec::new();
+    for row in rows {
+        let (soul_id, desired_state, intent_revision, status) = row?;
+        no_runtime.push(NoRuntimeInventoryRecord {
+            soul_id,
+            desired_state,
+            intent_revision,
+            status: match status.as_str() {
+                "verified_empty" => MaintenanceInventoryStatus::VerifiedEmpty,
+                "unresolved" => MaintenanceInventoryStatus::Unresolved,
+                _ => {
+                    return Err(RegistryError::Integrity(
+                        "unknown maintenance inventory status".into(),
+                    ));
+                }
+            },
+        });
+    }
+    drop(statement);
+    tx.commit()?;
+    Ok(MaintenanceInventorySnapshot { no_runtime })
 }
 
 #[derive(Clone)]
@@ -380,6 +535,27 @@ pub(crate) struct StopProgress {
     pub outcome: Option<StopOutcome>,
     pub capability: Option<(String, String)>,
     pub settled: bool,
+}
+
+/// Fenced revoke authority for a failed Reopen replacement proven to have no
+/// backend identity. This deliberately carries no runtime handle or Docker
+/// mutation authority.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingNoRuntimeRevoke {
+    pub soul_id: SoulId,
+    pub incarnation_id: IncarnationId,
+    pub intent_revision: u64,
+    pub endpoint: String,
+    pub grant_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReopenCreateEvidence {
+    NotAttempted,
+    DefinitelyNotCreated,
+    MayHaveCreated,
+    CreatedUncommitted,
+    IdentityCommitted,
 }
 
 /// Read-only association to the last committed terminal incarnation. This is
@@ -704,6 +880,18 @@ impl RecoveryWriteFence {
         self.active_incarnation_id = incarnation_id;
         self
     }
+
+    pub(crate) fn native_readiness_fence(&self) -> freshell_runtime_protocol::NativeReadinessFence {
+        freshell_runtime_protocol::NativeReadinessFence {
+            control_epoch: self.control_epoch,
+            intent_revision: self.intent_revision,
+            identity_revision: self.identity_revision,
+            evidence_revision: self.evidence_revision,
+            native_import_revision: self.native_import_revision,
+            recovery_attempt_id: self.recovery_attempt_id.clone(),
+            active_incarnation_id: self.active_incarnation_id.clone(),
+        }
+    }
 }
 
 impl RecoveryContext {
@@ -785,6 +973,12 @@ pub struct ReplacementPreparation {
     pub attempt_id: RecoveryAttemptId,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ReopenPreparation {
+    pub start: RecoveryStart,
+    pub replacement: ReplacementPreparation,
+}
+
 /// How turn settings fold into a recovery launch spec: a send's settings
 /// replace only the fields they state, while a configure's absent effort
 /// follows the provider's live configure rule.
@@ -794,11 +988,12 @@ enum SettingsFold {
     Configure,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputJournalDisposition {
     Dispatch,
     Completed,
     Ambiguous,
+    Refused(freshell_runtime_protocol::FreshAgentSendDiagnostic),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1192,13 +1387,14 @@ impl Registry {
         self.run_blocking(move |mut conn| {
             failpoint("commit_created")?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let reopen_prepared = reopen_incarnation_is_current(&tx, &incarnation_id)?;
             let now = now_millis();
             let changed = tx.execute(
-                "UPDATE incarnations SET docker_daemon_id=?1,container_id=?2,image_ref=?3,runtime_dir=?4,host_binary_path=?5,immutable_config_digest=?6,launch_policy=?9,launch_state='created',updated_at=?7 WHERE incarnation_id=?8 AND launch_state='prepared' AND container_id IS NULL AND EXISTS (SELECT 1 FROM souls WHERE soul_id=incarnations.soul_id AND desired_state='running')",
-                params![created.daemon_id.as_str(), created.container_id, created.image_ref, created.runtime_dir.to_string_lossy(), created.host_binary_path.to_string_lossy(), created.immutable_config_digest, now, incarnation_id.as_str(), created.launch_policy.map(|policy|serde_json::to_string(&policy)).transpose()?],
+                "UPDATE incarnations SET docker_daemon_id=?1,container_id=?2,image_ref=?3,runtime_dir=?4,host_binary_path=?5,immutable_config_digest=?6,launch_policy=?9,launch_state='created',updated_at=?7 WHERE incarnation_id=?8 AND launch_state='prepared' AND container_id IS NULL AND (EXISTS (SELECT 1 FROM souls WHERE soul_id=incarnations.soul_id AND desired_state='running') OR ?10)",
+                params![created.daemon_id.as_str(), created.container_id, created.image_ref, created.runtime_dir.to_string_lossy(), created.host_binary_path.to_string_lossy(), created.immutable_config_digest, now, incarnation_id.as_str(), created.launch_policy.map(|policy|serde_json::to_string(&policy)).transpose()?, reopen_prepared],
             )?;
             if changed != 1 { return Err(RegistryError::InvalidState(format!("cannot commit CREATED for {incarnation_id}"))); }
-            tx.execute("UPDATE commands SET state='created',updated_at=?1 WHERE incarnation_id=?2", params![now, incarnation_id.as_str()])?;
+            tx.execute("UPDATE commands SET state='created',updated_at=?1 WHERE incarnation_id=?2 AND state='prepared'", params![now, incarnation_id.as_str()])?;
             tx.commit()?;
             Ok(())
         }).await
@@ -1214,6 +1410,7 @@ impl Registry {
         self.run_blocking(move |mut conn| {
             failpoint("commit_grant")?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let reopen_prepared = reopen_incarnation_is_current(&tx, &incarnation_id)?;
             let existing: Option<(String, u64, String)> = tx.query_row(
                 "SELECT host_boot_id,execution_generation,grant_id FROM incarnations WHERE incarnation_id=?1 AND launch_state='starting'",
                 params![incarnation_id.as_str()],
@@ -1228,8 +1425,8 @@ impl Registry {
             }
 
             let previous: u64 = tx.query_row(
-                "SELECT i.execution_generation FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id WHERE i.incarnation_id=?1 AND i.launch_state='created' AND s.desired_state='running'",
-                params![incarnation_id.as_str()],
+                "SELECT i.execution_generation FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id WHERE i.incarnation_id=?1 AND i.launch_state='created' AND (s.desired_state='running' OR ?2)",
+                params![incarnation_id.as_str(), reopen_prepared],
                 |row| row.get(0),
             ).optional()?.ok_or_else(|| RegistryError::InvalidState(format!("cannot grant execution for {incarnation_id}; stop intent or lifecycle transition won")))?;
             let generation = previous.checked_add(1).ok_or_else(|| RegistryError::Integrity("execution generation overflow".into()))?;
@@ -1237,15 +1434,15 @@ impl Registry {
             let effective_json = serde_json::to_string(&effective_limits)?;
             let now = now_millis();
             let changed = tx.execute(
-                "UPDATE incarnations SET launch_state='starting',host_boot_id=?1,execution_generation=?2,grant_id=?3,effective_limits=?4,updated_at=?5 WHERE incarnation_id=?6 AND launch_state='created' AND EXISTS (SELECT 1 FROM souls WHERE soul_id=incarnations.soul_id AND desired_state='running')",
-                params![host_boot_id.as_str(), generation, grant_id.as_str(), effective_json, now, incarnation_id.as_str()],
+                "UPDATE incarnations SET launch_state='starting',host_boot_id=?1,execution_generation=?2,grant_id=?3,effective_limits=?4,updated_at=?5 WHERE incarnation_id=?6 AND launch_state='created' AND (EXISTS (SELECT 1 FROM souls WHERE soul_id=incarnations.soul_id AND desired_state='running') OR ?7)",
+                params![host_boot_id.as_str(), generation, grant_id.as_str(), effective_json, now, incarnation_id.as_str(), reopen_prepared],
             )?;
             if changed != 1 {
                 return Err(RegistryError::InvalidState(format!(
                     "cannot persist execution grant for {incarnation_id}; stop intent won"
                 )));
             }
-            tx.execute("UPDATE commands SET state='starting',updated_at=?1 WHERE incarnation_id=?2", params![now, incarnation_id.as_str()])?;
+            tx.execute("UPDATE commands SET state='starting',updated_at=?1 WHERE incarnation_id=?2 AND state='created'", params![now, incarnation_id.as_str()])?;
             tx.commit()?;
             Ok(ExecutionGrantRecord { control_epoch, execution_generation: generation, grant_id, host_boot_id })
         }).await
@@ -1420,14 +1617,15 @@ impl Registry {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             validate_recovery_write_fence(&tx, &soul, &fence)?;
             if incarnation_id != fence.active_incarnation_id { return Err(RegistryError::NativeIdentityConflict); }
-            validate_live_native_observation(&tx, &soul, &incarnation_id)?;
+            validate_initial_live_native_observation(&tx, &soul, &incarnation_id)?;
+            let reopen_prepared = reopen_incarnation_is_current(&tx, &incarnation_id)?;
             let now = now_millis();
             let changed = tx.execute(
-                "UPDATE incarnations SET launch_state='running',provider_preparation_pending=?3,updated_at=?1 WHERE incarnation_id=?2 AND launch_state='starting' AND EXISTS (SELECT 1 FROM souls WHERE soul_id=incarnations.soul_id AND desired_state='running')",
-                params![now, incarnation_id.as_str(), preparation_accepted],
+                "UPDATE incarnations SET launch_state='running',provider_preparation_pending=?3,updated_at=?1 WHERE incarnation_id=?2 AND launch_state='starting' AND (EXISTS (SELECT 1 FROM souls WHERE soul_id=incarnations.soul_id AND desired_state='running') OR ?4)",
+                params![now, incarnation_id.as_str(), preparation_accepted, reopen_prepared],
             )?;
             if changed != 1 { return Err(RegistryError::InvalidState(format!("cannot mark RUNNING for {incarnation_id}"))); }
-            tx.execute("UPDATE commands SET state='running',updated_at=?1 WHERE incarnation_id=?2", params![now, incarnation_id.as_str()])?;
+            tx.execute("UPDATE commands SET state='running',updated_at=?1 WHERE incarnation_id=?2 AND state='starting'", params![now, incarnation_id.as_str()])?;
             let (soul_id, terminal_spec): (String, Option<String>) = tx.query_row(
                 "SELECT soul_id,terminal_spec FROM incarnations WHERE incarnation_id=?1",
                 params![incarnation_id.as_str()],
@@ -1623,6 +1821,438 @@ impl Registry {
         self.begin_stop_expected(soul_id, None).await
     }
 
+    /// Return only a successful exact Reopen replay. The expected stopped
+    /// revision is intentionally checked by the semantic digest rather than
+    /// against the current, now-advanced soul revision.
+    pub(crate) async fn successful_reopen(
+        &self,
+        soul_id: SoulId,
+        request_id: RequestId,
+        payload_digest: String,
+    ) -> Result<Option<RuntimeView>, RegistryError> {
+        self.run_blocking(move |conn| {
+            let existing: Option<(String, String, String)> = conn
+                .query_row(
+                    "SELECT payload_digest,state,incarnation_id FROM commands WHERE soul_id=?1 AND request_id=?2",
+                    params![soul_id.as_str(), request_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((existing_digest, state, incarnation)) = existing else {
+                return Ok(None);
+            };
+            if existing_digest != payload_digest {
+                return Err(RegistryError::RequestConflict);
+            }
+            let succeeded: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM incarnations i JOIN recovery_attempts a ON a.attempt_id=i.recovery_attempt_id WHERE i.incarnation_id=?1 AND a.soul_id=?2 AND a.verdict='succeeded' AND a.finished_at IS NOT NULL)",
+                params![incarnation, soul_id.as_str()], |row| row.get(0),
+            )?;
+            if !succeeded || state == "reopen_prepared" {
+                return Ok(None);
+            }
+            let incarnation = IncarnationId::parse(incarnation)
+                .map_err(|_| RegistryError::Integrity("invalid Reopen incarnation id".into()))?;
+            Ok(load_inventory(&conn)?
+                .into_iter()
+                .find(|view| view.incarnation_id == incarnation))
+        })
+        .await
+    }
+
+    /// Prepare a replacement while the durable soul remains STOPPED. The
+    /// prepared command is deliberately not a success receipt; only
+    /// `finish_reopen` commits the running intent, success association, and
+    /// restored automatic view after activation succeeds.
+    pub(crate) async fn prepare_reopen(
+        &self,
+        soul_id: SoulId,
+        request_id: RequestId,
+        payload_digest: String,
+        expected_stopped_revision: u64,
+    ) -> Result<ReopenPreparation, RegistryError> {
+        let installation = self.installation_id().clone();
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let duplicate: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT payload_digest,state FROM commands WHERE soul_id=?1 AND request_id=?2",
+                    params![soul_id.as_str(), request_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((digest, _)) = duplicate {
+                return Err(if digest == payload_digest {
+                    RegistryError::InvalidState("Reopen request is already prepared".into())
+                } else {
+                    RegistryError::RequestConflict
+                });
+            }
+
+            let (desired, revision, recovery_state): (String, u64, String) = tx.query_row(
+                "SELECT desired_state,intent_revision,recovery_state FROM souls WHERE soul_id=?1",
+                params![soul_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).optional()?.ok_or_else(|| RegistryError::UnknownSoul(soul_id.clone()))?;
+            if revision != expected_stopped_revision {
+                return Err(RegistryError::StaleIntentRevision {
+                    expected: expected_stopped_revision,
+                    current: revision,
+                });
+            }
+            if desired != "stopped" || recovery_state != "stopped" {
+                return Err(RegistryError::InvalidState(
+                    "Reopen requires a stopped soul".into(),
+                ));
+            }
+
+            let addressed: (String, String, String, bool) = tx.query_row(
+                &format!(
+                    "SELECT incarnation_id,launch_state,cleanup_state,(docker_daemon_id IS NULL AND container_id IS NULL AND grant_id IS NULL) FROM incarnations WHERE soul_id=?1 ORDER BY CASE WHEN launch_state IN ({ACTIVE_STATES}) THEN 0 ELSE 1 END,created_at DESC,rowid DESC LIMIT 1"
+                ),
+                params![soul_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).optional()?.ok_or_else(|| RegistryError::InvalidState("Reopen has no addressable incarnation".into()))?;
+            let mut prior_incarnation_id = IncarnationId::parse(addressed.0)
+                .map_err(|_| RegistryError::Integrity("invalid Reopen prior incarnation id".into()))?;
+            if addressed.1 != "stopped" || addressed.2 != "verified_empty" {
+                return Err(RegistryError::InvalidState(
+                    "Reopen prior incarnation is not verified empty".into(),
+                ));
+            }
+            let (stop_outcome, settled, revoke_pending): (Option<String>, bool, bool) = tx
+                .query_row(
+                    "SELECT outcome,settled,revoke_pending FROM ordinary_stops WHERE soul_id=?1 AND incarnation_id=?2 AND intent_revision=?3",
+                    params![soul_id.as_str(), prior_incarnation_id.as_str(), expected_stopped_revision],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?
+                .ok_or_else(|| RegistryError::InvalidState("Reopen prior Stop is missing".into()))?;
+            if stop_outcome.as_deref() != Some("verified_empty") || !settled || revoke_pending {
+                return Err(RegistryError::InvalidState(
+                    "Reopen prior Stop is not fully settled".into(),
+                ));
+            }
+
+            let mut context = load_recovery_context(&tx, installation, &soul_id)?;
+            if context.prior_handle.incarnation_id() != &prior_incarnation_id {
+                // A verified-empty replacement that never acquired a backend
+                // identity has no worker to resume. Keep its cleanup receipt,
+                // and use the last owned incarnation's saved launch context.
+                let retired_reopen: bool = addressed.3 && tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM commands WHERE incarnation_id=?1 AND state='reopen_failed')",
+                    [prior_incarnation_id.as_str()], |row| row.get(0),
+                )?;
+                if !retired_reopen {
+                    return Err(RegistryError::InvalidState("Reopen prior incarnation changed".into()));
+                }
+                prior_incarnation_id = context.prior_handle.incarnation_id().clone();
+            }
+            if context.resume_spec.is_none() && context.native_session_id.is_some() {
+                context.resume_spec = crate::resume_catalog::exact_resume_candidate(&context, None)
+                    .map_err(|_| RegistryError::InvalidState("saved native identity has no exact resume workload".into()))?;
+                if context.resume_spec.is_none() {
+                    return Err(RegistryError::InvalidState("saved native identity has no exact resume workload".into()));
+                }
+            }
+            if let Some(resume) = context.resume_spec.as_ref() {
+                if resume.provider_session.provider != context.provider
+                    || resume.provider_session.provider_store_id != context.provider_store_id
+                    || context.native_session_id.as_deref()
+                        != Some(resume.provider_session.native_session_id.as_str())
+                {
+                    return Err(RegistryError::NativeIdentityConflict);
+                }
+                if let Some(terminal) = context.terminal.as_ref() {
+                    freshell_agent_runtime::prepare_terminal_for_resume(terminal, resume)
+                        .map_err(|_| RegistryError::InvalidState("saved exact resume workload is invalid".into()))?;
+                }
+            }
+            let attempt_id = RecoveryAttemptId::new();
+            let now = now_millis();
+            let path = if context.resume_spec.is_some() || context.native_session_id.is_some() {
+                RecoveryPath::NativeResume
+            } else {
+                RecoveryPath::PristineSeed
+            };
+            if path == RecoveryPath::PristineSeed && !context.permits_pristine_seed() {
+                return Err(RegistryError::InvalidState(
+                    "Reopen has no saved native resume identity".into(),
+                ));
+            }
+
+            let active: bool = tx.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM incarnations WHERE soul_id=?1 AND launch_state IN ({ACTIVE_STATES}))"),
+                params![soul_id.as_str()],
+                |row| row.get(0),
+            )?;
+            if active {
+                return Err(RegistryError::ActiveIncarnation(soul_id));
+            }
+
+            let incarnation_id = IncarnationId::new();
+            let launch_nonce = LaunchNonce::new();
+            let limits_json = serde_json::to_string(&context.requested_limits)?;
+            let terminal_json = context.terminal.as_ref().map(serde_json::to_string).transpose()?;
+            let fresh_agent_json = context.fresh_agent.as_ref().map(serde_json::to_string).transpose()?;
+            let fixture_kind = context.fixture.map(fixture_kind_name);
+            let terminal_id = context.terminal.as_ref().map(|terminal| terminal.terminal_id.as_str());
+            tx.execute(
+                "INSERT INTO incarnations (incarnation_id,soul_id,launch_nonce,docker_daemon_id,container_id,image_ref,runtime_dir,host_binary_path,immutable_config_digest,launch_state,host_boot_id,execution_generation,grant_id,requested_limits,effective_limits,cleanup_state,fixture_kind,terminal_id,terminal_spec,fresh_agent_spec,prior_incarnation_id,recovery_attempt_id,exit_code,oom_killed,created_at,updated_at) VALUES (?1,?2,?3,NULL,NULL,NULL,NULL,NULL,NULL,'prepared',NULL,0,NULL,?4,NULL,'none',?5,?6,?7,?8,?9,?10,NULL,0,?11,?11)",
+                params![incarnation_id.as_str(), soul_id.as_str(), launch_nonce.as_str(), limits_json, fixture_kind, terminal_id, terminal_json, fresh_agent_json, prior_incarnation_id.as_str(), attempt_id.as_str(), now],
+            )?;
+            tx.execute(
+                "INSERT INTO admission_reservations (incarnation_id,project_key,cpu_milli,memory_bytes,pids_max,created_at) VALUES (?1,?2,?3,?4,?5,?6)",
+                params![incarnation_id.as_str(), context.project_key, context.requested_limits.cpu_milli, context.requested_limits.memory_bytes, context.requested_limits.pids_max, now],
+            )?;
+            if let Some(native_session_id) = context.native_session_id.as_deref() {
+                let conflicting: Option<String> = tx.query_row(
+                    "SELECT incarnation_id FROM writer_claims WHERE provider=?1 AND provider_store_id=?2 AND native_session_id=?3",
+                    params![context.provider, context.provider_store_id, native_session_id],
+                    |row| row.get(0),
+                ).optional()?;
+                if conflicting.is_some() {
+                    return Err(RegistryError::NativeIdentityConflict);
+                }
+                tx.execute(
+                    "INSERT INTO writer_claims (provider,provider_store_id,native_session_id,soul_id,incarnation_id,intent_revision) VALUES (?1,?2,?3,?4,?5,?6)",
+                    params![context.provider, context.provider_store_id, native_session_id, soul_id.as_str(), incarnation_id.as_str(), expected_stopped_revision],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO recovery_attempts (attempt_id,soul_id,prior_incarnation_id,intent_revision,path,verdict,evidence_ref,started_at,finished_at) VALUES (?1,?2,?3,?4,?5,'replacement_prepared',NULL,?6,NULL)",
+                params![attempt_id.as_str(), soul_id.as_str(), prior_incarnation_id.as_str(), expected_stopped_revision, recovery_path_name(path), now],
+            )?;
+            tx.execute(
+                "INSERT INTO commands (soul_id,request_id,payload_digest,protected_payload_ref,state,provider_ack_id,incarnation_id,event_cursor,created_at,updated_at) VALUES (?1,?2,?3,NULL,'reopen_prepared',NULL,?4,0,?5,?5)",
+                params![soul_id.as_str(), request_id.as_str(), payload_digest, incarnation_id.as_str(), now],
+            )?;
+            tx.execute(
+                "UPDATE souls SET recovery_attempt_id=?1,updated_at=?2 WHERE soul_id=?3 AND desired_state='stopped' AND intent_revision=?4 AND recovery_attempt_id IS NULL",
+                params![attempt_id.as_str(), now, soul_id.as_str(), expected_stopped_revision],
+            )?;
+            tx.commit()?;
+
+            context.recovery_attempt_id = Some(attempt_id.clone());
+            let start = RecoveryStart {
+                attempt_id: attempt_id.clone(),
+                context: context.clone(),
+            };
+            let replacement = ReplacementPreparation {
+                prepared: PreparedLaunch {
+                    soul_id: soul_id.clone(),
+                    incarnation_id,
+                    launch_nonce,
+                    state: LaunchState::Prepared,
+                    intent_revision: expected_stopped_revision,
+                    existing_request: false,
+                },
+                fixture: context.fixture,
+                terminal: context.terminal.clone(),
+                fresh_agent: context.fresh_agent.clone(),
+                resume_spec: context.resume_spec.clone(),
+                prior_incarnation_id,
+                attempt_id,
+            };
+            Ok(ReopenPreparation {
+                start,
+                replacement,
+            })
+        })
+        .await
+    }
+
+    pub(crate) async fn persist_reopen_launch_specs(
+        &self,
+        soul_id: SoulId,
+        incarnation_id: IncarnationId,
+        attempt_id: RecoveryAttemptId,
+        terminal: Option<TerminalLaunchSpec>,
+        fresh_agent: Option<FreshAgentLaunchSpec>,
+    ) -> Result<(), RegistryError> {
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if !reopen_incarnation_is_current(&tx, &incarnation_id)? {
+                return Err(RegistryError::InvalidState(
+                    "prepared Reopen incarnation changed before provider context was saved".into(),
+                ));
+            }
+            let terminal_id = terminal.as_ref().map(|spec| spec.terminal_id.as_str());
+            let terminal_json = terminal.as_ref().map(serde_json::to_string).transpose()?;
+            let fresh_json = fresh_agent.as_ref().map(serde_json::to_string).transpose()?;
+            let changed = tx.execute(
+                "UPDATE incarnations SET terminal_id=?1,terminal_spec=?2,fresh_agent_spec=?3,updated_at=?4 WHERE incarnation_id=?5 AND soul_id=?6 AND recovery_attempt_id=?7 AND launch_state='prepared'",
+                params![terminal_id, terminal_json, fresh_json, now_millis(), incarnation_id.as_str(), soul_id.as_str(), attempt_id.as_str()],
+            )?;
+            if changed != 1 {
+                return Err(RegistryError::InvalidState(
+                    "prepared Reopen incarnation changed before provider context was saved".into(),
+                ));
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Record pending cleanup or settle only this failed Reopen's replacement.
+    /// Release authority after owned-runtime verification, or when explicit
+    /// create evidence proves the replacement was never created.
+    pub(crate) async fn settle_failed_reopen(
+        &self,
+        prepared: PreparedLaunch,
+        attempt: RecoveryAttemptId,
+        verified_outcome: Option<StopOutcome>,
+        pending_capability: Option<(String, String)>,
+        create_evidence: ReopenCreateEvidence,
+    ) -> Result<StopOutcome, RegistryError> {
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let (uncreated, generation): (bool, u64) = tx.query_row(
+                "SELECT (docker_daemon_id IS NULL AND container_id IS NULL AND grant_id IS NULL),execution_generation FROM incarnations WHERE incarnation_id=?1 AND soul_id=?2 AND launch_nonce=?3 AND recovery_attempt_id=?4 AND EXISTS(SELECT 1 FROM commands c WHERE c.incarnation_id=incarnations.incarnation_id AND c.state IN ('reopen_prepared','stopped','reopen_cleanup_pending','reopen_failed'))",
+                params![prepared.incarnation_id.as_str(), prepared.soul_id.as_str(), prepared.launch_nonce.as_str(), attempt.as_str()],
+                |row| Ok((row.get(0)?,row.get(1)?)),
+            )?;
+            let no_runtime_proven = uncreated
+                && matches!(
+                    create_evidence,
+                    ReopenCreateEvidence::NotAttempted
+                        | ReopenCreateEvidence::DefinitelyNotCreated
+                );
+            let outcome = match verified_outcome {
+                Some(outcome) => outcome,
+                None if no_runtime_proven => StopOutcome::VerifiedEmpty,
+                None => StopOutcome::BlockedOwnership,
+            };
+            let empty = outcome == StopOutcome::VerifiedEmpty;
+            let now = now_millis();
+            tx.execute(
+                "UPDATE incarnations SET launch_state=?1,cleanup_state=?2,updated_at=?3 WHERE incarnation_id=?4",
+                params![if empty { "stopped" } else { "stopping" }, if empty { "verified_empty" } else if outcome == StopOutcome::BlockedOwnership { "blocked_ownership" } else { "termination_unconfirmed" }, now, prepared.incarnation_id.as_str()],
+            )?;
+            tx.execute(
+                "UPDATE commands SET state=?1,updated_at=?2 WHERE incarnation_id=?3 AND state IN ('reopen_prepared','stopped','reopen_cleanup_pending')",
+                params![if empty { "reopen_failed" } else { "reopen_cleanup_pending" }, now, prepared.incarnation_id.as_str()],
+            )?;
+            if empty {
+                tx.execute("DELETE FROM writer_claims WHERE incarnation_id=?1", [prepared.incarnation_id.as_str()])?;
+                tx.execute("DELETE FROM admission_reservations WHERE incarnation_id=?1", [prepared.incarnation_id.as_str()])?;
+                tx.execute("UPDATE recovery_attempts SET verdict='reopen_failed',finished_at=?1 WHERE attempt_id=?2 AND verdict='replacement_prepared'", params![now, attempt.as_str()])?;
+                tx.execute("UPDATE souls SET recovery_attempt_id=NULL,updated_at=?1 WHERE soul_id=?2 AND desired_state='stopped' AND intent_revision=?3 AND recovery_attempt_id=?4", params![now, prepared.soul_id.as_str(), prepared.intent_revision, attempt.as_str()])?;
+            }
+            // The current stopped intent owns cleanup of its exact latest
+            // replacement, including when a newer Stop interrupted startup.
+            // Record a no-runtime proof only when creation was not attempted
+            // or the backend explicitly proved it did not happen. Missing
+            // committed identity alone is never enough to release authority.
+            let current_revision: Option<u64> = tx.query_row(
+                "SELECT intent_revision FROM souls s WHERE soul_id=?1 AND desired_state='stopped' AND ?2=(SELECT incarnation_id FROM incarnations WHERE soul_id=s.soul_id ORDER BY created_at DESC,rowid DESC LIMIT 1)",
+                params![prepared.soul_id.as_str(), prepared.incarnation_id.as_str()], |row| row.get(0),
+            ).optional()?;
+            if let Some(revision) = current_revision {
+                let revoke_pending = empty && pending_capability.is_some();
+                tx.execute(
+                    "INSERT INTO ordinary_stops(soul_id,incarnation_id,intent_revision,execution_generation,outcome,capability_endpoint,capability_grant_id,revoke_pending,settled,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(soul_id,incarnation_id,intent_revision) DO UPDATE SET outcome=excluded.outcome,capability_endpoint=excluded.capability_endpoint,capability_grant_id=excluded.capability_grant_id,revoke_pending=excluded.revoke_pending,settled=excluded.settled,updated_at=excluded.updated_at",
+                    params![prepared.soul_id.as_str(),prepared.incarnation_id.as_str(),revision,generation,stop_outcome_name(outcome),pending_capability.as_ref().map(|value| &value.0),pending_capability.as_ref().map(|value| &value.1),revoke_pending,empty && !revoke_pending,now],
+                )?;
+            }
+            tx.commit()?;
+            Ok(outcome)
+        }).await
+    }
+
+    /// Commit the successful Reopen only after the replacement is live and
+    /// provider preparation has settled. The CAS, success journal transition,
+    /// writer fence, and automatic-view restoration share one transaction.
+    pub(crate) async fn finish_reopen(
+        &self,
+        soul_id: SoulId,
+        request_id: RequestId,
+        payload_digest: String,
+        expected_stopped_revision: u64,
+        attempt_id: RecoveryAttemptId,
+        incarnation_id: IncarnationId,
+    ) -> Result<(), RegistryError> {
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let (desired, revision, recovery_attempt): (String, u64, Option<String>) = tx.query_row(
+                "SELECT desired_state,intent_revision,recovery_attempt_id FROM souls WHERE soul_id=?1",
+                params![soul_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            let prior: Option<String> = tx.query_row(
+                "SELECT prior_incarnation_id FROM recovery_attempts WHERE attempt_id=?1 AND soul_id=?2 AND intent_revision=?3 AND verdict='replacement_prepared' AND finished_at IS NULL",
+                params![attempt_id.as_str(), soul_id.as_str(), expected_stopped_revision],
+                |row| row.get(0),
+            ).optional()?.flatten();
+            let command: Option<(String, String)> = tx.query_row(
+                "SELECT payload_digest,state FROM commands WHERE soul_id=?1 AND request_id=?2 AND incarnation_id=?3",
+                params![soul_id.as_str(), request_id.as_str(), incarnation_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional()?;
+            let (digest, state) = command.ok_or(RegistryError::RequestConflict)?;
+            if digest != payload_digest || state != "reopen_prepared" {
+                return Err(RegistryError::RequestConflict);
+            }
+            let (launch_state, cleanup_state): (String, String) = tx.query_row(
+                "SELECT launch_state,cleanup_state FROM incarnations WHERE incarnation_id=?1 AND soul_id=?2",
+                params![incarnation_id.as_str(), soul_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if desired != "stopped"
+                || revision != expected_stopped_revision
+                || recovery_attempt.as_deref() != Some(attempt_id.as_str())
+                || prior.is_none()
+                || launch_state != "running"
+                || cleanup_state != "none"
+            {
+                return Err(RegistryError::StaleIntentRevision {
+                    expected: expected_stopped_revision,
+                    current: revision,
+                });
+            }
+            let next_revision = expected_stopped_revision
+                .checked_add(1)
+                .ok_or_else(|| RegistryError::Integrity("intent revision overflow".into()))?;
+            let now = now_millis();
+            let changed = tx.execute(
+                "UPDATE souls SET desired_state='running',intent_revision=?1,recovery_state='live',recovery_reason=NULL,recovery_attempt_id=NULL,updated_at=?2 WHERE soul_id=?3 AND desired_state='stopped' AND intent_revision=?4 AND recovery_attempt_id=?5",
+                params![next_revision, now, soul_id.as_str(), expected_stopped_revision, attempt_id.as_str()],
+            )?;
+            if changed != 1 {
+                return Err(RegistryError::StaleIntentRevision {
+                    expected: expected_stopped_revision,
+                    current: revision,
+                });
+            }
+            tx.execute(
+                "UPDATE writer_claims SET intent_revision=?1 WHERE soul_id=?2 AND incarnation_id=?3",
+                params![next_revision, soul_id.as_str(), incarnation_id.as_str()],
+            )?;
+            tx.execute(
+                "UPDATE commands SET state='running',updated_at=?1 WHERE soul_id=?2 AND request_id=?3 AND payload_digest=?4 AND incarnation_id=?5 AND state='reopen_prepared'",
+                params![now, soul_id.as_str(), request_id.as_str(), payload_digest, incarnation_id.as_str()],
+            )?;
+            tx.execute(
+                "UPDATE incarnations SET provider_preparation_pending=0,updated_at=?1 WHERE incarnation_id=?2 AND launch_state='running'",
+                params![now, incarnation_id.as_str()],
+            )?;
+            tx.execute(
+                "UPDATE recovery_attempts SET verdict='succeeded',evidence_ref=?1,finished_at=?2 WHERE attempt_id=?3 AND verdict='replacement_prepared' AND finished_at IS NULL",
+                params![serde_json::to_string(&vec![format!("{ACCEPTED_INCARNATION_REF}{}", incarnation_id.as_str())])?, now, attempt_id.as_str()],
+            )?;
+            crate::view_intents::make_automatic_primary_visible_in_tx(
+                &tx,
+                &soul_id,
+                next_revision,
+                now,
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn begin_stop_expected(
         &self,
         soul_id: SoulId,
@@ -1727,6 +2357,107 @@ impl Registry {
             }
             Ok(handles)
         }).await
+    }
+
+    /// Return the exact pending capability revoke for the current failed
+    /// Reopen replacement only when its persisted receipt proves the
+    /// replacement was never created. This path has no Docker authority.
+    pub(crate) async fn pending_no_runtime_reopen_revoke(
+        &self,
+        soul_id: SoulId,
+        intent_revision: u64,
+    ) -> Result<Option<PendingNoRuntimeRevoke>, RegistryError> {
+        self.run_blocking(move |conn| {
+            let row: Option<(String, String, String)> = conn
+                .query_row(
+                    &format!(
+                        "SELECT p.incarnation_id,p.capability_endpoint,p.capability_grant_id \
+                         FROM ordinary_stops p \
+                         JOIN souls s ON s.soul_id=p.soul_id \
+                         JOIN incarnations i ON i.incarnation_id=p.incarnation_id \
+                         WHERE p.soul_id=?1 AND p.intent_revision=?2 \
+                           AND p.outcome='verified_empty' AND p.revoke_pending=1 AND p.settled=0 \
+                           AND s.desired_state='stopped' AND s.intent_revision=p.intent_revision \
+                           AND i.launch_state='stopped' AND i.cleanup_state='verified_empty' \
+                           AND i.docker_daemon_id IS NULL AND i.container_id IS NULL AND i.grant_id IS NULL \
+                           AND p.capability_endpoint IS NOT NULL AND p.capability_grant_id IS NOT NULL \
+                           AND p.incarnation_id=(SELECT current.incarnation_id FROM incarnations current \
+                               WHERE current.soul_id=p.soul_id \
+                               ORDER BY CASE WHEN current.launch_state IN ({ACTIVE_STATES}) THEN 0 ELSE 1 END, \
+                                        current.created_at DESC,current.rowid DESC LIMIT 1) \
+                           AND EXISTS(SELECT 1 FROM commands c WHERE c.incarnation_id=i.incarnation_id AND c.state='reopen_failed')",
+                    ),
+                    params![soul_id.as_str(), intent_revision],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            row.map(|(incarnation, endpoint, grant_id)| {
+                Ok(PendingNoRuntimeRevoke {
+                    soul_id,
+                    incarnation_id: IncarnationId::parse(incarnation).map_err(|_| {
+                        RegistryError::Integrity("invalid no-runtime Reopen incarnation id".into())
+                    })?,
+                    intent_revision,
+                    endpoint,
+                    grant_id,
+                })
+            })
+            .transpose()
+        })
+        .await
+    }
+
+    /// Acknowledge only the captured current stopped revision and exact
+    /// no-runtime capability receipt. A newer Stop or replacement invalidates
+    /// this continuation.
+    pub(crate) async fn acknowledge_no_runtime_reopen_revoke(
+        &self,
+        pending: &PendingNoRuntimeRevoke,
+    ) -> Result<(), RegistryError> {
+        let pending = pending.clone();
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let latest: Option<String> = tx
+                .query_row(
+                    &format!(
+                        "SELECT incarnation_id FROM incarnations WHERE soul_id=?1 \
+                         ORDER BY CASE WHEN launch_state IN ({ACTIVE_STATES}) THEN 0 ELSE 1 END, \
+                                  created_at DESC,rowid DESC LIMIT 1"
+                    ),
+                    [pending.soul_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let current_matches: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM souls WHERE soul_id=?1 AND desired_state='stopped' AND intent_revision=?2)",
+                params![pending.soul_id.as_str(), pending.intent_revision],
+                |row| row.get(0),
+            )?;
+            if !current_matches || latest.as_deref() != Some(pending.incarnation_id.as_str()) {
+                return Err(RegistryError::InvalidState(
+                    "no-runtime Reopen revoke target changed before acknowledgement".into(),
+                ));
+            }
+            let changed = tx.execute(
+                "UPDATE ordinary_stops SET revoke_pending=0,settled=1,updated_at=?1 \
+                 WHERE soul_id=?2 AND incarnation_id=?3 AND intent_revision=?4 \
+                   AND outcome='verified_empty' AND revoke_pending=1 AND settled=0 \
+                   AND capability_endpoint=?5 AND capability_grant_id=?6 \
+                   AND EXISTS(SELECT 1 FROM incarnations i WHERE i.incarnation_id=?3 \
+                     AND i.soul_id=?2 AND i.launch_state='stopped' AND i.cleanup_state='verified_empty' \
+                     AND i.docker_daemon_id IS NULL AND i.container_id IS NULL AND i.grant_id IS NULL) \
+                   AND EXISTS(SELECT 1 FROM commands c WHERE c.incarnation_id=?3 AND c.state='reopen_failed')",
+                params![now_millis(), pending.soul_id.as_str(), pending.incarnation_id.as_str(), pending.intent_revision, pending.endpoint, pending.grant_id],
+            )?;
+            if changed != 1 {
+                return Err(RegistryError::InvalidState(
+                    "no-runtime Reopen revoke receipt changed before acknowledgement".into(),
+                ));
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
     }
 
     pub(crate) async fn stop_progress(
@@ -1934,11 +2665,12 @@ impl Registry {
     ) -> Result<(InputJournalDisposition, IncarnationId), RegistryError> {
         let payload_digest = input_payload_digest(data, correlation);
         let protected_payload = data.to_vec();
+        let has_data = !data.is_empty();
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if let Some((existing_digest, existing_payload, state, recorded_incarnation)) = tx
+            if let Some((existing_digest, existing_payload, state, recorded_incarnation, refusal)) = tx
                 .query_row(
-                    "SELECT payload_digest,protected_payload,state,incarnation_id FROM input_commands WHERE soul_id=?1 AND request_id=?2",
+                    "SELECT payload_digest,protected_payload,state,incarnation_id,fresh_agent_send_refusal FROM input_commands WHERE soul_id=?1 AND request_id=?2",
                     params![soul_id.as_str(), request_id.as_str()],
                     |row| {
                         Ok((
@@ -1946,6 +2678,7 @@ impl Registry {
                             row.get::<_, Vec<u8>>(1)?,
                             row.get::<_, String>(2)?,
                             row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
                         ))
                     },
                 )
@@ -1965,6 +2698,11 @@ impl Registry {
                         tx.commit()?;
                         return Ok((InputJournalDisposition::Ambiguous, recorded_incarnation));
                     }
+                    "refused" | "refused_before_admission" => {
+                        let diagnostic = parse_fresh_input_refusal(refusal)?;
+                        tx.commit()?;
+                        return Ok((InputJournalDisposition::Refused(diagnostic), recorded_incarnation));
+                    }
                     "queued" => {}
                     other => {
                         return Err(RegistryError::Integrity(format!(
@@ -1974,16 +2712,32 @@ impl Registry {
                 }
             }
 
-            let incarnation_raw: String = tx
+            let current: Option<(String, String)> = tx
                 .query_row(
-                    "SELECT i.incarnation_id FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id WHERE i.soul_id=?1 AND i.launch_state='running' AND s.desired_state='running' AND s.recovery_state='live' ORDER BY i.created_at DESC LIMIT 1",
+                    "SELECT i.incarnation_id,s.recovery_state FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id WHERE i.soul_id=?1 AND i.launch_state='running' AND s.desired_state='running' AND s.recovery_state IN ('live','blocked') ORDER BY i.created_at DESC LIMIT 1",
                     params![soul_id.as_str()],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
-                .optional()?
-                .ok_or_else(|| RegistryError::UnknownSoul(soul_id.clone()))?;
+                .optional()?;
+            let (incarnation_raw, recovery_state) =
+                current.ok_or_else(|| RegistryError::UnknownSoul(soul_id.clone()))?;
             let incarnation_id = IncarnationId::parse(incarnation_raw)
                 .map_err(|_| RegistryError::Integrity("invalid incarnation id".into()))?;
+            let admitted = match recovery_state.as_str() {
+                "live" => true,
+                "blocked" => {
+                    has_data
+                        && fresh_opencode_terminal_can_accept_input_before_native_identity(
+                            &tx,
+                            &soul_id,
+                            &incarnation_id,
+                        )?
+                }
+                _ => false,
+            };
+            if !admitted {
+                return Err(RegistryError::UnknownSoul(soul_id.clone()));
+            }
 
             // A settings refusal must roll back admission of the prompt too.
             // Recovery consumes every queued row, so publishing it separately
@@ -2020,14 +2774,14 @@ impl Registry {
         let digest = input_payload_digest(data, correlation);
         let payload = data.to_vec();
         self.run_blocking(move |conn| {
-            let row: Option<(String, Vec<u8>, String)> = conn
+            let row: Option<(String, Vec<u8>, String, Option<String>)> = conn
                 .query_row(
-                    "SELECT payload_digest,protected_payload,state FROM input_commands WHERE soul_id=?1 AND request_id=?2",
+                    "SELECT payload_digest,protected_payload,state,fresh_agent_send_refusal FROM input_commands WHERE soul_id=?1 AND request_id=?2",
                     params![soul_id.as_str(), request_id.as_str()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()?;
-            let Some((stored_digest, stored_payload, state)) = row else {
+            let Some((stored_digest, stored_payload, state, refusal)) = row else {
                 return Ok(None);
             };
             if stored_digest != digest || stored_payload != payload {
@@ -2036,9 +2790,56 @@ impl Registry {
             match state.as_str() {
                 "completed" => Ok(Some(InputJournalDisposition::Completed)),
                 "dispatching" | "ambiguous" => Ok(Some(InputJournalDisposition::Ambiguous)),
+                "refused" | "refused_before_admission" => Ok(Some(InputJournalDisposition::Refused(parse_fresh_input_refusal(refusal)?))),
                 "queued" => Ok(None),
                 _ => Err(RegistryError::Integrity(format!("unknown input command state {state}"))),
             }
+        })
+        .await
+    }
+
+    /// Record a refusal only when the blocked soul has no prior input for
+    /// this request. The refusal is never queued or counted as admitted work.
+    pub(crate) async fn refuse_blocked_unadmitted_input(
+        &self,
+        soul_id: SoulId,
+        request_id: RequestId,
+        data: &[u8],
+        correlation: &[u8],
+    ) -> Result<Option<freshell_runtime_protocol::FreshAgentSendDiagnostic>, RegistryError> {
+        let payload_digest = input_payload_digest(data, Some(correlation));
+        let protected_payload = data.to_vec();
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let reason: Option<Option<String>> = tx.query_row(
+                "SELECT s.recovery_reason FROM souls s WHERE s.soul_id=?1 AND s.desired_state='running' AND s.recovery_state='blocked' AND NOT EXISTS (SELECT 1 FROM input_commands c WHERE c.soul_id=s.soul_id AND c.request_id=?2)",
+                params![soul_id.as_str(), request_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+            let Some(reason) = reason else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            let incarnation = load_recovery_prior_incarnation(&tx, &soul_id, false)?;
+            let message = match reason.filter(|reason| !reason.is_empty()) {
+                Some(reason) => format!(
+                    "The hosted session is blocked during recovery ({reason}); this message was not sent."
+                ),
+                None => "The hosted session is blocked during recovery; this message was not sent.".into(),
+            };
+            let diagnostic = freshell_runtime_protocol::FreshAgentSendDiagnostic {
+                outcome: freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused,
+                message: Some(message),
+            };
+            let encoded = serde_json::to_string(&diagnostic)?;
+            let now = now_millis();
+            tx.execute(
+                "INSERT INTO input_commands (soul_id,request_id,payload_digest,protected_payload,incarnation_id,state,fresh_agent_send_refusal,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,'refused_before_admission',?6,?7,?7)",
+                params![soul_id.as_str(), request_id.as_str(), payload_digest, protected_payload, incarnation.as_str(), encoded, now],
+            )?;
+            tx.commit()?;
+            Ok(Some(diagnostic))
         })
         .await
     }
@@ -2120,6 +2921,35 @@ impl Registry {
         request_id: RequestId,
     ) -> Result<(), RegistryError> {
         self.set_input_state(soul_id, request_id, "ambiguous").await
+    }
+
+    /// Commit a proven fresh-agent refusal and its optional already-public
+    /// diagnostic in the same transaction. This outcome is never requeued.
+    pub(crate) async fn mark_fresh_input_refused(
+        &self,
+        soul_id: SoulId,
+        request_id: RequestId,
+        diagnostic: freshell_runtime_protocol::FreshAgentSendDiagnostic,
+    ) -> Result<(), RegistryError> {
+        if diagnostic.outcome != freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused
+        {
+            return Err(RegistryError::InvalidState(
+                "a non-refusal cannot settle a refused input".into(),
+            ));
+        }
+        let encoded = serde_json::to_string(&diagnostic)?;
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = tx.execute(
+                "UPDATE input_commands SET state='refused',fresh_agent_send_refusal=?1,updated_at=?2 WHERE soul_id=?3 AND request_id=?4 AND state='dispatching'",
+                params![encoded, now_millis(), soul_id.as_str(), request_id.as_str()],
+            )?;
+            if changed != 1 {
+                return Err(RegistryError::InvalidState(format!("input command {} is not dispatching", request_id)));
+            }
+            tx.commit()?;
+            Ok(())
+        }).await
     }
 
     /// Atomically moves one never-dispatched command onto the replacement
@@ -2341,6 +3171,31 @@ impl Registry {
         )
         .await
         .map(|_| ())
+    }
+
+    /// Commit a provider-verified Codex recovery root transition against the
+    /// exact write fence captured before the provider readiness operation.
+    /// The fresh provider proof can take long enough for stop, restart, or
+    /// another identity update to win; in that case the transition must not
+    /// adopt the result from the stale operation.
+    pub(crate) async fn record_fresh_agent_recovery_identity_fenced(
+        &self,
+        soul_id: SoulId,
+        incarnation_id: IncarnationId,
+        identity: NativeDispatchIdentity,
+        fence: RecoveryWriteFence,
+    ) -> Result<RecoveryWriteFence, RegistryError> {
+        self.transition_native_session_evidenced_fenced(
+            soul_id,
+            incarnation_id,
+            &identity.previous_native_session_id,
+            &identity.native_session_id,
+            fence,
+            NativeSessionTransitionEvidence::AcceptedDispatch {
+                pending_naming_handle: identity.pending_naming_handle,
+            },
+        )
+        .await
     }
 
     pub async fn transition_native_session_fenced(
@@ -3137,6 +3992,25 @@ impl Registry {
             .await
     }
 
+    pub(crate) async fn is_current_reopen_preparation(
+        &self,
+        soul_id: SoulId,
+        incarnation_id: IncarnationId,
+        intent_revision: u64,
+        attempt_id: RecoveryAttemptId,
+    ) -> Result<bool, RegistryError> {
+        self.run_blocking(move |conn| {
+            reopen_preparation_is_current(
+                &conn,
+                &soul_id,
+                Some(&incarnation_id),
+                intent_revision,
+                Some(&attempt_id),
+            )
+        })
+        .await
+    }
+
     /// Refresh a known exact origin using trusted host inventory. The caller
     /// captures context before discovery/I/O; completion never adopts a newer
     /// identity, import generation, or user intent.
@@ -3754,12 +4628,21 @@ impl Registry {
         start: RecoveryStart,
     ) -> Result<bool, RegistryError> {
         self.run_blocking(move |conn| {
-            let current:bool = conn.query_row(
+            let current: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM souls WHERE soul_id=?1 AND desired_state='running' AND recovery_state='recovering' AND intent_revision=?2 AND recovery_attempt_id=?3)",
-                params![start.context.soul_id.as_str(),start.context.intent_revision,start.attempt_id.as_str()],
-                |row|row.get(0),
+                params![start.context.soul_id.as_str(), start.context.intent_revision, start.attempt_id.as_str()],
+                |row| row.get(0),
             )?;
-            Ok(current)
+            if current {
+                return Ok(true);
+            }
+            reopen_preparation_is_current(
+                &conn,
+                &start.context.soul_id,
+                None,
+                start.context.intent_revision,
+                Some(&start.attempt_id),
+            )
         }).await
     }
 
@@ -3921,6 +4804,427 @@ impl Registry {
         }).await
     }
 
+    /// Issue the narrow startup authority that permits a replacement Codex
+    /// host to try the exact saved root and, only after typed not-found plus a
+    /// fresh store census, mint a new root. The authorization is derived from
+    /// the live registry rows so a caller cannot manufacture a fence by
+    /// relabeling an older incarnation's snapshot.
+    pub async fn authorize_native_readiness_recovery(
+        &self,
+        soul_id: SoulId,
+        target_incarnation_id: IncarnationId,
+        source_launch: NativeIdentityLaunch,
+        resume_spec: ResumeSpec,
+    ) -> Result<Option<NativeReadinessRecoveryAuthorization>, RegistryError> {
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let fence = load_recovery_write_fence(&tx, &soul_id)?;
+            validate_recovery_write_fence(&tx, &soul_id, &fence)?;
+            if fence.active_incarnation_id != target_incarnation_id {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+
+            let (provider, provider_store_id, native_session_id, desired, recovery_state,
+                intent_revision, identity_revision, evidence_revision, native_import_revision,
+                attempt_raw, resume_raw): NativeReadinessAuthorizationSoulRow = tx.query_row(
+                "SELECT provider,provider_store_id,native_session_id,desired_state,recovery_state,\
+                 intent_revision,identity_revision,evidence_revision,native_import_revision,\
+                 recovery_attempt_id,resume_spec FROM souls WHERE soul_id=?1",
+                params![soul_id.as_str()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,
+                    row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?)),
+            )?;
+            if provider != FreshProvider::Codex.as_str()
+                || resume_spec.provider_session.provider != FreshProvider::Codex.as_str()
+                || attempt_raw.is_none()
+            {
+                tx.commit()?;
+                return Ok(None);
+            }
+            let attempt_raw = attempt_raw.expect("checked above");
+            let attempt_id = RecoveryAttemptId::parse(attempt_raw.clone())
+                .map_err(|_| RegistryError::Integrity("invalid recovery attempt id".into()))?;
+            let Some(resume_raw) = resume_raw else {
+                return Err(RegistryError::NativeIdentityConflict);
+            };
+            let persisted_resume: ResumeSpec = serde_json::from_str(&resume_raw)?;
+            if persisted_resume != resume_spec {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+
+            let target: NativeReadinessAuthorizationTargetRow = tx.query_row(
+                "SELECT i.launch_state,i.launch_nonce,i.execution_generation,\
+                 i.native_identity_launch,i.fresh_agent_spec,i.prior_incarnation_id,\
+                 i.recovery_attempt_id,a.soul_id,a.prior_incarnation_id,a.intent_revision,\
+                 a.verdict,a.finished_at FROM incarnations i \
+                 JOIN recovery_attempts a ON a.attempt_id=i.recovery_attempt_id \
+                 WHERE i.incarnation_id=?1 AND i.soul_id=?2 AND a.attempt_id=?3",
+                params![target_incarnation_id.as_str(),soul_id.as_str(),attempt_id.as_str()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,
+                    row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,
+                    row.get(10)?,row.get(11)?)),
+            )?;
+            let target_launch: NativeIdentityLaunch = target.3
+                .as_deref()
+                .ok_or(RegistryError::NativeIdentityConflict)
+                .and_then(|raw| serde_json::from_str(raw).map_err(RegistryError::from))?;
+            let target_spec: FreshAgentLaunchSpec = target.4
+                .as_deref()
+                .ok_or(RegistryError::NativeIdentityConflict)
+                .and_then(|raw| serde_json::from_str(raw).map_err(RegistryError::from))?;
+            let prior_incarnation_id = IncarnationId::parse(
+                target.5.clone().ok_or(RegistryError::NativeIdentityConflict)?,
+            ).map_err(|_| RegistryError::NativeIdentityConflict)?;
+            let attempt_prior = IncarnationId::parse(
+                target.8.clone().ok_or(RegistryError::NativeIdentityConflict)?,
+            ).map_err(|_| RegistryError::NativeIdentityConflict)?;
+            let prior_state: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT launch_state,cleanup_state FROM incarnations WHERE incarnation_id=?1 AND soul_id=?2",
+                    params![prior_incarnation_id.as_str(),soul_id.as_str()],
+                    |row| Ok((row.get(0)?,row.get(1)?)),
+                )
+                .optional()?;
+
+            let exact_replacement = desired == "running"
+                && recovery_state == "recovering"
+                && target.0 == "starting"
+                && target.1 == source_launch.launch_nonce
+                && target.2 == source_launch.execution_generation
+                && target.6.as_deref() == Some(attempt_id.as_str())
+                && target.7 == soul_id.as_str()
+                && target.9 == intent_revision
+                && target.10 == "replacement_prepared"
+                && target.11.is_none()
+                && prior_incarnation_id == attempt_prior
+                && prior_state.as_ref().is_some_and(|(state, cleanup)| {
+                    state == "stopped" && cleanup == "verified_empty"
+                })
+                && attempt_raw == target.6.clone().unwrap_or_default()
+                && target_launch == source_launch
+                && source_launch.incarnation_id == target_incarnation_id
+                && source_launch.evidence_revision == evidence_revision
+                && source_launch.requested_native_session_id.as_deref()
+                    == native_session_id.as_deref()
+                && native_session_id.as_deref()
+                    == Some(resume_spec.provider_session.native_session_id.as_str())
+                && provider_store_id == resume_spec.provider_session.provider_store_id
+                && target_spec.provider == FreshProvider::Codex
+                && target_spec.session_type == "freshcodex"
+                && target_spec.native_session_id.as_deref() == native_session_id.as_deref()
+                && target_spec.provider_store_id == provider_store_id
+                && resume_spec.mode == target_spec.session_type
+                && resume_spec.runtime_variant == target_spec.runtime_variant
+                && resume_spec.evidence_revision == evidence_revision
+                && target_launch.execution_generation > 0
+                && identity_revision == fence.identity_revision
+                && evidence_revision == fence.evidence_revision
+                && native_import_revision == fence.native_import_revision;
+            if !exact_replacement {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+            let claim_exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM writer_claims WHERE provider=?1 AND \
+                 provider_store_id=?2 AND native_session_id=?3 AND soul_id=?4 \
+                 AND incarnation_id=?5 AND intent_revision=?6)",
+                params![provider,provider_store_id,native_session_id.as_deref(),soul_id.as_str(),
+                    target_incarnation_id.as_str(),intent_revision],
+                |row| row.get(0),
+            )?;
+            if !claim_exists {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+            let authorization = NativeReadinessRecoveryAuthorization {
+                source_fence: fence.native_readiness_fence(),
+                source_launch,
+                prior_incarnation_id,
+                resume_spec_sha256: freshell_runtime_protocol::resume_spec_sha256(&resume_spec),
+            };
+            if !authorization.is_valid_for(&target_spec, &resume_spec) {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+            tx.commit()?;
+            Ok(Some(authorization))
+        }).await
+    }
+
+    /// Commit a cold-host Codex root replacement together with its exact
+    /// observation. The only non-authorized path is an exact replay of the
+    /// receipt already stored by this incarnation after a lost supervisor
+    /// reply.
+    pub async fn record_native_readiness_recovery_receipt(
+        &self,
+        soul_id: SoulId,
+        receipt: NativeReadinessReceipt,
+        observation: NativeIdentityObservation,
+        authorization: Option<NativeReadinessRecoveryAuthorization>,
+        resume_spec: Option<ResumeSpec>,
+    ) -> Result<RecoveryWriteFence, RegistryError> {
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if !receipt.is_valid()
+                || receipt.absence_evidence.is_none()
+                || observation.native_session_id != receipt.identity.native_session_id
+                || !observation.matches_launch(&receipt.next_launch)
+                || !observation.matches_provider(FreshProvider::Codex.as_str(), true)
+            {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+            let target_incarnation_id = receipt.source_launch.incarnation_id.clone();
+            let receipt_raw = serde_json::to_string(&receipt)?;
+            let current: NativeReadinessReceiptCommitRow = tx.query_row(
+                "SELECT s.provider,s.native_session_id,s.intent_revision,s.identity_revision,\
+                 s.evidence_revision,s.native_import_revision,s.recovery_attempt_id,\
+                 s.resume_spec,i.native_identity_launch,i.native_identity_observation,\
+                 i.native_readiness_receipt,i.launch_state,i.fresh_agent_spec,i.prior_incarnation_id \
+                 FROM souls s JOIN incarnations i ON i.soul_id=s.soul_id \
+                 WHERE s.soul_id=?1 AND i.incarnation_id=?2",
+                params![soul_id.as_str(),target_incarnation_id.as_str()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,
+                    row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,
+                    row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?)),
+            )?;
+            if current.10.as_deref() == Some(receipt_raw.as_str())
+                && current.1.as_deref() == Some(receipt.identity.native_session_id.as_str())
+                && current.8.as_deref().and_then(|raw| serde_json::from_str::<NativeIdentityLaunch>(raw).ok())
+                    .as_ref() == Some(&receipt.next_launch)
+                && current.9.as_deref().and_then(|raw| serde_json::from_str::<NativeIdentityObservation>(raw).ok())
+                    .as_ref() == Some(&observation)
+            {
+                let fence = load_recovery_write_fence(&tx, &soul_id)?;
+                let attempt_id = receipt.source_fence.recovery_attempt_id
+                    .as_ref().ok_or(RegistryError::NativeIdentityConflict)?;
+                let prior_incarnation_id = receipt.absence_evidence
+                    .as_ref().ok_or(RegistryError::NativeIdentityConflict)?
+                    .prior_incarnation_id.clone();
+                let expected_identity_revision = receipt.source_fence.identity_revision
+                    .checked_add(1).ok_or(RegistryError::NativeIdentityConflict)?;
+                let recovery_state: String = tx.query_row(
+                    "SELECT recovery_state FROM souls WHERE soul_id=?1",
+                    params![soul_id.as_str()],
+                    |row| row.get(0),
+                )?;
+                let attempt: (String, String, u64, String, Option<i64>) = tx.query_row(
+                    "SELECT i.launch_state,i.prior_incarnation_id,a.intent_revision,a.verdict,a.finished_at \
+                     FROM incarnations i JOIN recovery_attempts a ON a.attempt_id=i.recovery_attempt_id \
+                     WHERE i.soul_id=?1 AND i.incarnation_id=?2 AND i.recovery_attempt_id=?3 \
+                     AND a.soul_id=?1 AND a.prior_incarnation_id=?4",
+                    params![soul_id.as_str(),target_incarnation_id.as_str(),attempt_id.as_str(),
+                        prior_incarnation_id.as_str()],
+                    |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+                )?;
+                let finished_success = attempt.3 == "succeeded" && attempt.4.is_some();
+                let still_prepared = attempt.3 == "replacement_prepared" && attempt.4.is_none();
+                let attempt_state_matches =
+                    (finished_success && current.6.is_none() && recovery_state == "live")
+                        || (still_prepared
+                            && current.6.as_deref() == Some(attempt_id.as_str())
+                            && recovery_state == "recovering");
+                let persisted_target: FreshAgentLaunchSpec = current.12
+                    .as_deref()
+                    .ok_or(RegistryError::NativeIdentityConflict)
+                    .and_then(|raw| serde_json::from_str(raw).map_err(RegistryError::from))?;
+                let next_claim: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM writer_claims WHERE provider='codex' \
+                     AND provider_store_id=(SELECT provider_store_id FROM souls WHERE soul_id=?1) \
+                     AND native_session_id=?2 AND soul_id=?1 AND incarnation_id=?3 \
+                     AND intent_revision=?4)",
+                    params![soul_id.as_str(),receipt.identity.native_session_id,
+                        target_incarnation_id.as_str(),receipt.source_fence.intent_revision],
+                    |row| row.get(0),
+                )?;
+                let exact_replay = fence.active_incarnation_id == target_incarnation_id
+                    && fence.control_epoch >= receipt.source_fence.control_epoch
+                    && fence.intent_revision == receipt.source_fence.intent_revision
+                    && fence.identity_revision == expected_identity_revision
+                    && fence.evidence_revision == receipt.next_launch.evidence_revision
+                    && fence.native_import_revision == receipt.source_fence.native_import_revision
+                    && current.2 == receipt.source_fence.intent_revision
+                    && current.3 == expected_identity_revision
+                    && current.4 == receipt.next_launch.evidence_revision
+                    && current.5 == receipt.source_fence.native_import_revision
+                    && current.7.is_none()
+                    && current.0 == FreshProvider::Codex.as_str()
+                    && current.1.as_deref() == Some(receipt.identity.native_session_id.as_str())
+                    && persisted_target.provider == FreshProvider::Codex
+                    && persisted_target.provider_store_id
+                        == receipt.absence_evidence.as_ref().unwrap().provider_store_id
+                    && persisted_target.native_session_id.as_deref()
+                        == Some(receipt.identity.native_session_id.as_str())
+                    && matches!(attempt.0.as_str(), "starting" | "running")
+                    && attempt.1 == prior_incarnation_id.as_str()
+                    && attempt.2 == receipt.source_fence.intent_revision
+                    && attempt_state_matches
+                    && next_claim
+                    && current.11 == attempt.0;
+                if exact_replay {
+                    tx.commit()?;
+                    return Ok(fence);
+                }
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+
+            let authorization = authorization.ok_or(RegistryError::NativeIdentityConflict)?;
+            let resume_spec = resume_spec.ok_or(RegistryError::NativeIdentityConflict)?;
+            let recovery_state: String = tx.query_row(
+                "SELECT recovery_state FROM souls WHERE soul_id=?1",
+                params![soul_id.as_str()],
+                |row| row.get(0),
+            )?;
+            let target_spec: FreshAgentLaunchSpec = current.12
+                .as_deref()
+                .ok_or(RegistryError::NativeIdentityConflict)
+                .and_then(|raw| serde_json::from_str(raw).map_err(RegistryError::from))?;
+            if !authorization.is_valid_for(&target_spec, &resume_spec)
+                || receipt.resume_spec_sha256.as_deref()
+                    != Some(authorization.resume_spec_sha256.as_str())
+                || authorization.source_fence != receipt.source_fence
+                || authorization.source_launch != receipt.source_launch
+                || receipt.source_launch.incarnation_id != target_incarnation_id
+                || current.0 != FreshProvider::Codex.as_str()
+                || current.1.as_deref() != receipt.source_launch.requested_native_session_id.as_deref()
+                || current.2 != receipt.source_fence.intent_revision
+                || current.3 != receipt.source_fence.identity_revision
+                || current.4 != receipt.source_fence.evidence_revision
+                || current.5 != receipt.source_fence.native_import_revision
+                || current.6.as_deref() != receipt.source_fence.recovery_attempt_id.as_ref().map(RecoveryAttemptId::as_str)
+                || current.7.as_deref().is_none_or(|raw| serde_json::from_str::<ResumeSpec>(raw).ok().as_ref() != Some(&resume_spec))
+                || current.8.as_deref().and_then(|raw| serde_json::from_str::<NativeIdentityLaunch>(raw).ok()).as_ref()
+                    != Some(&receipt.source_launch)
+                || recovery_state != "recovering"
+                || current.11 != "starting"
+                || current.13.as_deref() != Some(authorization.prior_incarnation_id.as_str())
+                || !receipt.absence_evidence.as_ref().is_some_and(|absence| {
+                    absence.prior_incarnation_id == authorization.prior_incarnation_id
+                        && absence.provider == FreshProvider::Codex.as_str()
+                        && absence.provider_store_id == target_spec.provider_store_id
+                        && absence.native_session_id == resume_spec.provider_session.native_session_id
+                        && absence.evidence_revision == receipt.source_launch.evidence_revision
+                        && freshell_agent_runtime::native_absence_census_matches(
+                            &absence.provider,
+                            &absence.provider_store_id,
+                            &absence.native_session_id,
+                            absence.evidence_revision,
+                            absence.store_state,
+                            std::slice::from_ref(&absence.census_reference),
+                        )
+                        && freshell_agent_runtime::native_absence_census_environment_matches(
+                            &resume_spec,
+                            std::slice::from_ref(&absence.census_reference),
+                        )
+                })
+            {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+            let attempt_id = authorization.source_fence.recovery_attempt_id
+                .clone().ok_or(RegistryError::NativeIdentityConflict)?;
+            let mut fence = RecoveryWriteFence {
+                control_epoch: receipt.source_fence.control_epoch,
+                intent_revision: receipt.source_fence.intent_revision,
+                identity_revision: receipt.source_fence.identity_revision,
+                evidence_revision: receipt.source_fence.evidence_revision,
+                native_import_revision: receipt.source_fence.native_import_revision,
+                recovery_attempt_id: Some(attempt_id.clone()),
+                active_incarnation_id: target_incarnation_id.clone(),
+            };
+            validate_recovery_write_fence(&tx, &soul_id, &fence)?;
+            let attempt_ok: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM recovery_attempts a JOIN incarnations i \
+                 ON i.recovery_attempt_id=a.attempt_id WHERE a.attempt_id=?1 AND a.soul_id=?2 \
+                 AND a.prior_incarnation_id=?3 AND a.intent_revision=?4 \
+                 AND a.verdict='replacement_prepared' AND a.finished_at IS NULL \
+                 AND i.incarnation_id=?5 AND i.prior_incarnation_id=a.prior_incarnation_id \
+                 AND i.recovery_attempt_id=?1 AND i.launch_state='starting')",
+                params![attempt_id.as_str(),soul_id.as_str(),authorization.prior_incarnation_id.as_str(),
+                    receipt.source_fence.intent_revision,target_incarnation_id.as_str()],
+                |row| row.get(0),
+            )?;
+            if !attempt_ok {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+            let old_root = receipt.identity.previous_native_session_id.as_str();
+            let new_root = receipt.identity.native_session_id.as_str();
+            let old_claim: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM writer_claims WHERE provider='codex' \
+                 AND provider_store_id=?1 AND native_session_id=?2 AND soul_id=?3 \
+                 AND incarnation_id=?4 AND intent_revision=?5)",
+                params![target_spec.provider_store_id,old_root,soul_id.as_str(),
+                    target_incarnation_id.as_str(),receipt.source_fence.intent_revision],
+                |row| row.get(0),
+            )?;
+            let new_claim: Option<String> = tx.query_row(
+                "SELECT incarnation_id FROM writer_claims WHERE provider='codex' \
+                 AND provider_store_id=?1 AND native_session_id=?2",
+                params![target_spec.provider_store_id,new_root],
+                |row| row.get(0),
+            ).optional()?;
+            if !old_claim
+                || new_claim
+                    .as_ref()
+                    .is_some_and(|owner| owner != target_incarnation_id.as_str())
+            {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+
+            let mut updated_spec = target_spec;
+            updated_spec.native_session_id = Some(new_root.to_string());
+            if let Some(reference) = updated_spec.session_ref.as_mut() {
+                if reference.provider != FreshProvider::Codex.as_str()
+                    || reference.session_id != old_root
+                {
+                    return Err(RegistryError::NativeIdentityConflict);
+                }
+                reference.session_id = new_root.to_string();
+            }
+            tx.execute(
+                "DELETE FROM writer_claims WHERE provider='codex' AND provider_store_id=?1 \
+                 AND native_session_id=?2 AND soul_id=?3 AND incarnation_id=?4 AND intent_revision=?5",
+                params![updated_spec.provider_store_id,old_root,soul_id.as_str(),
+                    target_incarnation_id.as_str(),receipt.source_fence.intent_revision],
+            )?;
+            if new_claim.is_none() {
+                tx.execute(
+                    "INSERT INTO writer_claims(provider,provider_store_id,native_session_id,soul_id,incarnation_id,intent_revision) VALUES('codex',?1,?2,?3,?4,?5)",
+                    params![updated_spec.provider_store_id,new_root,soul_id.as_str(),
+                        target_incarnation_id.as_str(),receipt.source_fence.intent_revision],
+                )?;
+            }
+            let next_identity_revision = receipt.source_fence.identity_revision.checked_add(1)
+                .ok_or_else(|| RegistryError::Integrity("identity revision overflow".into()))?;
+            let changed = tx.execute(
+                "UPDATE souls SET native_session_id=?1,identity_revision=?2,evidence_revision=?3,\
+                 resume_spec=NULL,allocation_state=CASE WHEN allocation_state='verified_durable' \
+                 THEN allocation_state ELSE 'materializing' END,updated_at=?4 WHERE soul_id=?5 \
+                 AND desired_state='running' AND recovery_state='recovering' \
+                 AND intent_revision=?6 AND identity_revision=?7 AND evidence_revision=?8 \
+                 AND native_import_revision=?9 AND recovery_attempt_id=?10",
+                params![new_root,next_identity_revision,receipt.next_launch.evidence_revision,now_millis(),
+                    soul_id.as_str(),receipt.source_fence.intent_revision,receipt.source_fence.identity_revision,
+                    receipt.source_fence.evidence_revision,receipt.source_fence.native_import_revision,
+                    attempt_id.as_str()],
+            )?;
+            if changed != 1 {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+            let changed = tx.execute(
+                "UPDATE incarnations SET native_identity_launch=?1,native_identity_observation=?2,\
+                 native_readiness_receipt=?3,fresh_agent_spec=?4,updated_at=?5 \
+                 WHERE incarnation_id=?6 AND native_identity_launch=?7 AND launch_state='starting'",
+                params![serde_json::to_string(&receipt.next_launch)?,serde_json::to_string(&observation)?,
+                    receipt_raw,serde_json::to_string(&updated_spec)?,now_millis(),
+                    target_incarnation_id.as_str(),serde_json::to_string(&receipt.source_launch)?],
+            )?;
+            if changed != 1 {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+            fence.identity_revision = next_identity_revision;
+            fence.evidence_revision = receipt.next_launch.evidence_revision;
+            let successor = load_recovery_write_fence(&tx, &soul_id)?;
+            tx.commit()?;
+            Ok(successor)
+        }).await
+    }
+
     pub async fn record_native_identity_observation(
         &self,
         soul_id: SoulId,
@@ -3932,7 +5236,8 @@ impl Registry {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             validate_recovery_write_fence(&tx, &soul_id, &fence)?;
             let context = load_recovery_context(&tx, installation, &soul_id)?;
-            if context.desired_state != DesiredState::Running
+            let reopen_prepared = reopen_incarnation_is_current(&tx, &fence.active_incarnation_id)?;
+            if (context.desired_state != DesiredState::Running && !reopen_prepared)
                 || observation.incarnation_id != fence.active_incarnation_id
                 || context.native_session_id.as_deref()
                     != Some(observation.native_session_id.as_str())
@@ -4376,7 +5681,86 @@ fn update_fresh_agent_settings_in_tx(
     if changed != 1 {
         return Err(RegistryError::UnknownIncarnation(incarnation_id.clone()));
     }
+    update_fresh_agent_resume_settings_in_tx(conn, soul_id, &spec)?;
     Ok(())
+}
+
+/// Keep the exact stored recovery launch profile aligned with settings accepted
+/// by the live host. These fields do not select or prove a native store; cwd
+/// does, so it deliberately stays bound to the captured resume evidence.
+fn update_fresh_agent_resume_settings_in_tx(
+    conn: &Connection,
+    soul_id: &SoulId,
+    launch: &FreshAgentLaunchSpec,
+) -> Result<(), RegistryError> {
+    let persisted: Option<(String, String, Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT provider,provider_store_id,native_session_id,resume_spec FROM souls WHERE soul_id=?1",
+            params![soul_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((provider, store, Some(native_session_id), Some(encoded_resume))) = persisted else {
+        return Ok(());
+    };
+    if provider != launch.provider.as_str()
+        || store != launch.provider_store_id
+        || launch.native_session_id.as_deref() != Some(native_session_id.as_str())
+    {
+        return Ok(());
+    }
+
+    let mut resume: ResumeSpec = serde_json::from_str(&encoded_resume)
+        .map_err(|_| RegistryError::Integrity("invalid fresh-agent resume spec".into()))?;
+    if resume.provider_session.provider != provider
+        || resume.provider_session.provider_store_id != store
+        || resume.provider_session.native_session_id != native_session_id
+    {
+        return Ok(());
+    }
+
+    let profile_changed = resume.model != launch.model
+        || resume.reasoning_effort != launch.effort
+        || resume.permission_mode != launch.permission_mode;
+    if !profile_changed {
+        return Ok(());
+    }
+    resume.model = launch.model.clone();
+    resume.reasoning_effort = launch.effort.clone();
+    resume.permission_mode = launch.permission_mode.clone();
+    let encoded_resume_updated = serde_json::to_string(&resume)
+        .map_err(|_| RegistryError::Integrity("encode fresh-agent resume spec".into()))?;
+    let changed = conn.execute(
+        "UPDATE souls SET resume_spec=?1,updated_at=?2 WHERE soul_id=?3 AND provider=?4 AND provider_store_id=?5 AND native_session_id=?6 AND resume_spec=?7",
+        params![
+            encoded_resume_updated,
+            now_millis(),
+            soul_id.as_str(),
+            provider,
+            store,
+            native_session_id,
+            encoded_resume,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(RegistryError::NativeIdentityConflict);
+    }
+    Ok(())
+}
+
+fn parse_fresh_input_refusal(
+    encoded: Option<String>,
+) -> Result<freshell_runtime_protocol::FreshAgentSendDiagnostic, RegistryError> {
+    let encoded = encoded
+        .ok_or_else(|| RegistryError::Integrity("refused input is missing its outcome".into()))?;
+    let diagnostic: freshell_runtime_protocol::FreshAgentSendDiagnostic =
+        serde_json::from_str(&encoded)?;
+    if diagnostic.outcome != freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused {
+        return Err(RegistryError::Integrity(
+            "refused input has a non-refusal outcome".into(),
+        ));
+    }
+    Ok(diagnostic)
 }
 
 fn input_payload_digest(data: &[u8], correlation: Option<&[u8]>) -> String {
@@ -4708,6 +6092,13 @@ fn mark_stop_outcome_in_tx(
     let now = now_millis();
     conn.execute("UPDATE incarnations SET launch_state=?1,cleanup_state=?2,updated_at=?3 WHERE incarnation_id=?4", params![launch_state,cleanup_state,now,incarnation.as_str()])?;
     if outcome == StopOutcome::VerifiedEmpty {
+        // A failed Reopen can leave this exact Stop for startup or a later
+        // request to finish. Its journal must settle with the verified-empty
+        // authority, before the pending command state is retired below.
+        conn.execute(
+            "UPDATE recovery_attempts SET verdict='reopen_failed',finished_at=?1 WHERE attempt_id=(SELECT recovery_attempt_id FROM incarnations WHERE incarnation_id=?2) AND verdict='replacement_prepared' AND finished_at IS NULL AND EXISTS(SELECT 1 FROM commands WHERE incarnation_id=?2 AND state='reopen_cleanup_pending')",
+            params![now, incarnation.as_str()],
+        )?;
         conn.execute(
             "DELETE FROM writer_claims WHERE incarnation_id=?1",
             [incarnation.as_str()],
@@ -4902,6 +6293,7 @@ fn create_schema(
             launch_policy TEXT,
             native_identity_launch TEXT,
             native_identity_observation TEXT,
+            native_readiness_receipt TEXT,
             launch_state TEXT NOT NULL,
             host_boot_id TEXT,
             execution_generation INTEGER NOT NULL,
@@ -4963,6 +6355,7 @@ fn create_schema(
             protected_payload BLOB NOT NULL,
             incarnation_id TEXT NOT NULL REFERENCES incarnations(incarnation_id),
             state TEXT NOT NULL,
+            fresh_agent_send_refusal TEXT,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
             PRIMARY KEY(soul_id, request_id)
@@ -5657,6 +7050,34 @@ fn migrate_schema(conn: &mut Connection) -> Result<(), RegistryError> {
         tx.commit()?;
         schema = 19;
     }
+    if schema == 19 {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !column_exists(&tx, "incarnations", "native_readiness_receipt")? {
+            tx.execute_batch("ALTER TABLE incarnations ADD COLUMN native_readiness_receipt TEXT;")?;
+        }
+        if !column_exists(&tx, "input_commands", "fresh_agent_send_refusal")? {
+            tx.execute_batch(
+                "ALTER TABLE input_commands ADD COLUMN fresh_agent_send_refusal TEXT;",
+            )?;
+        }
+        tx.execute_batch("UPDATE installation SET schema_version=20,inventory_revision=inventory_revision+1 WHERE singleton=1;")?;
+        tx.commit()?;
+        schema = 20;
+    }
+    if schema == 20 {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !column_exists(&tx, "incarnations", "native_readiness_receipt")? {
+            tx.execute_batch("ALTER TABLE incarnations ADD COLUMN native_readiness_receipt TEXT;")?;
+        }
+        if !column_exists(&tx, "input_commands", "fresh_agent_send_refusal")? {
+            tx.execute_batch(
+                "ALTER TABLE input_commands ADD COLUMN fresh_agent_send_refusal TEXT;",
+            )?;
+        }
+        tx.execute_batch("UPDATE installation SET schema_version=21,inventory_revision=inventory_revision+1 WHERE singleton=1;")?;
+        tx.commit()?;
+        schema = 21;
+    }
     if schema != SCHEMA_VERSION {
         return Err(RegistryError::Integrity(format!(
             "unsupported older schema {schema}"
@@ -6081,6 +7502,109 @@ fn validate_live_native_observation(
     Ok(())
 }
 
+fn validate_initial_live_native_observation(
+    conn: &Connection,
+    soul: &SoulId,
+    incarnation: &IncarnationId,
+) -> Result<(), RegistryError> {
+    if fresh_opencode_terminal_can_start_without_native_identity(conn, soul, incarnation)? {
+        return Ok(());
+    }
+    validate_live_native_observation(conn, soul, incarnation)
+}
+
+fn fresh_opencode_terminal_can_start_without_native_identity(
+    conn: &Connection,
+    soul: &SoulId,
+    incarnation: &IncarnationId,
+) -> Result<bool, RegistryError> {
+    let candidate: Option<(String, String, String, u64, u64)> = conn
+        .query_row(
+            "SELECT i.terminal_spec,i.native_identity_launch,i.launch_nonce,i.execution_generation,s.evidence_revision
+             FROM souls s JOIN incarnations i ON i.soul_id=s.soul_id
+             WHERE s.soul_id=?1 AND i.incarnation_id=?2
+               AND s.provider='opencode' AND s.native_session_id IS NULL AND s.resume_spec IS NULL
+               AND s.recovery_attempt_id IS NULL AND s.desired_state='running'
+               AND i.fresh_agent_spec IS NULL AND i.fixture_kind IS NULL
+               AND i.launch_state='starting' AND i.grant_id IS NOT NULL AND i.host_boot_id IS NOT NULL
+               AND i.prior_incarnation_id IS NULL AND i.native_identity_observation IS NULL
+               AND i.native_identity_launch IS NOT NULL AND i.execution_generation>0",
+            params![soul.as_str(), incarnation.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .optional()?;
+    let Some((terminal_spec, launch, nonce, generation, evidence_revision)) = candidate else {
+        return Ok(false);
+    };
+
+    let terminal: TerminalLaunchSpec = serde_json::from_str(&terminal_spec)?;
+    if terminal.validate().is_err()
+        || terminal.mode != "opencode"
+        || terminal.resume_session_id.is_some()
+        || terminal.opencode_transfer.is_some()
+        || terminal.opencode_transfer_attempt_id.is_some()
+        || terminal.opencode_adoption.is_some()
+    {
+        return Ok(false);
+    }
+    let launch: freshell_runtime_protocol::NativeIdentityLaunch = serde_json::from_str(&launch)?;
+    Ok(launch.incarnation_id == *incarnation
+        && launch.launch_nonce == nonce
+        && launch.execution_generation == generation
+        && launch.evidence_revision == evidence_revision
+        && launch.requested_native_session_id.is_none())
+}
+
+/// A fresh OpenCode process may need a prompt before it creates the native
+/// session row used by recovery. Admit input chunks while capability
+/// qualification is pending, but only for the exact current fresh terminal
+/// with no native identity; resume, transfer, adoption, fixture, and
+/// replacement paths stay closed.
+fn fresh_opencode_terminal_can_accept_input_before_native_identity(
+    conn: &Connection,
+    soul: &SoulId,
+    incarnation: &IncarnationId,
+) -> Result<bool, RegistryError> {
+    let candidate: Option<(String, String, String, u64, u64)> = conn
+        .query_row(
+            "SELECT i.terminal_spec,i.native_identity_launch,i.launch_nonce,i.execution_generation,s.evidence_revision
+             FROM souls s JOIN incarnations i ON i.soul_id=s.soul_id
+             WHERE s.soul_id=?1 AND i.incarnation_id=?2
+               AND s.provider='opencode' AND s.native_session_id IS NULL AND s.resume_spec IS NULL
+               AND s.recovery_attempt_id IS NULL AND s.desired_state='running'
+               AND s.recovery_state='blocked' AND s.recovery_reason='CAPABILITY_PENDING'
+               AND i.fresh_agent_spec IS NULL AND i.fixture_kind IS NULL
+               AND i.launch_state='running' AND i.grant_id IS NOT NULL AND i.host_boot_id IS NOT NULL
+               AND i.prior_incarnation_id IS NULL AND i.recovery_attempt_id IS NULL
+               AND i.native_identity_observation IS NULL
+               AND i.native_identity_launch IS NOT NULL AND i.execution_generation>0",
+            params![soul.as_str(), incarnation.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .optional()?;
+    let Some((terminal_spec, launch, nonce, generation, evidence_revision)) = candidate else {
+        return Ok(false);
+    };
+
+    let terminal: TerminalLaunchSpec = serde_json::from_str(&terminal_spec)?;
+    if terminal.validate().is_err()
+        || terminal.mode != "opencode"
+        || terminal.create_request_id.is_none()
+        || terminal.resume_session_id.is_some()
+        || terminal.opencode_transfer.is_some()
+        || terminal.opencode_transfer_attempt_id.is_some()
+        || terminal.opencode_adoption.is_some()
+    {
+        return Ok(false);
+    }
+    let launch: freshell_runtime_protocol::NativeIdentityLaunch = serde_json::from_str(&launch)?;
+    Ok(launch.incarnation_id == *incarnation
+        && launch.launch_nonce == nonce
+        && launch.execution_generation == generation
+        && launch.evidence_revision == evidence_revision
+        && launch.requested_native_session_id.is_none())
+}
+
 fn invalidate_claude_fork_recovery(
     tx: &rusqlite::Transaction<'_>,
     soul_id: &SoulId,
@@ -6179,11 +7703,19 @@ fn validate_recovery_revision_fence(
         (Some(expected), Some(current)) => expected.as_str() == current,
         _ => false,
     };
+    let reopen_prepared = desired == "stopped"
+        && reopen_preparation_is_current(
+            tx,
+            soul_id,
+            Some(&fence.active_incarnation_id),
+            intent,
+            fence.recovery_attempt_id.as_ref(),
+        )?;
     if identity != fence.identity_revision
         || evidence != fence.evidence_revision
         || import != fence.native_import_revision
         || !attempt_matches
-        || desired != "running"
+        || (desired != "running" && !reopen_prepared)
     {
         return Err(RegistryError::InvalidState(
             "stale recovery write fence; identity, evidence, import, attempt, or intent changed"
@@ -6191,6 +7723,34 @@ fn validate_recovery_revision_fence(
         ));
     }
     Ok(())
+}
+
+fn reopen_preparation_is_current(
+    conn: &Connection,
+    soul_id: &SoulId,
+    incarnation_id: Option<&IncarnationId>,
+    intent_revision: u64,
+    attempt_id: Option<&RecoveryAttemptId>,
+) -> Result<bool, RegistryError> {
+    let Some(attempt_id) = attempt_id else {
+        return Ok(false);
+    };
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM souls s JOIN recovery_attempts a ON a.attempt_id=s.recovery_attempt_id JOIN incarnations i ON i.soul_id=s.soul_id AND i.recovery_attempt_id=a.attempt_id AND i.prior_incarnation_id=a.prior_incarnation_id JOIN commands c ON c.soul_id=s.soul_id AND c.incarnation_id=i.incarnation_id WHERE s.soul_id=?1 AND (?2 IS NULL OR i.incarnation_id=?2) AND s.desired_state='stopped' AND s.intent_revision=?3 AND s.recovery_attempt_id=?4 AND a.intent_revision=s.intent_revision AND a.verdict='replacement_prepared' AND a.finished_at IS NULL AND c.state='reopen_prepared')",
+        params![soul_id.as_str(), incarnation_id.map(IncarnationId::as_str), intent_revision, attempt_id.as_str()],
+        |row| row.get(0),
+    )?)
+}
+
+fn reopen_incarnation_is_current(
+    conn: &Connection,
+    incarnation_id: &IncarnationId,
+) -> Result<bool, RegistryError> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id JOIN recovery_attempts a ON a.attempt_id=s.recovery_attempt_id AND a.attempt_id=i.recovery_attempt_id AND a.prior_incarnation_id=i.prior_incarnation_id JOIN commands c ON c.soul_id=s.soul_id AND c.incarnation_id=i.incarnation_id WHERE i.incarnation_id=?1 AND s.desired_state='stopped' AND s.intent_revision=a.intent_revision AND a.verdict='replacement_prepared' AND a.finished_at IS NULL AND c.state='reopen_prepared')",
+        params![incarnation_id.as_str()],
+        |row| row.get(0),
+    )?)
 }
 
 fn verify_schema_and_integrity(conn: &Connection) -> Result<(), RegistryError> {
@@ -6542,7 +8102,7 @@ fn load_recovery_context(
     let prior_handle = load_owned_handle(conn, installation, &incarnation_id)?;
     let (accepted_command_count, completed_command_count, dispatched_count): (u64, u64, u64) =
         conn.query_row(
-            "SELECT COUNT(*),COALESCE(SUM(CASE WHEN state='completed' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN state IN ('dispatching','completed','ambiguous') THEN 1 ELSE 0 END),0) FROM input_commands WHERE soul_id=?1",
+            "SELECT COALESCE(SUM(CASE WHEN state!='refused_before_admission' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN state='completed' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN state IN ('dispatching','completed','ambiguous') THEN 1 ELSE 0 END),0) FROM input_commands WHERE soul_id=?1",
             params![soul_id.as_str()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
@@ -7086,6 +8646,154 @@ pub(crate) fn stopped_repair_owner_candidates_in_connection(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    include!("fresh_agent_send_migration_tests.rs");
+
+    #[test]
+    fn maintenance_inventory_proves_only_safe_no_runtime_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let database_path = dir.path().join("runtime.sqlite3");
+        let safe_stopped = SoulId::new().to_string();
+        let desired_running = SoulId::new().to_string();
+        let blocked = SoulId::new().to_string();
+        let claimed = SoulId::new().to_string();
+        let reserved = SoulId::new().to_string();
+        let ambiguous_owner = SoulId::new().to_string();
+        let addressable = SoulId::new().to_string();
+        drop(registry);
+
+        let conn = Connection::open(&database_path).unwrap();
+        let insert_soul = |conn: &Connection, soul: &str, desired: &str, recovery: &str| {
+            conn.execute(
+                "INSERT INTO souls (soul_id,provider,provider_store_id,creation_seed_ref,desired_state,intent_revision,recovery_state,durability_state,allocation_state,checkpoint_revision,evidence_revision,successful_recoveries_in_window,project_key,resource_profile,provider_volume_name,created_at,updated_at) VALUES (?1,'codex','store','seed',?2,1,?3,'durable','allocated',0,0,0,'default','custom','volume',0,0)",
+                params![soul, desired, recovery],
+            )
+            .unwrap();
+        };
+        insert_soul(&conn, &safe_stopped, "stopped", "stopped");
+        insert_soul(&conn, &desired_running, "running", "live");
+        insert_soul(&conn, &blocked, "stopped", "blocked");
+        insert_soul(&conn, &claimed, "stopped", "stopped");
+        insert_soul(&conn, &reserved, "stopped", "stopped");
+        insert_soul(&conn, &ambiguous_owner, "stopped", "stopped");
+        insert_soul(&conn, &addressable, "stopped", "stopped");
+
+        // A dangling claim is inconsistent registry evidence and must not be
+        // mistaken for a safe no-runtime result.
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute(
+            "INSERT INTO writer_claims (provider,provider_store_id,native_session_id,soul_id,incarnation_id,intent_revision) VALUES ('codex','store','native',?1,'missing-incarnation',1)",
+            [&claimed],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO provider_input_preparations (soul_id,reservation_id,creation_seed_ref,image_ref,host_binary_path,host_binary_sha256,intent_revision,provider,consumed) VALUES (?1,'pending-reservation','seed','image','/host','digest',1,'opencode',0)",
+            [&reserved],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO native_origin_owners (provider,source_store_id,native_root_session_id,owner_soul_id,source_generation,ownership_state,updated_at) VALUES ('codex','store','root',?1,NULL,'ambiguous',0)",
+            [&ambiguous_owner],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO incarnations (incarnation_id,soul_id,launch_nonce,launch_state,execution_generation,requested_limits,cleanup_state,created_at,updated_at) VALUES ('addressable-incarnation',?1,'addressable-nonce','stopped',0,'{}','verified_empty',0,0)",
+            [&addressable],
+        )
+        .unwrap();
+        drop(conn);
+
+        let snapshot = read_maintenance_inventory(&database_path).unwrap();
+        let outcomes = snapshot
+            .no_runtime
+            .into_iter()
+            .map(|record| {
+                (
+                    record.soul_id,
+                    (record.desired_state, record.intent_revision, record.status),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(outcomes.len(), 6, "every no-incarnation soul is reported");
+        assert_eq!(
+            outcomes.get(&safe_stopped),
+            Some(&(
+                "stopped".to_string(),
+                1,
+                MaintenanceInventoryStatus::VerifiedEmpty
+            ))
+        );
+        for soul in [
+            &desired_running,
+            &blocked,
+            &claimed,
+            &reserved,
+            &ambiguous_owner,
+        ] {
+            let (_, revision, status) = outcomes.get(soul).expect("no-runtime soul is reported");
+            assert_eq!(*revision, 1);
+            assert_eq!(*status, MaintenanceInventoryStatus::Unresolved);
+        }
+        assert!(!outcomes.contains_key(&addressable));
+
+        // A dangling admission reservation cannot be tied to one soul, so it
+        // prevents all no-runtime rows from claiming the registry is empty.
+        let conn = Connection::open(&database_path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        conn.execute(
+            "INSERT INTO admission_reservations (incarnation_id,project_key,cpu_milli,memory_bytes,pids_max,created_at) VALUES ('missing-incarnation','default',1,1,1,0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let snapshot = read_maintenance_inventory(&database_path).unwrap();
+        let safe_record = snapshot
+            .no_runtime
+            .iter()
+            .find(|record| record.soul_id == safe_stopped)
+            .expect("safe soul remains represented");
+        assert_eq!(safe_record.status, MaintenanceInventoryStatus::Unresolved);
+
+        let conn = Connection::open(&database_path).unwrap();
+        assert_eq!(
+            conn.execute(
+                "DELETE FROM admission_reservations WHERE incarnation_id='missing-incarnation'",
+                [],
+            )
+            .unwrap(),
+            1,
+            "the dangling reservation is removed before testing other registry-wide evidence"
+        );
+        drop(conn);
+        let snapshot = read_maintenance_inventory(&database_path).unwrap();
+        let safe_record = snapshot
+            .no_runtime
+            .iter()
+            .find(|record| record.soul_id == safe_stopped)
+            .expect("safe soul remains represented");
+        assert_eq!(
+            safe_record.status,
+            MaintenanceInventoryStatus::VerifiedEmpty
+        );
+
+        // An ownerless row is registry-level unexplained authority. It must
+        // independently prevent a safe stopped soul from being called empty.
+        let conn = Connection::open(&database_path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        conn.execute(
+            "INSERT INTO native_origin_owners (provider,source_store_id,native_root_session_id,owner_soul_id,source_generation,ownership_state,updated_at) VALUES ('codex','store','root-without-owner',NULL,NULL,'owned',0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let snapshot = read_maintenance_inventory(&database_path).unwrap();
+        let safe_record = snapshot
+            .no_runtime
+            .iter()
+            .find(|record| record.soul_id == safe_stopped)
+            .expect("safe soul remains represented");
+        assert_eq!(safe_record.status, MaintenanceInventoryStatus::Unresolved);
+    }
     #[tokio::test]
     async fn recovery_initialization_grant_before_identity_is_not_pristine() {
         let dir = tempfile::tempdir().unwrap();
@@ -8474,6 +10182,107 @@ pub(crate) mod tests {
         prepared
     }
 
+    async fn materialize_codex_recovery_runtime(
+        registry: &Registry,
+        soul_id: SoulId,
+        workspace: &Path,
+    ) -> PreparedLaunch {
+        let workspace = std::fs::canonicalize(workspace).unwrap();
+        let workspace = workspace.to_string_lossy().into_owned();
+        let root = "codex-native-old";
+        let store = "codex-recovery-store";
+        let mut launch = prep(soul_id, RequestId::new(), "codex-recovery-fence");
+        launch.provider = "codex".into();
+        launch.provider_store_id = store.into();
+        launch.native_session_id = Some(root.into());
+        launch.fresh_agent = Some(FreshAgentLaunchSpec {
+            naming_handle: Some("pending-codex-name".into()),
+            collaboration_mode: None,
+            session_id: "codex-presentation".into(),
+            provider: freshell_runtime_protocol::FreshProvider::Codex,
+            session_type: "freshcodex".into(),
+            runtime_variant: "codex-cli".into(),
+            provider_store_id: store.into(),
+            cwd: workspace.clone(),
+            workspace_path: workspace,
+            git_common_dir: None,
+            run_as_uid: 65_534,
+            run_as_gid: 0,
+            model: Some("test-model".into()),
+            effort: None,
+            permission_mode: None,
+            sandbox: None,
+            native_session_id: Some(root.into()),
+            plugins: None,
+            model_selection: None,
+            session_ref: None,
+            fixture_transport: None,
+            provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
+            provider_launch_context: None,
+        });
+        let prepared = registry.prepare_launch(launch).await.unwrap();
+        let runtime_dir = format!("/tmp/freshell-runtime-test/{}", prepared.incarnation_id);
+        registry
+            .commit_created(
+                prepared.incarnation_id.clone(),
+                BackendCreatedRecord {
+                    launch_policy: None,
+                    daemon_id: DockerDaemonId::new(),
+                    container_id: format!("container-{}", prepared.incarnation_id),
+                    image_ref: format!("sha256:{}", "b".repeat(64)),
+                    runtime_dir: PathBuf::from(&runtime_dir),
+                    host_binary_path: PathBuf::from(format!("{runtime_dir}/host")),
+                    immutable_config_digest: format!("sha256:{}", "c".repeat(64)),
+                },
+            )
+            .await
+            .unwrap();
+        let grant = registry
+            .commit_execution_grant(prepared.incarnation_id.clone(), HostBootId::new(), limits())
+            .await
+            .unwrap();
+        let launch = freshell_runtime_protocol::NativeIdentityLaunch {
+            incarnation_id: prepared.incarnation_id.clone(),
+            launch_nonce: prepared.launch_nonce.as_str().into(),
+            evidence_revision: registry
+                .recovery_context(prepared.soul_id.clone())
+                .await
+                .unwrap()
+                .evidence_revision,
+            execution_generation: grant.execution_generation,
+            requested_native_session_id: Some(root.into()),
+        };
+        registry
+            .bind_native_identity_launch(launch.clone())
+            .await
+            .unwrap();
+        let context = registry
+            .recovery_context(prepared.soul_id.clone())
+            .await
+            .unwrap();
+        registry
+            .record_native_identity_observation(
+                prepared.soul_id.clone(),
+                freshell_runtime_protocol::NativeIdentityObservation {
+                    native_session_id: root.into(),
+                    incarnation_id: prepared.incarnation_id.clone(),
+                    launch_nonce: launch.launch_nonce,
+                    evidence_revision: launch.evidence_revision,
+                    source: freshell_runtime_protocol::NativeIdentitySource::FreshProviderHandshake,
+                    evidence_digest: "a".repeat(64),
+                },
+                context.write_fence(),
+            )
+            .await
+            .unwrap();
+        registry
+            .mark_running(prepared.incarnation_id.clone())
+            .await
+            .unwrap();
+        prepared
+    }
+
     #[tokio::test]
     async fn request_dedupe_returns_same_incarnation_and_conflict_rejects_changed_payload() {
         let dir = tempfile::tempdir().unwrap();
@@ -9703,6 +11512,183 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn codex_settings_changes_update_stored_resume_profile_without_changing_evidence() {
+        struct SettingsChangeCase {
+            configure: bool,
+            model: &'static str,
+            effort: Option<Option<String>>,
+            expected_effort: Option<&'static str>,
+        }
+        let cases = [
+            SettingsChangeCase {
+                configure: false,
+                model: "turn-model",
+                effort: Some(None),
+                expected_effort: None,
+            },
+            SettingsChangeCase {
+                configure: true,
+                model: "configured-model",
+                effort: None,
+                expected_effort: Some("low"),
+            },
+        ];
+        for SettingsChangeCase {
+            configure,
+            model,
+            effort,
+            expected_effort,
+        } in cases
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = Registry::open(dir.path(), None).unwrap();
+            let soul = SoulId::new();
+            let prepared =
+                materialize_codex_recovery_runtime(&registry, soul.clone(), dir.path()).await;
+            let recovery_cwd = dir.path().join("recovery-cwd");
+            std::fs::create_dir(&recovery_cwd).unwrap();
+            let recovery_cwd = std::fs::canonicalize(recovery_cwd).unwrap();
+
+            registry
+                .update_fresh_agent_settings(
+                    soul.clone(),
+                    prepared.incarnation_id.clone(),
+                    FreshAgentTurnSettings {
+                        effort: Some(Some("low".into())),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+
+            open_connection(&registry.inner.db_path)
+                .unwrap()
+                .execute(
+                    "UPDATE souls SET durability_state='checkpoint_captured',allocation_state='verified_durable',checkpoint_revision=1 WHERE soul_id=?1",
+                    params![soul.as_str()],
+                )
+                .unwrap();
+
+            let context = registry.recovery_context(soul.clone()).await.unwrap();
+            let candidate = crate::resume_catalog::exact_resume_candidate(&context, None)
+                .unwrap()
+                .expect("observed Codex identity has an exact resume profile");
+            assert_eq!(candidate.checkpoint_revision, 1);
+            assert_eq!(candidate.checkpoint_references.len(), 1);
+            let stored = registry
+                .store_verified_resume_spec_fenced(soul.clone(), candidate, context.write_fence())
+                .await
+                .unwrap();
+
+            let settings = FreshAgentTurnSettings {
+                collaboration_mode: None,
+                cwd: Some(recovery_cwd.to_string_lossy().into_owned()),
+                model: Some(model.into()),
+                effort,
+                permission_mode: Some("on-request".into()),
+                sandbox: None,
+            };
+            if configure {
+                registry
+                    .configure_fresh_agent_settings(
+                        soul.clone(),
+                        prepared.incarnation_id.clone(),
+                        settings,
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                registry
+                    .update_fresh_agent_settings(
+                        soul.clone(),
+                        prepared.incarnation_id.clone(),
+                        settings,
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let recovered = registry.recovery_context(soul).await.unwrap();
+            let recovered_launch = recovered
+                .fresh_agent
+                .as_ref()
+                .expect("fresh-agent launch profile remains persisted");
+            assert_eq!(recovered_launch.cwd, recovery_cwd.to_string_lossy());
+            assert_eq!(recovered_launch.model.as_deref(), Some(model));
+            assert_eq!(recovered_launch.effort.as_deref(), expected_effort);
+            assert_eq!(
+                recovered_launch.permission_mode.as_deref(),
+                Some("on-request"),
+            );
+            let original_store_cwd = stored.cwd.clone();
+            let mut expected_resume = stored;
+            expected_resume.model = Some(model.into());
+            expected_resume.reasoning_effort = expected_effort.map(str::to_owned);
+            expected_resume.permission_mode = Some("on-request".into());
+            assert_eq!(
+                recovered.resume_spec,
+                Some(expected_resume),
+                "accepted turn/config settings must mirror into the exact stored resume profile without changing its identity or evidence"
+            );
+            assert_eq!(
+                recovered.resume_spec.as_ref().map(|spec| spec.cwd.as_str()),
+                Some(original_store_cwd.as_str()),
+                "the proved native-store selection cwd must remain unchanged while the current launch setting advances"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_settings_do_not_rebind_a_resume_profile_to_a_different_native_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let soul = SoulId::new();
+        let prepared =
+            materialize_codex_recovery_runtime(&registry, soul.clone(), dir.path()).await;
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        let candidate = crate::resume_catalog::exact_resume_candidate(&context, None)
+            .unwrap()
+            .expect("observed Codex identity has an exact resume profile");
+        let stored = registry
+            .store_verified_resume_spec_fenced(soul.clone(), candidate, context.write_fence())
+            .await
+            .unwrap();
+
+        let mut mismatched = stored;
+        mismatched.provider_session.native_session_id = "different-native-session".into();
+        open_connection(&registry.inner.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE souls SET resume_spec=?1 WHERE soul_id=?2",
+                params![serde_json::to_string(&mismatched).unwrap(), soul.as_str()],
+            )
+            .unwrap();
+
+        registry
+            .update_fresh_agent_settings(
+                soul.clone(),
+                prepared.incarnation_id,
+                FreshAgentTurnSettings {
+                    collaboration_mode: None,
+                    cwd: None,
+                    model: Some("updated-model".into()),
+                    effort: Some(Some("high".into())),
+                    permission_mode: Some("on-request".into()),
+                    sandbox: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let recovered = registry.recovery_context(soul).await.unwrap();
+        assert_eq!(recovered.resume_spec, Some(mismatched));
+        assert_eq!(
+            recovered.fresh_agent.unwrap().model.as_deref(),
+            Some("updated-model")
+        );
+    }
+
+    #[tokio::test]
     async fn retry_budget_is_persisted_and_manual_retry_rearms_without_identity_change() {
         let dir = tempfile::tempdir().unwrap();
         let registry = Registry::open(dir.path(), None).unwrap();
@@ -10189,6 +12175,239 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn initial_fresh_opencode_terminal_can_publish_before_native_session_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let soul = SoulId::new();
+        let prepared = materialize_test_runtime(&registry, soul.clone()).await;
+        let terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+            "terminalId": "terminal-fresh-opencode",
+            "streamId": "stream-fresh-opencode",
+            "mode": "opencode",
+            "createRequestId": "create-fresh-opencode",
+            "program": "opencode",
+            "cwd": "/workspace",
+            "workspacePath": "/workspace",
+            "projectKey": "fresh-opencode-project",
+            "runAsUid": 65534,
+            "runAsGid": 0,
+            "cols": 80,
+            "rows": 24
+        }))
+        .unwrap();
+        terminal.validate().unwrap();
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        conn.execute(
+            "UPDATE souls SET provider='opencode',native_session_id=NULL,recovery_state='live' WHERE soul_id=?1",
+            [soul.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE incarnations SET fixture_kind=NULL,launch_state='created',terminal_spec=?1 WHERE incarnation_id=?2",
+            params![serde_json::to_string(&terminal).unwrap(), prepared.incarnation_id.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let grant = registry
+            .commit_execution_grant(prepared.incarnation_id.clone(), HostBootId::new(), limits())
+            .await
+            .unwrap();
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        registry
+            .bind_native_identity_launch(freshell_runtime_protocol::NativeIdentityLaunch {
+                incarnation_id: prepared.incarnation_id.clone(),
+                launch_nonce: context.prior_handle.launch_nonce().as_str().into(),
+                evidence_revision: context.evidence_revision,
+                execution_generation: grant.execution_generation,
+                requested_native_session_id: None,
+            })
+            .await
+            .unwrap();
+
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        let assert_not_exempt = |conn: &Connection, case: &str| {
+            assert!(
+                !fresh_opencode_terminal_can_start_without_native_identity(
+                    conn,
+                    &soul,
+                    &prepared.incarnation_id,
+                )
+                .unwrap(),
+                "initial-publication exemption must reject {case}"
+            );
+        };
+        let write_terminal = |conn: &Connection, spec: &TerminalLaunchSpec| {
+            conn.execute(
+                "UPDATE incarnations SET terminal_spec=?1 WHERE incarnation_id=?2",
+                params![
+                    serde_json::to_string(spec).unwrap(),
+                    prepared.incarnation_id.as_str()
+                ],
+            )
+            .unwrap();
+        };
+        assert!(fresh_opencode_terminal_can_start_without_native_identity(
+            &conn,
+            &soul,
+            &prepared.incarnation_id
+        )
+        .unwrap());
+
+        let mut resumed = terminal.clone();
+        resumed.resume_session_id = Some("ses_existing".into());
+        resumed.validate().unwrap();
+        write_terminal(&conn, &resumed);
+        assert_not_exempt(&conn, "a resumed terminal");
+        write_terminal(&conn, &terminal);
+
+        conn.execute(
+            "UPDATE souls SET resume_spec='{}' WHERE soul_id=?1",
+            [soul.as_str()],
+        )
+        .unwrap();
+        assert_not_exempt(&conn, "a saved recovery resume spec");
+        conn.execute(
+            "UPDATE souls SET resume_spec=NULL,recovery_attempt_id='attempt-recovery' WHERE soul_id=?1",
+            [soul.as_str()],
+        )
+        .unwrap();
+        assert_not_exempt(&conn, "an active recovery attempt");
+        conn.execute(
+            "UPDATE souls SET recovery_attempt_id=NULL WHERE soul_id=?1",
+            [soul.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE incarnations SET prior_incarnation_id='prior-incarnation' WHERE incarnation_id=?1",
+            [prepared.incarnation_id.as_str()],
+        )
+        .unwrap();
+        assert_not_exempt(&conn, "a replacement incarnation");
+        conn.execute(
+            "UPDATE incarnations SET prior_incarnation_id=NULL,fixture_kind='opencode' WHERE incarnation_id=?1",
+            [prepared.incarnation_id.as_str()],
+        )
+        .unwrap();
+        assert_not_exempt(&conn, "a fixture workload");
+        conn.execute(
+            "UPDATE incarnations SET fixture_kind=NULL WHERE incarnation_id=?1",
+            [prepared.incarnation_id.as_str()],
+        )
+        .unwrap();
+
+        let transfer_descriptor = opencode_transfer_descriptor("initial-boundary-transfer");
+        let transfer = opencode_terminal(&transfer_descriptor, &"a".repeat(32));
+        transfer.validate().unwrap();
+        write_terminal(&conn, &transfer);
+        assert_not_exempt(&conn, "a transferred terminal");
+
+        let adoption_baseline = OpenCodeAdoptionBaseline::from_descriptor(
+            opencode_transfer_descriptor("initial-boundary-adoption"),
+        )
+        .unwrap();
+        let mut adoption = terminal.clone();
+        adoption.resume_session_id = Some("ses_exact".into());
+        adoption.opencode_adoption = Some(freshell_runtime_protocol::OpenCodeAdoptionExpectation {
+            baseline: adoption_baseline,
+            root_session_id: "ses_exact".into(),
+            root_tail: freshell_runtime_protocol::OpenCodeVerifiedRootTail::QualifiedEmpty,
+            evidence_generation: "f".repeat(64),
+            incarnation_id: prepared.incarnation_id.clone(),
+            launch_nonce: "a".repeat(32),
+        });
+        adoption.validate().unwrap();
+        write_terminal(&conn, &adoption);
+        assert_not_exempt(&conn, "an adopted terminal");
+        write_terminal(&conn, &terminal);
+        drop(conn);
+
+        registry
+            .mark_running_observed_with_provider_preparation(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                context.write_fence(),
+                true,
+            )
+            .await
+            .unwrap();
+        let running = registry.recovery_context(soul.clone()).await.unwrap();
+        assert_eq!(running.native_session_id, None);
+        assert_eq!(
+            registry.inventory().await.unwrap()[0].launch_state,
+            LaunchState::Running
+        );
+
+        open_connection(&registry.inner.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE souls SET recovery_state='blocked',recovery_reason='CAPABILITY_PENDING' WHERE soul_id=?1",
+                [soul.as_str()],
+            )
+            .unwrap();
+        let first_prompt = RequestId::new();
+        let first_input = registry
+            .begin_input(soul.clone(), first_prompt, b"first OpenCode prompt", None)
+            .await;
+        assert!(
+            first_input.is_ok(),
+            "the exact live fresh OpenCode terminal must admit its first prompt while native identity is pending: {first_input:?}"
+        );
+        let prompt_enter = registry
+            .begin_input(soul.clone(), RequestId::new(), b"\r", None)
+            .await;
+        assert!(
+            prompt_enter.is_ok(),
+            "split text and Enter input must remain admissible before OpenCode creates native identity: {prompt_enter:?}"
+        );
+        open_connection(&registry.inner.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE souls SET recovery_state='live',recovery_reason=NULL WHERE soul_id=?1",
+                [soul.as_str()],
+            )
+            .unwrap();
+
+        // The first terminal output carries the provider session ID after the
+        // user's initial prompt creates the OpenCode session row.
+        crate::service::record_terminal_identity_observation(
+            &registry,
+            &running,
+            "ses_after_first_prompt",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            registry
+                .recovery_context(soul)
+                .await
+                .unwrap()
+                .native_session_id
+                .as_deref(),
+            Some("ses_after_first_prompt")
+        );
+        open_connection(&registry.inner.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE souls SET recovery_state='blocked',recovery_reason='CAPABILITY_PENDING' WHERE soul_id=?1",
+                [running.soul_id.as_str()],
+            )
+            .unwrap();
+        let after_identity = registry
+            .begin_input(
+                running.soul_id.clone(),
+                RequestId::new(),
+                b"input after native identity",
+                None,
+            )
+            .await;
+        assert!(
+            after_identity.is_err(),
+            "once native identity exists, the CAPABILITY_PENDING exception must close"
+        );
+    }
+
+    #[tokio::test]
     async fn recovery_seed_rejects_identity_observed_after_probe() {
         let dir = tempfile::tempdir().unwrap();
         let registry = Registry::open(dir.path(), None).unwrap();
@@ -10595,6 +12814,136 @@ pub(crate) mod tests {
                 .native_session_id,
             None
         );
+    }
+
+    #[tokio::test]
+    async fn codex_readiness_transition_requires_its_original_write_fence() {
+        #[derive(Clone, Copy)]
+        enum InterveningChange {
+            None,
+            Evidence,
+            StopIntent,
+            NewIncarnation,
+        }
+
+        for change in [
+            InterveningChange::None,
+            InterveningChange::Evidence,
+            InterveningChange::StopIntent,
+            InterveningChange::NewIncarnation,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = Registry::open(dir.path(), None).unwrap();
+            let soul = SoulId::new();
+            let prepared =
+                materialize_codex_recovery_runtime(&registry, soul.clone(), dir.path()).await;
+            let context = registry.recovery_context(soul.clone()).await.unwrap();
+            let fence = context.write_fence();
+
+            match change {
+                InterveningChange::None => {}
+                InterveningChange::Evidence => {
+                    open_connection(&registry.inner.db_path)
+                        .unwrap()
+                        .execute(
+                            "UPDATE souls SET evidence_revision=evidence_revision+1 WHERE soul_id=?1",
+                            params![soul.as_str()],
+                        )
+                        .unwrap();
+                }
+                InterveningChange::StopIntent => {
+                    registry.begin_stop(soul.clone()).await.unwrap();
+                }
+                InterveningChange::NewIncarnation => {
+                    let replacement = IncarnationId::new();
+                    let replacement_nonce = LaunchNonce::new();
+                    open_connection(&registry.inner.db_path)
+                        .unwrap()
+                        .execute(
+                            "UPDATE incarnations SET launch_state='stopped',cleanup_state='verified_empty' WHERE incarnation_id=?1",
+                            params![prepared.incarnation_id.as_str()],
+                        )
+                        .unwrap();
+                    open_connection(&registry.inner.db_path)
+                        .unwrap()
+                        .execute(
+                            "INSERT INTO incarnations(incarnation_id,soul_id,launch_nonce,launch_state,execution_generation,requested_limits,cleanup_state,created_at,updated_at) SELECT ?1,soul_id,?2,'running',execution_generation,requested_limits,'none',created_at+1,updated_at+1 FROM incarnations WHERE incarnation_id=?3",
+                            params![replacement.as_str(), replacement_nonce.as_str(), prepared.incarnation_id.as_str()],
+                        )
+                        .unwrap();
+                }
+            }
+
+            let transition = registry
+                .record_fresh_agent_recovery_identity_fenced(
+                    soul.clone(),
+                    prepared.incarnation_id.clone(),
+                    NativeDispatchIdentity {
+                        previous_native_session_id: "codex-native-old".into(),
+                        native_session_id: "codex-native-recovered".into(),
+                        pending_naming_handle: Some("pending-codex-name".into()),
+                    },
+                    fence,
+                )
+                .await;
+
+            let conn = open_connection(&registry.inner.db_path).unwrap();
+            let stored_root: Option<String> = conn
+                .query_row(
+                    "SELECT native_session_id FROM souls WHERE soul_id=?1",
+                    params![soul.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let old_claims: u64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM writer_claims WHERE soul_id=?1 AND native_session_id='codex-native-old'",
+                    params![soul.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let new_claims: u64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM writer_claims WHERE soul_id=?1 AND native_session_id='codex-native-recovered'",
+                    params![soul.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+
+            match change {
+                InterveningChange::None => {
+                    transition.expect("unmodified readiness fence should commit");
+                    let current = registry.recovery_context(soul.clone()).await.unwrap();
+                    assert_eq!(
+                        current.native_session_id.as_deref(),
+                        Some("codex-native-recovered")
+                    );
+                    assert_eq!(current.evidence_revision, context.evidence_revision + 1);
+                    assert_eq!(current.identity_revision, context.identity_revision + 1);
+                    assert_eq!(
+                        current
+                            .native_identity_launch
+                            .as_ref()
+                            .unwrap()
+                            .requested_native_session_id
+                            .as_deref(),
+                        Some("codex-native-recovered")
+                    );
+                    assert_eq!(
+                        current.fresh_agent.as_ref().unwrap().session_id,
+                        "codex-presentation"
+                    );
+                    assert_eq!((old_claims, new_claims), (0, 1));
+                }
+                InterveningChange::Evidence
+                | InterveningChange::StopIntent
+                | InterveningChange::NewIncarnation => {
+                    assert!(transition.is_err(), "stale readiness fence must not commit");
+                    assert_eq!(stored_root.as_deref(), Some("codex-native-old"));
+                    assert_eq!((old_claims, new_claims), (1, 0));
+                }
+            }
+        }
     }
 
     #[tokio::test]
