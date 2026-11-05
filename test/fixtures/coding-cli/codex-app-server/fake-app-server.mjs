@@ -7,6 +7,7 @@ import fs from 'node:fs'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 if (process.argv[2] === 'fake-durable-writer') {
   const outputPath = process.argv[3]
@@ -48,6 +49,18 @@ if (process.argv[2] === 'fake-durable-writer') {
   await new Promise(() => undefined)
 }
 
+if (process.argv[2] === 'fake-churn-child') {
+  const readyPath = process.argv[3]
+  const releasePath = process.argv[4]
+  fs.writeFileSync(readyPath, `${process.pid}\n`, 'utf8')
+  const deadline = Date.now() + 60_000
+  while (!fs.existsSync(releasePath)) {
+    if (Date.now() > deadline) process.exit(1)
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  process.exit(0)
+}
+
 if (process.argv[2] === 'fake-native-child') {
   process.on('SIGTERM', () => {
     if (process.env.FAKE_CODEX_NATIVE_CHILD_IGNORE_SIGTERM === '1') {
@@ -56,6 +69,43 @@ if (process.argv[2] === 'fake-native-child') {
     process.exit(0)
   })
 
+  if (process.env.FAKE_CODEX_NATIVE_CHILD_READY_FILE) {
+    fs.writeFileSync(process.env.FAKE_CODEX_NATIVE_CHILD_READY_FILE, `${process.pid}\n`, 'utf8')
+  }
+  if (process.env.FAKE_CODEX_NATIVE_CHURN_DIR) {
+    const churnDir = process.env.FAKE_CODEX_NATIVE_CHURN_DIR
+    const count = Number(process.env.FAKE_CODEX_NATIVE_CHURN_COUNT || 0)
+    for (let index = 0; index < count; index++) {
+      const child = spawn(process.execPath, [
+        fileURLToPath(import.meta.url),
+        'fake-churn-child',
+        path.join(churnDir, `helper-${index}.pid`),
+        path.join(churnDir, 'release'),
+      ], { stdio: 'ignore' })
+      child.unref()
+    }
+  }
+  if (process.env.FAKE_CODEX_NATIVE_IMMEDIATE_CHURN_DIR) {
+    const churnDir = process.env.FAKE_CODEX_NATIVE_IMMEDIATE_CHURN_DIR
+    const count = Number(process.env.FAKE_CODEX_NATIVE_IMMEDIATE_CHURN_COUNT || 0)
+    const outcomes = []
+    for (let index = 0; index < count; index++) {
+      const child = spawn(process.execPath, ['-e', 'process.exit(0)'], { stdio: 'ignore' })
+      let recorded = false
+      const record = (result) => {
+        if (recorded) return
+        recorded = true
+        outcomes.push(result)
+        if (outcomes.length === count) {
+          const complete = path.join(churnDir, 'immediate-churn-complete.json')
+          fs.writeFileSync(`${complete}.tmp`, JSON.stringify(outcomes), 'utf8')
+          fs.renameSync(`${complete}.tmp`, complete)
+        }
+      }
+      child.once('error', (error) => record({ pid: child.pid ?? null, error: error.message }))
+      child.once('close', (code, signal) => record({ pid: child.pid, code, signal }))
+    }
+  }
   setInterval(() => undefined, 1_000)
   process.stdin.resume()
   await new Promise(() => undefined)
@@ -603,11 +653,19 @@ if (portFile && port !== 0) {
 }
 
 let nativeChild
+if (behavior.sidecarPidFile) {
+  fs.writeFileSync(behavior.sidecarPidFile, `${process.pid}\n`, 'utf8')
+}
 if (behavior.spawnNativeChild) {
-  nativeChild = spawn(process.execPath, [new URL(import.meta.url).pathname, 'fake-native-child'], {
+  nativeChild = spawn(process.execPath, [fileURLToPath(import.meta.url), 'fake-native-child'], {
     env: {
       ...process.env,
       FAKE_CODEX_NATIVE_CHILD_IGNORE_SIGTERM: behavior.nativeChildIgnoresSigterm ? '1' : '',
+      FAKE_CODEX_NATIVE_CHILD_READY_FILE: behavior.nativeChildReadyFile || '',
+      FAKE_CODEX_NATIVE_CHURN_DIR: behavior.nativeChurnDir || '',
+      FAKE_CODEX_NATIVE_CHURN_COUNT: String(behavior.nativeChurnCount || 0),
+      FAKE_CODEX_NATIVE_IMMEDIATE_CHURN_DIR: behavior.nativeImmediateChurnDir || '',
+      FAKE_CODEX_NATIVE_IMMEDIATE_CHURN_COUNT: String(behavior.nativeImmediateChurnCount || 0),
     },
     stdio: 'ignore',
   })
@@ -979,7 +1037,17 @@ wss.on('connection', (socket) => {
     const floodStdoutBytes = Number(behavior.floodStdoutBeforeMethodsBytes?.[method] || 0)
     const floodStderrBytes = Number(behavior.floodStderrBeforeMethodsBytes?.[method] || 0)
     if (override?.error) {
-      setTimeout(() => {
+      setTimeout(async () => {
+        if (method === 'thread/resume' && behavior.waitForResumeReleasePath) {
+          if (behavior.resumeWaitingPath) {
+            fs.writeFileSync(behavior.resumeWaitingPath, `${process.pid}\n`, 'utf8')
+          }
+          const deadline = Date.now() + 45_000
+          while (!fs.existsSync(behavior.waitForResumeReleasePath)) {
+            if (Date.now() > deadline) throw new Error('Timed out waiting for test thread/resume release')
+            await new Promise((resolve) => setTimeout(resolve, 25))
+          }
+        }
         socket.send(JSON.stringify({
           id: message.id,
           error: override.error,
