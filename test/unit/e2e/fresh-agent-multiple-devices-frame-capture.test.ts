@@ -57,7 +57,12 @@ describe('fresh-agent WebSocket route frame capture', () => {
     })
     client.send.mockImplementation((message: string | Buffer) => {
       expect(frames).toContainEqual(message === heldReply
-        ? { direction: 'received', type: 'freshAgent.created', requestId: 'create-one' }
+        ? {
+            direction: 'received',
+            capturedAtMs: expect.any(Number),
+            type: 'freshAgent.created',
+            requestId: 'create-one',
+          }
         : { direction: 'received', type: 'freshAgent.forked', requestId: 'fork-one' })
       return message
     })
@@ -76,7 +81,12 @@ describe('fresh-agent WebSocket route frame capture', () => {
 
     expect(frames).toEqual([
       { direction: 'sent', type: 'freshAgent.fork', requestId: 'fork-one' },
-      { direction: 'received', type: 'freshAgent.created', requestId: 'create-one' },
+      {
+        direction: 'received',
+        capturedAtMs: expect.any(Number),
+        type: 'freshAgent.created',
+        requestId: 'create-one',
+      },
       { direction: 'received', type: 'freshAgent.forked', requestId: 'fork-one' },
     ])
     expect(server.send).toHaveBeenCalledExactlyOnceWith(forkMessage)
