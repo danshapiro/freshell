@@ -322,6 +322,13 @@ pub struct PaneSnapshot {
     pub pane_content: Option<Value>,
 }
 
+/// A pane in a layout owned by a currently connected UI client.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LivePaneSnapshot {
+    pub client_id: String,
+    pub pane: PaneSnapshot,
+}
+
 impl LayoutStore {
     fn lock(&self) -> MutexGuard<'_, LayoutInner> {
         self.inner.lock().expect("layout store mutex")
@@ -393,6 +400,34 @@ impl LayoutStore {
             .clients
             .iter()
             .map(|entry| entry.snapshot.clone())
+            .collect()
+    }
+
+    /// Read every pane from currently connected UI layout snapshots. Retained
+    /// snapshots from disconnected clients remain useful for reconnect and
+    /// recovery, but do not describe panes that are open now.
+    pub fn live_pane_snapshots(&self) -> Vec<LivePaneSnapshot> {
+        let inner = self.lock();
+        inner
+            .clients
+            .iter()
+            .filter(|entry| !entry.stale && entry.key != SERVER_CLIENT_KEY)
+            .flat_map(|entry| {
+                entry.snapshot.tabs.iter().flat_map(move |tab| {
+                    leaves_of(&entry.snapshot, &tab.id).into_iter().map(
+                        move |(pane_id, content)| LivePaneSnapshot {
+                            client_id: entry.key.clone(),
+                            pane: PaneSnapshot {
+                                tab_id: tab.id.clone(),
+                                pane_id,
+                                kind: string_field(&content, "kind"),
+                                terminal_id: string_field(&content, "terminalId"),
+                                pane_content: (!content.is_null()).then_some(content),
+                            },
+                        },
+                    )
+                })
+            })
             .collect()
     }
 

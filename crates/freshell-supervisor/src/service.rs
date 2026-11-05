@@ -1,28 +1,31 @@
 use crate::{
     admission::AdmissionPolicy,
     backend::{
-        host_actor_state_dir, BackendError, CreateRuntimeSpec, DockerEngineBackend, RuntimeBackend,
+        host_actor_state_dir, BackendError, CreateFailureCertainty, CreateRuntimeSpec,
+        DockerEngineBackend, RuntimeBackend,
     },
     opencode_transfer::{OpenCodeTransferStaging, StagingLimits},
     registry::{
         stable_provider_volume_name, BackendCreatedRecord, ExecutionGrantRecord,
         InputJournalDisposition, LaunchPreparation, PreparedLaunch, RecoveryWriteFence, Registry,
-        RegistryError,
+        RegistryError, ReopenCreateEvidence,
     },
 };
 use freshell_runtime_protocol::{
     host_proof, read_frame, write_frame, AdminCommand, AdminReply, AdminResult, CommandState,
     ControlRole, Envelope, FixtureKind, FreshAgentLaunchSpec, HostBootId, HostCommand, HostReply,
     HostResult, IncarnationId, IncidentId, LaunchResult, LaunchState, LimitApplication,
-    OpenCodeTransferAction, OpenCodeTransferReadinessReceipt, OpenCodeTransferResult, RequestId,
-    ResumeSpec, RuntimeError, RuntimeErrorCode, RuntimeLimits, RuntimeMetrics, RuntimeOutputBatch,
-    RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec, UpdateLimitsResult,
-    CONTROL_PROTOCOL_VERSION,
+    OpenCodeTransferAction, OpenCodeTransferReadinessReceipt, OpenCodeTransferResult,
+    RecoveryProbe, RequestId, ResumeSpec, RuntimeError, RuntimeErrorCode, RuntimeLimits,
+    RuntimeMetrics, RuntimeOutputBatch, RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec,
+    UpdateLimitsResult, CONTROL_PROTOCOL_VERSION, HOST_CAPABILITY_NATIVE_READINESS_RECEIPT_V1,
 };
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex as StdMutex, OnceLock,
@@ -37,6 +40,9 @@ use tokio::{
 };
 
 /// Private cause information retained before the public runtime error projection.
+type BoxedAdminDispatch<'a> =
+    Pin<Box<dyn Future<Output = Result<AdminResult, RuntimeError>> + Send + 'a>>;
+
 struct ClassifiedFailure {
     error: RuntimeError,
     category: &'static str,
@@ -105,12 +111,18 @@ pub struct SupervisorConfig {
     pub admission: AdmissionPolicy,
 }
 
+#[derive(Clone)]
 pub(crate) struct LaunchWorkload {
     pub(crate) soul_id: SoulId,
     pub(crate) fixture: Option<FixtureKind>,
     pub(crate) terminal: Option<TerminalLaunchSpec>,
     pub(crate) fresh_agent: Option<FreshAgentLaunchSpec>,
     pub(crate) resume_spec: Option<ResumeSpec>,
+}
+
+struct ReopenActivationFailure {
+    error: RuntimeError,
+    create_evidence: ReopenCreateEvidence,
 }
 
 impl LaunchWorkload {
@@ -123,6 +135,36 @@ impl LaunchWorkload {
                 .terminal
                 .as_ref()
                 .is_some_and(|terminal| terminal.mode == "opencode" && terminal.validate().is_ok())
+    }
+
+    pub(crate) fn requires_native_startup_observation(&self, provider: &str) -> bool {
+        let requires_native_identity = self.fixture.is_none()
+            && matches!(
+                provider,
+                "claude" | "kilroy" | "codex" | "opencode" | "amplifier"
+            )
+            && !self.fresh_agent.as_ref().is_some_and(|agent| {
+                crate::registry::deterministic_fresh_agent_fixture(provider, agent)
+            });
+        if !requires_native_identity {
+            return false;
+        }
+
+        // A new OpenCode TUI does not create its native session row until its
+        // first prompt. Waiting for that identity here blocks terminal.create,
+        // which is also the reply the browser needs before it can send input.
+        // Resume and Fresh Agent launches keep the exact startup identity check.
+        let fresh_opencode_terminal = provider == "opencode"
+            && self.fresh_agent.is_none()
+            && self.resume_spec.is_none()
+            && self.terminal.as_ref().is_some_and(|terminal| {
+                terminal.mode == "opencode"
+                    && terminal.resume_session_id.is_none()
+                    && terminal.opencode_transfer.is_none()
+                    && terminal.opencode_transfer_attempt_id.is_none()
+                    && terminal.opencode_adoption.is_none()
+            });
+        !fresh_opencode_terminal
     }
 }
 
@@ -141,6 +183,16 @@ struct McpCapabilityRequest<'a> {
     prior_context: Option<&'a freshell_runtime_protocol::ProviderLaunchContext>,
     provider_secret_references: Option<&'a [freshell_runtime_protocol::ProviderSecretReference]>,
     provider_path_inputs: Option<&'a freshell_runtime_protocol::ProviderPathInputs>,
+}
+
+struct ReplacementMcpCapabilityRequest<'a> {
+    start: &'a crate::registry::RecoveryStart,
+    provider: &'a str,
+    context: &'a freshell_runtime_protocol::ProviderLaunchContext,
+    references: &'a [freshell_runtime_protocol::ProviderSecretReference],
+    cwd: &'a str,
+    workspace: &'a str,
+    reopen_prepared: bool,
 }
 
 #[derive(Clone)]
@@ -447,14 +499,286 @@ impl Supervisor {
                     .await
                     .map(AdminResult::Recovery)
             }
-            _ => Box::pin(self.dispatch_non_recovery(envelope)).await,
+            _ => self.dispatch_non_recovery(envelope).await,
         }
     }
 
-    async fn dispatch_non_recovery(
+    // Keep the sizeable provider operations out of the general command
+    // switch's polling frame. A request only polls its own command family.
+    #[inline(never)]
+    fn dispatch_non_recovery<'a>(
+        &'a self,
+        envelope: Envelope<AdminCommand>,
+    ) -> BoxedAdminDispatch<'a> {
+        if is_fresh_agent_admin_command(&envelope.body) {
+            let request_id = envelope.request_id;
+            let command = envelope.body;
+            self.dispatch_fresh_agent_command(request_id, command)
+        } else {
+            self.dispatch_general_boxed(envelope)
+        }
+    }
+
+    #[inline(never)]
+    fn dispatch_fresh_agent_command<'a>(
+        &'a self,
+        request_id: RequestId,
+        command: AdminCommand,
+    ) -> BoxedAdminDispatch<'a> {
+        match command {
+            AdminCommand::FreshAgentPrepareNative(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                self.fresh_agent_prepare_native(request.soul_id).await?;
+                Ok(AdminResult::FreshAgentCommand {
+                    state: CommandState::Completed,
+                })
+            }),
+            command => self.dispatch_other_fresh_agent_command(request_id, command),
+        }
+    }
+
+    #[inline(never)]
+    fn dispatch_other_fresh_agent_command<'a>(
+        &'a self,
+        request_id: RequestId,
+        command: AdminCommand,
+    ) -> BoxedAdminDispatch<'a> {
+        // Match before making the async future so each command gets a
+        // separate heap-backed future.
+        match command {
+            AdminCommand::FreshAgentSend(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let state = Box::pin(self.fresh_agent_send(
+                    request_id,
+                    request.soul_id,
+                    request.text,
+                    request.settings,
+                    request.checkpoint_logical_attempt_id,
+                ))
+                .await?;
+                Ok(AdminResult::FreshAgentCommand { state })
+            }),
+            AdminCommand::FreshAgentFork(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let result = Box::pin(self.fresh_agent_fork(
+                    request_id,
+                    request.soul_id,
+                    request.parent_session_id,
+                    request.input,
+                ))
+                .await?;
+                Ok(AdminResult::FreshAgentFork(result))
+            }),
+            AdminCommand::FreshAgentCompact(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let state = Box::pin(self.fresh_agent_compact(
+                    request_id,
+                    request.soul_id,
+                    request.instructions,
+                    request.cwd,
+                ))
+                .await?;
+                Ok(AdminResult::FreshAgentCommand { state })
+            }),
+            AdminCommand::FreshAgentConfigure(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let state = Box::pin(self.fresh_agent_configure(
+                    request_id,
+                    request.soul_id,
+                    request.settings,
+                ))
+                .await?;
+                Ok(AdminResult::FreshAgentCommand { state })
+            }),
+            AdminCommand::FreshAgentRollback(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let state = Box::pin(self.fresh_agent_rollback(request_id, request)).await?;
+                Ok(AdminResult::FreshAgentCommand { state })
+            }),
+            AdminCommand::FreshAgentCapture(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::FreshAgentCapture(
+                    Box::pin(self.fresh_agent_capture(request.soul_id, request.max_bytes)).await?,
+                ))
+            }),
+            AdminCommand::FreshAgentModelCatalog(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::FreshAgentModelCatalog(
+                    Box::pin(self.fresh_agent_model_catalog(request.soul_id, request.cwd)).await?,
+                ))
+            }),
+            AdminCommand::FreshAgentNativeName(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::FreshAgentNativeName(
+                    Box::pin(self.fresh_agent_native_name(request)).await?,
+                ))
+            }),
+            AdminCommand::FreshAgentReadSnapshot(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::FreshAgentSnapshot(
+                    Box::pin(self.fresh_agent_snapshot(request.soul_id)).await?,
+                ))
+            }),
+            AdminCommand::FreshAgentReadChild(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::FreshAgentChildSnapshot(
+                    Box::pin(self.fresh_agent_read_child(request.soul_id, request.child_thread_id))
+                        .await?,
+                ))
+            }),
+            AdminCommand::FreshAgentResolve(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let state = Box::pin(self.fresh_agent_resolve(
+                    request.soul_id,
+                    request.decision_id,
+                    request.decision,
+                    request.operation_attempt_id,
+                ))
+                .await?;
+                Ok(AdminResult::FreshAgentCommand { state })
+            }),
+            AdminCommand::FreshAgentInterrupt(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Box::pin(self.fresh_agent_interrupt(request.soul_id, request.request_id)).await?;
+                Ok(AdminResult::FreshAgentInterrupted)
+            }),
+            AdminCommand::FreshAgentReadHistory(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let context = self
+                    .registry
+                    .recovery_context(request.soul_id)
+                    .await
+                    .map_err(map_registry)?;
+                let handle = &context.prior_handle;
+                let agent = handle.fresh_agent().ok_or_else(|| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::InvalidRequest,
+                        "soul is not a fresh agent",
+                    )
+                })?;
+                let native_id = context.native_session_id.as_deref().ok_or_else(|| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::InvalidRequest,
+                        "saved native session identity unavailable",
+                    )
+                })?;
+                let mut snapshot = Box::pin(self.backend.read_native_history(
+                    handle,
+                    agent.provider.as_str(),
+                    native_id,
+                    &self.config.host_binary_path,
+                ))
+                .await
+                .map_err(map_backend)?;
+                // Kilroy uses the Claude transcript contract, with its own session type.
+                let wire_provider =
+                    if agent.provider == freshell_runtime_protocol::FreshProvider::Kilroy {
+                        "claude"
+                    } else {
+                        agent.provider.as_str()
+                    };
+                if snapshot["threadId"].as_str() != Some(native_id)
+                    || snapshot["provider"].as_str() != Some(wire_provider)
+                {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::OwnershipMismatch,
+                        "native history identity mismatch",
+                    ));
+                }
+                // Presentation context comes from the persisted owned launch.
+                // It does not assert provider identity, LIVE, or loss evidence.
+                snapshot["managedDirectory"] = serde_json::json!({
+                    "incarnationId": handle.incarnation_id(),
+                    "cwd": agent.cwd,
+                    "workspacePath": agent.workspace_path,
+                    "gitCommonDir": agent.git_common_dir,
+                    "sessionType": agent.session_type,
+                });
+                Ok(AdminResult::FreshAgentHistory(snapshot))
+            }),
+            AdminCommand::FreshAgentReadEvents(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let events = Box::pin(self.fresh_agent_read_events(
+                    request.soul_id,
+                    request.after_sequence,
+                    request.max_events,
+                ))
+                .await?;
+                Ok(AdminResult::FreshAgentEvents(events))
+            }),
+            AdminCommand::FreshAgentPrepareNative(_) => Box::pin(async move {
+                unreachable!("native readiness is handled before other FreshAgent commands")
+            }),
+            AdminCommand::FreshAgentReadRetainedState(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let budget_ms = request.max_duration_ms.min(DEFAULT_HOST_COMMAND_TIMEOUT_MS);
+                let soul_id = request.soul_id;
+                let events = match tokio::time::timeout(
+                    Duration::from_millis(budget_ms),
+                    self.fresh_agent_read_events_inner(soul_id.clone(), 0, 1, true),
+                )
+                .await
+                {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        tracing::warn!(%soul_id, budget_ms, "freshagent.retained_read_timeout");
+                        return Err(RuntimeError::new(
+                            RuntimeErrorCode::HostUnreachable,
+                            "fresh-agent retained state read timed out",
+                        ));
+                    }
+                };
+                Ok(AdminResult::FreshAgentEvents(events))
+            }),
+            _ => unreachable!("non-FreshAgent command reached the FreshAgent switch"),
+        }
+    }
+
+    #[inline(never)]
+    fn dispatch_general_boxed<'a>(
+        &'a self,
+        envelope: Envelope<AdminCommand>,
+    ) -> BoxedAdminDispatch<'a> {
+        Box::pin(self.dispatch_general(envelope))
+    }
+
+    async fn dispatch_general(
         &self,
         envelope: Envelope<AdminCommand>,
     ) -> Result<AdminResult, RuntimeError> {
+        let request_id = envelope.request_id;
         match envelope.body {
             AdminCommand::ReserveProviderInputs(request) => {
                 self.registry
@@ -541,7 +865,7 @@ impl Supervisor {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
-                self.lookup_native_auth(request)
+                Box::pin(async move { self.lookup_native_auth(request).await })
                     .await
                     .map(AdminResult::NativeAuthLookup)
             }
@@ -549,7 +873,7 @@ impl Supervisor {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
-                self.observe_claude_sources(*request)
+                Box::pin(async move { self.observe_claude_sources(*request).await })
                     .await
                     .map(AdminResult::ClaudeSourceObservation)
             }
@@ -800,7 +1124,10 @@ impl Supervisor {
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
                 request.validate_payload()?;
-                self.restore_lost_souls(envelope.request_id, request)
+                // The restore future is much larger than the other command
+                // states. Construct it inside a boxed async block so merely
+                // polling an unrelated command does not reserve its stack.
+                Box::pin(async move { self.restore_lost_souls(request_id, request).await })
                     .await
                     .map(AdminResult::RestoreLostSouls)
             }
@@ -830,7 +1157,7 @@ impl Supervisor {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
-                self.launch(envelope.request_id, *request)
+                self.launch(request_id, *request)
                     .await
                     .map(AdminResult::Launch)
             }
@@ -843,12 +1170,15 @@ impl Supervisor {
                     .await?;
                 Ok(AdminResult::Stop { outcome, view })
             }
+            AdminCommand::Reopen(request) => Box::pin(self.reopen(request_id, request))
+                .await
+                .map(AdminResult::Reopen),
             AdminCommand::TerminalInput(request) => {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
                 let state = self
-                    .terminal_input(envelope.request_id, request.soul_id, request.data)
+                    .terminal_input(request_id, request.soul_id, request.data)
                     .await?;
                 Ok(AdminResult::TerminalInput { state })
             }
@@ -874,206 +1204,6 @@ impl Supervisor {
                     .await?;
                 Ok(AdminResult::TerminalOutput(output))
             }
-            AdminCommand::FreshAgentSend(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                let state = self
-                    .fresh_agent_send(
-                        envelope.request_id,
-                        request.soul_id,
-                        request.text,
-                        request.settings,
-                        request.checkpoint_logical_attempt_id,
-                    )
-                    .await?;
-                Ok(AdminResult::FreshAgentCommand { state })
-            }
-            AdminCommand::FreshAgentFork(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                let result = self
-                    .fresh_agent_fork(
-                        envelope.request_id,
-                        request.soul_id,
-                        request.parent_session_id,
-                        request.input,
-                    )
-                    .await?;
-                Ok(AdminResult::FreshAgentFork(result))
-            }
-            AdminCommand::FreshAgentCompact(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                let state = self
-                    .fresh_agent_compact(
-                        envelope.request_id,
-                        request.soul_id,
-                        request.instructions,
-                        request.cwd,
-                    )
-                    .await?;
-                Ok(AdminResult::FreshAgentCommand { state })
-            }
-            AdminCommand::FreshAgentConfigure(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                let state = self
-                    .fresh_agent_configure(envelope.request_id, request.soul_id, request.settings)
-                    .await?;
-                Ok(AdminResult::FreshAgentCommand { state })
-            }
-            AdminCommand::FreshAgentRollback(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                let state = self
-                    .fresh_agent_rollback(envelope.request_id, request)
-                    .await?;
-                Ok(AdminResult::FreshAgentCommand { state })
-            }
-            AdminCommand::FreshAgentCapture(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                Ok(AdminResult::FreshAgentCapture(
-                    self.fresh_agent_capture(request.soul_id, request.max_bytes)
-                        .await?,
-                ))
-            }
-            AdminCommand::FreshAgentModelCatalog(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                Ok(AdminResult::FreshAgentModelCatalog(
-                    self.fresh_agent_model_catalog(request.soul_id, request.cwd)
-                        .await?,
-                ))
-            }
-            AdminCommand::FreshAgentNativeName(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                Ok(AdminResult::FreshAgentNativeName(
-                    self.fresh_agent_native_name(request).await?,
-                ))
-            }
-            AdminCommand::FreshAgentReadSnapshot(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                Ok(AdminResult::FreshAgentSnapshot(
-                    self.fresh_agent_snapshot(request.soul_id).await?,
-                ))
-            }
-            AdminCommand::FreshAgentReadChild(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                Ok(AdminResult::FreshAgentChildSnapshot(
-                    self.fresh_agent_read_child(request.soul_id, request.child_thread_id)
-                        .await?,
-                ))
-            }
-            AdminCommand::FreshAgentResolve(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                let state = self
-                    .fresh_agent_resolve(request.soul_id, request.decision_id, request.decision)
-                    .await?;
-                Ok(AdminResult::FreshAgentCommand { state })
-            }
-            AdminCommand::FreshAgentInterrupt(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                self.fresh_agent_interrupt(request.soul_id).await?;
-                Ok(AdminResult::FreshAgentInterrupted)
-            }
-            AdminCommand::FreshAgentPrepareNative(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                self.fresh_agent_prepare_native(request.soul_id).await?;
-                Ok(AdminResult::FreshAgentCommand {
-                    state: CommandState::Completed,
-                })
-            }
-            AdminCommand::FreshAgentReadHistory(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                let context = self
-                    .registry
-                    .recovery_context(request.soul_id)
-                    .await
-                    .map_err(map_registry)?;
-                let handle = &context.prior_handle;
-                let agent = handle.fresh_agent().ok_or_else(|| {
-                    RuntimeError::new(
-                        RuntimeErrorCode::InvalidRequest,
-                        "soul is not a fresh agent",
-                    )
-                })?;
-                let native_id = context.native_session_id.as_deref().ok_or_else(|| {
-                    RuntimeError::new(
-                        RuntimeErrorCode::InvalidRequest,
-                        "saved native session identity unavailable",
-                    )
-                })?;
-                let mut snapshot = self
-                    .backend
-                    .read_native_history(
-                        handle,
-                        agent.provider.as_str(),
-                        native_id,
-                        &self.config.host_binary_path,
-                    )
-                    .await
-                    .map_err(map_backend)?;
-                // Kilroy uses the Claude transcript contract, with its own session type.
-                let wire_provider =
-                    if agent.provider == freshell_runtime_protocol::FreshProvider::Kilroy {
-                        "claude"
-                    } else {
-                        agent.provider.as_str()
-                    };
-                if snapshot["threadId"].as_str() != Some(native_id)
-                    || snapshot["provider"].as_str() != Some(wire_provider)
-                {
-                    return Err(RuntimeError::new(
-                        RuntimeErrorCode::OwnershipMismatch,
-                        "native history identity mismatch",
-                    ));
-                }
-                // Presentation context comes from the persisted owned launch.
-                // It does not assert provider identity, LIVE, or loss evidence.
-                snapshot["managedDirectory"] = serde_json::json!({
-                    "incarnationId": handle.incarnation_id(),
-                    "cwd": agent.cwd,
-                    "workspacePath": agent.workspace_path,
-                    "gitCommonDir": agent.git_common_dir,
-                    "sessionType": agent.session_type,
-                });
-                Ok(AdminResult::FreshAgentHistory(snapshot))
-            }
-            AdminCommand::FreshAgentReadEvents(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                let events = self
-                    .fresh_agent_read_events(
-                        request.soul_id,
-                        request.after_sequence,
-                        request.max_events,
-                    )
-                    .await?;
-                Ok(AdminResult::FreshAgentEvents(events))
-            }
             AdminCommand::RuntimeMetrics(request) => {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
@@ -1092,6 +1222,7 @@ impl Supervisor {
             AdminCommand::Recover(_) => {
                 unreachable!("recovery is dispatched before the general command switch")
             }
+            _ => unreachable!("only general commands reach this dispatcher"),
         }
     }
 
@@ -1494,7 +1625,29 @@ impl Supervisor {
            + '_ {
         // Construct the large activation state here so recovery callers only
         // retain the boxed future while polling host replies and registry I/O.
-        Box::pin(self.activate_prepared_observed_inner(prepared, workload, limits, fence))
+        Box::pin(
+            self.activate_prepared_observed_inner(prepared, workload, limits, fence, false, None),
+        )
+    }
+
+    fn activate_reopen_prepared_observed<'a>(
+        &'a self,
+        prepared: PreparedLaunch,
+        workload: LaunchWorkload,
+        limits: RuntimeLimits,
+        fence: RecoveryWriteFence,
+        create_evidence: &'a mut ReopenCreateEvidence,
+    ) -> impl std::future::Future<Output = Result<(LaunchResult, RecoveryWriteFence), RuntimeError>>
+           + Send
+           + 'a {
+        Box::pin(self.activate_prepared_observed_inner(
+            prepared,
+            workload,
+            limits,
+            fence,
+            true,
+            Some(create_evidence),
+        ))
     }
 
     async fn activate_prepared_observed_inner(
@@ -1503,6 +1656,8 @@ impl Supervisor {
         workload: LaunchWorkload,
         limits: RuntimeLimits,
         mut fence: RecoveryWriteFence,
+        defer_provider_preparation_completion: bool,
+        mut create_evidence: Option<&mut ReopenCreateEvidence>,
     ) -> Result<(LaunchResult, RecoveryWriteFence), RuntimeError> {
         let mut state = prepared.state;
         if let Some(capability) = workload
@@ -1556,52 +1711,81 @@ impl Supervisor {
                     self.activation_failure(&prepared, state, "ensure_host_actor_directory", error)
                 })?;
             }
-            let created = self
-                .backend
-                .create_stopped(&CreateRuntimeSpec {
-                    prior_provider_owner: self
-                        .registry
-                        .prior_provider_owner(prepared.incarnation_id.clone())
-                        .await
-                        .map_err(map_registry)?,
-                    initial_input_reservation: self
-                        .registry
-                        .bound_input_reservation(prepared.incarnation_id.clone())
-                        .await
-                        .map_err(map_registry)
-                        .map_err(|error| {
-                            self.activation_failure(
-                                &prepared,
-                                state,
-                                "revalidate_initial_provider_source",
-                                error,
-                            )
-                        })?,
-                    installation_id: self.registry.installation_id().clone(),
-                    soul_id: prepared.soul_id.clone(),
-                    incarnation_id: prepared.incarnation_id.clone(),
-                    image_ref: self.config.image_ref.clone(),
-                    host_binary_path: self.config.host_binary_path.clone(),
-                    runtime_dir: runtime_dir.clone(),
-                    limits,
-                    test_run_id: self.config.test_run_id.clone(),
-                    terminal: workload.terminal.clone(),
-                    fresh_agent: workload.fresh_agent.clone(),
-                    opencode_transfer_dir,
-                    provider_volume_name: stable_provider_volume_name(
-                        self.registry.installation_id(),
-                        &prepared.soul_id,
-                    ),
-                })
-                .await
-                .map_err(|error| {
-                    self.activation_failure_from_backend(
-                        &prepared,
-                        state,
-                        "create_stopped_runtime",
-                        error,
-                    )
-                })?;
+            let create_spec = CreateRuntimeSpec {
+                prior_provider_owner: self
+                    .registry
+                    .prior_provider_owner(prepared.incarnation_id.clone())
+                    .await
+                    .map_err(map_registry)?,
+                initial_input_reservation: self
+                    .registry
+                    .bound_input_reservation(prepared.incarnation_id.clone())
+                    .await
+                    .map_err(map_registry)
+                    .map_err(|error| {
+                        self.activation_failure(
+                            &prepared,
+                            state,
+                            "revalidate_initial_provider_source",
+                            error,
+                        )
+                    })?,
+                installation_id: self.registry.installation_id().clone(),
+                soul_id: prepared.soul_id.clone(),
+                incarnation_id: prepared.incarnation_id.clone(),
+                image_ref: self.config.image_ref.clone(),
+                host_binary_path: self.config.host_binary_path.clone(),
+                runtime_dir: runtime_dir.clone(),
+                limits,
+                test_run_id: self.config.test_run_id.clone(),
+                terminal: workload.terminal.clone(),
+                fresh_agent: workload.fresh_agent.clone(),
+                opencode_transfer_dir,
+                provider_volume_name: stable_provider_volume_name(
+                    self.registry.installation_id(),
+                    &prepared.soul_id,
+                ),
+            };
+            let created = if let Some(evidence) = create_evidence.as_deref_mut() {
+                match self
+                    .backend
+                    .create_stopped_with_evidence(&create_spec)
+                    .await
+                {
+                    Ok(created) => {
+                        *evidence = ReopenCreateEvidence::CreatedUncommitted;
+                        created
+                    }
+                    Err(failure) => {
+                        *evidence = match failure.certainty {
+                            CreateFailureCertainty::DefinitelyNotCreated => {
+                                ReopenCreateEvidence::DefinitelyNotCreated
+                            }
+                            CreateFailureCertainty::MayHaveCreated => {
+                                ReopenCreateEvidence::MayHaveCreated
+                            }
+                        };
+                        return Err(self.activation_failure_from_backend(
+                            &prepared,
+                            state,
+                            "create_stopped_runtime",
+                            failure.error,
+                        ));
+                    }
+                }
+            } else {
+                self.backend
+                    .create_stopped(&create_spec)
+                    .await
+                    .map_err(|error| {
+                        self.activation_failure_from_backend(
+                            &prepared,
+                            state,
+                            "create_stopped_runtime",
+                            error,
+                        )
+                    })?
+            };
             append_event(
                 &self.config.lifecycle_log,
                 "supervisor.container_created_stopped",
@@ -1629,6 +1813,9 @@ impl Supervisor {
                     self.activation_failure(&prepared, state, "commit_backend_identity", error)
                 })?;
             state = LaunchState::Created;
+            if let Some(evidence) = create_evidence {
+                *evidence = ReopenCreateEvidence::IdentityCommitted;
+            }
             crash_if("after_created_commit");
         }
 
@@ -1784,19 +1971,50 @@ impl Supervisor {
                 ));
             }
         };
+        if let Some(receipt) = accepted.native_readiness_receipt.clone() {
+            let observation = accepted
+                .native_identity_observation
+                .clone()
+                .ok_or_else(|| {
+                    self.activation_failure(
+                        &prepared,
+                        state,
+                        "commit_native_readiness_receipt",
+                        RuntimeError::new(
+                            RuntimeErrorCode::RecoveryWrongIdentity,
+                            "host returned a native readiness receipt without its exact observation",
+                        ),
+                    )
+                })?;
+            fence = self
+                .registry
+                .record_native_readiness_recovery_receipt(
+                    workload.soul_id.clone(),
+                    receipt.clone(),
+                    observation.clone(),
+                    accepted.native_readiness_recovery.take(),
+                    workload.resume_spec.clone(),
+                )
+                .await
+                .map_err(map_registry)
+                .map_err(|error| {
+                    self.activation_failure(
+                        &prepared,
+                        state,
+                        "commit_native_readiness_receipt",
+                        error,
+                    )
+                })?;
+            accepted.native_session_id = Some(receipt.identity.native_session_id.clone());
+            accepted.native_identity_observation = Some(observation);
+        }
         let native_context = self
             .registry
             .recovery_context(workload.soul_id.clone())
             .await
             .map_err(map_registry)?;
-        let requires_native_observation = workload.fixture.is_none()
-            && matches!(
-                native_context.provider.as_str(),
-                "claude" | "kilroy" | "codex" | "opencode" | "amplifier"
-            )
-            && !workload.fresh_agent.as_ref().is_some_and(|agent| {
-                crate::registry::deterministic_fresh_agent_fixture(&native_context.provider, agent)
-            });
+        let requires_native_observation =
+            workload.requires_native_startup_observation(&native_context.provider);
         if requires_native_observation {
             let wait = Box::pin(self.wait_for_native_startup(
                 &workload,
@@ -1950,7 +2168,9 @@ impl Supervisor {
                 workload.soul_id.clone(),
                 handle.incarnation_id().clone(),
                 fence,
-                workload.resume_spec.is_none(),
+                workload.resume_spec.is_none()
+                    || native_context.resume_spec.is_none()
+                    || defer_provider_preparation_completion,
             )
             .await
             .map_err(map_registry)
@@ -1964,7 +2184,7 @@ impl Supervisor {
                 serde_json::json!({"incarnationId":handle.incarnation_id(),"error":error.message}),
             );
         }
-        if workload.resume_spec.is_none() {
+        if workload.resume_spec.is_none() && !defer_provider_preparation_completion {
             self.complete_pending_provider_preparation(&handle)
                 .await
                 .map_err(|error| {
@@ -2304,6 +2524,7 @@ impl Supervisor {
         match disposition {
             InputJournalDisposition::Completed => return Ok(CommandState::Completed),
             InputJournalDisposition::Ambiguous => return Ok(CommandState::Ambiguous),
+            InputJournalDisposition::Refused(_) => return Ok(CommandState::Cancelled),
             InputJournalDisposition::Dispatch => {}
         }
         let handle = self
@@ -2453,13 +2674,31 @@ impl Supervisor {
         {
             Some(InputJournalDisposition::Completed) => return Ok(CommandState::Completed),
             Some(InputJournalDisposition::Ambiguous) => return Ok(CommandState::Ambiguous),
+            Some(InputJournalDisposition::Refused(diagnostic)) => {
+                return Err(fresh_send_refusal_error(diagnostic))
+            }
             Some(InputJournalDisposition::Dispatch) | None => {}
         }
-        let active = self
-            .registry
-            .active_handle_for_soul(soul_id.clone())
-            .await
-            .map_err(map_registry)?;
+        let active = match self.registry.active_handle_for_soul(soul_id.clone()).await {
+            Ok(active) => active,
+            Err(error @ RegistryError::UnknownSoul(_)) => {
+                let blocked = self
+                    .registry
+                    .refuse_blocked_unadmitted_input(
+                        soul_id.clone(),
+                        request_id.clone(),
+                        text.as_bytes(),
+                        &settings_correlation,
+                    )
+                    .await
+                    .map_err(map_registry)?;
+                if let Some(diagnostic) = blocked {
+                    return Err(fresh_send_refusal_error(diagnostic));
+                }
+                return Err(map_registry(error));
+            }
+            Err(error) => return Err(map_registry(error)),
+        };
         if active.fresh_agent().is_none() {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::UnsupportedWorkload,
@@ -2483,6 +2722,9 @@ impl Supervisor {
         match disposition {
             InputJournalDisposition::Completed => return Ok(CommandState::Completed),
             InputJournalDisposition::Ambiguous => return Ok(CommandState::Ambiguous),
+            InputJournalDisposition::Refused(diagnostic) => {
+                return Err(fresh_send_refusal_error(diagnostic))
+            }
             InputJournalDisposition::Dispatch => {}
         }
         let handle = self
@@ -2564,6 +2806,24 @@ impl Supervisor {
                     .map_err(map_registry)?;
                 Ok(CommandState::ProviderAcked)
             }
+            Ok(HostResult::FreshAgentCommand {
+                state: CommandState::Cancelled,
+                ..
+            }) => {
+                self.registry
+                    .mark_fresh_input_refused(
+                        soul_id,
+                        request_id,
+                        freshell_runtime_protocol::FreshAgentSendDiagnostic {
+                            outcome:
+                                freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused,
+                            message: None,
+                        },
+                    )
+                    .await
+                    .map_err(map_registry)?;
+                Ok(CommandState::Cancelled)
+            }
             Ok(HostResult::FreshAgentCommand { state, .. }) => {
                 self.registry
                     .mark_input_ambiguous(soul_id, request_id)
@@ -2582,10 +2842,21 @@ impl Supervisor {
                 ))
             }
             Err(error) => {
-                self.registry
-                    .mark_input_ambiguous(soul_id, request_id)
-                    .await
-                    .map_err(map_registry)?;
+                let refusal = error.fresh_agent_send_diagnostic.as_ref().filter(|diagnostic| {
+                    error.code != RuntimeErrorCode::CommandAmbiguous
+                        && diagnostic.outcome == freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused
+                });
+                if let Some(diagnostic) = refusal {
+                    self.registry
+                        .mark_fresh_input_refused(soul_id, request_id, diagnostic.clone())
+                        .await
+                        .map_err(map_registry)?;
+                } else {
+                    self.registry
+                        .mark_input_ambiguous(soul_id, request_id)
+                        .await
+                        .map_err(map_registry)?;
+                }
                 Err(error)
             }
         }
@@ -2610,7 +2881,7 @@ impl Supervisor {
         let fixture = current.fresh_agent.as_ref().is_some_and(|agent| {
             crate::registry::deterministic_fresh_agent_fixture(&current.provider, agent)
         });
-        let can_prepare = !fixture
+        let can_prepare_claude = !fixture
             && matches!(current.provider.as_str(), "claude" | "kilroy")
             && current.desired_state == freshell_runtime_protocol::DesiredState::Running
             && current.prior_handle.incarnation_id() == active.incarnation_id()
@@ -2629,7 +2900,7 @@ impl Supervisor {
                 })
             && [
                 "native-identity-observation-v1",
-                "fresh-agent-native-readiness-v1",
+                HOST_CAPABILITY_NATIVE_READINESS_RECEIPT_V1,
             ]
             .iter()
             .all(|required| {
@@ -2637,11 +2908,15 @@ impl Supervisor {
                     .iter()
                     .any(|capability| capability == required)
             });
-        if can_prepare
-            && (status.exited
-                || crate::recovery::current_native_observation(&current, &status).is_none())
-        {
+        let readiness_needed = status.exited
+            || crate::recovery::current_native_observation(&current, &status).is_none();
+        if readiness_needed && can_prepare_claude {
             let before = current.write_fence();
+            let expected_launch = current
+                .native_identity_launch
+                .clone()
+                .expect("Claude readiness requires a bound native launch");
+            let source_fence = before.native_readiness_fence();
             let result = self
                 .await_running_startup(
                     soul_id,
@@ -2652,6 +2927,8 @@ impl Supervisor {
                         &host,
                         HostCommand::FreshAgentPrepareNative {
                             incarnation_id: active.incarnation_id().clone(),
+                            expected_launch: Some(expected_launch),
+                            source_fence: Some(source_fence),
                         },
                     ),
                 )
@@ -2682,6 +2959,237 @@ impl Supervisor {
                     "fresh-agent owner or intent changed during native readiness",
                 ));
             }
+        } else if readiness_needed
+            && !fixture
+            && current.provider == "codex"
+            && current.desired_state == freshell_runtime_protocol::DesiredState::Running
+            && current.prior_handle.incarnation_id() == active.incarnation_id()
+            && current
+                .native_session_id
+                .as_deref()
+                .is_some_and(|root| !root.is_empty())
+            && current
+                .native_identity_launch
+                .as_ref()
+                .is_some_and(|launch| {
+                    launch.incarnation_id == *active.incarnation_id()
+                        && launch.launch_nonce == active.launch_nonce().as_str()
+                        && launch.execution_generation > 0
+                        && launch.execution_generation == status.max_execution_generation
+                        && launch.evidence_revision == current.evidence_revision
+                        && launch
+                            .requested_native_session_id
+                            .as_deref()
+                            .is_none_or(|root| Some(root) == current.native_session_id.as_deref())
+                })
+            && [
+                "native-identity-observation-v1",
+                HOST_CAPABILITY_NATIVE_READINESS_RECEIPT_V1,
+            ]
+            .iter()
+            .all(|required| {
+                host.capabilities
+                    .iter()
+                    .any(|capability| capability == required)
+            })
+        {
+            let before_probe = current.write_fence();
+            let (probe, probed_context) = self
+                .probe_codex_native_readiness_locked(&current, &host)
+                .await?;
+            if probed_context.write_fence() != before_probe {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::StaleIntentRevision,
+                    "Codex readiness source changed before its provider check",
+                ));
+            }
+            let fresh_store_proof = matches!(
+                probe,
+                RecoveryProbe::ResumeReady { .. }
+                    | RecoveryProbe::DefinitivelyUnavailable {
+                        path: freshell_runtime_protocol::RecoveryPath::NativeResume,
+                        ..
+                    }
+            );
+            if fresh_store_proof {
+                let before = before_probe;
+                let expected_launch =
+                    probed_context
+                        .native_identity_launch
+                        .clone()
+                        .ok_or_else(|| {
+                            RuntimeError::new(
+                                RuntimeErrorCode::RecoveryBlocked,
+                                "Codex readiness has no current native launch binding",
+                            )
+                        })?;
+                let source_fence = before.native_readiness_fence();
+                let before_provider = self
+                    .registry
+                    .recovery_context(soul_id.clone())
+                    .await
+                    .map_err(map_registry)?;
+                if before_provider.write_fence() != before
+                    || before_provider.native_identity_launch.as_ref() != Some(&expected_launch)
+                    || before_provider.native_session_id != probed_context.native_session_id
+                {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::StaleIntentRevision,
+                        "Codex readiness source changed before native recovery",
+                    ));
+                }
+                let result = self
+                    .await_running_startup(
+                        soul_id,
+                        "prepare_fresh_native_readiness",
+                        self.send_authenticated_host_command(
+                            active.incarnation_id().clone(),
+                            active.runtime_dir(),
+                            &host,
+                            HostCommand::FreshAgentPrepareNative {
+                                incarnation_id: active.incarnation_id().clone(),
+                                expected_launch: Some(expected_launch.clone()),
+                                source_fence: Some(source_fence),
+                            },
+                        ),
+                    )
+                    .await??;
+                let (state, reported_native, identity) = match result {
+                    HostResult::FreshAgentCommand {
+                        state,
+                        native_session_id,
+                        native_identity,
+                        ..
+                    } => (state, native_session_id, native_identity),
+                    _ => {
+                        return Err(RuntimeError::new(
+                            RuntimeErrorCode::HostAuthenticationFailed,
+                            "unexpected Codex native readiness reply",
+                        ));
+                    }
+                };
+                if !matches!(state, CommandState::Completed | CommandState::ProviderAcked) {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::HostAuthenticationFailed,
+                        "Codex native readiness did not complete",
+                    ));
+                }
+                status = self
+                    .host_status(active.incarnation_id().clone(), active.runtime_dir(), &host)
+                    .await?;
+                let still_current = self
+                    .registry
+                    .recovery_context(soul_id.clone())
+                    .await
+                    .map_err(map_registry)?;
+                if still_current.write_fence() != before
+                    || still_current.native_identity_launch.as_ref() != Some(&expected_launch)
+                    || still_current.native_session_id != probed_context.native_session_id
+                {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::StaleIntentRevision,
+                        "Codex readiness source changed while the provider was recovering",
+                    ));
+                }
+                let native_observation = status.native_identity_observation.as_ref();
+                let Some(native_observation) = native_observation else {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::RecoveryWrongIdentity,
+                        "Codex readiness returned without authenticated native proof",
+                    ));
+                };
+                if status.exited
+                    || !native_observation.matches_provider("codex", true)
+                    || native_observation.incarnation_id != *active.incarnation_id()
+                    || native_observation.launch_nonce != active.launch_nonce().as_str()
+                    || status.native_session_id.as_deref()
+                        != Some(native_observation.native_session_id.as_str())
+                    || reported_native.as_deref()
+                        != Some(native_observation.native_session_id.as_str())
+                {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::RecoveryWrongIdentity,
+                        "Codex native readiness proof does not match the current host",
+                    ));
+                }
+                match identity {
+                    Some(identity) => {
+                        let previous = probed_context
+                            .native_session_id
+                            .as_deref()
+                            .expect("Codex readiness precondition requires an exact prior root");
+                        let mut expected_next = expected_launch.clone();
+                        expected_next.evidence_revision = expected_next
+                            .evidence_revision
+                            .checked_add(1)
+                            .ok_or_else(|| {
+                                RuntimeError::new(
+                                    RuntimeErrorCode::RecoveryWrongIdentity,
+                                    "Codex native identity revision is exhausted",
+                                )
+                            })?;
+                        expected_next.requested_native_session_id =
+                            Some(identity.native_session_id.clone());
+                        if identity.previous_native_session_id != previous
+                            || identity.native_session_id.is_empty()
+                            || identity.native_session_id == previous
+                            || identity.native_session_id.chars().any(char::is_control)
+                            || reported_native.as_deref()
+                                != Some(identity.native_session_id.as_str())
+                            || !native_observation.matches_launch(&expected_next)
+                            || native_observation.native_session_id != identity.native_session_id
+                        {
+                            return Err(RuntimeError::new(
+                                RuntimeErrorCode::RecoveryWrongIdentity,
+                                "Codex native recovery transition is not bound to the accepted proof",
+                            ));
+                        }
+                        self.registry
+                            .record_fresh_agent_recovery_identity_fenced(
+                                soul_id.clone(),
+                                active.incarnation_id().clone(),
+                                identity,
+                                before,
+                            )
+                            .await
+                            .map_err(map_registry)?;
+                        current = self
+                            .registry
+                            .recovery_context(soul_id.clone())
+                            .await
+                            .map_err(map_registry)?;
+                        if current.native_session_id.as_deref()
+                            != Some(native_observation.native_session_id.as_str())
+                            || current.native_identity_launch.as_ref() != Some(&expected_next)
+                            || current.fresh_agent.as_ref().is_none_or(|agent| {
+                                agent.native_session_id.as_deref()
+                                    != Some(native_observation.native_session_id.as_str())
+                            })
+                        {
+                            return Err(RuntimeError::new(
+                                RuntimeErrorCode::RecoveryWrongIdentity,
+                                "Codex native root transition was not committed consistently",
+                            ));
+                        }
+                    }
+                    None => {
+                        if reported_native.as_deref() != probed_context.native_session_id.as_deref()
+                            || !native_observation.matches_launch(&expected_launch)
+                            || native_observation.native_session_id
+                                != probed_context
+                                    .native_session_id
+                                    .as_deref()
+                                    .unwrap_or_default()
+                        {
+                            return Err(RuntimeError::new(
+                                RuntimeErrorCode::RecoveryWrongIdentity,
+                                "Codex readiness did not prove the current native root",
+                            ));
+                        }
+                        current = still_current;
+                    }
+                }
+            }
         }
         // gc1p Fix B1: a codex native exit inside this still-live host is
         // send-recoverable. The classification is derived locally from the
@@ -2696,6 +3204,10 @@ impl Supervisor {
                 && current.fresh_agent.is_some()
                 && current.desired_state == freshell_runtime_protocol::DesiredState::Running
                 && current.prior_handle.incarnation_id() == active.incarnation_id()
+                && current
+                    .native_identity_launch
+                    .as_ref()
+                    .is_some_and(|launch| launch.incarnation_id == *active.incarnation_id())
                 && classify_send_recoverable_exit(current, status)
                     == crate::inventory::FreshProviderExitClass::CodexSendRecoverable
         };
@@ -2709,6 +3221,11 @@ impl Supervisor {
             && crate::recovery::current_native_observation(&current, &status).is_none()
         {
             let before = current.write_fence();
+            let expected_launch = current
+                .native_identity_launch
+                .clone()
+                .expect("codex send-recoverable readiness requires a bound native launch");
+            let source_fence = before.native_readiness_fence();
             let result = self
                 .await_running_startup(
                     soul_id,
@@ -2719,6 +3236,8 @@ impl Supervisor {
                         &host,
                         HostCommand::FreshAgentPrepareNative {
                             incarnation_id: active.incarnation_id().clone(),
+                            expected_launch: Some(expected_launch),
+                            source_fence: Some(source_fence),
                         },
                     ),
                 )
@@ -3235,7 +3754,24 @@ impl Supervisor {
         // Metadata discovery must not queue behind lifecycle work and then
         // dispatch after the name worker's existing request budget expired.
         let Ok(_guard) = lifecycle_lock.try_lock() else {
-            return Ok(unavailable());
+            append_event(
+                &self.config.lifecycle_log,
+                "freshagent.native_name_refused",
+                serde_json::json!({
+                    "severity":"info",
+                    "reason":"lifecycle_busy",
+                    "soulId":request.soul_id,
+                    "nativeSessionId":request.source.native_session_id,
+                    "operation":match &request.operation {
+                        freshell_runtime_protocol::FreshAgentNativeNameOperation::Probe => "probe",
+                        freshell_runtime_protocol::FreshAgentNativeNameOperation::Read => "read",
+                        freshell_runtime_protocol::FreshAgentNativeNameOperation::Write { .. } => "write",
+                    },
+                }),
+            );
+            return Ok(FreshAgentNativeNameReply::Failed(
+                FreshAgentNativeNameError::LifecycleBusy,
+            ));
         };
         let handle = self
             .registry
@@ -3254,18 +3790,76 @@ impl Supervisor {
                 && view.recovery_state == freshell_runtime_protocol::RecoveryState::Live
                 && view.desired_state == freshell_runtime_protocol::DesiredState::Running
         };
-        if !matches_source(&before)
-            || !handle.fresh_agent().is_some_and(|agent| {
-                agent.provider == freshell_runtime_protocol::FreshProvider::Codex
-            })
-            || request.codex_home.is_empty()
-        {
+        if !matches_source(&before) {
+            append_event(
+                &self.config.lifecycle_log,
+                "freshagent.native_name_refused",
+                serde_json::json!({
+                    "severity":"warning",
+                    "reason":"source_mismatch",
+                    "soulId":request.soul_id,
+                    "requestedIncarnationId":request.source.incarnation_id,
+                    "currentIncarnationId":before.incarnation_id,
+                    "requestedHostBootId":request.source.host_boot_id,
+                    "currentHostBootId":before.host_boot_id,
+                    "requestedExecutionGeneration":request.source.execution_generation,
+                    "currentExecutionGeneration":before.execution_generation,
+                    "requestedIntentRevision":request.source.intent_revision,
+                    "currentIntentRevision":before.intent_revision,
+                    "requestedNativeSessionId":request.source.native_session_id,
+                    "currentNativeSessionId":before.native_session_id,
+                    "currentLaunchState":before.launch_state,
+                    "currentRecoveryState":before.recovery_state,
+                    "currentDesiredState":before.desired_state,
+                }),
+            );
+            return Ok(unavailable());
+        }
+        let is_fresh_codex = handle
+            .fresh_agent()
+            .is_some_and(|agent| agent.provider == freshell_runtime_protocol::FreshProvider::Codex);
+        if !is_fresh_codex {
+            append_event(
+                &self.config.lifecycle_log,
+                "freshagent.native_name_refused",
+                serde_json::json!({
+                    "severity":"warning",
+                    "reason":"provider_mismatch",
+                    "soulId":request.soul_id,
+                    "hasFreshAgent":handle.fresh_agent().is_some(),
+                    "providerIsCodex":is_fresh_codex,
+                }),
+            );
+            return Ok(unavailable());
+        }
+        if request.codex_home.is_empty() {
+            append_event(
+                &self.config.lifecycle_log,
+                "freshagent.native_name_refused",
+                serde_json::json!({
+                    "severity":"warning",
+                    "reason":"missing_codex_home",
+                    "soulId":request.soul_id,
+                    "codexHomePresent":false,
+                }),
+            );
             return Ok(unavailable());
         }
         let host = self
             .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
             .await?;
         if host.host_boot_id != request.source.host_boot_id {
+            append_event(
+                &self.config.lifecycle_log,
+                "freshagent.native_name_refused",
+                serde_json::json!({
+                    "severity":"warning",
+                    "reason":"host_boot_mismatch",
+                    "soulId":request.soul_id,
+                    "requestedHostBootId":request.source.host_boot_id,
+                    "currentHostBootId":host.host_boot_id,
+                }),
+            );
             return Ok(unavailable());
         }
         let reply = self
@@ -3494,6 +4088,7 @@ impl Supervisor {
         soul_id: SoulId,
         decision_id: String,
         decision: serde_json::Value,
+        operation_attempt_id: Option<String>,
     ) -> Result<CommandState, RuntimeError> {
         let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
         let _lifecycle_guard = lifecycle_lock.lock().await;
@@ -3524,6 +4119,7 @@ impl Supervisor {
                     incarnation_id: handle.incarnation_id().clone(),
                     decision_id,
                     decision,
+                    operation_attempt_id,
                 },
             )
             .await?
@@ -3536,7 +4132,11 @@ impl Supervisor {
         }
     }
 
-    async fn fresh_agent_interrupt(&self, soul_id: SoulId) -> Result<(), RuntimeError> {
+    async fn fresh_agent_interrupt(
+        &self,
+        soul_id: SoulId,
+        request_id: Option<String>,
+    ) -> Result<(), RuntimeError> {
         let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
         let _lifecycle_guard = lifecycle_lock.lock().await;
         let handle = self
@@ -3554,6 +4154,7 @@ impl Supervisor {
                 &host,
                 HostCommand::FreshAgentInterrupt {
                     incarnation_id: handle.incarnation_id().clone(),
+                    request_id,
                 },
             )
             .await?
@@ -3571,6 +4172,17 @@ impl Supervisor {
         soul_id: SoulId,
         after_sequence: u64,
         max_events: u32,
+    ) -> Result<freshell_runtime_protocol::AgentEventBatch, RuntimeError> {
+        self.fresh_agent_read_events_inner(soul_id, after_sequence, max_events, false)
+            .await
+    }
+
+    async fn fresh_agent_read_events_inner(
+        &self,
+        soul_id: SoulId,
+        after_sequence: u64,
+        max_events: u32,
+        retained_only: bool,
     ) -> Result<freshell_runtime_protocol::AgentEventBatch, RuntimeError> {
         let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
         let _guard = lifecycle_lock.lock().await;
@@ -3624,6 +4236,13 @@ impl Supervisor {
                     retained["source"]["incarnationId"] =
                         serde_json::json!(handle.incarnation_id());
                     retained["source"]["hostBootId"] = serde_json::json!(host.host_boot_id);
+                }
+                if retained_only {
+                    // This bounded read is display-only. In particular, a
+                    // cancelled request must not leave a journal-driven
+                    // identity transition or recovery probe in progress.
+                    events.events.clear();
+                    return Ok(events);
                 }
                 let mut observed_current_start = false;
                 let latest_start =
@@ -4241,6 +4860,52 @@ impl Supervisor {
         cwd: &str,
         workspace: &str,
     ) -> Result<freshell_runtime_protocol::PreparedProviderContext, RuntimeError> {
+        self.issue_replacement_mcp_capability_inner(ReplacementMcpCapabilityRequest {
+            start,
+            provider,
+            context,
+            references,
+            cwd,
+            workspace,
+            reopen_prepared: false,
+        })
+        .await
+    }
+
+    async fn issue_reopen_mcp_capability(
+        &self,
+        start: &crate::registry::RecoveryStart,
+        provider: &str,
+        context: &freshell_runtime_protocol::ProviderLaunchContext,
+        references: &[freshell_runtime_protocol::ProviderSecretReference],
+        cwd: &str,
+        workspace: &str,
+    ) -> Result<freshell_runtime_protocol::PreparedProviderContext, RuntimeError> {
+        self.issue_replacement_mcp_capability_inner(ReplacementMcpCapabilityRequest {
+            start,
+            provider,
+            context,
+            references,
+            cwd,
+            workspace,
+            reopen_prepared: true,
+        })
+        .await
+    }
+
+    async fn issue_replacement_mcp_capability_inner(
+        &self,
+        request: ReplacementMcpCapabilityRequest<'_>,
+    ) -> Result<freshell_runtime_protocol::PreparedProviderContext, RuntimeError> {
+        let ReplacementMcpCapabilityRequest {
+            start,
+            provider,
+            context,
+            references,
+            cwd,
+            workspace,
+            reopen_prepared,
+        } = request;
         let codex_source_runtime = if provider == "codex" {
             use freshell_platform::codex_inputs::NativeSourceRuntime;
             let incompatible =
@@ -4296,24 +4961,28 @@ impl Supervisor {
                 .as_ref()
                 .map(|inputs| inputs.generation_id.as_str()),
         );
-        let response = self
-            .mcp_capability_callback(McpCapabilityRequest {
-                action: "issue",
-                soul_id: &start.context.soul_id,
-                incarnation_id: None,
-                grant_id: None,
-                provider: Some(provider),
-                tui_source,
-                workspace: Some(workspace),
-                auth_lookup_authority: Some(&scope.key),
-                claude_recovery_source: claude_recovery_source.as_ref(),
-                codex_source_runtime,
-                cwd: Some(cwd),
-                prior_context: Some(context),
-                provider_secret_references: Some(references),
-                provider_path_inputs: Some(&path_inputs),
-            })
-            .await?;
+        let callback_request = McpCapabilityRequest {
+            action: "issue",
+            soul_id: &start.context.soul_id,
+            incarnation_id: None,
+            grant_id: None,
+            provider: Some(provider),
+            tui_source,
+            workspace: Some(workspace),
+            auth_lookup_authority: Some(&scope.key),
+            claude_recovery_source: claude_recovery_source.as_ref(),
+            codex_source_runtime,
+            cwd: Some(cwd),
+            prior_context: Some(context),
+            provider_secret_references: Some(references),
+            provider_path_inputs: Some(&path_inputs),
+        };
+        let response = if reopen_prepared {
+            self.mcp_capability_callback_for_reopen(callback_request)
+                .await?
+        } else {
+            self.mcp_capability_callback(callback_request).await?
+        };
         let prepared: freshell_runtime_protocol::PreparedProviderContext =
             serde_json::from_slice(&response).map_err(|_| {
                 RuntimeError::new(
@@ -4337,6 +5006,21 @@ impl Supervisor {
     async fn mcp_capability_callback(
         &self,
         request: McpCapabilityRequest<'_>,
+    ) -> Result<Vec<u8>, RuntimeError> {
+        self.mcp_capability_callback_inner(request, true).await
+    }
+
+    async fn mcp_capability_callback_for_reopen(
+        &self,
+        request: McpCapabilityRequest<'_>,
+    ) -> Result<Vec<u8>, RuntimeError> {
+        self.mcp_capability_callback_inner(request, false).await
+    }
+
+    async fn mcp_capability_callback_inner(
+        &self,
+        request: McpCapabilityRequest<'_>,
+        await_running: bool,
     ) -> Result<Vec<u8>, RuntimeError> {
         if self.config.control_secret.contains(['\r', '\n']) {
             return Err(RuntimeError::new(
@@ -4388,7 +5072,7 @@ impl Supervisor {
         // Recovery composes several large native request futures. Keep this
         // exchange and intent polling off its nested poll stack.
         let bounded = Box::pin(tokio::time::timeout(budget, exchange));
-        let response = if request.action == "issue" {
+        let response = if request.action == "issue" && await_running {
             Box::pin(self.await_running_startup(request.soul_id, "provider_preparation", bounded))
                 .await?
         } else {
@@ -4430,6 +5114,28 @@ impl Supervisor {
         stage: &'static str,
         operation: impl std::future::Future<Output = T>,
     ) -> Result<T, RuntimeError> {
+        self.await_startup_with_reopen_authority(soul_id, stage, None, operation)
+            .await
+    }
+
+    async fn await_running_or_reopen_startup<T>(
+        &self,
+        soul_id: &SoulId,
+        incarnation_id: &IncarnationId,
+        stage: &'static str,
+        operation: impl std::future::Future<Output = T>,
+    ) -> Result<T, RuntimeError> {
+        self.await_startup_with_reopen_authority(soul_id, stage, Some(incarnation_id), operation)
+            .await
+    }
+
+    async fn await_startup_with_reopen_authority<T>(
+        &self,
+        soul_id: &SoulId,
+        stage: &'static str,
+        reopen_incarnation: Option<&IncarnationId>,
+        operation: impl std::future::Future<Output = T>,
+    ) -> Result<T, RuntimeError> {
         tokio::pin!(operation);
         loop {
             let context = self
@@ -4438,24 +5144,556 @@ impl Supervisor {
                 .await
                 .map_err(map_registry)?;
             if context.desired_state != freshell_runtime_protocol::DesiredState::Running {
-                append_event(
-                    &self.config.lifecycle_log,
-                    "supervisor.startup.interrupted",
-                    serde_json::json!({
-                        "severity":"info", "soulId":soul_id, "intentRevision":context.intent_revision,
-                        "stage":stage, "reason":"stopped_intent"
-                    }),
-                );
-                return Err(RuntimeError::new(
-                    RuntimeErrorCode::StaleIntentRevision,
-                    "startup interrupted by stopped intent",
-                ));
+                let reopen_is_current =
+                    match (reopen_incarnation, context.recovery_attempt_id.as_ref()) {
+                        (Some(incarnation_id), Some(attempt_id)) => self
+                            .registry
+                            .is_current_reopen_preparation(
+                                soul_id.clone(),
+                                incarnation_id.clone(),
+                                context.intent_revision,
+                                attempt_id.clone(),
+                            )
+                            .await
+                            .map_err(map_registry)?,
+                        _ => false,
+                    };
+                if !reopen_is_current {
+                    append_event(
+                        &self.config.lifecycle_log,
+                        "supervisor.startup.interrupted",
+                        serde_json::json!({
+                            "severity":"info", "soulId":soul_id, "intentRevision":context.intent_revision,
+                            "stage":stage, "reason":"stopped_intent"
+                        }),
+                    );
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::StaleIntentRevision,
+                        "startup interrupted by stopped intent",
+                    ));
+                }
             }
             tokio::select! {
                 result = &mut operation => return Ok(result),
                 _ = sleep(Duration::from_millis(100)) => {}
             }
         }
+    }
+
+    async fn reopen(
+        &self,
+        request_id: RequestId,
+        request: freshell_runtime_protocol::ReopenRequest,
+    ) -> Result<freshell_runtime_protocol::ReopenResult, RuntimeError> {
+        let payload_digest = semantic_reopen_digest(&request);
+        if let Some(view) = self
+            .registry
+            .successful_reopen(
+                request.soul_id.clone(),
+                request_id.clone(),
+                payload_digest.clone(),
+            )
+            .await
+            .map_err(map_registry)?
+        {
+            return Ok(reopened_result(view));
+        }
+        self.registry
+            .assert_epoch(request.expected_control_epoch)
+            .map_err(map_registry)?;
+
+        let lifecycle_lock = self.lifecycle_lock(&request.soul_id).await;
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        if let Some(view) = self
+            .registry
+            .successful_reopen(
+                request.soul_id.clone(),
+                request_id.clone(),
+                payload_digest.clone(),
+            )
+            .await
+            .map_err(map_registry)?
+        {
+            return Ok(reopened_result(view));
+        }
+        self.registry
+            .assert_epoch(request.expected_control_epoch)
+            .map_err(map_registry)?;
+
+        let prior_context = self
+            .registry
+            .recovery_context(request.soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let prior_incarnation = prior_context.prior_handle.incarnation_id().clone();
+        let prior_view = find_view(&self.registry, &prior_incarnation).await?;
+
+        if let Some(pending) = self
+            .registry
+            .pending_no_runtime_reopen_revoke(
+                request.soul_id.clone(),
+                request.expected_intent_revision,
+            )
+            .await
+            .map_err(map_registry)?
+        {
+            match self
+                .notify_mcp_capability(
+                    "revoke",
+                    &pending.endpoint,
+                    &pending.soul_id,
+                    &pending.incarnation_id,
+                    &pending.grant_id,
+                )
+                .await
+            {
+                Ok(()) => {
+                    self.registry
+                        .acknowledge_no_runtime_reopen_revoke(&pending)
+                        .await
+                        .map_err(map_registry)?;
+                    append_event(
+                        &self.config.lifecycle_log,
+                        "supervisor.reopen.no_runtime_revoke_settled",
+                        serde_json::json!({
+                            "severity":"info",
+                            "soulId":pending.soul_id,
+                            "incarnationId":pending.incarnation_id,
+                            "intentRevision":pending.intent_revision,
+                        }),
+                    );
+                }
+                Err(error) => {
+                    append_event(
+                        &self.config.lifecycle_log,
+                        "supervisor.reopen.no_runtime_revoke_pending",
+                        serde_json::json!({
+                            "severity":"warning",
+                            "soulId":pending.soul_id,
+                            "incarnationId":pending.incarnation_id,
+                            "intentRevision":pending.intent_revision,
+                            "errorCode":error.code,
+                        }),
+                    );
+                    return Ok(pending_reopen_result(
+                        Some(prior_view),
+                        "the failed replacement capability revoke is still pending",
+                    ));
+                }
+            }
+        }
+
+        for handle in self
+            .registry
+            .pending_stop_handles()
+            .await
+            .map_err(map_registry)?
+            .into_iter()
+            .filter(|handle| handle.soul_id() == &request.soul_id)
+        {
+            let stop_fence = handle.stop_fence().map_err(map_registry)?;
+            if stop_fence.intent_revision != request.expected_intent_revision {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::StaleIntentRevision,
+                    "Reopen expected a different stopped intent revision",
+                ));
+            }
+            let outcome = self.finish_stop_handle(&handle).await?;
+            let view = find_view(&self.registry, handle.incarnation_id()).await?;
+            if outcome != StopOutcome::VerifiedEmpty {
+                return Ok(failed_reopen_result(
+                    Some(view),
+                    "the prior runtime could not be verified empty",
+                ));
+            }
+            let progress = self
+                .registry
+                .stop_progress(&handle)
+                .await
+                .map_err(map_registry)?;
+            if !progress.settled {
+                return Ok(pending_reopen_result(
+                    Some(view),
+                    "the prior runtime capability revoke is still pending",
+                ));
+            }
+        }
+
+        let preparation = match self
+            .registry
+            .prepare_reopen(
+                request.soul_id.clone(),
+                request_id.clone(),
+                payload_digest.clone(),
+                request.expected_intent_revision,
+            )
+            .await
+        {
+            Ok(preparation) => preparation,
+            Err(error @ RegistryError::StaleIntentRevision { .. })
+            | Err(error @ RegistryError::RequestConflict) => return Err(map_registry(error)),
+            Err(error) => {
+                append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.reopen.refused",
+                    serde_json::json!({
+                        "severity":"warning",
+                        "soulId":request.soul_id,
+                        "expectedIntentRevision":request.expected_intent_revision,
+                        "reason":"prior_stop_or_saved_resume_not_ready",
+                        "errorCode":map_registry(error).code,
+                    }),
+                );
+                return Ok(failed_reopen_result(
+                    Some(prior_view),
+                    "the stopped runtime or saved conversation is not ready for Reopen",
+                ));
+            }
+        };
+
+        let terminal = if preparation.replacement.resume_spec.is_some() {
+            terminal_without_first_boot_state(preparation.replacement.terminal.clone())
+        } else {
+            preparation.replacement.terminal.clone()
+        };
+        let fresh_agent = fresh_without_raw_bootstrap(preparation.replacement.fresh_agent.clone());
+        let mut workload = LaunchWorkload {
+            soul_id: request.soul_id.clone(),
+            fixture: preparation.replacement.fixture,
+            terminal,
+            fresh_agent,
+            resume_spec: preparation.replacement.resume_spec.clone(),
+        };
+        let view = match Box::pin(self.activate_reopen(
+            &preparation,
+            request_id,
+            payload_digest,
+            &request,
+            &mut workload,
+        ))
+        .await
+        {
+            Ok(view) => view,
+            Err(failure) => {
+                self.settle_failed_reopen(&preparation, &workload, failure.create_evidence)
+                    .await;
+                let failure_view = find_view(
+                    &self.registry,
+                    &preparation.replacement.prepared.incarnation_id,
+                )
+                .await
+                .unwrap_or(prior_view);
+                append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.reopen.failed",
+                    serde_json::json!({
+                        "severity":"error", "soulId":request.soul_id,
+                        "incarnationId":preparation.replacement.prepared.incarnation_id,
+                        "attemptId":preparation.start.attempt_id, "errorCode":failure.error.code,
+                    }),
+                );
+                return Ok(failed_reopen_result(
+                    Some(failure_view),
+                    "the replacement could not be reopened; inspect cleanup state and use manual recovery if needed",
+                ));
+            }
+        };
+        append_event(
+            &self.config.lifecycle_log,
+            "supervisor.reopen.succeeded",
+            serde_json::json!({
+                "severity":"info", "soulId":request.soul_id,
+                "incarnationId":view.incarnation_id, "intentRevision":view.intent_revision,
+            }),
+        );
+        Ok(reopened_result(view))
+    }
+
+    async fn activate_reopen(
+        &self,
+        preparation: &crate::registry::ReopenPreparation,
+        request_id: RequestId,
+        payload_digest: String,
+        request: &freshell_runtime_protocol::ReopenRequest,
+        workload: &mut LaunchWorkload,
+    ) -> Result<RuntimeView, ReopenActivationFailure> {
+        let mut create_evidence = ReopenCreateEvidence::NotAttempted;
+        self.activate_reopen_inner(
+            preparation,
+            request_id,
+            payload_digest,
+            request,
+            workload,
+            &mut create_evidence,
+        )
+        .await
+        .map_err(|error| ReopenActivationFailure {
+            error,
+            create_evidence,
+        })
+    }
+
+    async fn activate_reopen_inner(
+        &self,
+        preparation: &crate::registry::ReopenPreparation,
+        request_id: RequestId,
+        payload_digest: String,
+        request: &freshell_runtime_protocol::ReopenRequest,
+        workload: &mut LaunchWorkload,
+        create_evidence: &mut ReopenCreateEvidence,
+    ) -> Result<RuntimeView, RuntimeError> {
+        let provider_context = workload
+            .terminal
+            .as_ref()
+            .and_then(|spec| {
+                spec.provider_launch_context.as_ref().map(|context| {
+                    (
+                        spec.mode.clone(),
+                        context.clone(),
+                        spec.provider_secret_references.clone(),
+                        spec.cwd.clone(),
+                        spec.workspace_path.clone(),
+                    )
+                })
+            })
+            .or_else(|| {
+                workload.fresh_agent.as_ref().and_then(|agent| {
+                    agent.provider_launch_context.as_ref().map(|context| {
+                        (
+                            agent.provider.native_provider().to_owned(),
+                            context.clone(),
+                            agent.provider_secret_references.clone(),
+                            agent.cwd.clone(),
+                            agent.workspace_path.clone(),
+                        )
+                    })
+                })
+            });
+        if let Some((provider, context, references, cwd, workspace)) = provider_context {
+            if context.mcp_capability.is_some() {
+                // The prior grant was revoked by Stop. It is not a newly
+                // issued preparation and must never be aborted on behalf of
+                // this replacement if renewal itself fails.
+                if let Some(saved) = workload
+                    .terminal
+                    .as_mut()
+                    .and_then(|terminal| terminal.provider_launch_context.as_mut())
+                    .or_else(|| {
+                        workload
+                            .fresh_agent
+                            .as_mut()
+                            .and_then(|agent| agent.provider_launch_context.as_mut())
+                    })
+                {
+                    saved.mcp_capability = None;
+                }
+                let prepared = self
+                    .issue_reopen_mcp_capability(
+                        &preparation.start,
+                        &provider,
+                        &context,
+                        &references,
+                        &cwd,
+                        &workspace,
+                    )
+                    .await?;
+                install_reopen_provider_context(
+                    workload.terminal.as_mut(),
+                    workload.fresh_agent.as_mut(),
+                    prepared,
+                )?;
+            }
+        }
+        self.registry
+            .persist_reopen_launch_specs(
+                request.soul_id.clone(),
+                preparation.replacement.prepared.incarnation_id.clone(),
+                preparation.start.attempt_id.clone(),
+                workload.terminal.clone(),
+                workload.fresh_agent.clone(),
+            )
+            .await
+            .map_err(map_registry)?;
+
+        let prepared = preparation.replacement.prepared.clone();
+        let fence = preparation
+            .start
+            .context
+            .write_fence_for_attempt(preparation.start.attempt_id.clone())
+            .for_incarnation(prepared.incarnation_id.clone());
+        Box::pin(self.activate_reopen_prepared_observed(
+            prepared.clone(),
+            workload.clone(),
+            preparation.start.context.requested_limits,
+            fence,
+            create_evidence,
+        ))
+        .await?;
+
+        let handle = self
+            .registry
+            .owned_handle(prepared.incarnation_id.clone())
+            .await
+            .map_err(map_registry)?;
+        Box::pin(self.await_running_or_reopen_startup(
+            &request.soul_id,
+            &prepared.incarnation_id,
+            "reopen_provider_commit",
+            self.commit_provider_preparation(&handle),
+        ))
+        .await??;
+
+        self.registry
+            .finish_reopen(
+                request.soul_id.clone(),
+                request_id,
+                payload_digest,
+                request.expected_intent_revision,
+                preparation.start.attempt_id.clone(),
+                prepared.incarnation_id.clone(),
+            )
+            .await
+            .map_err(map_registry)?;
+        find_view(&self.registry, &prepared.incarnation_id).await
+    }
+
+    async fn settle_failed_reopen(
+        &self,
+        preparation: &crate::registry::ReopenPreparation,
+        workload: &LaunchWorkload,
+        create_evidence: ReopenCreateEvidence,
+    ) {
+        let prepared = &preparation.replacement.prepared;
+        let handle = self
+            .registry
+            .owned_handle(prepared.incarnation_id.clone())
+            .await
+            .ok();
+        let capability = reopen_capability(workload)
+            .map(|capability| (capability.endpoint.clone(), capability.grant_id.clone()));
+        // Persist the exact pending cleanup before touching a runtime or its
+        // provider capability. Startup reconciliation can finish this Stop if
+        // this worker disappears during either external operation.
+        if self
+            .registry
+            .settle_failed_reopen(
+                prepared.clone(),
+                preparation.start.attempt_id.clone(),
+                handle.as_ref().map(|_| StopOutcome::TerminationUnconfirmed),
+                capability.clone(),
+                create_evidence,
+            )
+            .await
+            .is_err()
+        {
+            append_event(
+                &self.config.lifecycle_log,
+                "supervisor.reopen.failure_cleanup_reservation_failed",
+                serde_json::json!({"severity":"error", "soulId":prepared.soul_id,
+                    "incarnationId":prepared.incarnation_id, "attemptId":preparation.start.attempt_id}),
+            );
+            return;
+        }
+        let outcome = if let Some(handle) = handle.as_ref() {
+            Some(self.stop_failed_reopen(handle).await)
+        } else {
+            // The registry independently checks the exact uncreated row. A
+            // missing/corrupt owned handle alone never proves a runtime empty.
+            None
+        };
+        let aborted = self
+            .abort_reopen_provider_preparation(prepared, workload)
+            .await;
+        let pending_capability = (!aborted).then_some(capability).flatten();
+        let settled = self
+            .registry
+            .settle_failed_reopen(
+                prepared.clone(),
+                preparation.start.attempt_id.clone(),
+                outcome,
+                pending_capability,
+                create_evidence,
+            )
+            .await;
+        append_event(
+            &self.config.lifecycle_log,
+            "supervisor.reopen.failure_cleanup",
+            serde_json::json!({
+                "severity":if matches!(settled, Ok(StopOutcome::VerifiedEmpty)) { "info" } else { "error" },
+                "soulId":prepared.soul_id, "incarnationId":prepared.incarnation_id,
+                "attemptId":preparation.start.attempt_id,
+                "outcome":settled.as_ref().ok(), "providerAbortConfirmed":aborted,
+                "registrySettlementFailed":settled.is_err(),
+            }),
+        );
+    }
+
+    async fn stop_failed_reopen(
+        &self,
+        handle: &crate::registry::OwnedRuntimeHandle,
+    ) -> StopOutcome {
+        if self.backend.verify_empty(handle).await.unwrap_or(false) {
+            return StopOutcome::VerifiedEmpty;
+        }
+        let stopped = match self.backend.request_stop(handle, 2).await {
+            Ok(()) => match self
+                .verify_empty_with_budget(handle, Duration::from_secs(3))
+                .await
+            {
+                Ok(true) => return StopOutcome::VerifiedEmpty,
+                Ok(false) => self.backend.force_stop(handle).await,
+                Err(error) if error.code == RuntimeErrorCode::OwnershipMismatch => {
+                    return StopOutcome::BlockedOwnership
+                }
+                Err(_) => return StopOutcome::TerminationUnconfirmed,
+            },
+            Err(error) => Err(error),
+        };
+        match stopped {
+            Ok(()) => match self
+                .verify_empty_with_budget(handle, Duration::from_secs(3))
+                .await
+            {
+                Ok(true) => StopOutcome::VerifiedEmpty,
+                _ => StopOutcome::TerminationUnconfirmed,
+            },
+            Err(BackendError::OwnershipMismatch(_)) => StopOutcome::BlockedOwnership,
+            Err(BackendError::Unavailable(_)) => StopOutcome::BackendUnavailable,
+            Err(_) => StopOutcome::TerminationUnconfirmed,
+        }
+    }
+
+    async fn abort_reopen_provider_preparation(
+        &self,
+        prepared: &PreparedLaunch,
+        workload: &LaunchWorkload,
+    ) -> bool {
+        let capability = reopen_capability(workload);
+        if let Some(capability) = capability {
+            if let Err(error) = self
+                .notify_mcp_capability(
+                    "abort",
+                    &capability.endpoint,
+                    &prepared.soul_id,
+                    &prepared.incarnation_id,
+                    &capability.grant_id,
+                )
+                .await
+            {
+                append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.reopen.provider_abort_pending",
+                    serde_json::json!({
+                        "severity":"warning",
+                        "soulId":prepared.soul_id,
+                        "incarnationId":prepared.incarnation_id,
+                        "errorCode":error.code,
+                    }),
+                );
+                return false;
+            }
+        }
+        true
     }
 
     async fn stop(
@@ -5004,8 +6242,26 @@ impl Supervisor {
             })
             .await
             .map_err(map_registry)?;
+        let native_readiness_recovery =
+            match (workload.fresh_agent.as_ref(), workload.resume_spec.as_ref()) {
+                (Some(agent), Some(resume))
+                    if agent.provider == freshell_runtime_protocol::FreshProvider::Codex =>
+                {
+                    self.registry
+                        .authorize_native_readiness_recovery(
+                            workload.soul_id.clone(),
+                            incarnation_id.clone(),
+                            native_identity_launch.clone(),
+                            resume.clone(),
+                        )
+                        .await
+                        .map_err(map_registry)?
+                }
+                _ => None,
+            };
         let command = HostCommand::GrantExecution {
             native_identity_launch: Some(native_identity_launch.clone()),
+            native_readiness_recovery: native_readiness_recovery.clone().map(Box::new),
             incarnation_id: incarnation_id.clone(),
             soul_id: workload.soul_id.clone(),
             host_boot_id: grant.host_boot_id.clone(),
@@ -5019,12 +6275,48 @@ impl Supervisor {
             resume_spec: workload.resume_spec.clone().map(Box::new),
             dispatch_budget_ms: None,
         };
-        match self
+        let grant_reply = match self
             .send_authenticated_host_command(incarnation_id, handle.runtime_dir(), host, command)
-            .await?
+            .await
         {
+            Ok(reply) => reply,
+            Err(original_error) if native_readiness_recovery.is_some() => {
+                // The provider transition and host receipt are durable before
+                // GrantAccepted is sent. If that reply was lost, ask Status
+                // for the exact persisted receipt instead of redispatching
+                // startup work or accepting only the observed root string.
+                match self
+                    .host_status(handle.incarnation_id().clone(), handle.runtime_dir(), host)
+                    .await
+                {
+                    Ok(status)
+                        if !status.exited
+                            && status.host_boot_id == grant.host_boot_id
+                            && status.max_execution_generation == grant.execution_generation
+                            && status.native_readiness_receipt.is_some()
+                            && status.worker_pid.is_some() =>
+                    {
+                        HostResult::GrantAccepted {
+                            host_boot_id: status.host_boot_id,
+                            worker_pid: status.worker_pid.expect("checked above"),
+                            worker_launch_count: status.worker_launch_count,
+                            fixture_evidence: status.fixture_evidence,
+                            native_session_id: status.native_session_id,
+                            native_identity_observation: status.native_identity_observation,
+                            native_readiness_receipt: status.native_readiness_receipt,
+                            opencode_transfer_receipt: status.opencode_transfer_receipt,
+                            opencode_adoption: status.opencode_adoption,
+                        }
+                    }
+                    _ => return Err(original_error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        match grant_reply {
             HostResult::GrantAccepted {
                 native_identity_observation,
+                native_readiness_receipt,
                 host_boot_id,
                 worker_pid,
                 worker_launch_count,
@@ -5036,11 +6328,15 @@ impl Supervisor {
                 let observed_root = native_identity_observation
                     .as_ref()
                     .filter(|observation| {
-                        observation.matches_launch(&native_identity_launch)
+                        native_readiness_receipt.as_ref().is_some_and(|receipt| {
+                            observation.matches_launch(&receipt.next_launch)
+                                && observation.native_session_id
+                                    == receipt.identity.native_session_id
+                        }) || (observation.matches_launch(&native_identity_launch)
                             && observation.matches_provider(
                                 &identity_context.provider,
                                 workload.fresh_agent.is_some(),
-                            )
+                            ))
                     })
                     .map(|observation| observation.native_session_id.clone());
                 // Fixture roots are presentation identity only. Ordinary
@@ -5071,7 +6367,17 @@ impl Supervisor {
                     worker_launch_count,
                     fixture_evidence,
                     native_session_id: observed_root.or(fixture_root),
-                    native_identity_observation,
+                    native_identity_observation: native_identity_observation.filter(
+                        |observation| {
+                            native_readiness_receipt.as_ref().is_some_and(|receipt| {
+                                observation.matches_launch(&receipt.next_launch)
+                                    && observation.native_session_id
+                                        == receipt.identity.native_session_id
+                            }) || observation.matches_launch(&native_identity_launch)
+                        },
+                    ),
+                    native_readiness_receipt,
+                    native_readiness_recovery,
                     opencode_transfer_receipt: validate_opencode_transfer_receipt(
                         workload
                             .terminal
@@ -5104,12 +6410,15 @@ impl Supervisor {
         use crate::recovery::NativeIdentityWait;
         let opencode_readiness = workload.opencode_tui_readiness_required(&context.provider);
         let result = self
-            .wait_for_native_identity(
+            .wait_for_native_identity_with_reopen_authority(
                 &workload.soul_id,
                 incarnation_id,
                 intent_revision,
                 crate::recovery::native_identity_wait_timeout(opencode_readiness),
                 false,
+                context.recovery_attempt_id.as_ref().filter(|_| {
+                    context.desired_state == freshell_runtime_protocol::DesiredState::Stopped
+                }),
             )
             .await;
         let (outcome, adoption_pending, elapsed_ms) = match &result {
@@ -5162,6 +6471,7 @@ impl Supervisor {
         {
             HostResult::Status {
                 native_identity_observation,
+                native_readiness_receipt,
                 max_execution_generation,
                 host_boot_id,
                 worker_pid,
@@ -5174,6 +6484,7 @@ impl Supervisor {
                 ..
             } => Ok(HostStatus {
                 native_identity_observation,
+                native_readiness_receipt,
                 max_execution_generation,
                 host_boot_id,
                 worker_pid,
@@ -5250,8 +6561,12 @@ impl Supervisor {
         host: &AuthenticatedHost,
         command: HostCommand,
     ) -> Result<HostResult, ClassifiedFailure> {
-        let startup_soul = match &command {
-            HostCommand::GrantExecution { soul_id, .. } => Some(soul_id.clone()),
+        let startup_authority = match &command {
+            HostCommand::GrantExecution {
+                soul_id,
+                incarnation_id,
+                ..
+            } => Some((soul_id.clone(), incarnation_id.clone())),
             _ => None,
         };
         let budget = self.host_command_budgets.for_command(&command);
@@ -5269,8 +6584,14 @@ impl Supervisor {
             &envelope,
             budget,
         ));
-        let reply = if let Some(soul) = startup_soul {
-            Box::pin(self.await_running_startup(&soul, "execution_grant", exchange)).await??
+        let reply = if let Some((soul, incarnation)) = startup_authority {
+            Box::pin(self.await_running_or_reopen_startup(
+                &soul,
+                &incarnation,
+                "execution_grant",
+                exchange,
+            ))
+            .await??
         } else {
             exchange.await?
         };
@@ -5321,6 +6642,1791 @@ impl Supervisor {
             },
             fence,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::CreateRuntimeFailure;
+    use crate::registry::tests::materialize_test_runtime;
+    use freshell_runtime_protocol::{
+        AdminCommand, AdminResult, ControlRole, Envelope, ReopenOutcome, ReopenRequest, RequestId,
+        SoulId, StopOutcome,
+    };
+    use serde::Deserialize;
+    use serde_json::Value;
+    use std::collections::HashMap;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::UnixListener,
+        sync::oneshot,
+    };
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct FrozenCallbackRequest {
+        action: String,
+        control_secret: String,
+        soul_id: String,
+        incarnation_id: Option<String>,
+        grant_id: Option<String>,
+        provider: Option<String>,
+        tui_source: Option<Value>,
+        workspace: Option<String>,
+        auth_lookup_authority: Option<String>,
+        claude_recovery_source: Option<Value>,
+        codex_source_runtime: Option<Value>,
+        cwd: Option<String>,
+        prior_context: Option<Value>,
+        provider_secret_references: Option<Value>,
+        provider_path_inputs: Option<Value>,
+    }
+
+    async fn frozen_callback_peer(
+        listener: UnixListener,
+        expected_actions: Vec<String>,
+        prepared_provider_context: Vec<u8>,
+        failed_action: Option<String>,
+        mut issue_gate: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+    ) -> Vec<FrozenCallbackRequest> {
+        let mut requests = Vec::new();
+        for expected_action in expected_actions {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut body = Vec::new();
+            stream.read_to_end(&mut body).await.unwrap();
+            let raw: Value = serde_json::from_slice(&body).unwrap();
+            let fields: std::collections::BTreeSet<_> = raw
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                fields,
+                [
+                    "action",
+                    "authLookupAuthority",
+                    "claudeRecoverySource",
+                    "codexSourceRuntime",
+                    "controlSecret",
+                    "cwd",
+                    "grantId",
+                    "incarnationId",
+                    "priorContext",
+                    "provider",
+                    "providerPathInputs",
+                    "providerSecretReferences",
+                    "soulId",
+                    "tuiSource",
+                    "workspace",
+                ]
+                .into_iter()
+                .collect(),
+                "frozen callback request has the exact protocol-v2 field set"
+            );
+            let request: FrozenCallbackRequest = serde_json::from_value(raw).unwrap();
+            assert_eq!(request.action, expected_action);
+            let response: &[u8] = if request.action == "issue" {
+                if let Some((prepared, continue_issue)) = issue_gate.take() {
+                    prepared.send(()).unwrap();
+                    continue_issue.await.unwrap();
+                }
+                prepared_provider_context.as_slice()
+            } else if failed_action.as_deref() == Some(request.action.as_str()) {
+                b"rejected"
+            } else {
+                b"ok"
+            };
+            requests.push(request);
+            stream.write_all(response).await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+        requests
+    }
+
+    #[derive(Default)]
+    struct FakeReopenBackend {
+        runtimes: StdMutex<HashMap<String, FakeReopenRuntime>>,
+        probe: Arc<StdMutex<ReopenProviderProbe>>,
+        granted: Arc<tokio::sync::Notify>,
+        create_attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct ReopenProviderProbe {
+        fail_create: bool,
+        create_then_fail: bool,
+        fail_identity_commit: bool,
+        fail_after_grant: bool,
+        refuse_cleanup: bool,
+        pause_observation: bool,
+        grants: Vec<HostCommand>,
+        resumed_args: Vec<String>,
+        history_path: Option<PathBuf>,
+        history_read: Option<String>,
+        stop_count: usize,
+        provider_volumes: Vec<String>,
+        cleanup_registry: Option<PathBuf>,
+    }
+
+    struct FakeReopenRuntime {
+        incarnation_id: IncarnationId,
+        state: crate::backend::BackendRuntimeState,
+        host: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    impl Drop for FakeReopenBackend {
+        fn drop(&mut self) {
+            for runtime in self.runtimes.get_mut().unwrap().values_mut() {
+                if let Some(host) = runtime.host.take() {
+                    host.abort();
+                }
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeBackend for FakeReopenBackend {
+        async fn create_stopped(
+            &self,
+            spec: &CreateRuntimeSpec,
+        ) -> Result<crate::backend::BackendCreated, BackendError> {
+            self.create_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut probe = self.probe.lock().unwrap();
+            if probe.fail_create {
+                return Err(BackendError::Unavailable("injected create refusal".into()));
+            }
+            let create_then_fail = probe.create_then_fail;
+            let fail_identity_commit = probe.fail_identity_commit;
+            let registry_path = probe.cleanup_registry.clone();
+            probe
+                .provider_volumes
+                .push(spec.provider_volume_name.clone());
+            drop(probe);
+            let container_id = format!("{:064x}", self.runtimes.lock().unwrap().len() + 1);
+            self.runtimes.lock().unwrap().insert(
+                container_id.clone(),
+                FakeReopenRuntime {
+                    incarnation_id: spec.incarnation_id.clone(),
+                    state: crate::backend::BackendRuntimeState::Created,
+                    host: None,
+                },
+            );
+            if fail_identity_commit {
+                let registry_path = registry_path.expect("identity commit failure needs registry");
+                rusqlite::Connection::open(registry_path)
+                    .unwrap()
+                    .execute_batch(
+                        "CREATE TRIGGER IF NOT EXISTS reject_reopen_backend_identity_commit
+                         BEFORE UPDATE OF container_id ON incarnations
+                         BEGIN SELECT RAISE(ABORT, 'injected identity commit failure'); END;",
+                    )
+                    .unwrap();
+            }
+            if create_then_fail {
+                return Err(BackendError::Unavailable(
+                    "injected create acknowledgement loss after recording runtime".into(),
+                ));
+            }
+            Ok(crate::backend::BackendCreated {
+                daemon_id: freshell_runtime_protocol::DockerDaemonId::new(),
+                container_id,
+                immutable_config_digest: "fake-reopen-config".into(),
+            })
+        }
+
+        async fn create_stopped_with_evidence(
+            &self,
+            spec: &CreateRuntimeSpec,
+        ) -> Result<crate::backend::BackendCreated, CreateRuntimeFailure> {
+            match self.create_stopped(spec).await {
+                Ok(created) => Ok(created),
+                Err(error) if self.probe.lock().unwrap().create_then_fail => {
+                    Err(CreateRuntimeFailure::may_have_created(error))
+                }
+                Err(error) => Err(CreateRuntimeFailure::definitely_not_created(error)),
+            }
+        }
+
+        async fn start_host(
+            &self,
+            handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<(), BackendError> {
+            let socket_path = handle.runtime_dir().join("host.sock");
+            let listener = UnixListener::bind(&socket_path)
+                .map_err(|error| BackendError::Unavailable(error.to_string()))?;
+            let secret = std::fs::read(handle.runtime_dir().join("secret"))
+                .map_err(|error| BackendError::Unavailable(error.to_string()))?;
+            let incarnation = handle.incarnation_id().clone();
+            let limits = handle.requested_limits();
+            let probe = self.probe.clone();
+            let granted = self.granted.clone();
+            let host = tokio::spawn(async move {
+                let boot = freshell_runtime_protocol::HostBootId::new();
+                let mut grant_epoch = 0;
+                let mut execution_generation = 0;
+                let mut observation = None;
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let Ok(request) = read_frame::<_, Envelope<HostCommand>>(&mut stream).await
+                    else {
+                        return;
+                    };
+                    let command = request.body.clone();
+                    let result = match request.body {
+                        HostCommand::Hello {
+                            incarnation_id: requested,
+                            challenge,
+                        } if requested == incarnation => Ok(HostResult::Hello {
+                            host_boot_id: boot.clone(),
+                            proof: host_proof(&secret, &challenge, &boot, &incarnation),
+                            capabilities: vec!["native-identity-observation-v1".into()],
+                            effective_limits: limits,
+                        }),
+                        HostCommand::GrantExecution {
+                            control_epoch,
+                            execution_generation: generation,
+                            terminal,
+                            resume_spec,
+                            native_identity_launch,
+                            ..
+                        } => {
+                            grant_epoch = control_epoch;
+                            execution_generation = generation;
+                            let mut probe = probe.lock().unwrap();
+                            probe.grants.push(command);
+                            if let (Some(terminal), Some(resume)) = (&terminal, &resume_spec) {
+                                let resumed = freshell_agent_runtime::prepare_terminal_for_resume(
+                                    terminal, resume,
+                                )
+                                .unwrap();
+                                probe.resumed_args = resumed.args;
+                                if let Some(path) = &probe.history_path {
+                                    assert_eq!(
+                                        resume.provider_session.native_session_id,
+                                        "native-reopen"
+                                    );
+                                    probe.history_read =
+                                        Some(std::fs::read_to_string(path).unwrap());
+                                }
+                            }
+                            if terminal.is_some() {
+                                observation = native_identity_launch.map(|launch| freshell_runtime_protocol::NativeIdentityObservation {
+                                    native_session_id: "native-reopen".into(),
+                                    incarnation_id: launch.incarnation_id,
+                                    launch_nonce: launch.launch_nonce,
+                                    evidence_revision: launch.evidence_revision,
+                                    source: freshell_runtime_protocol::NativeIdentitySource::CodexAppServer,
+                                    evidence_digest: "d".repeat(64),
+                                });
+                            }
+                            granted.notify_one();
+                            Ok(HostResult::GrantAccepted {
+                                host_boot_id: boot.clone(),
+                                worker_pid: 42,
+                                worker_launch_count: 1,
+                                fixture_evidence: serde_json::json!({"fixture":"reopen"}),
+                                native_session_id: None,
+                                native_identity_observation: None,
+                                native_readiness_receipt: None,
+                                opencode_transfer_receipt: None,
+                                opencode_adoption: Default::default(),
+                            })
+                        }
+                        HostCommand::Status { .. } => {
+                            let probe = probe.lock().unwrap();
+                            Ok(HostResult::Status {
+                                host_boot_id: boot.clone(),
+                                worker_pid: Some(42),
+                                worker_launch_count: 1,
+                                max_control_epoch: grant_epoch,
+                                max_execution_generation: execution_generation,
+                                fixture_evidence: serde_json::json!({"fixture":"reopen"}),
+                                exited: probe.fail_after_grant,
+                                native_session_id: (!probe.pause_observation)
+                                    .then(|| {
+                                        observation
+                                            .as_ref()
+                                            .map(|value| value.native_session_id.clone())
+                                    })
+                                    .flatten(),
+                                native_identity_observation: (!probe.pause_observation)
+                                    .then(|| observation.clone())
+                                    .flatten(),
+                                native_readiness_receipt: None,
+                                opencode_transfer_receipt: None,
+                                opencode_adoption: Default::default(),
+                            })
+                        }
+                        _ => return,
+                    };
+                    if write_frame(
+                        &mut stream,
+                        &HostReply {
+                            request_id: request.request_id,
+                            result,
+                        },
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+            let mut runtimes = self.runtimes.lock().unwrap();
+            let runtime = runtimes.get_mut(handle.container_id()).ok_or_else(|| {
+                BackendError::OwnershipMismatch("unknown Reopen fixture container".into())
+            })?;
+            if runtime.incarnation_id != *handle.incarnation_id() {
+                return Err(BackendError::OwnershipMismatch(
+                    "Reopen fixture container changed incarnation".into(),
+                ));
+            }
+            runtime.state = crate::backend::BackendRuntimeState::Running;
+            runtime.host = Some(host);
+            Ok(())
+        }
+
+        async fn inspect(
+            &self,
+            handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<crate::backend::BackendInspection, BackendError> {
+            let runtimes = self.runtimes.lock().unwrap();
+            let runtime = runtimes.get(handle.container_id()).ok_or_else(|| {
+                BackendError::OwnershipMismatch("unknown Reopen fixture container".into())
+            })?;
+            if runtime.incarnation_id != *handle.incarnation_id() {
+                return Err(BackendError::OwnershipMismatch(
+                    "Reopen fixture container changed incarnation".into(),
+                ));
+            }
+            Ok(crate::backend::BackendInspection {
+                state: runtime.state,
+                configured_limits: handle.requested_limits(),
+            })
+        }
+
+        async fn request_stop(
+            &self,
+            handle: &crate::registry::OwnedRuntimeHandle,
+            _grace_seconds: u64,
+        ) -> Result<(), BackendError> {
+            let mut probe = self.probe.lock().unwrap();
+            probe.stop_count += 1;
+            if let Some(path) = &probe.cleanup_registry {
+                let database = rusqlite::Connection::open(path).unwrap();
+                let (command, cleanup, claims, reservations): (String, String, u64, u64) = database.query_row(
+                    "SELECT c.state,i.cleanup_state,(SELECT COUNT(*) FROM writer_claims WHERE incarnation_id=i.incarnation_id),(SELECT COUNT(*) FROM admission_reservations WHERE incarnation_id=i.incarnation_id) FROM incarnations i JOIN commands c ON c.incarnation_id=i.incarnation_id WHERE i.incarnation_id=?1",
+                    [handle.incarnation_id().as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+                ).unwrap();
+                assert_eq!((command.as_str(),cleanup.as_str(),claims,reservations), ("reopen_cleanup_pending","termination_unconfirmed",1,1), "cleanup must be durable before contacting the runtime and keep authority until empty is proven");
+            }
+            if probe.refuse_cleanup {
+                return Err(BackendError::Unavailable("injected stop refusal".into()));
+            }
+            let mut runtimes = self.runtimes.lock().unwrap();
+            let runtime = runtimes.get_mut(handle.container_id()).unwrap();
+            assert_eq!(runtime.incarnation_id, *handle.incarnation_id());
+            runtime.state = crate::backend::BackendRuntimeState::Exited;
+            if let Some(host) = runtime.host.take() {
+                host.abort();
+            }
+            Ok(())
+        }
+
+        async fn force_stop(
+            &self,
+            _handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<(), BackendError> {
+            Err(BackendError::Unavailable(
+                "unexpected Reopen fixture force stop".into(),
+            ))
+        }
+
+        async fn verify_empty(
+            &self,
+            handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<bool, BackendError> {
+            Ok(matches!(
+                self.inspect(handle).await?.state,
+                crate::backend::BackendRuntimeState::Created
+                    | crate::backend::BackendRuntimeState::Exited
+                    | crate::backend::BackendRuntimeState::Missing
+                    | crate::backend::BackendRuntimeState::Dead
+            ))
+        }
+
+        async fn list_known(
+            &self,
+            handles: &[crate::registry::OwnedRuntimeHandle],
+        ) -> Result<Vec<(IncarnationId, crate::backend::BackendInspection)>, BackendError> {
+            let mut result = Vec::new();
+            for handle in handles {
+                result.push((handle.incarnation_id().clone(), self.inspect(handle).await?));
+            }
+            Ok(result)
+        }
+
+        async fn read_limits(
+            &self,
+            handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<RuntimeLimits, BackendError> {
+            Ok(handle.requested_limits())
+        }
+
+        async fn enable_long_lived(
+            &self,
+            _handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    async fn stopped_supervisor(root: &Path) -> (Supervisor, SoulId, IncarnationId, u64) {
+        let registry = Registry::open(root.join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        let launch = materialize_test_runtime(&registry, soul.clone()).await;
+        let connection = rusqlite::Connection::open(registry.database_path()).unwrap();
+        connection
+            .execute(
+                "UPDATE souls SET provider='claude',provider_store_id='reopen-store',native_session_id='native-reopen' WHERE soul_id=?1",
+                [soul.as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE incarnations SET fixture_kind='native_session' WHERE incarnation_id=?1",
+                [launch.incarnation_id.as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO view_intents (view_id,soul_id,owner_id,workspace_id,kind,preferred_tab_id,preferred_pane_id,title,placement_group,visibility,revision,soul_intent_revision,created_at,updated_at) VALUES ('view-reopen-fixture',?1,'owner-reopen-fixture','workspace-reopen-fixture','automatic_primary','tab-reopen-fixture','pane-reopen-fixture','Reopen fixture','group-reopen-fixture','visible',1,1,1,1)",
+                [soul.as_str()],
+            )
+            .unwrap();
+        drop(connection);
+        let handle = registry
+            .begin_stop_expected(soul.clone(), Some(launch.intent_revision))
+            .await
+            .unwrap();
+        registry
+            .record_ordinary_stop_outcome(&handle, StopOutcome::VerifiedEmpty)
+            .await
+            .unwrap();
+        let revision = handle.stop_fence().unwrap().intent_revision;
+        let incarnation = handle.incarnation_id().clone();
+        let supervisor = Supervisor::new(
+            registry,
+            Arc::new(FakeReopenBackend::default()),
+            SupervisorConfig {
+                runtime_root: root.join("runtime"),
+                control_socket_path: root.join("control.sock"),
+                host_binary_path: std::env::current_exe().unwrap(),
+                image_ref: format!("sha256:{}", "a".repeat(64)),
+                test_run_id: "reopen-test".into(),
+                control_secret: "synthetic-reopen-control-secret".into(),
+                lifecycle_log: root.join("lifecycle.jsonl"),
+                admission: Default::default(),
+            },
+        )
+        .unwrap();
+        (supervisor, soul, incarnation, revision)
+    }
+
+    fn seed_reopen_callback_capability(
+        supervisor: &Supervisor,
+        soul: &SoulId,
+        prior_incarnation: &IncarnationId,
+        revision: u64,
+    ) {
+        let provider_launch_context = freshell_runtime_protocol::ProviderLaunchContext {
+            prepared_inputs: None,
+            preparation: freshell_runtime_protocol::ProviderPreparation::Codex {
+                tui_args: Vec::new(),
+                sidecar_args: Vec::new(),
+                approval_default: None,
+            },
+            mcp_capability: Some(freshell_runtime_protocol::McpCapabilityReference {
+                grant_id: "grant-reopen-prior".into(),
+                endpoint: "http://host.docker.internal:3456".into(),
+                provider_relative_path: ".freshell/mcp-capability.json".into(),
+                host_gateway_address: None,
+            }),
+            config: Vec::new(),
+        };
+        let terminal = freshell_runtime_protocol::TerminalLaunchSpec {
+            terminal_id: "terminal-reopen-prior".into(),
+            stream_id: "stream-reopen-prior".into(),
+            mode: "codex".into(),
+            program: "codex".into(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::from([(
+                "HOME".into(),
+                "/home/freshell/provider".into(),
+            )]),
+            cwd: "/synthetic/workspace".into(),
+            run_as_uid: 65_534,
+            run_as_gid: 0,
+            cols: 80,
+            rows: 24,
+            project_key: "test-project".into(),
+            workspace_path: "/synthetic/workspace".into(),
+            git_common_dir: None,
+            create_request_id: Some("create-reopen-prior".into()),
+            resume_session_id: Some("native-reopen".into()),
+            provider_model: None,
+            provider_reasoning_effort: None,
+            provider_sandbox: None,
+            provider_permission_mode: None,
+            provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
+            provider_launch_context: Some(provider_launch_context),
+            opencode_transfer: None,
+            opencode_transfer_attempt_id: None,
+            opencode_adoption: None,
+        };
+        let connection = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+        connection
+            .execute(
+                "UPDATE souls SET provider='codex',provider_store_id='reopen-store',native_session_id='native-reopen' WHERE soul_id=?1",
+                [soul.as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE incarnations SET terminal_id=?1,terminal_spec=?2 WHERE incarnation_id=?3",
+                rusqlite::params![
+                    terminal.terminal_id,
+                    serde_json::to_string(&terminal).unwrap(),
+                    prior_incarnation.as_str()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE ordinary_stops SET capability_endpoint='http://host.docker.internal:3456',capability_grant_id='grant-reopen-prior',revoke_pending=1,settled=0 WHERE soul_id=?1 AND incarnation_id=?2 AND intent_revision=?3",
+                rusqlite::params![soul.as_str(), prior_incarnation.as_str(), revision],
+            )
+            .unwrap();
+    }
+
+    fn reopened_codex_provider_context() -> Vec<u8> {
+        serde_json::to_vec(&freshell_runtime_protocol::PreparedProviderContext {
+            provider_launch_context: freshell_runtime_protocol::ProviderLaunchContext {
+                prepared_inputs: None,
+                preparation: freshell_runtime_protocol::ProviderPreparation::Codex {
+                    tui_args: Vec::new(),
+                    sidecar_args: Vec::new(),
+                    approval_default: None,
+                },
+                mcp_capability: Some(freshell_runtime_protocol::McpCapabilityReference {
+                    grant_id: "grant-reopen-new".into(),
+                    endpoint: "http://host.docker.internal:3456".into(),
+                    provider_relative_path: ".freshell/mcp-capability.json".into(),
+                    host_gateway_address: None,
+                }),
+                config: Vec::new(),
+            },
+            provider_secret_references: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    fn reopen_envelope(
+        supervisor: &Supervisor,
+        request_id: RequestId,
+        soul_id: SoulId,
+        expected_intent_revision: u64,
+    ) -> Envelope<AdminCommand> {
+        let mut envelope = Envelope::new(
+            request_id,
+            ControlRole::Web,
+            AdminCommand::Reopen(ReopenRequest {
+                soul_id,
+                expected_intent_revision,
+                expected_control_epoch: Some(supervisor.registry.control_epoch()),
+            }),
+        );
+        envelope.auth = Some(supervisor.config.control_secret.clone());
+        envelope
+    }
+
+    fn bind_reopen_callback(supervisor: &Supervisor) -> UnixListener {
+        let path = supervisor
+            .config
+            .control_socket_path
+            .with_file_name("mcp.sock");
+        let _ = std::fs::remove_file(&path);
+        UnixListener::bind(path).unwrap()
+    }
+
+    async fn seed_native_reopen(
+        supervisor: &Supervisor,
+        soul: &SoulId,
+        previous: &IncarnationId,
+        revision: u64,
+        callback: bool,
+        saved_resume: bool,
+    ) {
+        seed_reopen_callback_capability(supervisor, soul, previous, revision);
+        let mut terminal = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap()
+            .terminal
+            .unwrap();
+        terminal.resume_session_id = None;
+        terminal.args = vec!["--model".into(), "selected-model".into()];
+        if !callback {
+            terminal.provider_launch_context = None;
+        }
+        let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+        database.execute("UPDATE incarnations SET fixture_kind=NULL,terminal_spec=?1 WHERE incarnation_id=?2", rusqlite::params![serde_json::to_string(&terminal).unwrap(), previous.as_str()]).unwrap();
+        if !callback {
+            database.execute("UPDATE ordinary_stops SET capability_endpoint=NULL,capability_grant_id=NULL,revoke_pending=0,settled=1 WHERE soul_id=?1", [soul.as_str()]).unwrap();
+        }
+        if saved_resume {
+            let context = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            let resume = crate::resume_catalog::exact_resume_candidate(&context, None)
+                .unwrap()
+                .unwrap();
+            database
+                .execute(
+                    "UPDATE souls SET resume_spec=?1 WHERE soul_id=?2",
+                    rusqlite::params![serde_json::to_string(&resume).unwrap(), soul.as_str()],
+                )
+                .unwrap();
+        }
+    }
+
+    fn reopen_result(reply: AdminReply) -> freshell_runtime_protocol::ReopenResult {
+        match reply.result.unwrap() {
+            AdminResult::Reopen(result) => result,
+            other => panic!("unexpected Reopen result: {other:?}"),
+        }
+    }
+
+    async fn invoke_reopen(
+        supervisor: &Supervisor,
+        envelope: Envelope<AdminCommand>,
+    ) -> freshell_runtime_protocol::ReopenResult {
+        let AdminCommand::Reopen(request) = envelope.body else {
+            panic!("expected Reopen command")
+        };
+        Box::pin(supervisor.reopen(envelope.request_id, request))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reopen_native_readiness_only_accepts_current_prepared_attempt() {
+        for stop_during_readiness in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut supervisor, soul, previous, revision) =
+                stopped_supervisor(directory.path()).await;
+            seed_native_reopen(&supervisor, &soul, &previous, revision, false, true).await;
+            let backend = Arc::new(FakeReopenBackend::default());
+            backend.probe.lock().unwrap().pause_observation = stop_during_readiness;
+            supervisor.backend = backend.clone();
+            let envelope = reopen_envelope(&supervisor, RequestId::new(), soul.clone(), revision);
+            let mut operation = Box::pin(invoke_reopen(&supervisor, envelope));
+            tokio::select! {
+                _ = backend.granted.notified() => {}
+                result = &mut operation => panic!("Reopen ended before native startup: {result:?}"),
+            }
+            if stop_during_readiness {
+                let stop = supervisor
+                    .registry
+                    .begin_stop_expected(soul.clone(), Some(revision))
+                    .await
+                    .unwrap();
+                assert_eq!(stop.stop_fence().unwrap().intent_revision, revision + 1);
+                backend.probe.lock().unwrap().pause_observation = false;
+            }
+            let result = tokio::time::timeout(Duration::from_secs(5), operation)
+                .await
+                .unwrap();
+            assert_eq!(
+                result.outcome,
+                if stop_during_readiness {
+                    ReopenOutcome::Failed
+                } else {
+                    ReopenOutcome::Reopened
+                },
+                "{result:?}"
+            );
+            let context = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                context.desired_state,
+                if stop_during_readiness {
+                    freshell_runtime_protocol::DesiredState::Stopped
+                } else {
+                    freshell_runtime_protocol::DesiredState::Running
+                }
+            );
+            if stop_during_readiness {
+                let database =
+                    rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+                let visible: String = database
+                    .query_row(
+                        "SELECT visibility FROM view_intents WHERE soul_id=?1",
+                        [soul.as_str()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(visible, "hidden");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reopen_native_identity_without_resume_spec_builds_exact_resume_workload() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut supervisor, soul, previous, revision) = stopped_supervisor(directory.path()).await;
+        seed_native_reopen(&supervisor, &soul, &previous, revision, false, false).await;
+        let context = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        assert!(context.resume_spec.is_none());
+        assert!(context
+            .terminal
+            .as_ref()
+            .unwrap()
+            .resume_session_id
+            .is_none());
+        let history_path = directory.path().join("native-reopen.jsonl");
+        let history = "{\"role\":\"user\",\"text\":\"saved provider conversation\"}\n";
+        std::fs::write(&history_path, history).unwrap();
+        let backend = Arc::new(FakeReopenBackend::default());
+        backend.probe.lock().unwrap().history_path = Some(history_path.clone());
+        supervisor.backend = backend.clone();
+        let result = Box::pin(invoke_reopen(
+            &supervisor,
+            reopen_envelope(&supervisor, RequestId::new(), soul.clone(), revision),
+        ))
+        .await;
+        let probe = backend.probe.lock().unwrap();
+        let HostCommand::GrantExecution { resume_spec, .. } = &probe.grants[0] else {
+            panic!("no provider grant")
+        };
+        let resume = resume_spec
+            .as_ref()
+            .expect("saved native identity must be delivered as an exact resume workload");
+        assert_eq!(resume.provider_session.native_session_id, "native-reopen");
+        assert_eq!(resume.provider_session.provider_store_id, "reopen-store");
+        assert!(probe
+            .resumed_args
+            .windows(2)
+            .any(|args| args == ["resume", "native-reopen"]));
+        assert_eq!(probe.history_read.as_deref(), Some(history));
+        assert_eq!(std::fs::read_to_string(history_path).unwrap(), history);
+        assert_eq!(
+            probe.provider_volumes,
+            [context.prior_handle.provider_volume_name()]
+        );
+        assert_eq!(result.outcome, ReopenOutcome::Reopened, "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn reopen_resume_commits_provider_preparation_before_publish() {
+        for fail_commit in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let (supervisor, soul, previous, revision) = stopped_supervisor(directory.path()).await;
+            seed_reopen_callback_capability(&supervisor, &soul, &previous, revision);
+            let context = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            let resume = crate::resume_catalog::exact_resume_candidate(&context, None)
+                .unwrap()
+                .unwrap();
+            let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+            database
+                .execute(
+                    "UPDATE souls SET resume_spec=?1 WHERE soul_id=?2",
+                    rusqlite::params![serde_json::to_string(&resume).unwrap(), soul.as_str()],
+                )
+                .unwrap();
+            let listener = UnixListener::bind(
+                supervisor
+                    .config
+                    .control_socket_path
+                    .with_file_name("mcp.sock"),
+            )
+            .unwrap();
+            let actions = if fail_commit {
+                vec!["revoke", "issue", "activate", "commit", "abort"]
+            } else {
+                vec!["revoke", "issue", "activate", "commit"]
+            };
+            let peer = tokio::spawn(frozen_callback_peer(
+                listener,
+                actions.iter().map(|action| (*action).to_owned()).collect(),
+                reopened_codex_provider_context(),
+                fail_commit.then(|| "commit".into()),
+                None,
+            ));
+            let result = Box::pin(invoke_reopen(
+                &supervisor,
+                reopen_envelope(&supervisor, RequestId::new(), soul.clone(), revision),
+            ))
+            .await;
+            let requests = match tokio::time::timeout(Duration::from_secs(5), peer).await {
+                Ok(requests) => requests.unwrap(),
+                Err(_) => panic!(
+                    "exact resume returned {:?} without finishing provider commit",
+                    result.outcome
+                ),
+            };
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|request| request.action.as_str())
+                    .collect::<Vec<_>>(),
+                actions
+            );
+            assert_eq!(
+                result.outcome,
+                if fail_commit {
+                    ReopenOutcome::Failed
+                } else {
+                    ReopenOutcome::Reopened
+                }
+            );
+            let (desired, visibility, successes): (String, String, u64) = database.query_row("SELECT desired_state,(SELECT visibility FROM view_intents WHERE soul_id=?1),(SELECT COUNT(*) FROM recovery_attempts WHERE soul_id=?1 AND verdict='succeeded') FROM souls WHERE soul_id=?1", [soul.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+            assert_eq!(
+                (desired.as_str(), visibility.as_str(), successes),
+                if fail_commit {
+                    ("stopped", "hidden", 0)
+                } else {
+                    ("running", "visible", 1)
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reopen_failure_cleanup_retires_replacement_and_allows_retry() {
+        for failure in ["issue", "create", "after-grant", "commit", "unconfirmed"] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut supervisor, soul, previous, revision) =
+                stopped_supervisor(directory.path()).await;
+            let with_callback = matches!(failure, "issue" | "commit");
+            seed_native_reopen(&supervisor, &soul, &previous, revision, with_callback, true).await;
+            let callback_socket = supervisor
+                .config
+                .control_socket_path
+                .with_file_name("mcp.sock");
+            let peer = with_callback.then(|| {
+                let listener = UnixListener::bind(&callback_socket).unwrap();
+                let actions = if failure == "issue" {
+                    vec!["revoke", "issue"]
+                } else {
+                    vec!["revoke", "issue", "activate", "commit", "abort"]
+                };
+                tokio::spawn(frozen_callback_peer(
+                    listener,
+                    actions.into_iter().map(str::to_owned).collect(),
+                    if failure == "issue" {
+                        b"rejected".to_vec()
+                    } else {
+                        reopened_codex_provider_context()
+                    },
+                    (failure == "commit").then(|| "commit".into()),
+                    None,
+                ))
+            });
+            let backend = Arc::new(FakeReopenBackend::default());
+            {
+                let mut probe = backend.probe.lock().unwrap();
+                probe.fail_create = failure == "create";
+                probe.fail_after_grant = matches!(failure, "after-grant" | "unconfirmed");
+                probe.refuse_cleanup = failure == "unconfirmed";
+                probe.cleanup_registry = Some(supervisor.registry.database_path().to_path_buf());
+            }
+            supervisor.backend = backend.clone();
+            let result = Box::pin(invoke_reopen(
+                &supervisor,
+                reopen_envelope(&supervisor, RequestId::new(), soul.clone(), revision),
+            ))
+            .await;
+            assert_eq!(result.outcome, ReopenOutcome::Failed);
+            if let Some(peer) = peer {
+                tokio::time::timeout(Duration::from_secs(2), peer)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                std::fs::remove_file(&callback_socket).unwrap();
+            }
+            let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+            let (desired, current_revision, visibility, active, claims, reservations): (String,u64,String,u64,u64,u64) = database.query_row("SELECT desired_state,intent_revision,(SELECT visibility FROM view_intents WHERE soul_id=?1),(SELECT COUNT(*) FROM incarnations WHERE soul_id=?1 AND launch_state IN ('prepared','created','starting','running','stopping')),(SELECT COUNT(*) FROM writer_claims WHERE soul_id=?1),(SELECT COUNT(*) FROM admission_reservations a JOIN incarnations i ON i.incarnation_id=a.incarnation_id WHERE i.soul_id=?1) FROM souls WHERE soul_id=?1", [soul.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).unwrap();
+            assert_eq!(
+                (desired.as_str(), current_revision, visibility.as_str()),
+                ("stopped", revision, "hidden")
+            );
+            if failure == "unconfirmed" {
+                assert_eq!((active, claims, reservations), (1, 1, 1));
+                let cleanup: String = database
+                    .query_row(
+                        "SELECT cleanup_state FROM incarnations WHERE incarnation_id!=?1",
+                        [previous.as_str()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(cleanup, "termination_unconfirmed");
+                let retry = Box::pin(invoke_reopen(
+                    &supervisor,
+                    reopen_envelope(&supervisor, RequestId::new(), soul.clone(), revision),
+                ))
+                .await;
+                assert_eq!(retry.outcome, ReopenOutcome::Failed);
+                assert_eq!(backend.probe.lock().unwrap().grants.len(), 1);
+                {
+                    let mut probe = backend.probe.lock().unwrap();
+                    probe.refuse_cleanup = false;
+                    probe.fail_after_grant = false;
+                }
+                let recovered = Box::pin(invoke_reopen(
+                    &supervisor,
+                    reopen_envelope(&supervisor, RequestId::new(), soul.clone(), revision),
+                ))
+                .await;
+                assert_eq!(recovered.outcome, ReopenOutcome::Reopened);
+                let unfinished: u64 = database.query_row("SELECT COUNT(*) FROM recovery_attempts WHERE soul_id=?1 AND finished_at IS NULL", [soul.as_str()], |row| row.get(0)).unwrap();
+                assert_eq!(
+                    unfinished, 0,
+                    "finishing deferred cleanup must also settle the failed Reopen journal"
+                );
+            } else {
+                assert_eq!(
+                    (active, claims, reservations),
+                    (0, 0, 0),
+                    "{failure}: failed replacement must release only verified-empty authority"
+                );
+                {
+                    let mut probe = backend.probe.lock().unwrap();
+                    if matches!(failure, "after-grant" | "commit") {
+                        assert_eq!(probe.stop_count, 1);
+                    }
+                    probe.fail_create = false;
+                    probe.fail_after_grant = false;
+                }
+                let retry_peer = with_callback.then(|| {
+                    tokio::spawn(frozen_callback_peer(
+                        UnixListener::bind(&callback_socket).unwrap(),
+                        ["issue", "activate", "commit"]
+                            .into_iter()
+                            .map(str::to_owned)
+                            .collect(),
+                        reopened_codex_provider_context(),
+                        None,
+                        None,
+                    ))
+                });
+                let retry = Box::pin(invoke_reopen(
+                    &supervisor,
+                    reopen_envelope(&supervisor, RequestId::new(), soul, revision),
+                ))
+                .await;
+                assert_eq!(
+                    retry.outcome,
+                    ReopenOutcome::Reopened,
+                    "{failure}: {retry:?}"
+                );
+                if let Some(peer) = retry_peer {
+                    tokio::time::timeout(Duration::from_secs(2), peer)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reopen_success_replay_survives_later_stop() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut supervisor, soul, _, revision) = stopped_supervisor(directory.path()).await;
+        let backend = Arc::new(FakeReopenBackend::default());
+        supervisor.backend = backend.clone();
+        let request = reopen_envelope(&supervisor, RequestId::new(), soul.clone(), revision);
+        let first = reopen_result(supervisor.dispatch(request.clone()).await);
+        assert_eq!(first.outcome, ReopenOutcome::Reopened);
+        let incarnation = first.view.unwrap().incarnation_id;
+        let (outcome, stopped) = Box::pin(supervisor.stop(soul.clone(), Some(revision + 1)))
+            .await
+            .unwrap();
+        assert_eq!(outcome, StopOutcome::VerifiedEmpty);
+        let second = Box::pin(invoke_reopen(
+            &supervisor,
+            reopen_envelope(
+                &supervisor,
+                RequestId::new(),
+                soul.clone(),
+                stopped.intent_revision,
+            ),
+        ))
+        .await;
+        assert_eq!(second.outcome, ReopenOutcome::Reopened);
+        assert_ne!(second.view.unwrap().incarnation_id, incarnation);
+        let before = supervisor.registry.inventory().await.unwrap().len();
+        let grants_before = backend.probe.lock().unwrap().grants.len();
+        let replay = supervisor.dispatch(request).await;
+        assert!(
+            replay.result.is_ok(),
+            "a committed successful receipt survives later Stop: {replay:?}"
+        );
+        let replay = reopen_result(replay);
+        assert_eq!(replay.outcome, ReopenOutcome::Reopened);
+        assert_eq!(replay.view.unwrap().incarnation_id, incarnation);
+        assert_eq!(supervisor.registry.inventory().await.unwrap().len(), before);
+        assert_eq!(backend.probe.lock().unwrap().grants.len(), grants_before);
+    }
+
+    #[tokio::test]
+    async fn reopen_success_replay_returns_same_incarnation_before_revision_validation() {
+        let directory = tempfile::tempdir().unwrap();
+        let (supervisor, soul, previous, revision) = stopped_supervisor(directory.path()).await;
+        let request_id = RequestId::new();
+        let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+        let old_container: String = database
+            .query_row(
+                "SELECT container_id FROM incarnations WHERE incarnation_id=?1",
+                [previous.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let old_command: (String, String, String) = database
+            .query_row(
+                "SELECT request_id,payload_digest,state FROM commands WHERE soul_id=?1",
+                [soul.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let hidden_visibility: String = database
+            .query_row(
+                "SELECT visibility FROM view_intents WHERE soul_id=?1 AND kind='automatic_primary'",
+                [soul.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hidden_visibility, "hidden");
+        drop(database);
+
+        let first = supervisor
+            .dispatch(reopen_envelope(
+                &supervisor,
+                request_id.clone(),
+                soul.clone(),
+                revision,
+            ))
+            .await
+            .result
+            .unwrap();
+        let AdminResult::Reopen(first) = first else {
+            panic!("Reopen returned an unexpected result: {first:?}");
+        };
+        assert_eq!(
+            first.outcome,
+            ReopenOutcome::Reopened,
+            "{first:?}\n{}",
+            std::fs::read_to_string(&supervisor.config.lifecycle_log).unwrap()
+        );
+        let first_view = first.view.expect("reopened result includes its view");
+        assert_ne!(first_view.incarnation_id, previous);
+        assert_eq!(first_view.soul_id, soul);
+        assert_eq!(
+            first_view.desired_state,
+            freshell_runtime_protocol::DesiredState::Running
+        );
+        assert_eq!(
+            first_view.launch_state,
+            freshell_runtime_protocol::LaunchState::Running
+        );
+        assert_eq!(first_view.provider.as_deref(), Some("claude"));
+        assert_eq!(
+            first_view.native_session_id.as_deref(),
+            Some("native-reopen")
+        );
+        assert_ne!(
+            first_view.container_id.as_deref(),
+            Some(old_container.as_str())
+        );
+
+        let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+        let reopened_soul: (String, String, Option<String>, String, u64) = database
+            .query_row(
+                "SELECT provider,provider_store_id,native_session_id,desired_state,intent_revision FROM souls WHERE soul_id=?1",
+                [soul.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            reopened_soul,
+            (
+                "claude".into(),
+                "reopen-store".into(),
+                Some("native-reopen".into()),
+                "running".into(),
+                revision + 1
+            )
+        );
+        let retained_command: (String, String, String, String) = database
+            .query_row(
+                "SELECT request_id,payload_digest,state,incarnation_id FROM commands WHERE soul_id=?1 AND request_id=?2",
+                rusqlite::params![soul.as_str(), old_command.0],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            retained_command,
+            (
+                old_command.0,
+                old_command.1,
+                old_command.2,
+                previous.to_string()
+            ),
+            "the previous command history remains associated with its original incarnation"
+        );
+        let (reopen_state, reopen_incarnation): (String, String) = database
+            .query_row(
+                "SELECT state,incarnation_id FROM commands WHERE soul_id=?1 AND request_id=?2",
+                rusqlite::params![soul.as_str(), request_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(reopen_state, "running");
+        assert_eq!(reopen_incarnation, first_view.incarnation_id.as_str());
+        let (visibility, view_revision): (String, u64) = database
+            .query_row(
+                "SELECT visibility,soul_intent_revision FROM view_intents WHERE soul_id=?1 AND kind='automatic_primary'",
+                [soul.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (visibility.as_str(), view_revision),
+            ("visible", revision + 1)
+        );
+        drop(database);
+
+        let replay = supervisor
+            .dispatch(reopen_envelope(&supervisor, request_id, soul, revision))
+            .await
+            .result
+            .unwrap();
+        let AdminResult::Reopen(replay) = replay else {
+            panic!("Reopen replay returned an unexpected result: {replay:?}");
+        };
+        assert_eq!(replay.outcome, ReopenOutcome::Reopened);
+        assert_eq!(
+            replay.view.unwrap().incarnation_id,
+            first_view.incarnation_id,
+            "exact successful replay must return its original incarnation before checking the stale revision"
+        );
+    }
+
+    #[tokio::test]
+    async fn reopen_conflicting_digest_and_stale_revision_are_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let (supervisor, soul, _previous, revision) = stopped_supervisor(directory.path()).await;
+        let request_id = RequestId::new();
+        let first = supervisor
+            .dispatch(reopen_envelope(
+                &supervisor,
+                request_id.clone(),
+                soul.clone(),
+                revision,
+            ))
+            .await;
+        assert!(matches!(
+            first.result.unwrap(),
+            AdminResult::Reopen(result) if result.outcome == ReopenOutcome::Reopened
+        ));
+
+        let conflict = supervisor
+            .dispatch(reopen_envelope(
+                &supervisor,
+                request_id,
+                soul.clone(),
+                revision + 1,
+            ))
+            .await;
+        assert_eq!(
+            conflict.result.unwrap_err().code,
+            freshell_runtime_protocol::RuntimeErrorCode::RequestIdConflict
+        );
+
+        let stale = supervisor
+            .dispatch(reopen_envelope(
+                &supervisor,
+                RequestId::new(),
+                soul.clone(),
+                revision,
+            ))
+            .await;
+        assert_eq!(
+            stale.result.unwrap_err().code,
+            freshell_runtime_protocol::RuntimeErrorCode::StaleIntentRevision
+        );
+
+        let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+        let (commands, incarnations): (u64, u64) = database
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM commands WHERE soul_id=?1),(SELECT COUNT(*) FROM incarnations WHERE soul_id=?1)",
+                [soul.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(commands, 2);
+        assert_eq!(incarnations, 2);
+    }
+
+    #[tokio::test]
+    async fn reopen_pending_revoke_keeps_stopped_revision_command_and_view() {
+        let directory = tempfile::tempdir().unwrap();
+        let (supervisor, soul, previous, revision) = stopped_supervisor(directory.path()).await;
+        let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+        database
+            .execute(
+                "UPDATE ordinary_stops SET capability_endpoint='http://host.docker.internal:3456',capability_grant_id='grant-pending-reopen',revoke_pending=1,settled=0 WHERE soul_id=?1 AND incarnation_id=?2 AND intent_revision=?3",
+                rusqlite::params![soul.as_str(), previous.as_str(), revision],
+            )
+            .unwrap();
+        let before: (u64, u64, String, u64, String) = database
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM commands WHERE soul_id=?1),(SELECT COUNT(*) FROM incarnations WHERE soul_id=?1),desired_state,intent_revision,(SELECT visibility FROM view_intents WHERE soul_id=?1 AND kind='automatic_primary') FROM souls WHERE soul_id=?1",
+                [soul.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        drop(database);
+
+        let reply = supervisor
+            .dispatch(reopen_envelope(
+                &supervisor,
+                RequestId::new(),
+                soul.clone(),
+                revision,
+            ))
+            .await;
+        let AdminResult::Reopen(result) = reply.result.unwrap() else {
+            panic!("Reopen returned an unexpected result");
+        };
+        assert_eq!(result.outcome, ReopenOutcome::Pending);
+
+        let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+        let after: (u64, u64, String, u64, String, u64) = database
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM commands WHERE soul_id=?1),(SELECT COUNT(*) FROM incarnations WHERE soul_id=?1),desired_state,intent_revision,(SELECT visibility FROM view_intents WHERE soul_id=?1 AND kind='automatic_primary'),(SELECT COUNT(*) FROM commands WHERE soul_id=?1 AND state='reopen_prepared') FROM souls WHERE soul_id=?1",
+                [soul.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            after.0, before.0,
+            "pending revoke cannot associate a Reopen command"
+        );
+        assert_eq!(
+            after.1, before.1,
+            "pending revoke cannot create a new incarnation"
+        );
+        assert_eq!(after.2, "stopped");
+        assert_eq!(after.3, revision);
+        assert_eq!(after.4, "hidden");
+        assert_eq!(after.5, 0);
+        let revoke_pending: bool = database
+            .query_row(
+                "SELECT revoke_pending FROM ordinary_stops WHERE soul_id=?1 AND incarnation_id=?2 AND intent_revision=?3",
+                rusqlite::params![soul.as_str(), previous.as_str(), revision],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(revoke_pending);
+    }
+
+    #[tokio::test]
+    async fn reopen_pending_no_runtime_revoke_retries_without_docker() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut supervisor, soul, previous, revision) = stopped_supervisor(directory.path()).await;
+        seed_reopen_callback_capability(&supervisor, &soul, &previous, revision);
+        let backend = Arc::new(FakeReopenBackend::default());
+        backend.probe.lock().unwrap().fail_create = true;
+        supervisor.backend = backend.clone();
+
+        let first_listener = bind_reopen_callback(&supervisor);
+        let first_peer = tokio::spawn(frozen_callback_peer(
+            first_listener,
+            ["revoke", "issue", "activate", "abort"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            reopened_codex_provider_context(),
+            Some("abort".into()),
+            None,
+        ));
+        let first = invoke_reopen(
+            &supervisor,
+            reopen_envelope(&supervisor, RequestId::new(), soul.clone(), revision),
+        )
+        .await;
+        assert_eq!(first.outcome, ReopenOutcome::Failed);
+        let first_requests = first_peer.await.unwrap();
+        assert_eq!(
+            first_requests
+                .iter()
+                .map(|request| request.action.as_str())
+                .collect::<Vec<_>>(),
+            ["revoke", "issue", "activate", "abort"]
+        );
+
+        let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+        let (failed_incarnation, pending_grant, pending): (String, String, bool) = database
+            .query_row(
+                "SELECT p.incarnation_id,p.capability_grant_id,p.revoke_pending FROM ordinary_stops p JOIN incarnations i ON i.incarnation_id=p.incarnation_id WHERE p.soul_id=?1 AND p.intent_revision=?2 ORDER BY i.created_at DESC,i.rowid DESC LIMIT 1",
+                rusqlite::params![soul.as_str(), revision],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(pending_grant, "grant-reopen-new");
+        assert!(pending);
+        let before_retry: (u64, u64, String, u64) = database
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM incarnations WHERE soul_id=?1),(SELECT COUNT(*) FROM commands WHERE soul_id=?1),desired_state,intent_revision FROM souls WHERE soul_id=?1",
+                [soul.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        drop(database);
+
+        let attempts_before_retry = backend
+            .create_attempts
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let retry_listener = bind_reopen_callback(&supervisor);
+        let retry_peer = tokio::spawn(frozen_callback_peer(
+            retry_listener,
+            ["revoke"].into_iter().map(str::to_owned).collect(),
+            reopened_codex_provider_context(),
+            Some("revoke".into()),
+            None,
+        ));
+        let retry = invoke_reopen(
+            &supervisor,
+            reopen_envelope(&supervisor, RequestId::new(), soul.clone(), revision),
+        )
+        .await;
+        assert_eq!(
+            retry.outcome,
+            ReopenOutcome::Pending,
+            "an unresolved no-runtime grant revoke remains pending"
+        );
+        let retry_requests = tokio::time::timeout(Duration::from_secs(1), retry_peer)
+            .await
+            .expect("Reopen must retry the recorded capability revoke")
+            .unwrap();
+        assert_eq!(retry_requests.len(), 1);
+        assert_eq!(retry_requests[0].action, "revoke");
+        assert_eq!(
+            retry_requests[0].incarnation_id.as_deref(),
+            Some(failed_incarnation.as_str())
+        );
+        assert_eq!(
+            retry_requests[0].grant_id.as_deref(),
+            Some("grant-reopen-new")
+        );
+        assert_eq!(
+            backend
+                .create_attempts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            attempts_before_retry,
+            "retrying a capability-only receipt must not contact the runtime backend"
+        );
+
+        let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+        let after_pending: (u64, u64, String, u64) = database
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM incarnations WHERE soul_id=?1),(SELECT COUNT(*) FROM commands WHERE soul_id=?1),desired_state,intent_revision FROM souls WHERE soul_id=?1",
+                [soul.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(after_pending, before_retry);
+        let pending_after: bool = database
+            .query_row(
+                "SELECT revoke_pending FROM ordinary_stops WHERE soul_id=?1 AND incarnation_id=?2 AND intent_revision=?3",
+                rusqlite::params![soul.as_str(), failed_incarnation, revision],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(pending_after);
+        drop(database);
+
+        backend.probe.lock().unwrap().fail_create = false;
+        let settled_listener = bind_reopen_callback(&supervisor);
+        let settled_peer = tokio::spawn(frozen_callback_peer(
+            settled_listener,
+            ["revoke", "issue", "activate", "commit"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            reopened_codex_provider_context(),
+            None,
+            None,
+        ));
+        let settled = invoke_reopen(
+            &supervisor,
+            reopen_envelope(&supervisor, RequestId::new(), soul.clone(), revision),
+        )
+        .await;
+        assert_eq!(settled.outcome, ReopenOutcome::Reopened);
+        let settled_requests = settled_peer.await.unwrap();
+        assert_eq!(settled_requests[0].action, "revoke");
+        assert_eq!(
+            settled_requests[0].grant_id.as_deref(),
+            Some("grant-reopen-new")
+        );
+    }
+
+    #[tokio::test]
+    async fn reopen_uncertain_create_retains_authority_until_verified() {
+        #[derive(Debug)]
+        struct LatestRecoverySnapshot {
+            incarnation_id: String,
+            launch_state: String,
+            cleanup_state: String,
+            command_state: String,
+            stop_outcome: Option<String>,
+            stop_settled: bool,
+            writer_claim_count: u64,
+            reservation_count: u64,
+            recovery_attempt_id: Option<String>,
+            identity_is_empty: bool,
+        }
+
+        let mut failures = Vec::new();
+        for (label, create_then_fail, fail_identity_commit) in [
+            ("uncertain create", true, false),
+            ("identity commit failure", false, true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut supervisor, soul, _previous, revision) =
+                stopped_supervisor(directory.path()).await;
+            let backend = Arc::new(FakeReopenBackend::default());
+            {
+                let mut probe = backend.probe.lock().unwrap();
+                probe.create_then_fail = create_then_fail;
+                probe.fail_identity_commit = fail_identity_commit;
+                probe.cleanup_registry = Some(supervisor.registry.database_path().to_path_buf());
+            }
+            supervisor.backend = backend.clone();
+
+            let result = invoke_reopen(
+                &supervisor,
+                reopen_envelope(&supervisor, RequestId::new(), soul.clone(), revision),
+            )
+            .await;
+            if result.outcome != ReopenOutcome::Failed {
+                failures.push(format!("{label}: initial Reopen should fail"));
+            }
+            if backend.runtimes.lock().unwrap().len() != 1 {
+                failures.push(format!(
+                    "{label}: the fake backend must record the created runtime"
+                ));
+            }
+
+            let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+            let latest = database
+                .query_row(
+                    "SELECT i.incarnation_id,i.launch_state,i.cleanup_state,c.state,p.outcome,p.settled,(SELECT COUNT(*) FROM writer_claims WHERE incarnation_id=i.incarnation_id),(SELECT COUNT(*) FROM admission_reservations WHERE incarnation_id=i.incarnation_id),s.recovery_attempt_id,(i.docker_daemon_id IS NULL AND i.container_id IS NULL AND i.grant_id IS NULL) FROM incarnations i JOIN commands c ON c.incarnation_id=i.incarnation_id JOIN souls s ON s.soul_id=i.soul_id LEFT JOIN ordinary_stops p ON p.incarnation_id=i.incarnation_id WHERE i.soul_id=?1 ORDER BY i.created_at DESC,i.rowid DESC LIMIT 1",
+                    [soul.as_str()],
+                    |row| {
+                        Ok(LatestRecoverySnapshot {
+                            incarnation_id: row.get(0)?,
+                            launch_state: row.get(1)?,
+                            cleanup_state: row.get(2)?,
+                            command_state: row.get(3)?,
+                            stop_outcome: row.get(4)?,
+                            stop_settled: row.get(5)?,
+                            writer_claim_count: row.get(6)?,
+                            reservation_count: row.get(7)?,
+                            recovery_attempt_id: row.get(8)?,
+                            identity_is_empty: row.get(9)?,
+                        })
+                    },
+                )
+                .unwrap();
+            if latest.launch_state != "stopping"
+                || latest.cleanup_state != "blocked_ownership"
+                || latest.command_state != "reopen_cleanup_pending"
+                || latest.stop_outcome.as_deref() != Some("blocked_ownership")
+                || latest.stop_settled
+                || latest.writer_claim_count != 1
+                || latest.reservation_count != 1
+                || latest.recovery_attempt_id.is_none()
+                || !latest.identity_is_empty
+            {
+                failures.push(format!(
+                    "{label}: uncertain ownership must remain blocked with claims and reservations; got {latest:?}"
+                ));
+            }
+            let before_retry: (u64, u64) = database
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM incarnations WHERE soul_id=?1),(SELECT intent_revision FROM souls WHERE soul_id=?1)",
+                    [soul.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let verified_empty_count: u64 = database
+                .query_row(
+                    "SELECT COUNT(*) FROM ordinary_stops WHERE incarnation_id=?1 AND outcome='verified_empty'",
+                    [&latest.incarnation_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if verified_empty_count != 0 {
+                failures.push(format!(
+                    "{label}: missing identity cannot be reported VerifiedEmpty"
+                ));
+            }
+            drop(database);
+
+            let attempts_before_retry = backend
+                .create_attempts
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let retry = invoke_reopen(
+                &supervisor,
+                reopen_envelope(&supervisor, RequestId::new(), soul.clone(), revision),
+            )
+            .await;
+            if retry.outcome != ReopenOutcome::Failed {
+                failures.push(format!(
+                    "{label}: blocked replacement must remain unavailable"
+                ));
+            }
+            if backend
+                .create_attempts
+                .load(std::sync::atomic::Ordering::SeqCst)
+                != attempts_before_retry
+            {
+                failures.push(format!("{label}: retry contacted the runtime backend"));
+            }
+            let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+            let after_retry: (u64, u64) = database
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM incarnations WHERE soul_id=?1),(SELECT intent_revision FROM souls WHERE soul_id=?1)",
+                    [soul.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            if after_retry != before_retry {
+                failures.push(format!(
+                    "{label}: blocked retry changed incarnation count or revision from {before_retry:?} to {after_retry:?}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[tokio::test]
+    async fn reopen_uses_frozen_legacy_callback_actions() {
+        let directory = tempfile::tempdir().unwrap();
+        let (supervisor, soul, previous, revision) = stopped_supervisor(directory.path()).await;
+        seed_reopen_callback_capability(&supervisor, &soul, &previous, revision);
+        let callback_socket = supervisor
+            .config
+            .control_socket_path
+            .with_file_name("mcp.sock");
+        let listener = UnixListener::bind(&callback_socket).unwrap();
+        let (prepared_tx, prepared_rx) = oneshot::channel();
+        let (continue_tx, continue_rx) = oneshot::channel();
+        let peer = tokio::spawn(frozen_callback_peer(
+            listener,
+            ["revoke", "issue", "activate", "commit"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            reopened_codex_provider_context(),
+            None,
+            Some((prepared_tx, continue_rx)),
+        ));
+        let request_id = RequestId::new();
+        let mut reopen = Box::pin(supervisor.dispatch(reopen_envelope(
+            &supervisor,
+            request_id.clone(),
+            soul.clone(),
+            revision,
+        )));
+        tokio::select! {
+            _ = prepared_rx => {}
+            reply = &mut reopen => panic!("Reopen finished before provider callback was released: {reply:?}"),
+        }
+        let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+        let prepared_state: (String, u64, String, String, String) = database
+            .query_row(
+                "SELECT s.desired_state,s.intent_revision,c.state,i.launch_state,v.visibility FROM souls s JOIN commands c ON c.soul_id=s.soul_id AND c.request_id=?2 JOIN incarnations i ON i.incarnation_id=c.incarnation_id JOIN view_intents v ON v.soul_id=s.soul_id AND v.kind='automatic_primary' WHERE s.soul_id=?1",
+                rusqlite::params![soul.as_str(), request_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            prepared_state,
+            (
+                "stopped".into(),
+                revision,
+                "reopen_prepared".into(),
+                "prepared".into(),
+                "hidden".into(),
+            ),
+            "a prepared Reopen keeps stopped intent and hidden view until final success"
+        );
+        drop(database);
+        continue_tx.send(()).unwrap();
+        let result = reopen.await;
+        let AdminResult::Reopen(result) = result
+            .result
+            .unwrap_or_else(|error| panic!("Reopen failed unexpectedly: {error:?}"))
+        else {
+            panic!("Reopen returned an unexpected result");
+        };
+        assert_eq!(result.outcome, ReopenOutcome::Reopened);
+        let reopened_incarnation = result.view.unwrap().incarnation_id;
+        let requests = peer.await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.action.as_str())
+                .collect::<Vec<_>>(),
+            ["revoke", "issue", "activate", "commit"]
+        );
+        assert!(requests.iter().all(|request| {
+            request.control_secret == supervisor.config.control_secret
+                && request.soul_id == soul.as_str()
+        }));
+        assert_eq!(requests[0].action, "revoke");
+        assert_eq!(
+            requests[0].incarnation_id.as_deref(),
+            Some(previous.as_str())
+        );
+        assert_eq!(requests[0].grant_id.as_deref(), Some("grant-reopen-prior"));
+        let issue = &requests[1];
+        assert!(issue.incarnation_id.is_none());
+        assert!(issue.grant_id.is_none());
+        assert_eq!(issue.provider.as_deref(), Some("codex"));
+        assert_eq!(issue.workspace.as_deref(), Some("/synthetic/workspace"));
+        assert_eq!(issue.cwd.as_deref(), Some("/synthetic/workspace"));
+        assert!(issue.auth_lookup_authority.is_some());
+        assert!(issue.codex_source_runtime.is_some());
+        assert!(issue.tui_source.is_none());
+        assert!(issue.claude_recovery_source.is_none());
+        assert!(issue.prior_context.is_some());
+        assert_eq!(
+            issue.provider_secret_references,
+            Some(Value::Array(Vec::new()))
+        );
+        assert_eq!(
+            issue.provider_path_inputs,
+            Some(Value::Object(Default::default()))
+        );
+        for request in &requests[2..] {
+            assert_eq!(
+                request.incarnation_id.as_deref(),
+                Some(reopened_incarnation.as_str())
+            );
+            assert_eq!(request.grant_id.as_deref(), Some("grant-reopen-new"));
+            assert!(request.provider.is_none());
+            assert!(request.workspace.is_none());
+            assert!(request.cwd.is_none());
+            assert!(request.prior_context.is_none());
+            assert!(request.provider_secret_references.is_none());
+            assert!(request.provider_path_inputs.is_none());
+        }
+        assert_ne!(reopened_incarnation, previous);
+    }
+
+    #[tokio::test]
+    async fn reopen_aborts_prepared_capability_after_activation_rejection() {
+        let directory = tempfile::tempdir().unwrap();
+        let (supervisor, soul, previous, revision) = stopped_supervisor(directory.path()).await;
+        seed_reopen_callback_capability(&supervisor, &soul, &previous, revision);
+        let listener = UnixListener::bind(
+            supervisor
+                .config
+                .control_socket_path
+                .with_file_name("mcp.sock"),
+        )
+        .unwrap();
+        let peer = tokio::spawn(frozen_callback_peer(
+            listener,
+            ["revoke", "issue", "activate", "abort"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            reopened_codex_provider_context(),
+            Some("activate".into()),
+            None,
+        ));
+
+        let reply = supervisor
+            .dispatch(reopen_envelope(
+                &supervisor,
+                RequestId::new(),
+                soul.clone(),
+                revision,
+            ))
+            .await;
+        let AdminResult::Reopen(result) = reply.result.unwrap() else {
+            panic!("Reopen returned an unexpected result");
+        };
+        assert_eq!(result.outcome, ReopenOutcome::Failed);
+        let requests = peer.await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.action.as_str())
+                .collect::<Vec<_>>(),
+            ["revoke", "issue", "activate", "abort"]
+        );
+        assert_eq!(
+            requests[0].incarnation_id.as_deref(),
+            Some(previous.as_str())
+        );
+        assert_eq!(requests[0].grant_id.as_deref(), Some("grant-reopen-prior"));
+        assert_eq!(requests[3].incarnation_id, requests[2].incarnation_id);
+        assert_eq!(requests[3].grant_id.as_deref(), Some("grant-reopen-new"));
+
+        let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+        let (desired, intent_revision, view_visibility, prepared_count): (String, u64, String, u64) = database
+            .query_row(
+                "SELECT desired_state,intent_revision,(SELECT visibility FROM view_intents WHERE soul_id=?1 AND kind='automatic_primary'),(SELECT COUNT(*) FROM commands WHERE soul_id=?1 AND state='reopen_prepared') FROM souls WHERE soul_id=?1",
+                [soul.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(desired, "stopped");
+        assert_eq!(intent_revision, revision);
+        assert_eq!(view_visibility, "hidden");
+        assert_eq!(
+            prepared_count, 0,
+            "a rejected preparation must be settled before returning"
+        );
     }
 }
 
@@ -5499,6 +8605,9 @@ pub(crate) struct AuthenticatedHost {
 }
 pub(crate) struct AcceptedGrant {
     native_identity_observation: Option<freshell_runtime_protocol::NativeIdentityObservation>,
+    native_readiness_receipt: Option<freshell_runtime_protocol::NativeReadinessReceipt>,
+    native_readiness_recovery:
+        Option<freshell_runtime_protocol::NativeReadinessRecoveryAuthorization>,
     host_boot_id: HostBootId,
     worker_pid: u32,
     worker_launch_count: u64,
@@ -5510,6 +8619,7 @@ pub(crate) struct HostStatus {
     pub(crate) max_execution_generation: u64,
     pub(crate) native_identity_observation:
         Option<freshell_runtime_protocol::NativeIdentityObservation>,
+    pub(crate) native_readiness_receipt: Option<freshell_runtime_protocol::NativeReadinessReceipt>,
     pub(crate) host_boot_id: HostBootId,
     pub(crate) worker_pid: Option<u32>,
     pub(crate) worker_launch_count: u64,
@@ -6100,6 +9210,28 @@ fn release_qualified_workload(
 /// Host commands that wait on a provider (a turn, a compaction, a settings
 /// apply, a rollback, a launch) get the long fresh-agent budget instead of
 /// the control budget.
+fn is_fresh_agent_admin_command(command: &AdminCommand) -> bool {
+    matches!(
+        command,
+        AdminCommand::FreshAgentSend(_)
+            | AdminCommand::FreshAgentFork(_)
+            | AdminCommand::FreshAgentCompact(_)
+            | AdminCommand::FreshAgentConfigure(_)
+            | AdminCommand::FreshAgentRollback(_)
+            | AdminCommand::FreshAgentCapture(_)
+            | AdminCommand::FreshAgentModelCatalog(_)
+            | AdminCommand::FreshAgentNativeName(_)
+            | AdminCommand::FreshAgentReadSnapshot(_)
+            | AdminCommand::FreshAgentReadChild(_)
+            | AdminCommand::FreshAgentResolve(_)
+            | AdminCommand::FreshAgentInterrupt(_)
+            | AdminCommand::FreshAgentPrepareNative(_)
+            | AdminCommand::FreshAgentReadHistory(_)
+            | AdminCommand::FreshAgentReadEvents(_)
+            | AdminCommand::FreshAgentReadRetainedState(_)
+    )
+}
+
 pub(crate) fn uses_fresh_agent_command_budget(command: &HostCommand) -> bool {
     matches!(
         command,
@@ -6342,6 +9474,7 @@ mod grant_identity_tests {
                                     _ => Some("raw-root".into()),
                                 },
                                 native_identity_observation: reply_observation.clone(),
+                                native_readiness_receipt: None,
                                 opencode_transfer_receipt: None,
                                 opencode_adoption: Default::default(),
                             }
@@ -6429,7 +9562,29 @@ mod grant_identity_tests {
                 _ => None,
             };
             assert_eq!(accepted.native_session_id.as_deref(), expected, "{case}");
-            assert_eq!(accepted.native_identity_observation, observation, "{case}");
+            let launch_mismatch = matches!(
+                case,
+                "wrong-nonce"
+                    | "wrong-revision"
+                    | "wrong-incarnation"
+                    | "wrong-proof-root"
+                    | "wrong-requested-root"
+                    | "fixture-stale-proof"
+            );
+            if case == "current-proof"
+                || case == "fixture-stale-proof"
+                || (case.starts_with("wrong-") && !fixture)
+            {
+                assert!(
+                    observation.is_some(),
+                    "{case}: the fake host must send its configured proof"
+                );
+            }
+            let accepted_observation = if launch_mismatch { None } else { observation };
+            assert_eq!(
+                accepted.native_identity_observation, accepted_observation,
+                "{case}"
+            );
             let context = registry.recovery_context(soul).await.unwrap();
             assert_eq!(context.never_dispatched, was_never_dispatched);
             assert_eq!(context.accepted_command_count, 0);
@@ -6890,6 +10045,7 @@ mod host_command_budget_tests {
             .unwrap();
         let command = HostCommand::GrantExecution {
             native_identity_launch: None,
+            native_readiness_recovery: None,
             incarnation_id: prepared.incarnation_id.clone(),
             soul_id: prepared.soul_id,
             host_boot_id: grant.host_boot_id,
@@ -6938,6 +10094,7 @@ mod host_command_budget_tests {
                                 fixture_evidence: serde_json::json!({}),
                                 native_session_id: None,
                                 native_identity_observation: None,
+                                native_readiness_receipt: None,
                                 opencode_adoption: Default::default(),
                                 opencode_transfer_receipt: None,
                             }
@@ -8137,6 +11294,7 @@ mod codex_pre_worker_retry_tests {
                                 fixture_evidence: serde_json::json!({}),
                                 native_session_id: Some(current.native_session_id.clone()),
                                 native_identity_observation: Some(current),
+                                native_readiness_receipt: None,
                                 opencode_transfer_receipt: None,
                                 opencode_adoption: Default::default(),
                             })
@@ -8155,6 +11313,7 @@ mod codex_pre_worker_retry_tests {
                         .as_ref()
                         .map(|value| value.native_session_id.clone()),
                     native_identity_observation: observation.clone(),
+                    native_readiness_receipt: None,
                     opencode_transfer_receipt: None,
                     opencode_adoption: Default::default(),
                 }),
@@ -8659,6 +11818,111 @@ mod stop_intent_order_tests {
     }
 }
 
+fn semantic_reopen_digest(request: &freshell_runtime_protocol::ReopenRequest) -> String {
+    let value = serde_json::json!({
+        "operation":"reopen",
+        "soulId":request.soul_id,
+        "expectedStoppedIntentRevision":request.expected_intent_revision,
+    });
+    format!("sha256:{:x}", Sha256::digest(value.to_string().as_bytes()))
+}
+
+fn reopened_result(view: RuntimeView) -> freshell_runtime_protocol::ReopenResult {
+    freshell_runtime_protocol::ReopenResult {
+        outcome: freshell_runtime_protocol::ReopenOutcome::Reopened,
+        view: Some(view),
+        message: None,
+    }
+}
+
+fn pending_reopen_result(
+    view: Option<RuntimeView>,
+    message: &str,
+) -> freshell_runtime_protocol::ReopenResult {
+    freshell_runtime_protocol::ReopenResult {
+        outcome: freshell_runtime_protocol::ReopenOutcome::Pending,
+        view,
+        message: Some(message.into()),
+    }
+}
+
+fn failed_reopen_result(
+    view: Option<RuntimeView>,
+    message: &str,
+) -> freshell_runtime_protocol::ReopenResult {
+    freshell_runtime_protocol::ReopenResult {
+        outcome: freshell_runtime_protocol::ReopenOutcome::Failed,
+        view,
+        message: Some(message.into()),
+    }
+}
+
+fn terminal_without_first_boot_state(
+    terminal: Option<TerminalLaunchSpec>,
+) -> Option<TerminalLaunchSpec> {
+    terminal.map(|mut terminal| {
+        terminal.provider_bootstrap_files.clear();
+        terminal.opencode_transfer = None;
+        terminal.opencode_transfer_attempt_id = None;
+        terminal.opencode_adoption = None;
+        terminal
+    })
+}
+
+fn fresh_without_raw_bootstrap(
+    agent: Option<FreshAgentLaunchSpec>,
+) -> Option<FreshAgentLaunchSpec> {
+    agent.map(|mut agent| {
+        if agent.provider != freshell_runtime_protocol::FreshProvider::Kilroy {
+            agent.provider_bootstrap_files.clear();
+        }
+        agent
+    })
+}
+
+fn reopen_capability(
+    workload: &LaunchWorkload,
+) -> Option<&freshell_runtime_protocol::McpCapabilityReference> {
+    workload
+        .terminal
+        .as_ref()
+        .and_then(|terminal| terminal.provider_launch_context.as_ref())
+        .or_else(|| {
+            workload
+                .fresh_agent
+                .as_ref()
+                .and_then(|agent| agent.provider_launch_context.as_ref())
+        })
+        .and_then(|context| context.mcp_capability.as_ref())
+}
+
+fn install_reopen_provider_context(
+    terminal: Option<&mut TerminalLaunchSpec>,
+    fresh_agent: Option<&mut FreshAgentLaunchSpec>,
+    prepared: freshell_runtime_protocol::PreparedProviderContext,
+) -> Result<(), RuntimeError> {
+    match (terminal, fresh_agent) {
+        (Some(terminal), None) => {
+            prepared.validate(&terminal.mode)?;
+            terminal.provider_launch_context = Some(prepared.provider_launch_context);
+            terminal.provider_secret_references = prepared.provider_secret_references;
+        }
+        (None, Some(agent)) => {
+            let provider = agent.provider.native_provider();
+            prepared.validate(provider)?;
+            agent.provider_launch_context = Some(prepared.provider_launch_context);
+            agent.provider_secret_references = prepared.provider_secret_references;
+        }
+        _ => {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "saved provider context does not identify exactly one workload",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn semantic_launch_digest(
     request: &freshell_runtime_protocol::LaunchRequest,
 ) -> Result<String, RuntimeError> {
@@ -9074,6 +12338,7 @@ mod opencode_transfer_restart_tests {
                                 max_execution_generation: 1,
                                 fixture_evidence: serde_json::json!({}),
                                 exited: false,
+                                native_readiness_receipt: None,
                                 opencode_transfer_receipt: None,
                                 opencode_adoption: Default::default(),
                             }
@@ -9165,7 +12430,8 @@ mod opencode_transfer_restart_tests {
                 .fresh_agent_resolve(
                     soul.clone(),
                     "uncommitted-decision".into(),
-                    serde_json::json!({"behavior":"allow"})
+                    serde_json::json!({"behavior":"allow"}),
+                    None,
                 )
                 .await
                 .unwrap_err()
@@ -9182,10 +12448,22 @@ mod opencode_transfer_restart_tests {
             RuntimeErrorCode::RecoveryBlocked,
             "provider compaction also waits for the registry commit"
         );
-        let transition = supervisor
-            .fresh_agent_fork(RequestId::new(), soul.clone(), "native-parent".into(), None)
-            .await
-            .unwrap();
+        let mut fork = Envelope::new(
+            RequestId::new(),
+            ControlRole::Web,
+            AdminCommand::FreshAgentFork(freshell_runtime_protocol::FreshAgentForkRequest {
+                soul_id: soul.clone(),
+                parent_session_id: "native-parent".into(),
+                input: None,
+                expected_control_epoch: Some(registry.control_epoch()),
+            }),
+        );
+        fork.auth = Some("synthetic-secret".into());
+        let AdminResult::FreshAgentFork(transition) =
+            supervisor.dispatch(fork).await.result.unwrap()
+        else {
+            panic!("the authenticated fork must return its native transition");
+        };
         assert_eq!(transition.child_session_id, "native-child");
         let replay = supervisor
             .fresh_agent_read_events(soul.clone(), 0, 128)
@@ -9465,7 +12743,7 @@ mod opencode_transfer_restart_tests {
         )
         .unwrap();
         conn.execute(
-            "UPDATE incarnations SET runtime_dir=?1,execution_generation=1,fresh_agent_spec=?2 WHERE incarnation_id=?3",
+            "UPDATE incarnations SET runtime_dir=?1,execution_generation=1,launch_nonce='send-recoverable-nonce',launch_state='running',fresh_agent_spec=?2 WHERE incarnation_id=?3",
             params![
                 runtime.to_string_lossy(),
                 serde_json::json!({
@@ -9486,6 +12764,19 @@ mod opencode_transfer_restart_tests {
                 prepared.incarnation_id.clone(),
                 "old-owned-root".into(),
             )
+            .await
+            .unwrap();
+        // Production binds the native identity launch at the typed identity
+        // commit; the send-recoverable class always carries that binding, and
+        // the readiness arm reuses it as the prepare command's launch.
+        registry
+            .bind_native_identity_launch(freshell_runtime_protocol::NativeIdentityLaunch {
+                incarnation_id: prepared.incarnation_id.clone(),
+                launch_nonce: "send-recoverable-nonce".into(),
+                evidence_revision: 0,
+                execution_generation: 1,
+                requested_native_session_id: Some("old-owned-root".into()),
+            })
             .await
             .unwrap();
         let context = registry.recovery_context(soul.clone()).await.unwrap();
@@ -9533,6 +12824,7 @@ mod opencode_transfer_restart_tests {
                             Ok(HostResult::Status {
                                 native_session_id: None,
                                 native_identity_observation: None::<NativeIdentityObservation>,
+                                native_readiness_receipt: None,
                                 host_boot_id: boot.clone(),
                                 worker_pid: Some(123),
                                 worker_launch_count: 1,
@@ -9546,7 +12838,7 @@ mod opencode_transfer_restart_tests {
                                 opencode_adoption: Default::default(),
                             })
                         }
-                        HostCommand::FreshAgentPrepareNative { incarnation_id } => {
+                        HostCommand::FreshAgentPrepareNative { incarnation_id, .. } => {
                             assert_eq!(incarnation_id, incarnation);
                             preparations.fetch_add(1, Ordering::SeqCst);
                             // The readiness arm's honest class-(ii) verdict:
@@ -9746,6 +13038,94 @@ mod opencode_transfer_restart_tests {
             files,
             total_bytes: payload.len() as u64,
         }
+    }
+
+    #[test]
+    fn native_startup_observation_wait_exempts_only_fresh_opencode_terminals() {
+        use freshell_runtime_protocol::{
+            OpenCodeAdoptionBaseline, OpenCodeAdoptionExpectation, OpenCodeVerifiedRootTail,
+        };
+
+        fn terminal_workload(resume_session_id: Option<&str>) -> LaunchWorkload {
+            let mut terminal = serde_json::json!({
+                "terminalId": "terminal-opencode-policy",
+                "streamId": "stream-opencode-policy",
+                "mode": "opencode",
+                "program": "opencode",
+                "cwd": "/workspace",
+                "workspacePath": "/workspace",
+                "projectKey": "project-opencode-policy",
+                "runAsUid": 65534,
+                "runAsGid": 0,
+                "cols": 80,
+                "rows": 24
+            });
+            if let Some(session_id) = resume_session_id {
+                terminal["resumeSessionId"] = serde_json::json!(session_id);
+            }
+            LaunchWorkload {
+                soul_id: SoulId::new(),
+                fixture: None,
+                terminal: Some(serde_json::from_value(terminal).unwrap()),
+                fresh_agent: None,
+                resume_spec: None,
+            }
+        }
+
+        let fresh_terminal = terminal_workload(None);
+        assert!(!fresh_terminal.requires_native_startup_observation("opencode"));
+
+        let resumed_terminal = terminal_workload(Some("ses_existing"));
+        assert!(resumed_terminal.requires_native_startup_observation("opencode"));
+
+        let mut transferred_terminal = terminal_workload(Some("ses_exact"));
+        let transferred_spec = transferred_terminal.terminal.as_mut().unwrap();
+        transferred_spec.opencode_transfer = Some(descriptor());
+        transferred_spec.opencode_transfer_attempt_id = Some(ATTEMPT_A.into());
+        transferred_spec.validate().unwrap();
+        assert!(transferred_terminal.requires_native_startup_observation("opencode"));
+
+        let mut adopted_terminal = terminal_workload(Some("ses_exact"));
+        let baseline = OpenCodeAdoptionBaseline::from_descriptor(descriptor()).unwrap();
+        adopted_terminal
+            .terminal
+            .as_mut()
+            .unwrap()
+            .opencode_adoption = Some(OpenCodeAdoptionExpectation {
+            baseline,
+            root_session_id: "ses_exact".into(),
+            root_tail: OpenCodeVerifiedRootTail::QualifiedEmpty,
+            evidence_generation: "e".repeat(64),
+            incarnation_id: IncarnationId::new(),
+            launch_nonce: ATTEMPT_A.into(),
+        });
+        adopted_terminal
+            .terminal
+            .as_ref()
+            .unwrap()
+            .validate()
+            .unwrap();
+        assert!(adopted_terminal.requires_native_startup_observation("opencode"));
+
+        let mut fresh_agent = terminal_workload(None);
+        fresh_agent.terminal = None;
+        fresh_agent.fresh_agent = Some(
+            serde_json::from_value(serde_json::json!({
+                "sessionId": "fresh-opencode-policy",
+                "provider": "opencode",
+                "sessionType": "freshopencode",
+                "runtimeVariant": "opencode-mcp",
+                "providerStoreId": "provider-store-policy",
+                "cwd": "/workspace",
+                "workspacePath": "/workspace",
+                "runAsUid": 65534,
+                "runAsGid": 0
+            }))
+            .unwrap(),
+        );
+        assert!(fresh_agent.requires_native_startup_observation("opencode"));
+
+        assert!(fresh_terminal.requires_native_startup_observation("codex"));
     }
 
     #[tokio::test]
@@ -9952,6 +13332,7 @@ mod opencode_transfer_restart_tests {
                             exited: case == "provider-exit"
                                 && elapsed >= Duration::from_millis(250),
                             native_session_id: Some("ses_exact".into()),
+                            native_readiness_receipt: None,
                             opencode_transfer_receipt: None,
                             opencode_adoption: if matches!(case, "initial" | "saved") {
                                 OpenCodeAdoptionStatus::AwaitingObservation
@@ -10308,6 +13689,16 @@ fn map_opencode_transfer(error: crate::opencode_transfer::StagingError) -> Runti
         | crate::opencode_transfer::StagingError::Metadata(_) => RuntimeErrorCode::RegistryFailure,
     };
     RuntimeError::new(code, error.to_string())
+}
+
+fn fresh_send_refusal_error(
+    diagnostic: freshell_runtime_protocol::FreshAgentSendDiagnostic,
+) -> RuntimeError {
+    RuntimeError::new(
+        RuntimeErrorCode::HostUnreachable,
+        "hosted fresh-agent command failed",
+    )
+    .with_fresh_agent_send_diagnostic(diagnostic)
 }
 
 fn map_registry(error: RegistryError) -> RuntimeError {
@@ -10896,6 +14287,7 @@ mod interrupted_transaction_tests {
         HostCommand::GrantExecution {
             dispatch_budget_ms: None,
             native_identity_launch: None,
+            native_readiness_recovery: None,
             incarnation_id: incarnation,
             soul_id: soul,
             host_boot_id: boot,
@@ -10997,6 +14389,7 @@ mod interrupted_transaction_tests {
                                     worker_launch_count: 1,
                                     fixture_evidence: serde_json::json!({}),
                                     native_session_id: None,
+                                    native_readiness_receipt: None,
                                     opencode_transfer_receipt: None,
                                     opencode_adoption: OpenCodeAdoptionStatus::NotRequired,
                                 })
@@ -14329,6 +17722,7 @@ mod native_observation_ipc_tests {
                             fixture_evidence: serde_json::json!({}),
                             exited: false,
                             native_session_id: Some("ses_unqualified_status".into()),
+                            native_readiness_receipt: None,
                             opencode_transfer_receipt: None,
                             opencode_adoption: Default::default(),
                         },
@@ -14473,6 +17867,7 @@ mod native_observation_ipc_tests {
                                 fixture_evidence: serde_json::json!({}),
                                 exited: !delayed_reattach,
                                 native_session_id: Some("ses_from_status".into()),
+                                native_readiness_receipt: None,
                                 opencode_transfer_receipt: None,
                                 opencode_adoption: Default::default(),
                             }
@@ -14850,3 +18245,7 @@ mod control_connection_tests {
 #[cfg(test)]
 #[path = "native_clear_service_tests.rs"]
 mod native_clear_service_tests;
+
+#[cfg(test)]
+#[path = "fresh_agent_blocked_send_tests.rs"]
+mod fresh_agent_blocked_send_tests;

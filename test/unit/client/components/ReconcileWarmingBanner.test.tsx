@@ -67,11 +67,11 @@ function layoutFor(paneIds: string[]): PaneNode {
   null as PaneNode | null)!
 }
 
-function ref(paneId: string): { tabId: string; paneId: string } {
-  return { tabId: 'tab-1', paneId }
+function ref(paneId: string): { tabId: string; paneId: string; createRequestId: string } {
+  return { tabId: 'tab-1', paneId, createRequestId: `cr-${paneId}` }
 }
 
-function sevenRefs(): { tabId: string; paneId: string }[] {
+function sevenRefs(): { tabId: string; paneId: string; createRequestId: string }[] {
   return ['p1', 'p2', 'p3', 'p4', 'p5', 'p6', 'p7'].map(ref)
 }
 

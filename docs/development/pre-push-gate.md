@@ -8,12 +8,22 @@ Filtered by what the push changes (diff between the remote refs being updated an
 
 | Push contains | Checks |
 |---|---|
-| Any `.rs`, `Cargo.toml`/`Cargo.lock`, `rust-toolchain*`, `test/fixtures/**` | `cargo fmt --all --check`, then `cargo clippy --workspace --exclude freshell-tauri --all-targets -- -D warnings`, then **targeted `cargo test`**: the changed crates plus every workspace crate that transitively depends on them (full `--workspace --exclude freshell-tauri` when the change is root-level — `Cargo.lock`, toolchain, `.cargo/` — or the base is unknown). `freshell-tauri` is excluded per clippy parity. Test fixtures are cross-crate rust-test infrastructure, so a `test/fixtures/**` change routes to the whole workspace. |
+| Any `.rs`, `Cargo.toml`/`Cargo.lock`, `rust-toolchain*`, `test/fixtures/**` | `cargo fmt --all --check`, then `cargo clippy --workspace --exclude freshell-tauri --all-targets -- -D warnings`, then **targeted `cargo test` in the disposable Docker sandbox**: the changed crates plus every workspace crate that transitively depends on them (full `--workspace --exclude freshell-tauri` when the change is root-level — `Cargo.lock`, toolchain, `.cargo/` — or the base is unknown). `freshell-tauri` is excluded per clippy parity. Test fixtures are cross-crate rust-test infrastructure, so a `test/fixtures/**` change routes to the whole workspace. |
 | Any `.ts`/`.tsx`, `package.json`/`package-lock.json`, `pnpm-lock.yaml`/`pnpm-workspace.yaml`, `.npmrc`, `tsconfig*` | The repo typecheck (client + tools, tsc `--noEmit`), run through the pushing worktree's package manager |
 | Only docs/config/other files | Nothing |
 | New branch with no merge-base with origin/main | Both gates (full) |
 
 Cost when warm: fmt ~5s, typecheck ~1-2 min, clippy ~2-5 min on a warm target dir (first run in a fresh checkout is a cold build — longer). The test lane adds only the affected crates' tests — e.g. a `freshell-freshagent` change tests freshagent plus its dependents (~3-4 min warm); a client-only push pays nothing.
+
+For a Rust push that needs process isolation, set `FRESHELL_RUST_TEST_SANDBOX=1`. The hook keeps its existing plan and sends only the selected Cargo test command through the pushing worktree's `scripts/sandbox-test.sh --runtime-suite`; fmt, Clippy, and typecheck keep their normal routes. Sandbox or Cargo failures still block the push, with no host-test fallback. The default is unset, so ordinary pushes do not require Docker.
+
+When validating an unmerged hook from a worktree, use command-scoped Git config so the shared hook owner remains untouched:
+
+```bash
+FRESHELL_RUST_TEST_SANDBOX=1 git \
+  -c "core.hooksPath=$(git rev-parse --show-toplevel)/scripts/hooks" \
+  push origin <branch>
+```
 
 Routing lives in `scripts/hooks/pre-push`; the crate→package targeting logic is `scripts/hooks/rust-test-targets.ts`, unit-tested in `test/unit/scripts/rust-test-targets.test.ts` (which also exercises the hook end-to-end against real git ranges in debug mode).
 

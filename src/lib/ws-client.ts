@@ -560,6 +560,11 @@ export class WsClient {
             pacedTerminalReplayV1: true,
             terminalLifetimeClaimV1: true,
             managedRuntimeV1: true,
+            // Session-index readiness (auto-restore-warming Task 2): opt in
+            // to `ready.sessionIndexReady` and the `sessions.index.ready`
+            // boot broadcast. Additive — an old server strips it and keeps
+            // the exact legacy wire behavior.
+            sessionIndexReadyV1: true,
           },
           ...helloExtensions,
         })

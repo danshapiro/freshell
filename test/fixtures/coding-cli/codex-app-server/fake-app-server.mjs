@@ -7,6 +7,7 @@ import fs from 'node:fs'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 if (process.argv[2] === 'fake-durable-writer') {
   const outputPath = process.argv[3]
@@ -25,6 +26,8 @@ if (process.argv[2] === 'fake-durable-writer') {
   appendWitness()
 
   const server = net.createServer((socket) => {
+    // The reply acknowledges a completed write; callers need no timer sleep.
+    appendWitness()
     socket.end('fake codex durable writer\n')
   })
   server.listen(0, '127.0.0.1', () => {
@@ -34,6 +37,7 @@ if (process.argv[2] === 'fake-durable-writer') {
     }
     fs.writeFileSync(portPath, `${address.port}\n`, 'utf8')
     fs.writeFileSync(readyPath, `${process.pid}\n`, 'utf8')
+    process.send?.({ type: 'durable-writer.ready' })
   })
   const timer = setInterval(appendWitness, intervalMs)
   process.on('SIGTERM', () => {
@@ -45,6 +49,18 @@ if (process.argv[2] === 'fake-durable-writer') {
   await new Promise(() => undefined)
 }
 
+if (process.argv[2] === 'fake-churn-child') {
+  const readyPath = process.argv[3]
+  const releasePath = process.argv[4]
+  fs.writeFileSync(readyPath, `${process.pid}\n`, 'utf8')
+  const deadline = Date.now() + 60_000
+  while (!fs.existsSync(releasePath)) {
+    if (Date.now() > deadline) process.exit(1)
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  process.exit(0)
+}
+
 if (process.argv[2] === 'fake-native-child') {
   process.on('SIGTERM', () => {
     if (process.env.FAKE_CODEX_NATIVE_CHILD_IGNORE_SIGTERM === '1') {
@@ -53,6 +69,43 @@ if (process.argv[2] === 'fake-native-child') {
     process.exit(0)
   })
 
+  if (process.env.FAKE_CODEX_NATIVE_CHILD_READY_FILE) {
+    fs.writeFileSync(process.env.FAKE_CODEX_NATIVE_CHILD_READY_FILE, `${process.pid}\n`, 'utf8')
+  }
+  if (process.env.FAKE_CODEX_NATIVE_CHURN_DIR) {
+    const churnDir = process.env.FAKE_CODEX_NATIVE_CHURN_DIR
+    const count = Number(process.env.FAKE_CODEX_NATIVE_CHURN_COUNT || 0)
+    for (let index = 0; index < count; index++) {
+      const child = spawn(process.execPath, [
+        fileURLToPath(import.meta.url),
+        'fake-churn-child',
+        path.join(churnDir, `helper-${index}.pid`),
+        path.join(churnDir, 'release'),
+      ], { stdio: 'ignore' })
+      child.unref()
+    }
+  }
+  if (process.env.FAKE_CODEX_NATIVE_IMMEDIATE_CHURN_DIR) {
+    const churnDir = process.env.FAKE_CODEX_NATIVE_IMMEDIATE_CHURN_DIR
+    const count = Number(process.env.FAKE_CODEX_NATIVE_IMMEDIATE_CHURN_COUNT || 0)
+    const outcomes = []
+    for (let index = 0; index < count; index++) {
+      const child = spawn(process.execPath, ['-e', 'process.exit(0)'], { stdio: 'ignore' })
+      let recorded = false
+      const record = (result) => {
+        if (recorded) return
+        recorded = true
+        outcomes.push(result)
+        if (outcomes.length === count) {
+          const complete = path.join(churnDir, 'immediate-churn-complete.json')
+          fs.writeFileSync(`${complete}.tmp`, JSON.stringify(outcomes), 'utf8')
+          fs.renameSync(`${complete}.tmp`, complete)
+        }
+      }
+      child.once('error', (error) => record({ pid: child.pid ?? null, error: error.message }))
+      child.once('close', (code, signal) => record({ pid: child.pid, code, signal }))
+    }
+  }
   setInterval(() => undefined, 1_000)
   process.stdin.resume()
   await new Promise(() => undefined)
@@ -398,7 +451,7 @@ function successResult(method, params) {
         ? params.input.map((part) => (part && typeof part.text === 'string' ? part.text : '')).filter(Boolean).join('\n')
         : ''
       const turn = makeRecordedTurn(`turn-${turns.length + 1}`, promptText, params)
-      if (behavior.liveTranscript) {
+      if (behavior.liveTranscript || behavior.turnFailure) {
         turn.status = 'inProgress'
         turn.items = [turn.items[0]]
       }
@@ -600,11 +653,19 @@ if (portFile && port !== 0) {
 }
 
 let nativeChild
+if (behavior.sidecarPidFile) {
+  fs.writeFileSync(behavior.sidecarPidFile, `${process.pid}\n`, 'utf8')
+}
 if (behavior.spawnNativeChild) {
-  nativeChild = spawn(process.execPath, [new URL(import.meta.url).pathname, 'fake-native-child'], {
+  nativeChild = spawn(process.execPath, [fileURLToPath(import.meta.url), 'fake-native-child'], {
     env: {
       ...process.env,
       FAKE_CODEX_NATIVE_CHILD_IGNORE_SIGTERM: behavior.nativeChildIgnoresSigterm ? '1' : '',
+      FAKE_CODEX_NATIVE_CHILD_READY_FILE: behavior.nativeChildReadyFile || '',
+      FAKE_CODEX_NATIVE_CHURN_DIR: behavior.nativeChurnDir || '',
+      FAKE_CODEX_NATIVE_CHURN_COUNT: String(behavior.nativeChurnCount || 0),
+      FAKE_CODEX_NATIVE_IMMEDIATE_CHURN_DIR: behavior.nativeImmediateChurnDir || '',
+      FAKE_CODEX_NATIVE_IMMEDIATE_CHURN_COUNT: String(behavior.nativeImmediateChurnCount || 0),
     },
     stdio: 'ignore',
   })
@@ -634,12 +695,32 @@ if (behavior.spawnDurableWriter) {
       ...process.env,
       FAKE_CODEX_WRITER_IGNORE_SIGTERM: behavior.durableWriterIgnoresSigterm ? '1' : '',
     },
-    stdio: 'ignore',
+    stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
   })
-  durableWriterChild.unref()
   if (behavior.durableWriterPidPath) {
     fs.writeFileSync(behavior.durableWriterPidPath, `${durableWriterChild.pid}\n`, 'utf8')
   }
+  // Establish the writer before exposing the app-server handshake. Readiness is
+  // a child acknowledgement, independent of startup speed and host contention.
+  await new Promise((resolve, reject) => {
+    const cleanup = () => {
+      durableWriterChild.off('message', onMessage)
+      durableWriterChild.off('error', onError)
+      durableWriterChild.off('exit', onExit)
+    }
+    const onError = (error) => { cleanup(); reject(error) }
+    const onExit = (code, signal) => onError(new Error(`durable writer exited before readiness: ${code ?? signal}`))
+    const onMessage = (message) => {
+      if (message?.type !== 'durable-writer.ready') return
+      cleanup()
+      resolve()
+    }
+    durableWriterChild.on('message', onMessage)
+    durableWriterChild.once('error', onError)
+    durableWriterChild.once('exit', onExit)
+  })
+  durableWriterChild.unref()
+  durableWriterChild.channel?.unref()
 }
 
 const wss = portFile
@@ -956,7 +1037,17 @@ wss.on('connection', (socket) => {
     const floodStdoutBytes = Number(behavior.floodStdoutBeforeMethodsBytes?.[method] || 0)
     const floodStderrBytes = Number(behavior.floodStderrBeforeMethodsBytes?.[method] || 0)
     if (override?.error) {
-      setTimeout(() => {
+      setTimeout(async () => {
+        if (method === 'thread/resume' && behavior.waitForResumeReleasePath) {
+          if (behavior.resumeWaitingPath) {
+            fs.writeFileSync(behavior.resumeWaitingPath, `${process.pid}\n`, 'utf8')
+          }
+          const deadline = Date.now() + 45_000
+          while (!fs.existsSync(behavior.waitForResumeReleasePath)) {
+            if (Date.now() > deadline) throw new Error('Timed out waiting for test thread/resume release')
+            await new Promise((resolve) => setTimeout(resolve, 25))
+          }
+        }
         socket.send(JSON.stringify({
           id: message.id,
           error: override.error,
@@ -1045,6 +1136,13 @@ wss.on('connection', (socket) => {
           turn: { id: result.turn.id, status: 'inProgress' },
         })
         const prompt = (message.params?.input ?? []).filter((part) => part.type === 'text').map((part) => part.text).join('\n')
+        if (behavior.turnFailure && !behavior.liveTranscript) {
+          const threadId = message.params.threadId
+          const turnId = result.turn.id
+          const item = result.turn.items[0]
+          broadcastNotification('item/started', { threadId, turnId, item })
+          broadcastNotification('item/completed', { threadId, turnId, item })
+        }
         if (behavior.liveTranscript && (!behavior.liveTranscriptPrompts || behavior.liveTranscriptPrompts.some(marker => prompt.includes(marker)))) {
           const threadId = message.params.threadId
           const turnId = result.turn.id
@@ -1098,16 +1196,26 @@ wss.on('connection', (socket) => {
           interrupted = response.cancelled === true
         }
         await new Promise((resolve) => setTimeout(resolve, Number(behavior.turnCompleteDelayMs ?? 150)))
-        behavior.threadStatuses[message.params?.threadId] = 'idle'
+        const recorded = loadRecordedTurns(message.params.threadId)
+        const finished = recorded.find((turn) => turn.id === result.turn.id)
+        if (finished && behavior.turnFailure) {
+          finished.status = interrupted ? 'interrupted' : 'failed'
+          finished.error = interrupted ? null : behavior.turnFailure
+          persistRecordedTurns(message.params.threadId, recorded)
+        }
+        const terminalStatus = interrupted ? 'interrupted' : behavior.turnFailure ? 'failed' : 'completed'
+        const lifecycleFirst = behavior.failureLifecycleFirst && terminalStatus === 'failed'
+        behavior.threadStatuses[message.params?.threadId] = lifecycleFirst ? 'systemError' : 'idle'
         broadcastNotification('thread/status/changed', {
           threadId: message.params?.threadId,
-          status: { type: 'idle' },
+          status: { type: lifecycleFirst ? 'systemError' : 'idle' },
         })
+        if (lifecycleFirst) await new Promise((resolve) => setTimeout(resolve, 100))
         broadcastNotification('turn/completed', {
           threadId: message.params?.threadId,
           turn: behavior.terminalItemsView
-            ? projectTurnItemsView({ ...loadRecordedTurns(message.params.threadId).find(turn => turn.id === result.turn.id), status: interrupted ? 'interrupted' : 'completed' }, behavior.terminalItemsView)
-            : { id: result.turn.id, status: interrupted ? 'interrupted' : 'completed' },
+            ? projectTurnItemsView({ ...finished, status: terminalStatus }, behavior.terminalItemsView)
+            : { id: result.turn.id, status: terminalStatus, ...(terminalStatus === 'failed' ? { error: behavior.turnFailure } : {}) },
         })
       }
       if (method === 'initialize') {

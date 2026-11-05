@@ -283,6 +283,7 @@ mod tests {
         let broadcast_tx = StdArc::new(tokio::sync::broadcast::channel::<String>(16).0);
         let rx = broadcast_tx.subscribe();
         let state = WsState {
+            session_index_ready: None,
             pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
             layout: Default::default(),
             terminal_meta: Default::default(),

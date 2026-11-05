@@ -837,11 +837,10 @@ mod tests {
             "ONECLI_GATEWAY=1\nLUNAROUTE_API_KEY=proxy-managed-placeholder\nLUNAROUTE_BASE_URL=https://lunaroute.example/v1\nHTTPS_PROXY=http://<AGENT_TOKEN>@192.0.2.10:10255\n",
             "ONECLI_GATEWAY=1\nLUNAROUTE_API_KEY=key\nLUNAROUTE_BASE_URL=https://lunaroute.example/v1\nHTTPS_PROXY=http://user:one@192.0.2.10:10255\nhttps_proxy=http://user:two@192.0.2.10:10255\n",
         ] {
-            assert!(resolve_profile(
-                ProviderSecretProfile::AmplifierOnecliLunarouteGlm53,
-                raw,
-            )
-            .is_err());
+            assert!(
+                resolve_profile(ProviderSecretProfile::AmplifierOnecliLunarouteGlm53, raw,)
+                    .is_err()
+            );
         }
     }
 
@@ -852,11 +851,10 @@ mod tests {
             "ONECLI_GATEWAY=1\nLUNAROUTE_API_KEY=key\nLUNAROUTE_BASE_URL=http://lunaroute.example/v1\nHTTPS_PROXY=http://user:credential@192.0.2.10:10255\n",
             "ONECLI_GATEWAY=1\nLUNAROUTE_API_KEY=key\nLUNAROUTE_BASE_URL=https://lunaroute.example/v1\n",
         ] {
-            assert!(resolve_profile(
-                ProviderSecretProfile::AmplifierOnecliLunarouteGlm53,
-                raw,
-            )
-            .is_err());
+            assert!(
+                resolve_profile(ProviderSecretProfile::AmplifierOnecliLunarouteGlm53, raw,)
+                    .is_err()
+            );
         }
     }
 

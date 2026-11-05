@@ -627,6 +627,61 @@ describe('Panes Persistence Integration', () => {
     expect(restored.crashTrace).toEqual({ exitCode: 1, resumedAtMs: 1_753_760_220_000 })
   })
 
+  it('staleSessionNotice persists across a panes round-trip (denylist keeps new fields)', () => {
+    // Focused repair round 3, Major 2 (the crashTrace pin's sibling): the
+    // FreshUnbound stale-id notice lives on pane content, persists by the
+    // same denylist property, and survives the hydrate whitelist
+    // (normalizePaneContent) — so the explanation naming the lost
+    // conversation is still visible after a reload until dismissed.
+    const store1 = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+      },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+    })
+
+    const notice = 'Saved antigravity session deleted-conversation could not be found on disk — started a fresh session instead.'
+    store1.dispatch(addTab({ mode: 'antigravity' }))
+    const tabId = store1.getState().tabs.tabs[0].id
+    store1.dispatch(initLayout({
+      tabId,
+      content: {
+        kind: 'terminal',
+        mode: 'antigravity',
+        shell: 'system',
+        createRequestId: 'req-stale-notice',
+        status: 'running',
+        staleSessionNotice: notice,
+      } as any,
+    }))
+
+    vi.runAllTimers()
+    const persistedTabs = loadPersistedTabs()
+    const persistedPanes = loadPersistedPanes()
+
+    const store2 = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+      },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+    })
+    if (persistedTabs?.tabs) {
+      store2.dispatch(hydrateTabs(persistedTabs.tabs))
+    }
+    if (persistedPanes) {
+      store2.dispatch(hydratePanes(persistedPanes))
+    }
+
+    const restoredLayout = store2.getState().panes.layouts[tabId]
+    expect(restoredLayout).toBeDefined()
+    expect(restoredLayout.type).toBe('leaf')
+    const restored = (restoredLayout as any).content
+    expect(restored.kind).toBe('terminal')
+    expect(restored.staleSessionNotice).toBe(notice)
+  })
+
   it('round-trips a host-stats leaf: {kind:"host-stats"} normalizes bare and survives reload validation', () => {
     const store1 = configureStore({
       reducer: {

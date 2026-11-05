@@ -40,9 +40,10 @@ fn failure(
     owner: Option<crate::ownership_lane::TerminalOwnerFields>,
 ) -> RestLaneError {
     let kind = match code.as_str() {
-        "SESSION_RESERVED" | "STALE_CLAIM" | "CODEX_DELIVERY_AMBIGUOUS" => {
-            RestLaneErrorKind::Conflict
-        }
+        "SESSION_RESERVED"
+        | "STALE_CLAIM"
+        | "CODEX_DELIVERY_AMBIGUOUS"
+        | "CODEX_PREVIOUS_DELIVERY_AMBIGUOUS" => RestLaneErrorKind::Conflict,
         "SESSION_NOT_FOUND" => RestLaneErrorKind::NotFound,
         code if code.starts_with("INVALID_") => RestLaneErrorKind::BadRequest,
         _ => RestLaneErrorKind::Unavailable,
@@ -266,18 +267,29 @@ impl FreshAgentRestLane for CodexRestLane {
                         let (code, message) = match outcome {
                             NativeSettlement::Interrupted => (
                                 "CODEX_TURN_INTERRUPTED",
-                                "the submitted Codex turn was interrupted",
+                                "the submitted Codex turn was interrupted".to_string(),
                             ),
-                            NativeSettlement::Failed => {
-                                ("CODEX_TURN_FAILED", "the submitted Codex turn failed")
-                            }
+                            NativeSettlement::Failed => (
+                                "CODEX_TURN_FAILED",
+                                self.state
+                                    .turn_provider_error(
+                                        &session_id,
+                                        &incarnation_id,
+                                        &submitted_turn_id,
+                                    )
+                                    .await
+                                    .unwrap_or_else(|| {
+                                        "the submitted Codex turn failed".to_string()
+                                    }),
+                            ),
                             NativeSettlement::OwnedExit => (
                                 "FRESH_AGENT_SESSION_ENDED",
-                                "the owned Codex runtime exited before the turn completed",
+                                "the owned Codex runtime exited before the turn completed"
+                                    .to_string(),
                             ),
                             NativeSettlement::Completed => unreachable!(),
                         };
-                        let mut error = failure(code.into(), message.into(), Some(false), None);
+                        let mut error = failure(code.into(), message, Some(false), None);
                         error.kind = RestLaneErrorKind::Conflict;
                         error.correlation = Some(Box::new(RestLaneErrorCorrelation {
                             session_id: Some(session_id),
@@ -302,7 +314,21 @@ impl FreshAgentRestLane for CodexRestLane {
                 message,
                 retryable,
                 owner,
-            } => Err(failure(code, message, retryable, owner)),
+            } => {
+                let previous_delivery_ambiguous = code == "CODEX_PREVIOUS_DELIVERY_AMBIGUOUS";
+                let mut error = failure(code, message, retryable, owner);
+                if previous_delivery_ambiguous {
+                    // The previous request is uncertain, but this request was
+                    // refused before dispatch and has its own correlation.
+                    error.retryable = Some(false);
+                }
+                error.correlation = Some(Box::new(RestLaneErrorCorrelation {
+                    session_id: Some(request.session_id),
+                    request_id: Some(request.request_id),
+                    ..Default::default()
+                }));
+                Err(error)
+            }
             CodexSendOutcome::Ambiguous {
                 session_id,
                 request_id,

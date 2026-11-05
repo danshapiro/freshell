@@ -66,6 +66,13 @@ import { RetainedFixtureBrowserSession, runTask2RetainedFixture, Task2RetainedBr
 import { requireAmplifierOnecliBootstrap, readAmplifierQualificationProfile, stageAmplifierQualificationProfile } from './runtime-amplifier-onecli.js'
 import { ownedClaudeStartupPreferences } from './runtime-native-feasibility.js'
 import { defaultReceiptFileName } from './runtime-receipts.js'
+import { createP2G01SandboxHandoff, isExactP2G01Selection, P2_G01_HANDOFF_CONTAINER_PATH,
+  P2_G01_SANDBOX_OPT_IN, P2_G01_SPEC, P2_G01_TITLE,
+  p2G01PlaywrightInvocation, p2G01PnpmStoreVolume, type P2G01SandboxHandoff } from './external-browser-sandbox.js'
+
+export { createP2G01SandboxHandoff, isExactP2G01Selection, P2_G01_HANDOFF_CONTAINER_PATH,
+  P2_G01_SANDBOX_OPT_IN, P2_G01_SPEC, P2_G01_TITLE, parseP2G01SandboxHandoff,
+  p2G01PlaywrightInvocation, p2G01PnpmStoreVolume } from './external-browser-sandbox.js'
 
 type OwnedProcessIdentity = { pid: number; startTicks: string; executable: string; cwd: string }
 type OwnedProcessScope = { children: OwnedProcessIdentity[]; groupPresent: boolean }
@@ -2083,40 +2090,47 @@ export type ExternalBrowserCounts = {
 export function parseExternalCloudExecutionEvents(
   events: readonly unknown[], context: Pick<ManagedExternalDescriptor, 'runId' | 'candidateSha'>,
 ): ExternalBrowserCaseResult[] {
-  const observed = parseExternalCloudCaseObservations(events, context)
-  if (observed.status !== 'passed') throw new Error('Cloud execution completion failed')
+  return parseExternalExecutionEvents(events, context)
+}
+
+export function parseExternalExecutionEvents(
+  events: readonly unknown[], context: Pick<ManagedExternalDescriptor, 'runId' | 'candidateSha'>,
+): ExternalBrowserCaseResult[] {
+  const observed = parseExternalCaseObservations(events, context)
+  if (observed.status !== 'passed') throw new Error('external execution completion failed')
   return observed.cases
 }
 
-function parseExternalCloudCaseObservations(
+function parseExternalCaseObservations(
   events: readonly unknown[], context: Pick<ManagedExternalDescriptor, 'runId' | 'candidateSha'>,
 ): { status: FullResult['status']; cases: ExternalBrowserCaseResult[] } {
   const cases: ExternalBrowserCaseResult[] = []
   let completion: Record<string, unknown> | undefined
   for (const input of events) {
-    if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('invalid Cloud execution event')
+    if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('invalid external execution event')
     const event = input as Record<string, unknown>
     if (!['managed_external_case', 'managed_external_complete'].includes(String(event.event))) continue
     if (event.runId !== context.runId || event.candidateSha !== context.candidateSha) {
-      throw new Error('Cloud execution event differs from the owned run or candidate')
+      throw new Error('external execution event differs from the owned run or candidate')
     }
     if (event.event === 'managed_external_complete') {
-      if (completion) throw new Error('duplicate Cloud execution completion')
+      if (completion) throw new Error('duplicate external execution completion')
       completion = event
       continue
     }
     if (typeof event.id !== 'string' || !event.id || typeof event.title !== 'string' || !event.title
       || typeof event.file !== 'string' || !['passed', 'failed', 'skipped', 'timedOut', 'interrupted'].includes(String(event.status))) {
-      throw new Error('invalid Cloud execution case observation')
+      throw new Error('invalid external execution case observation')
     }
     specName(event.file)
-    if (cases.some(row => row.id === event.id)) throw new Error('duplicate Cloud execution case')
+    if (cases.some(row => row.id === event.id)) throw new Error('duplicate external execution case')
     cases.push({ id: event.id, title: event.title, file: event.file, status: event.status as ExternalBrowserCaseResult['status'] })
   }
   const status = z.enum(['passed', 'failed', 'timedout', 'interrupted']).safeParse(completion?.status)
-  if (!completion || !status.success || !cases.length || completion.cases !== cases.length) {
-    throw new Error('Cloud execution completion is missing, failed or incomplete')
-  }
+  if (!completion) throw new Error('external execution completion event is missing')
+  if (!status.success) throw new Error('external execution completion status is invalid')
+  if (!cases.length) throw new Error('external execution completed without an executed case')
+  if (completion.cases !== cases.length) throw new Error('external execution case count is incomplete')
   return { status: status.data, cases }
 }
 
@@ -2843,7 +2857,7 @@ export function readOwnedExternalCloudCases(context: OwnedExternalCloudJob, exec
   const executions = new Set(entries.data.map(row => row.labels['run.googleapis.com/execution_name']))
   const executionName = [...executions][0]
   if (executions.size !== 1 || !executionName.startsWith(`${context.jobName}-`)) throw new Error('Cloud observations do not belong to one exact owned execution')
-  return { executionName, ...parseExternalCloudCaseObservations(entries.data.map(row => row.jsonPayload), context) }
+  return { executionName, ...parseExternalCaseObservations(entries.data.map(row => row.jsonPayload), context) }
 }
 
 export function settleExternalCloudChildOutput(exitCode: number, records: readonly Record<string, unknown>[],
@@ -2918,7 +2932,19 @@ export async function dispatchOwnedExternalBrowser(
   signal?: AbortSignal,
 ): Promise<ExternalBrowserCounts> {
   const selectedEnv = validateSelection(selection, environment)
-  if (selectedEnv.FRESHELL_E2E_BACKEND !== 'cloud') throw new Error('managed external browser requires its configured cloud backend')
+  const sandboxOptIn = selectedEnv[P2_G01_SANDBOX_OPT_IN]
+  const localSandbox = sandboxOptIn === '1'
+  if (sandboxOptIn !== undefined && !localSandbox) throw new Error(`${P2_G01_SANDBOX_OPT_IN} must be exactly 1 when set`)
+  if (localSandbox) {
+    if (selectedEnv.FRESHELL_E2E_BACKEND !== 'local') {
+      throw new Error('P2-G01 local sandbox dispatch requires FRESHELL_E2E_BACKEND=local')
+    }
+    if (!isExactP2G01Selection(selection)) {
+      throw new Error('local sandbox dispatch requires the exact P2-G01 spec and title')
+    }
+  } else if (selectedEnv.FRESHELL_E2E_BACKEND !== 'cloud') {
+    throw new Error('managed external browser requires the configured Cloud backend or explicit P2-G01 local sandbox')
+  }
   try {
     signal?.throwIfAborted()
     const ownedEnvironment = await owner.start(selection)
@@ -2931,13 +2957,21 @@ export async function dispatchOwnedExternalBrowser(
       ...(selection.grep ? { FRESHELL_RUNTIME_EXTERNAL_GREP: selection.grep } : {}),
     }
     const selected = requiredCases(selection, await owner.list(selection, env), env)
+    if (localSandbox && (selected.length !== 1 || selected[0].file !== P2_G01_SPEC
+      || selected[0].title.split(' › ').at(-1) !== P2_G01_TITLE)) {
+      throw new Error('P2-G01 local sandbox admission must list exactly one matching case')
+    }
     signal?.throwIfAborted()
-    const child = await owner.child('pnpm', [
-      'run', 'test:e2e', '--project=chromium-external-target', '--shards=1', '--workers=1', '--retries=0', '--timeout=120m',
-      selection.spec, ...(selection.grep ? ['--grep', selection.grep] : []),
-    ], env, ...(signal ? [signal] : []))
+    const child = localSandbox
+      ? await owner.child('sandbox-p2-g01', [], env, ...(signal ? [signal] : []))
+      : await owner.child('pnpm', [
+        // Playwright's CLI accepts milliseconds; keep this at 120 minutes.
+        'run', 'test:e2e', '--project=chromium-external-target', '--shards=1', '--workers=1', '--retries=0', '--timeout=7200000',
+        selection.spec, ...(selection.grep ? ['--grep', selection.grep] : []),
+      ], env, ...(signal ? [signal] : []))
     signal?.throwIfAborted()
-    if (child.exitCode !== 0) throw new Error('configured cloud dispatch failed')
+    if (child.exitCode !== 0) throw new Error(localSandbox ? 'P2-G01 local sandbox dispatch failed' : 'configured Cloud dispatch failed')
+    if (localSandbox && child.cases.length !== 1) throw new Error('P2-G01 local sandbox must report exactly one executed case')
     const results = selected.map((row) => {
       const matches = child.cases.filter((result) => result.id === row.id && result.file === row.file && result.title === row.title)
       if (matches.length !== 1) throw new Error('selected/executed external case identities differ')
@@ -2952,7 +2986,7 @@ export async function dispatchOwnedExternalBrowser(
     }
     const cleanup = await owner.finish()
     if (!cleanup.ok || cleanup.errors.length) throw new Error('owned external cleanup failed')
-    if (owner.publishOriginals) counts.originals = [owner.publishOriginals(selected, results)]
+    if (owner.publishOriginals && !localSandbox) counts.originals = [owner.publishOriginals(selected, results)]
     return counts
   } catch (error) {
     let cleanup: { ok: boolean; errors: string[] }
@@ -3194,6 +3228,11 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
   private relay?: OwnedManagedRuntimeRelay
   private tunnel?: OwnedManagedRuntimeTunnel
   private cloud?: OwnedRuntimeChild
+  private sandboxChild?: OwnedRuntimeChild
+  private sandboxHandoffDirectory?: string
+  private sandboxHandoffFile?: string
+  private sandboxChildSpawnPending = false
+  private sandboxChildSettled = false
   private cloudDiagnosticFingerprint?: string
   private descriptor?: ManagedExternalDescriptor
   private retained?: OwnedRetainedBrowserFixtures
@@ -3268,6 +3307,7 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
     return listExternalBrowserCases(selection, environment)
   }
   async child(command: string, args: string[], environment: NodeJS.ProcessEnv, signal?: AbortSignal): Promise<{ exitCode: number; cases: ExternalBrowserCaseResult[] }> {
+    if (command === 'sandbox-p2-g01') return this.runP2G01InSandbox(args, environment, signal)
     if (command !== 'pnpm' || !this.owner || !this.descriptor || !this.tunnel) throw new Error('owned Cloud dispatch is not ready')
     const manager = (this.environment.PATH ?? '').split(path.delimiter).map(directory => path.join(directory, 'pnpm')).find(file => fs.existsSync(file))
     if (!manager || execFileSync(manager, ['--version'], { encoding: 'utf8' }).trim() !== '10.34.5') throw new Error('owned dispatch requires pinned pnpm')
@@ -3287,6 +3327,201 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
     this.captureCloudEvents(events)
     await this.captureCloudDiagnostics()
     return settleExternalCloudChildOutput(exitCode, [...events.values()], [...this.cloudJobs.values()])
+  }
+  private sandboxHostEnvironment(): NodeJS.ProcessEnv {
+    const environment = this.environment
+    const runId = this.descriptor?.runId
+    if (!runId) throw new Error('P2-G01 sandbox pnpm store requires an owned run identity')
+    const dockerHost = environment.DOCKER_HOST ?? process.env.DOCKER_HOST
+    if (!dockerHost?.startsWith('unix://')) throw new Error('local sandbox dispatch requires the owned Unix Docker endpoint')
+    return {
+      PATH: environment.PATH ?? process.env.PATH,
+      HOME: environment.HOME ?? process.env.HOME,
+      TMPDIR: environment.TMPDIR ?? process.env.TMPDIR,
+      ...(environment.XDG_RUNTIME_DIR ? { XDG_RUNTIME_DIR: environment.XDG_RUNTIME_DIR } : {}),
+      DOCKER_HOST: dockerHost,
+      FRESHELL_SANDBOX_P2_G01_RUN_ID: runId,
+      FRESHELL_SANDBOX_P2_G01_PNPM_STORE_VOLUME: p2G01PnpmStoreVolume(runId),
+      ...(environment.FRESHELL_SANDBOX_CACHE_PREFIX
+        ? { FRESHELL_SANDBOX_CACHE_PREFIX: environment.FRESHELL_SANDBOX_CACHE_PREFIX } : {}),
+    }
+  }
+  private async createSandboxHandoff(handoff: P2G01SandboxHandoff): Promise<string> {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-p2-g01-handoff-'))
+    this.sandboxHandoffDirectory = directory
+    await fsp.chmod(directory, 0o700)
+    const file = path.join(directory, 'external-target.json')
+    await fsp.writeFile(file, `${JSON.stringify(handoff)}\n`, { encoding: 'utf8', mode: 0o444, flag: 'wx' })
+    await fsp.chmod(file, 0o444)
+    const directoryStat = await fsp.stat(directory)
+    const fileStat = await fsp.lstat(file)
+    if (!fileStat.isFile() || fileStat.isSymbolicLink() || (directoryStat.mode & 0o777) !== 0o700
+      || (fileStat.mode & 0o777) !== 0o444 || directoryStat.uid !== process.getuid?.()
+      || fileStat.uid !== process.getuid?.()) {
+      throw new Error('P2-G01 handoff must remain in an owner-only directory with a read-only descriptor')
+    }
+    this.sandboxHandoffFile = file
+    return file
+  }
+  private async removeSandboxHandoff(): Promise<void> {
+    if (this.sandboxChildSpawnPending) throw new Error('sandbox child startup has not settled; retaining its descriptor')
+    if (this.sandboxChild && !this.sandboxChildSettled) {
+      throw new Error('sandbox child has not settled; retaining its descriptor')
+    }
+    const directory = this.sandboxHandoffDirectory
+    if (!directory) return
+    await fsp.rm(directory, { recursive: true, force: false })
+    if (fs.existsSync(directory) || (this.sandboxHandoffFile && fs.existsSync(this.sandboxHandoffFile))) {
+      throw new Error('P2-G01 handoff cleanup could not verify descriptor removal')
+    }
+    this.sandboxHandoffDirectory = undefined
+    this.sandboxHandoffFile = undefined
+  }
+  private async runP2G01InSandbox(
+    args: string[], environment: NodeJS.ProcessEnv, signal?: AbortSignal,
+  ): Promise<{ exitCode: number; cases: ExternalBrowserCaseResult[] }> {
+    if (args.length || !this.owner || !this.descriptor || !this.tunnel) {
+      throw new Error('owned P2-G01 sandbox dispatch is not ready')
+    }
+    const selection = {
+      spec: environment.FRESHELL_RUNTIME_EXTERNAL_SPEC ?? '',
+      grep: environment.FRESHELL_RUNTIME_EXTERNAL_GREP,
+    }
+    if (!isExactP2G01Selection(selection)) throw new Error('sandbox dispatch requires the exact P2-G01 selector')
+    signal?.throwIfAborted()
+    const handoff = createP2G01SandboxHandoff(selection, this.descriptor)
+    const handoffFile = await this.createSandboxHandoff(handoff)
+    const wrapper = fs.realpathSync(path.join(this.repoRoot, 'scripts/sandbox-test.sh'))
+    const wrapperArgs = ['--workspace-root', fs.realpathSync(this.repoRoot), '--external-browser', handoffFile]
+    this.sandboxChildSpawnPending = true
+    this.sandboxChild = await OwnedRuntimeChild.create('/usr/bin/bash', [wrapper, ...wrapperArgs], this.repoRoot,
+      this.sandboxHostEnvironment())
+    this.sandboxChildSpawnPending = false
+    const deadline = Date.now() + 3 * 60 * 60_000
+    while (this.sandboxChild.alive()) {
+      signal?.throwIfAborted()
+      this.tunnel.assertAlive()
+      if (Date.now() > deadline) throw new Error('owned P2-G01 sandbox browser lifetime expired')
+      await delay(200)
+    }
+    const exitCode = await this.sandboxChild.wait()
+    await this.sandboxChild.stop()
+    this.sandboxChildSettled = true
+    const output = this.sandboxChild.output()
+    this.sandboxChild = undefined
+    const stdoutEvents = output.stdout.split(/\r?\n/).flatMap((line) => {
+      try { return [JSON.parse(line)] } catch { return [] }
+    })
+    const reporterEvents = stdoutEvents.filter((event): event is Record<string, unknown> =>
+      Boolean(event) && typeof event === 'object' && !Array.isArray(event)
+      && ['managed_external_case', 'managed_external_complete'].includes(String((event as Record<string, unknown>).event)))
+    const reportedCases = reporterEvents.filter(event => event.event === 'managed_external_case')
+    const reportedCompletions = reporterEvents.filter(event => event.event === 'managed_external_complete')
+    const completionStatus = reportedCompletions.length === 1
+      && ['passed', 'failed', 'timedout', 'interrupted'].includes(String(reportedCompletions[0].status))
+      ? reportedCompletions[0].status as string : reportedCompletions.length === 1 ? 'invalid' : 'missing-or-duplicate'
+    const completionCases = reportedCompletions.length === 1 && Number.isSafeInteger(reportedCompletions[0].cases)
+      ? reportedCompletions[0].cases as number : null
+    const stderrEvents = output.stderr.split(/\r?\n/).flatMap((line) => {
+      try { return [JSON.parse(line) as Record<string, unknown>] } catch { return [] }
+    }).filter((event) => event && typeof event === 'object' && !Array.isArray(event))
+    const workloadEvents = stderrEvents.filter(event =>
+      event.event === 'sandbox_workload_finished' || event.event === 'sandbox_workload_failed')
+    const settlementEvents = stderrEvents.filter(event =>
+      event.event === 'sandbox_container_settled' || event.event === 'sandbox_container_unsettled')
+    const pnpmStoreCleanupEvents = stderrEvents.filter(event => event.event === 'sandbox_external_pnpm_store_settled')
+    const preparationWorkloads = workloadEvents.filter(event => event.phase === 'preparation')
+    const executionWorkloads = workloadEvents.filter(event => event.phase === 'execution')
+    const preparationSettlements = settlementEvents.filter(event => event.phase === 'preparation')
+    const executionSettlements = settlementEvents.filter(event => event.phase === 'execution')
+    const cleanupEventValid = (events: Record<string, unknown>[], phase: 'preparation' | 'execution') =>
+      events.length === 1 && events[0].event === 'sandbox_container_settled'
+      && events[0].phase === phase && events[0].severity === 'info' && events[0].code === 0
+      && typeof events[0].container === 'string' && /^freshell-sandbox-[A-Za-z0-9]{8}$/.test(events[0].container)
+    const workloadState = (events: Record<string, unknown>[]) => events.length === 1
+      && (events[0].event === 'sandbox_workload_finished' || events[0].event === 'sandbox_workload_failed')
+      && Number.isSafeInteger(events[0].code)
+      ? events[0].event === 'sandbox_workload_finished' && events[0].code === 0 ? 'finished' : 'failed'
+      : 'missing-or-duplicate'
+    const pnpmStoreCleanupValid = pnpmStoreCleanupEvents.length === 1
+      && pnpmStoreCleanupEvents[0].severity === 'info'
+      && pnpmStoreCleanupEvents[0].runId === this.descriptor.runId
+      && pnpmStoreCleanupEvents[0].volume === p2G01PnpmStoreVolume(this.descriptor.runId)
+      && pnpmStoreCleanupEvents[0].phase === 'execution'
+      && pnpmStoreCleanupEvents[0].absent === true && pnpmStoreCleanupEvents[0].removed === true
+    this.owner.runtime.recordLifecycle('external.sandbox_browser_reporter_observed', {
+      runId: this.descriptor.runId, candidateSha: this.descriptor.candidateSha, exitCode,
+      reporterEventCount: reporterEvents.length, caseCount: reportedCases.length,
+      completionCount: reportedCompletions.length, completionStatus, completionCases,
+      workloadPreparationState: workloadState(preparationWorkloads),
+      workloadExecutionState: workloadState(executionWorkloads),
+      cleanupCompletionCount: settlementEvents.length,
+      cleanupPreparationCount: preparationSettlements.length,
+      cleanupExecutionCount: executionSettlements.length,
+      cleanupFailureCount: settlementEvents.filter(event => event.event === 'sandbox_container_unsettled').length
+        + (pnpmStoreCleanupValid ? 0 : 1),
+      pnpmStoreCleanupCount: pnpmStoreCleanupEvents.length,
+      pnpmStoreAbsent: pnpmStoreCleanupValid,
+    })
+    if (settlementEvents.length !== 2 || workloadEvents.length !== 2
+      || !cleanupEventValid(preparationSettlements, 'preparation') || !cleanupEventValid(executionSettlements, 'execution')
+      || preparationSettlements[0].container === executionSettlements[0].container
+      || preparationWorkloads.length !== 1 || executionWorkloads.length !== 1
+      || preparationWorkloads[0].container !== preparationSettlements[0].container
+      || executionWorkloads[0].container !== executionSettlements[0].container) {
+      this.captureP2G01SandboxOutput(output, 'container_settlement_evidence_invalid')
+      throw new Error('P2-G01 sandbox preparation or execution cleanup evidence is missing or invalid')
+    }
+    if (workloadState(preparationWorkloads) !== 'finished') {
+      this.captureP2G01SandboxOutput(output, 'preparation_workload_failed')
+      throw new Error('P2-G01 dependency preparation workload failed')
+    }
+    if (workloadState(executionWorkloads) !== 'finished' || exitCode !== 0) {
+      this.captureP2G01SandboxOutput(output, 'execution_workload_failed')
+      throw new Error('P2-G01 sandbox browser child failed')
+    }
+    if (!pnpmStoreCleanupValid) {
+      this.captureP2G01SandboxOutput(output, 'pnpm_store_cleanup_evidence_invalid')
+      throw new Error('P2-G01 run-scoped pnpm store cleanup evidence is missing or invalid')
+    }
+    let cases: ExternalBrowserCaseResult[]
+    try { cases = parseExternalExecutionEvents(stdoutEvents, this.descriptor) }
+    catch (error) {
+      this.captureP2G01SandboxOutput(output, 'reporter_completion_invalid')
+      throw error
+    }
+    if (cases.length !== 1 || cases[0].status !== 'passed'
+      || cases[0].file !== P2_G01_SPEC || cases[0].title.split(' › ').at(-1) !== P2_G01_TITLE) {
+      this.captureP2G01SandboxOutput(output, 'reported_case_identity_invalid')
+      throw new Error('P2-G01 sandbox reporter did not prove exactly one matching pass')
+    }
+    this.owner.runtime.recordLifecycle('external.sandbox_browser_cleanup_verified', {
+      runId: this.descriptor.runId, candidateSha: this.descriptor.candidateSha,
+      preparationContainer: preparationSettlements[0].container, executionContainer: executionSettlements[0].container,
+      pnpmStoreVolume: p2G01PnpmStoreVolume(this.descriptor.runId), pnpmStoreAbsent: true,
+      admitted: cases.length, passed: cases.filter(row => row.status === 'passed').length,
+    })
+    await this.removeSandboxHandoff()
+    return { exitCode, cases }
+  }
+  private captureP2G01SandboxOutput(output: { stdout: string; stderr: string }, reason: string): void {
+    if (!this.owner || !this.descriptor) return
+    const redact = (value: string): string => {
+      let safe = value
+      for (const secret of [this.descriptor!.token, this.descriptor!.baseUrl, this.descriptor!.wsUrl]) {
+        if (secret) safe = safe.replaceAll(secret, '[redacted]')
+      }
+      safe = safe.replace(/(authorization\s*:\s*bearer\s+)[^\s]+/gi, '$1[redacted]')
+      return safe.slice(-16_384)
+    }
+    const artifact = this.owner.runtime.writeArtifact('p2-g01-sandbox-output-private.json', {
+      runId: this.descriptor.runId, candidateSha: this.descriptor.candidateSha, reason,
+      stdout: redact(output.stdout), stderr: redact(output.stderr),
+    })
+    this.owner.runtime.recordLifecycle('external.sandbox_browser_failure_diagnostics_captured', {
+      runId: this.descriptor.runId, candidateSha: this.descriptor.candidateSha,
+      artifact: path.basename(artifact), stdoutBytes: Buffer.byteLength(output.stdout), stderrBytes: Buffer.byteLength(output.stderr),
+    })
   }
   private async captureCloudDiagnostics(): Promise<void> {
     if (!this.cloud || !this.owner) return
@@ -3335,6 +3570,14 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
           await this.captureCloudDiagnostics()
         }
       }],
+      ['sandbox browser child', async () => {
+        if (this.sandboxChild) {
+          await this.sandboxChild.stop()
+          this.sandboxChildSettled = true
+          this.sandboxChild = undefined
+        }
+      }],
+      ['sandbox descriptor', async () => { await this.removeSandboxHandoff() }],
       ['Cloud jobs', async () => { for (const job of this.cloudJobs.values()) cleanupOwnedExternalCloudJob(job) }],
       ['retained fixtures', async () => { await this.retained?.cancel() }],
       ['runtime', async () => { if (this.owner) { const result = await this.owner.stop(); errors.push(...result.errors) } }],

@@ -21,6 +21,8 @@ import {
 const ZOD_BACKED_SERVER_MESSAGES = [
   'amplifier.activity.list.response',
   'amplifier.activity.updated',
+  'antigravity.activity.list.response',
+  'antigravity.activity.updated',
   'claude.activity.list.response',
   'claude.activity.updated',
   'codex.activity.list.response',
@@ -31,6 +33,7 @@ const ZOD_BACKED_SERVER_MESSAGES = [
   'opencode.activity.list.response',
   'opencode.activity.updated',
   'pane.reconcile.result',
+  'sessions.index.ready',
   'terminal.idle',
   'terminal.meta.updated',
   'terminal.stuck',

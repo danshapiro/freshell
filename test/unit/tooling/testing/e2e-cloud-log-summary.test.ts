@@ -21,7 +21,7 @@ describe('Cloud Playwright log summary extraction', () => {
     ]
     expect(extractE2eCloudPlaywrightSummaryLines(output)).toEqual(expected)
 
-    const cli = spawnSync(process.execPath, [cliPath], { input: output, encoding: 'utf8' })
+    const cli = spawnSync(process.execPath, [cliPath], { timeout: 30_000, killSignal: 'SIGKILL', input: output, encoding: 'utf8' })
     expect(cli.status, cli.stderr).toBe(0)
     expect(cli.stdout.trimEnd().split('\n')).toEqual(expected)
   })

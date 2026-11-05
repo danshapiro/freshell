@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use super::{FreshClaudeState, RuntimeIdentity, PROVIDER};
 use crate::claude_turns::{
-    EffectiveStatus, Folded, ResultVerdict, SharedLedger, StopReissue, TurnFact,
+    EffectiveStatus, Folded, ResultVerdict, SharedLedger, StopReissue, TurnFact, TurnOutcome,
 };
 use freshell_protocol::{FreshAgentEvent, ServerMessage};
 
@@ -211,6 +211,39 @@ impl FreshClaudeState {
                 TURN_FAILED_CODE,
                 message,
             );
+        }
+        let request_ids: Vec<_> = settled
+            .request_ids
+            .iter()
+            .filter(|id| !id.is_empty())
+            .collect();
+        if !request_ids.is_empty() {
+            let outcome = match settled.verdict.outcome() {
+                TurnOutcome::Completed => "completed",
+                TurnOutcome::Failed => "failed",
+                TurnOutcome::Interrupted => "interrupted",
+            };
+            let mut event = json!({
+                "type": "freshAgent.turn.settled",
+                "sessionId": record.sidecar_session_id,
+                "requestIds": request_ids,
+                "outcome": outcome,
+            });
+            // This is the same diagnostic published to the user immediately
+            // above. Other provider and transport details remain private.
+            if let Some(message) = settled
+                .verdict
+                .banner()
+                .filter(|message| !message.trim().is_empty())
+            {
+                event["message"] = json!(message);
+            }
+            self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                event,
+                provider: PROVIDER.to_string(),
+                session_id: record.stamp.to_string(),
+                session_type: record.session_type.to_string(),
+            }));
         }
         self.edges.settle(
             record,

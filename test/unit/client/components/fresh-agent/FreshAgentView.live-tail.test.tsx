@@ -380,19 +380,119 @@ describe('provider notices (transcript-live D6)', () => {
     await mount(store)
     const message = 'Code rewound successfully. '.repeat(20).trim()
     deliver(store, { type: 'freshAgent.notice', level: 'info', code: 'REWOUND', message })
-    const summary = screen.getByText('Notice details').closest('summary')!
+    const status = screen.getByRole('status', { name: 'Agent notices' })
+    const summary = status.querySelector('summary')!
+    const body = status.querySelector('.fresh-agent-diagnostic-body p')!
+    expect(summary).toHaveTextContent(message.slice(0, 160))
     fireEvent.click(summary)
     await advance(0)
     expect(summary.closest('details')).toHaveAttribute('open')
     await advance(10_000)
-    expect(screen.getByText(message)).toBeVisible()
+    expect(body).toBeVisible()
     fireEvent.click(summary)
     await advance(0)
     await advance(6_001)
-    expect(screen.queryByText(message)).not.toBeInTheDocument()
+    expect(screen.queryByRole('status', { name: 'Agent notices' })).not.toBeInTheDocument()
   })
 
-  it('keeps expanded provider diagnostics until the user finishes reading', async () => {
+  it.each([['info', 'warning'], ['warning', 'info'], ['error', 'info']] as const)(
+    'expires a new closed %s → %s surface after the reading surface changes',
+    async (from, to) => {
+      serve(() => claudeSnapshot([userTurn('u-user', 'question')]))
+      const store = createStore()
+      await mount(store)
+      deliver(store, { type: 'freshAgent.notice', level: from, code: 'FIRST', message: 'First feedback' })
+      const first = from === 'info'
+        ? screen.getByRole('status', { name: 'Agent notices' }).querySelector('details')!
+        : screen.getByRole('alert').closest('details')!
+      first.open = true
+      fireEvent(first, new Event('toggle', { bubbles: true }))
+      await advance(0)
+      deliver(store, { type: 'freshAgent.notice', level: to, code: 'NEXT', message: 'Replacement feedback' })
+      await advance(6_001)
+      expect(screen.queryByText('Replacement feedback')).toBeNull()
+    },
+  )
+
+  it('keeps warning and error reading surfaces independent until expiry or dismissal', async () => {
+    serve(() => claudeSnapshot([userTurn('u-user', 'question')]))
+    const store = createStore()
+    await mount(store)
+    deliver(store, { type: 'freshAgent.notice', level: 'warning', code: 'FIRST', message: 'First warning' })
+    const warningDetails = screen.getByRole('alert', { name: 'Agent warning' }).closest('details')!
+    warningDetails.open = true
+    fireEvent(warningDetails, new Event('toggle', { bubbles: true }))
+    await advance(0)
+    deliver(store, { type: 'freshAgent.notice', level: 'error', code: 'NEXT', message: 'Replacement error' })
+    const errorDetails = screen.getByRole('alert', { name: 'Replacement error' }).closest('details')!
+    expect(errorDetails).not.toBe(warningDetails)
+    expect(warningDetails).toHaveAttribute('open')
+    errorDetails.open = true
+    fireEvent(errorDetails, new Event('toggle', { bubbles: true }))
+    await advance(0)
+    await advance(10_000)
+    expect(warningDetails.querySelector('.fresh-agent-diagnostic-body')).toHaveTextContent('First warning')
+    expect(errorDetails.querySelector('.fresh-agent-diagnostic-body')).toHaveTextContent('Replacement error')
+    errorDetails.open = false
+    fireEvent(errorDetails, new Event('toggle', { bubbles: true }))
+    await advance(0)
+    await advance(5_999)
+    expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('First warning')
+    expect(screen.getByRole('alert', { name: 'Replacement error' })).toHaveTextContent('Replacement error')
+    await advance(2)
+    expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('First warning')
+    expect(screen.getByRole('alert', { name: 'Replacement error' })).toHaveTextContent('Replacement error')
+    errorDetails.open = true
+    fireEvent(errorDetails, new Event('toggle', { bubbles: true }))
+    await advance(0)
+    expect(errorDetails.querySelector('.fresh-agent-diagnostic-body')).toHaveTextContent('Replacement error')
+    fireEvent.click(within(errorDetails).getByRole('button', { name: 'Dismiss' }))
+    expect(screen.queryByRole('alert', { name: 'Replacement error' })).toBeNull()
+    expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('First warning')
+    warningDetails.open = false
+    fireEvent(warningDetails, new Event('toggle', { bubbles: true }))
+    await advance(0)
+    await advance(5_999)
+    expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('First warning')
+    await advance(2)
+    expect(screen.queryByRole('alert', { name: 'Agent warning' })).toBeNull()
+  })
+
+  it('does not revive the open state of a removed routine disclosure', async () => {
+    serve(() => claudeSnapshot([userTurn('u-user', 'question')]))
+    const store = createStore()
+    await mount(store)
+    deliver(store, { type: 'freshAgent.notice', level: 'info', code: 'ONE', message: 'First routine' })
+    const details = screen.getByRole('status', { name: 'Agent notices' }).querySelector('details')!
+    details.open = true
+    fireEvent(details, new Event('toggle', { bubbles: true }))
+    await advance(0)
+    deliver(store, { type: 'freshAgent.notice', level: 'warning', code: 'TWO', message: 'Middle diagnostic' })
+    deliver(store, { type: 'freshAgent.notice', level: 'info', code: 'THREE', message: 'Last routine' })
+    await advance(6_001)
+    expect(screen.queryByText('Last routine')).toBeNull()
+  })
+
+  it('inherits an already-open routine group when new provider feedback arrives', async () => {
+    serve(() => claudeSnapshot([userTurn('u-user', 'question')]))
+    const store = createStore()
+    await mount(store)
+    act(() => store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: { reconcileNotice: 'Session restored' } })))
+    const details = screen.getByRole('status', { name: 'Agent notices' }).querySelector('details')!
+    details.open = true
+    fireEvent(details, new Event('toggle', { bubbles: true }))
+    await advance(0)
+    deliver(store, { type: 'freshAgent.notice', level: 'info', code: 'SAVED', message: 'New settings saved' })
+    await advance(10_000)
+    // Reconciliation may expire, but the info notice keeps this same group mounted.
+    expect(screen.getByRole('status', { name: 'Agent notices' }).querySelector('summary')).toHaveTextContent('New settings saved')
+    details.open = false
+    fireEvent(details, new Event('toggle', { bubbles: true }))
+    await advance(6_001)
+    expect(screen.queryByText('New settings saved')).toBeNull()
+  })
+
+  it('keeps provider errors after reading until the user dismisses them', async () => {
     serve(() => claudeSnapshot([userTurn('u-user', 'question')]))
     const store = createStore()
     await mount(store)
@@ -407,6 +507,12 @@ describe('provider notices (transcript-live D6)', () => {
     fireEvent.click(summary)
     await advance(0)
     await advance(6_001)
+    expect(summary).toBeVisible()
+    expect(summary).toHaveTextContent(message.slice(0, 160))
+    fireEvent.click(summary)
+    await advance(0)
+    expect(screen.getByText(message.trim())).toBeVisible()
+    fireEvent.click(within(summary.closest('details')!).getByRole('button', { name: 'Dismiss' }))
     expect(screen.queryByText(message.trim())).not.toBeInTheDocument()
   })
 

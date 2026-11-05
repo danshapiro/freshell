@@ -4169,13 +4169,15 @@ mod tests {
             .find(|r| r["sessionId"] == json!(FRESH_CONV))
             .expect("the fresh fixture's row");
         assert_eq!(fresh["provider"], json!("antigravity"));
-        assert_eq!(fresh["cwd"], json!("/home/u/proj"));
-        assert_eq!(fresh["projectPath"], json!("/home/u/proj"));
+        // Real records carry no workspace evidence (binary v1.4.12): the
+        // cwd key is omitted and the row groups under "unknown".
+        assert_eq!(fresh["cwd"], json!(null));
+        assert_eq!(fresh["projectPath"], json!("unknown"));
         assert_eq!(fresh["title"], json!("Fix the flaky test"));
         assert_eq!(fresh["firstUserMessage"], json!("Fix the flaky test"));
         assert_eq!(fresh["summary"], json!("Fixed the test."));
-        assert_eq!(fresh["createdAt"], json!(1_793_304_000_000i64));
-        assert_eq!(fresh["lastActivityAt"], json!(1_793_304_005_500i64));
+        assert_eq!(fresh["createdAt"], json!(1_793_304_001_000i64));
+        assert_eq!(fresh["lastActivityAt"], json!(1_793_304_005_000i64));
 
         // The file-search provider gate must admit "antigravity": the
         // userMessages tier finds the fixture's user text and the fullText

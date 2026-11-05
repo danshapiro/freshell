@@ -111,6 +111,7 @@ async fn sweep_captured_tree_until_dead(
     ownership_id: &str,
     owned_root_pid: Option<i32>,
     expected_start: Option<u64>,
+    root_parent: Option<(i32, u64)>,
 ) -> bool {
     for round in 0..24u8 {
         let mut observation_complete = true;
@@ -130,6 +131,7 @@ async fn sweep_captured_tree_until_dead(
             ownership_id,
             owned_root_pid,
             expected_start,
+            root_parent,
             &tree,
             &mut |_, _| {},
         );
@@ -190,6 +192,11 @@ pub struct CondemnedRuntimeIdentity {
     /// The tagged `(pid, starttime)` pairs discovered at kill time — the
     /// child plus its descendants, captured while readable.
     pub tree: Vec<(i32, u64)>,
+    /// The direct parent's `(pid, starttime)` captured while the root was
+    /// live. Optional for old serialized identities and platforms without
+    /// `/proc`; missing or stale evidence keeps opaque descendants ambiguous.
+    #[serde(default)]
+    pub root_parent: Option<(i32, u64)>,
     /// The ownership tag the tree was discovered under.
     pub ownership_id: String,
     /// Whether the owned-process observation completed without losing the
@@ -262,6 +269,10 @@ fn capture_runtime_identity(
     }
     let observed_start = child_observation.ok().flatten();
     let child_start = previous.map_or(observed_start, |recorded| recorded.start_time);
+    let root_parent = previous.map_or_else(
+        || child_start.and_then(|start| capture_root_parent_identity(pid as i32, start)),
+        |recorded| recorded.root_parent,
+    );
     let mut tree = previous.map_or_else(Vec::new, |recorded| recorded.tree.clone());
     if let Some(start) = child_start {
         capture_complete &= capture_linked_descendants(pid as i32, start, ownership_id, &mut tree);
@@ -274,6 +285,7 @@ fn capture_runtime_identity(
         ownership_id,
         Some(pid as i32),
         child_start,
+        root_parent,
         &tree,
         before_read,
     );
@@ -302,6 +314,7 @@ fn capture_runtime_identity(
         pid,
         start_time: child_start,
         tree,
+        root_parent,
         ownership_id: ownership_id.to_string(),
         capture_complete,
     }
@@ -319,6 +332,7 @@ pub fn record_condemned_runtime_identity(
         pid,
         start_time: None,
         tree: Vec::new(),
+        root_parent: None,
         ownership_id: ownership_id.to_string(),
         capture_complete: false,
     }
@@ -384,6 +398,7 @@ pub async fn kill_and_confirm_recorded_tree_dead(
         &recorded.ownership_id,
         Some(recorded.pid as i32),
         recorded.start_time,
+        recorded.root_parent,
     )
     .await;
     swept
@@ -718,6 +733,92 @@ fn proc_starttime_from_open_stat(
         .map_err(|_| invalid())
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcProcessSnapshot {
+    pid: i32,
+    start_time: u64,
+    parent_pid: i32,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StableParentLink {
+    process: (i32, u64),
+    parent: (i32, u64),
+}
+
+#[cfg(target_os = "linux")]
+fn proc_process_snapshot_observation(
+    pid: i32,
+) -> Result<Option<ProcProcessSnapshot>, ProcObservationError> {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if proc_entry_gone(&error) => return Ok(None),
+        Err(error) => return Err(ProcObservationError::io("parent_stat_read", &error)),
+    };
+    let invalid = || ProcObservationError::invalid("parent_stat_parse");
+    let fields: Vec<&str> = stat
+        .rsplit(')')
+        .next()
+        .ok_or_else(invalid)?
+        .split_whitespace()
+        .collect();
+    match fields.first() {
+        Some(&"Z") | Some(&"X") => return Ok(None),
+        None => return Err(invalid()),
+        Some(_) => {}
+    }
+    let parent_pid = fields
+        .get(1)
+        .ok_or_else(invalid)?
+        .parse::<i32>()
+        .map_err(|_| invalid())?;
+    let start_time = fields
+        .get(19)
+        .ok_or_else(invalid)?
+        .parse::<u64>()
+        .map_err(|_| invalid())?;
+    Ok(Some(ProcProcessSnapshot {
+        pid,
+        start_time,
+        parent_pid,
+    }))
+}
+
+/// Read a process-parent link only when the process and its parent incarnation
+/// stayed stable across the observation. A missing or racing link is not proof.
+#[cfg(target_os = "linux")]
+fn stable_parent_link(pid: i32) -> Option<StableParentLink> {
+    let first = proc_process_snapshot_observation(pid).ok().flatten()?;
+    if first.parent_pid <= 0 {
+        return None;
+    }
+    let parent_start = proc_starttime_observation(first.parent_pid)
+        .ok()
+        .flatten()?;
+    let second = proc_process_snapshot_observation(pid).ok().flatten()?;
+    let parent_start_after = proc_starttime_observation(first.parent_pid)
+        .ok()
+        .flatten()?;
+    if first != second || parent_start != parent_start_after {
+        return None;
+    }
+    Some(StableParentLink {
+        process: (first.pid, first.start_time),
+        parent: (first.parent_pid, parent_start),
+    })
+}
+
+/// Capture the root's direct parent while the exact root incarnation is live.
+/// Failure only omits optional exclusion evidence; it does not weaken the
+/// existing owned-tree capture result.
+#[cfg(target_os = "linux")]
+fn capture_root_parent_identity(pid: i32, root_start: u64) -> Option<(i32, u64)> {
+    let link = stable_parent_link(pid)?;
+    (link.process == (pid, root_start)).then_some(link.parent)
+}
+
 /// Classify the current occupant against the recorded process incarnation.
 #[cfg(target_os = "linux")]
 pub(crate) fn recorded_process_evidence(
@@ -898,6 +999,7 @@ fn scan_tagged_pids_observing(
     ownership_id: &str,
     owned_root_pid: Option<i32>,
     expected_start: Option<u64>,
+    root_parent: Option<(i32, u64)>,
     known_tree: &[(i32, u64)],
     before_read: &mut impl FnMut(&str, i32),
 ) -> TaggedProcessScan {
@@ -965,8 +1067,13 @@ fn scan_tagged_pids_observing(
             Ok(status) => status,
             Err(error) if proc_entry_gone(&error) => continue,
             Err(error) => {
-                if unreadable_process_may_be_owned(pid, owned_root_pid, expected_start, known_tree)
-                {
+                if unreadable_process_may_be_owned(
+                    pid,
+                    owned_root_pid,
+                    expected_start,
+                    root_parent,
+                    known_tree,
+                ) {
                     capture_failure(
                         pid,
                         expected_start,
@@ -983,7 +1090,13 @@ fn scan_tagged_pids_observing(
             .find_map(|line| line.strip_prefix("Uid:")?.split_whitespace().next())
             .and_then(|uid| uid.parse::<libc::uid_t>().ok())
         else {
-            if unreadable_process_may_be_owned(pid, owned_root_pid, expected_start, known_tree) {
+            if unreadable_process_may_be_owned(
+                pid,
+                owned_root_pid,
+                expected_start,
+                root_parent,
+                known_tree,
+            ) {
                 capture_failure(
                     pid,
                     expected_start,
@@ -1009,8 +1122,13 @@ fn scan_tagged_pids_observing(
                 // example a non-dumpable user service). An unrelated process
                 // cannot be evidence about this sidecar; an unreadable
                 // process in the known sidecar ancestry does.
-                if unreadable_process_may_be_owned(pid, owned_root_pid, expected_start, known_tree)
-                {
+                if unreadable_process_may_be_owned(
+                    pid,
+                    owned_root_pid,
+                    expected_start,
+                    root_parent,
+                    known_tree,
+                ) {
                     capture_failure(
                         pid,
                         expected_start,
@@ -1053,16 +1171,88 @@ fn process_is_known_owned_process(
 }
 
 #[cfg(target_os = "linux")]
+fn recorded_parent_is_current_non_subreaper(parent: (i32, u64)) -> bool {
+    if parent.0 <= 1
+        || parent.0 != std::process::id() as i32
+        || proc_starttime_observation(parent.0).ok().flatten() != Some(parent.1)
+    {
+        return false;
+    }
+    let mut subreaper = 0;
+    let probe = unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut subreaper, 0, 0, 0) };
+    probe == 0 && subreaper == 0
+}
+
+#[cfg(target_os = "linux")]
+fn stable_branch_to_recorded_parent(
+    pid: i32,
+    start_time: u64,
+    owned_root_pid: i32,
+    root_parent: (i32, u64),
+    known_tree: &[(i32, u64)],
+) -> Option<Vec<StableParentLink>> {
+    let mut current = (pid, start_time);
+    let mut path = Vec::new();
+    for _ in 0..128 {
+        if current.0 == owned_root_pid || known_tree.contains(&current) {
+            return None;
+        }
+        let link = stable_parent_link(current.0)?;
+        if link.process != current {
+            return None;
+        }
+        path.push(link);
+        if link.parent == root_parent {
+            return Some(path);
+        }
+        if link.parent.0 <= 1 {
+            return None;
+        }
+        current = link.parent;
+    }
+    None
+}
+
+/// An opaque candidate is unrelated only when two stable ancestry walks place
+/// it in a separate branch below the exact live, non-subreaper parent captured
+/// for the owned root. Requiring that parent to be this observer lets us query
+/// its current child-subreaper state; remote or stale parent evidence remains
+/// conservative.
+#[cfg(target_os = "linux")]
+fn process_is_proven_foreign_branch(
+    pid: i32,
+    start_time: u64,
+    owned_root_pid: Option<i32>,
+    root_parent: Option<(i32, u64)>,
+    known_tree: &[(i32, u64)],
+) -> bool {
+    let (Some(owned_root_pid), Some(root_parent)) = (owned_root_pid, root_parent) else {
+        return false;
+    };
+    if !recorded_parent_is_current_non_subreaper(root_parent) {
+        return false;
+    }
+    let first =
+        stable_branch_to_recorded_parent(pid, start_time, owned_root_pid, root_parent, known_tree);
+    let second =
+        stable_branch_to_recorded_parent(pid, start_time, owned_root_pid, root_parent, known_tree);
+    matches!((first, second), (Some(first), Some(second)) if first == second)
+        && recorded_parent_is_current_non_subreaper(root_parent)
+}
+
+#[cfg(target_os = "linux")]
 fn unreadable_process_may_be_owned(
     pid: i32,
     owned_root_pid: Option<i32>,
     expected_start: Option<u64>,
+    root_parent: Option<(i32, u64)>,
     known_tree: &[(i32, u64)],
 ) -> bool {
     unreadable_process_may_be_owned_observing(
         pid,
         owned_root_pid,
         expected_start,
+        root_parent,
         known_tree,
         &mut || {},
     )
@@ -1073,6 +1263,7 @@ fn unreadable_process_may_be_owned_observing(
     pid: i32,
     owned_root_pid: Option<i32>,
     expected_start: Option<u64>,
+    root_parent: Option<(i32, u64)>,
     known_tree: &[(i32, u64)],
     after_stat: &mut impl FnMut(),
 ) -> bool {
@@ -1093,6 +1284,18 @@ fn unreadable_process_may_be_owned_observing(
         return false;
     };
     if observed < root_start {
+        return false;
+    }
+    if process_is_proven_foreign_branch(pid, observed, owned_root_pid, root_parent, known_tree) {
+        tracing::debug!(
+            target: "freshell_freshagent::session_lease",
+            event = "session_lease.opaque_ownership_proven_unrelated",
+            pid,
+            ?owned_root_pid,
+            ?root_parent,
+            observed_start = observed,
+            "opaque process is on a stable sibling branch"
+        );
         return false;
     }
     // A direct child of this non-subreaper cannot have reparented here from
@@ -1128,7 +1331,7 @@ fn unreadable_process_may_be_owned_observing(
     #[cfg(debug_assertions)]
     eprintln!(
         "{}",
-        serde_json::json!({"severity":"warn","event":"session_lease.opaque_ownership_unavailable","pid":pid,"rootPid":owned_root_pid,"expectedStart":expected_start,"observedStart":observed,"observerPid":std::process::id(),"parentPid":parent_pid(pid),"rootParentPid":owned_root_pid.and_then(parent_pid),"observerSubreaper":subreaper,"subreaperProbe":is_subreaper})
+        serde_json::json!({"severity":"warn","event":"session_lease.opaque_ownership_unavailable","pid":pid,"rootPid":owned_root_pid,"expectedStart":expected_start,"observedStart":observed,"observerPid":std::process::id(),"parentPid":parent_pid(pid),"rootParentPid":owned_root_pid.and_then(parent_pid),"recordedRootParent":root_parent,"observerSubreaper":subreaper,"subreaperProbe":is_subreaper})
     );
     tracing::warn!(pid, ?owned_root_pid, ?expected_start, observed_start=observed,
         "session_lease.opaque_ownership_unavailable: opaque process may be a later reparented writer");
@@ -1510,6 +1713,159 @@ mod tests {
         (child, tag)
     }
 
+    #[cfg(target_os = "linux")]
+    fn proc_parent_pid(pid: i32) -> Option<i32> {
+        std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .ok()?
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:")?.trim().parse::<i32>().ok())
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ChildSubreaperGuard {
+        previous: libc::c_int,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ChildSubreaperGuard {
+        fn new() -> Self {
+            let mut previous = 0;
+            assert_eq!(
+                unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut previous, 0, 0, 0) },
+                0,
+                "read test process subreaper state"
+            );
+            Self { previous }
+        }
+
+        fn set(&self, enabled: bool) {
+            assert_eq!(
+                unsafe {
+                    libc::prctl(
+                        libc::PR_SET_CHILD_SUBREAPER,
+                        libc::c_int::from(enabled),
+                        0,
+                        0,
+                        0,
+                    )
+                },
+                0,
+                "set test process subreaper state"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ChildSubreaperGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::prctl(libc::PR_SET_CHILD_SUBREAPER, self.previous, 0, 0, 0);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct AdoptedOpaqueChild {
+        pid: i32,
+        start_time: u64,
+        reaped: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl AdoptedOpaqueChild {
+        fn new(pid: i32, start_time: u64) -> Self {
+            Self {
+                pid,
+                start_time,
+                reaped: false,
+            }
+        }
+
+        fn reap(&mut self) {
+            if proc_starttime(self.pid) == Some(self.start_time) {
+                unsafe {
+                    libc::kill(self.pid, libc::SIGKILL);
+                }
+            }
+            let mut status = 0;
+            loop {
+                let result = unsafe { libc::waitpid(self.pid, &mut status, 0) };
+                if result == self.pid {
+                    self.reaped = true;
+                    return;
+                }
+                let error = std::io::Error::last_os_error();
+                match error.raw_os_error() {
+                    Some(libc::EINTR) => continue,
+                    Some(libc::ECHILD) => {
+                        self.reaped = true;
+                        return;
+                    }
+                    _ => panic!("reap owned opaque child {}: {error}", self.pid),
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for AdoptedOpaqueChild {
+        fn drop(&mut self) {
+            if !self.reaped {
+                if proc_starttime(self.pid) == Some(self.start_time) {
+                    unsafe {
+                        libc::kill(self.pid, libc::SIGKILL);
+                    }
+                }
+                let mut status = 0;
+                while unsafe { libc::waitpid(self.pid, &mut status, 0) } < 0
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+                {
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct DetachedOpaqueChild {
+        pid: i32,
+        start_time: u64,
+        settled: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl DetachedOpaqueChild {
+        fn new(pid: i32, start_time: u64) -> Self {
+            Self {
+                pid,
+                start_time,
+                settled: false,
+            }
+        }
+
+        async fn kill_and_wait(&mut self) {
+            if proc_starttime(self.pid) == Some(self.start_time) {
+                signal_recorded_incarnation(self.pid as u32, Some(self.start_time), libc::SIGKILL);
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while proc_starttime(self.pid) == Some(self.start_time) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("init reaps the exact killed fixture child");
+            self.settled = true;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for DetachedOpaqueChild {
+        fn drop(&mut self) {
+            if !self.settled && proc_starttime(self.pid) == Some(self.start_time) {
+                signal_recorded_incarnation(self.pid as u32, Some(self.start_time), libc::SIGKILL);
+            }
+        }
+    }
+
     /// The dumpable root owns the opaque child's readiness/release pipes and
     /// reaps it on either our explicit exit or the production SIGTERM path.
     #[cfg(target_os = "linux")]
@@ -1539,6 +1895,8 @@ print(json.dumps({'pid':os.getpid(), 'uid':os.geteuid(), 'dumpable':libc.prctl(3
 for command in sys.stdin:
     if command == 'exit\n':
         close()
+    if command == 'orphan\n':
+        os._exit(0)
     if command in ('hide\n', 'show\n'):
         dumpable = int(command == 'show\n')
         assert libc.prctl(4,dumpable,0,0,0) == 0
@@ -1554,8 +1912,12 @@ for command in sys.stdin:
         assert libc.prctl(4,0,0,0,0) == 0
         assert libc.prctl(3,0,0,0,0) == 0
         os.write(ack, json.dumps({'pid':os.getpid(), 'parent':os.getppid(), 'uid':os.geteuid(), 'dumpable':0}).encode() + b'\n')
-        assert os.read(reader,1) == b'X'
-        os._exit(0)
+        command = os.read(reader,1)
+        if command == b'X':
+            os._exit(0)
+        if command == b'':
+            signal.pause()
+        os._exit(1)
     with os.fdopen(ready) as replies:
         print(replies.readline(), end='', flush=True)
 close()
@@ -1623,6 +1985,17 @@ close()
             }
             assert!(self.root.wait().unwrap().success());
         }
+
+        fn orphan_child(&mut self) {
+            use std::io::Write;
+            self.root
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"orphan\n")
+                .unwrap();
+            assert!(self.root.wait().unwrap().success());
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1649,6 +2022,7 @@ close()
             &fixture.tag,
             Some(pid as i32),
             Some(root_start),
+            None,
             &[],
             &mut |_, _| {},
         );
@@ -1657,6 +2031,7 @@ close()
             &fixture.tag,
             Some(pid as i32),
             Some(root_start),
+            None,
             &linked,
             &mut |_, _| {},
         );
@@ -1826,20 +2201,31 @@ close()
                     if reap_before_read {
                         assert!(child.wait().unwrap().success());
                     } else {
-                        let deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(2);
+                        // Wait for the kernel's exit acknowledgement without reaping.
+                        // A wall-clock spin makes fixture setup depend on scheduler load;
+                        // WNOWAIT preserves the exact zombie the capture must observe.
+                        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
                         loop {
-                            let (state, observed_start) = zombie_identity();
-                            assert_eq!(observed_start, start);
-                            if state == "Z" {
+                            let result = unsafe {
+                                libc::waitid(
+                                    libc::P_PID,
+                                    pid,
+                                    &mut info,
+                                    libc::WEXITED | libc::WNOWAIT,
+                                )
+                            };
+                            if result == 0 {
                                 break;
                             }
-                            assert!(
-                                std::time::Instant::now() < deadline,
-                                "normal exit did not reach zombie state"
+                            let error = std::io::Error::last_os_error();
+                            assert_eq!(
+                                error.kind(),
+                                std::io::ErrorKind::Interrupted,
+                                "wait for the fixture's unreaped exit: {error}"
                             );
-                            std::thread::yield_now();
                         }
+                        assert_eq!(unsafe { info.si_pid() }, pid as libc::pid_t);
+                        assert_eq!(zombie_identity(), ("Z".into(), start));
                     }
                     exited = true;
                 }
@@ -1990,6 +2376,322 @@ assert child.wait() == 0
     }
 
     #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn later_sibling_opaque_child_does_not_block_owned_cleanup() {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
+
+        let observer_pid = std::process::id() as i32;
+        let parent_pid = |pid: i32| {
+            std::fs::read_to_string(format!("/proc/{pid}/status"))
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("PPid:")?.trim().parse::<i32>().ok())
+                .unwrap()
+        };
+
+        // Capture a complete owned-root identity before the sibling branch or
+        // its opaque child exists. Both roots below are direct children of the
+        // same test process, as the CI warning's rootParentPid/observerPid pair.
+        let mut owned = LinkedOpaqueFixture::new();
+        let owned_pid = owned.root.id() as i32;
+        let owned_start = proc_starttime(owned_pid).unwrap();
+        assert_eq!(parent_pid(owned_pid), observer_pid);
+        let recorded = record_condemned_runtime_identity(
+            owned.root.id(),
+            "CAPTURE_TEST_OWNERSHIP",
+            &owned.tag,
+        );
+        assert!(recorded.capture_complete, "owned identity: {recorded:?}");
+        assert_eq!(recorded.start_time, Some(owned_start));
+        assert_eq!(recorded.tree, vec![(owned_pid, owned_start)]);
+        let observer_start = proc_starttime(observer_pid).unwrap();
+        assert_eq!(recorded.root_parent, Some((observer_pid, observer_start)));
+
+        // The cleanup handoff crosses a serialized record boundary. Exercise
+        // the decoded value through the real process-confirmation path below.
+        let persisted: CondemnedRuntimeIdentity =
+            serde_json::from_slice(&serde_json::to_vec(&recorded).unwrap()).unwrap();
+        assert_eq!(persisted.root_parent, recorded.root_parent);
+        assert_eq!(persisted.tree, recorded.tree);
+
+        // The sibling's readiness and pipe-backed child are explicit barriers:
+        // neither can predate the completed owned-root capture, and the opaque
+        // child remains live while owned cleanup is checked.
+        let mut sibling = LinkedOpaqueFixture::new();
+        let sibling_pid = sibling.root.id() as i32;
+        let sibling_start = proc_starttime(sibling_pid).unwrap();
+        assert_eq!(parent_pid(sibling_pid), observer_pid);
+        assert_ne!(sibling.tag, owned.tag);
+        assert!(
+            std::fs::read(format!("/proc/{sibling_pid}/environ"))
+                .unwrap()
+                .split(|byte| *byte == 0)
+                .any(|entry| {
+                    entry == format!("CAPTURE_TEST_OWNERSHIP={}", sibling.tag).as_bytes()
+                }),
+            "the readable sibling root carries its distinct owner tag"
+        );
+        let (opaque_pid, opaque_start) = sibling.spawn_opaque_member();
+        assert!(
+            opaque_start >= owned_start,
+            "candidate starts after owned root"
+        );
+        assert_eq!(parent_pid(opaque_pid), sibling_pid);
+        assert_eq!(process_is_descendant_of(opaque_pid, sibling_pid), Ok(true));
+        assert_eq!(
+            process_is_descendant_of(opaque_pid, owned_pid),
+            Ok(false),
+            "the sibling's opaque child is not in the owned root's tree"
+        );
+
+        owned.close();
+        assert_eq!(proc_starttime(owned_pid), None, "owned root was reaped");
+        assert_eq!(proc_starttime(sibling_pid), Some(sibling_start));
+        assert_eq!(proc_starttime(opaque_pid), Some(opaque_start));
+        assert_eq!(
+            std::fs::read(format!("/proc/{opaque_pid}/environ"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "the candidate is genuinely opaque, not a fabricated scan result"
+        );
+
+        // Old records omit the optional parent proof. They stay conservative
+        // while the opaque sibling child remains live.
+        let mut legacy_json = serde_json::to_value(&persisted).unwrap();
+        legacy_json.as_object_mut().unwrap().remove("rootParent");
+        let legacy: CondemnedRuntimeIdentity = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(legacy.root_parent, None);
+        let legacy_confirmed =
+            kill_and_confirm_recorded_tree_dead(&legacy, "CAPTURE_TEST_OWNERSHIP").await;
+
+        // A PID that still exists with a different birth identity cannot
+        // license exclusion of the unreadable candidate.
+        let mut stale_parent = persisted.clone();
+        stale_parent.root_parent = Some((observer_pid, observer_start + 1));
+        let stale_parent_confirmed =
+            kill_and_confirm_recorded_tree_dead(&stale_parent, "CAPTURE_TEST_OWNERSHIP").await;
+
+        let confirmed =
+            kill_and_confirm_recorded_tree_dead(&persisted, "CAPTURE_TEST_OWNERSHIP").await;
+        let sibling_survived = proc_starttime(sibling_pid) == Some(sibling_start);
+        let opaque_survived = proc_starttime(opaque_pid) == Some(opaque_start);
+
+        // Always release and reap the sibling fixture before making the red
+        // assertion; its owner waits for and reaps the exact opaque child.
+        sibling.close();
+        assert!(
+            proc_starttime(opaque_pid).is_none(),
+            "opaque child cleaned up"
+        );
+
+        assert!(
+            confirmed,
+            "the exited owned root should be confirmable while an opaque child of a distinct sibling root remains live"
+        );
+        assert!(!legacy_confirmed, "missing parent proof stays ambiguous");
+        assert!(
+            !stale_parent_confirmed,
+            "stale parent proof stays ambiguous"
+        );
+        assert!(sibling_survived, "cleanup must not kill the sibling root");
+        assert!(
+            opaque_survived,
+            "cleanup must not signal the opaque sibling child"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn opaque_child_reparented_outside_recorded_parent_stays_ambiguous() {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
+
+        let observer_pid = std::process::id() as i32;
+        let mut owned = LinkedOpaqueFixture::new();
+        let owned_pid = owned.root.id() as i32;
+        let recorded = record_condemned_runtime_identity(
+            owned.root.id(),
+            "CAPTURE_TEST_OWNERSHIP",
+            &owned.tag,
+        );
+        assert!(recorded.capture_complete, "owned identity: {recorded:?}");
+        assert_eq!(
+            recorded.root_parent.map(|parent| parent.0),
+            Some(observer_pid)
+        );
+
+        let mut sibling = LinkedOpaqueFixture::new();
+        let sibling_pid = sibling.root.id() as i32;
+        let (opaque_pid, opaque_start) = sibling.spawn_opaque_member();
+        assert_eq!(proc_parent_pid(opaque_pid), Some(sibling_pid));
+        assert!(process_is_proven_foreign_branch(
+            opaque_pid,
+            opaque_start,
+            Some(owned_pid),
+            recorded.root_parent,
+            &recorded.tree,
+        ));
+        let mut detached = DetachedOpaqueChild::new(opaque_pid, opaque_start);
+
+        // Before the sibling exits, the candidate has a stable path to the
+        // recorded parent. Reparenting it to PID 1 removes that proof.
+        sibling.orphan_child();
+        let reparented_to = proc_parent_pid(opaque_pid).unwrap();
+        assert_ne!(reparented_to, sibling_pid);
+        assert_ne!(reparented_to, observer_pid);
+        assert!(!process_is_proven_foreign_branch(
+            opaque_pid,
+            opaque_start,
+            Some(owned_pid),
+            recorded.root_parent,
+            &recorded.tree,
+        ));
+        assert_eq!(proc_starttime(opaque_pid), Some(opaque_start));
+        assert_eq!(
+            std::fs::read(format!("/proc/{opaque_pid}/environ"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        owned.close();
+        let confirmed =
+            kill_and_confirm_recorded_tree_dead(&recorded, "CAPTURE_TEST_OWNERSHIP").await;
+        let opaque_survived = proc_starttime(opaque_pid) == Some(opaque_start);
+        detached.kill_and_wait().await;
+
+        assert!(!confirmed, "changed ancestry remains ambiguous");
+        assert!(
+            opaque_survived,
+            "confirmation must not signal the adopted child"
+        );
+        assert_eq!(proc_starttime(owned_pid), None, "owned root was reaped");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn subreaper_ambiguity_helper_child() {
+        const CHILD_MODE: &str = "FRESHELL_SESSION_LEASE_SUBREAPER_CHILD";
+        if std::env::var_os(CHILD_MODE).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            return;
+        }
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
+
+        let observer_pid = std::process::id() as i32;
+        let mut owned = LinkedOpaqueFixture::new();
+        let owned_pid = owned.root.id() as i32;
+        let recorded = record_condemned_runtime_identity(
+            owned.root.id(),
+            "CAPTURE_TEST_OWNERSHIP",
+            &owned.tag,
+        );
+        assert!(recorded.capture_complete, "owned identity: {recorded:?}");
+        assert_eq!(
+            recorded.root_parent.map(|parent| parent.0),
+            Some(observer_pid)
+        );
+
+        let mut sibling = LinkedOpaqueFixture::new();
+        let sibling_pid = sibling.root.id() as i32;
+        let (opaque_pid, opaque_start) = sibling.spawn_opaque_member();
+        assert_eq!(proc_parent_pid(opaque_pid), Some(sibling_pid));
+
+        // This is an isolated current_exe test process, so changing its
+        // subreaper state cannot affect the parent Cargo test process.
+        let subreaper = ChildSubreaperGuard::new();
+        subreaper.set(true);
+        sibling.orphan_child();
+        let mut adopted = AdoptedOpaqueChild::new(opaque_pid, opaque_start);
+        assert_eq!(proc_parent_pid(opaque_pid), Some(observer_pid));
+        assert_eq!(proc_starttime(opaque_pid), Some(opaque_start));
+        assert_eq!(
+            std::fs::read(format!("/proc/{opaque_pid}/environ"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        owned.close();
+        let confirmed =
+            kill_and_confirm_recorded_tree_dead(&recorded, "CAPTURE_TEST_OWNERSHIP").await;
+        let opaque_survived = proc_starttime(opaque_pid) == Some(opaque_start);
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "session_lease.subreaper_opaque_child_remains_ambiguous",
+                "observerPid": observer_pid,
+                "ownedRootPid": owned_pid,
+                "recordedRootParent": recorded.root_parent,
+                "siblingRootPid": sibling_pid,
+                "opaquePid": opaque_pid,
+                "opaqueParentAfterReparent": proc_parent_pid(opaque_pid),
+                "opaqueStart": opaque_start,
+                "opaqueSurvivedConfirmation": opaque_survived,
+                "confirmation": confirmed,
+            })
+        );
+        adopted.reap();
+        drop(subreaper);
+
+        assert!(
+            !confirmed,
+            "a subreaper parent keeps adopted opaque children ambiguous"
+        );
+        assert!(
+            opaque_survived,
+            "confirmation must not signal the adopted child"
+        );
+        assert_eq!(proc_starttime(owned_pid), None, "owned root was reaped");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn subreaper_ambiguity_runs_in_an_isolated_test_process() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "session_lease::tests::subreaper_ambiguity_helper_child",
+                "--nocapture",
+            ])
+            .env("FRESHELL_SESSION_LEASE_SUBREAPER_CHILD", "1")
+            .output()
+            .expect("run isolated subreaper regression helper");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // `--exact` selects only this helper; its unique structured event
+        // proves it ran even when libtest interleaves its progress output.
+        let reports: Vec<_> = stdout
+            .match_indices('{')
+            .filter_map(|(start, _)| {
+                serde_json::Deserializer::from_str(&stdout[start..])
+                    .into_iter::<serde_json::Value>()
+                    .next()
+                    .and_then(Result::ok)
+            })
+            .filter(|event| {
+                event.get("event").and_then(serde_json::Value::as_str)
+                    == Some("session_lease.subreaper_opaque_child_remains_ambiguous")
+            })
+            .collect();
+        assert!(
+            output.status.success()
+                && reports.len() == 1
+                && reports[0]
+                    .get("confirmation")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(false)
+                && reports[0]
+                    .get("opaqueSurvivedConfirmation")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true),
+            "isolated subreaper regression failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            stdout,
+            String::from_utf8_lossy(&output.stderr),
+        );
+        println!("{stdout}");
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn opaque_candidate_reaped_during_observation_is_gone() {
         let _process_fixture = crate::session_lease::process_fixture::blocking_lock();
@@ -2037,6 +2739,7 @@ assert sys.stdin.readline() == 'exit\n'
             candidate,
             Some(owned.id() as i32),
             Some(root_start),
+            None,
             &[],
             &mut || {
                 other.stdin.as_mut().unwrap().write_all(b"close\n").unwrap();
@@ -2399,6 +3102,7 @@ assert sys.stdin.readline() == 'exit\n'
             pid,
             start_time: Some(proc_starttime(pid as i32).expect("start time") + 1),
             tree: Vec::new(),
+            root_parent: None,
             ownership_id: "r48-kill-path".to_string(),
             capture_complete: true,
         };
@@ -2441,6 +3145,7 @@ assert sys.stdin.readline() == 'exit\n'
             pid,
             start_time: None,
             tree: Vec::new(),
+            root_parent: None,
             ownership_id: "r54-unconfirmable".to_string(),
             capture_complete: true,
         };
@@ -2478,6 +3183,7 @@ assert sys.stdin.readline() == 'exit\n'
             pid,
             start_time: proc_starttime(pid as i32),
             tree: Vec::new(),
+            root_parent: None,
             ownership_id: "r54-pinned".to_string(),
             capture_complete: true,
         };
@@ -2512,6 +3218,7 @@ assert sys.stdin.readline() == 'exit\n'
             pid,
             start_time: None,
             tree: Vec::new(),
+            root_parent: None,
             ownership_id: "r56-incomplete-evidence".to_string(),
             capture_complete: false,
         };

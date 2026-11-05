@@ -419,6 +419,7 @@ async fn startup_recovery_naturally_exhausts_and_cold_hydration_requires_manual_
                     exited: false,
                     native_session_id: Some(observation.native_session_id.clone()),
                     native_identity_observation: Some(observation.clone()),
+                    native_readiness_receipt: None,
                     opencode_adoption: OpenCodeAdoptionStatus::NotRequired,
                     opencode_transfer_receipt: None,
                 },

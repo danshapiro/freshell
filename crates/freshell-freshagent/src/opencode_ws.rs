@@ -366,6 +366,8 @@ enum TurnTaskKind {
 struct TurnTask {
     kind: TurnTaskKind,
     handle: tokio::task::JoinHandle<()>,
+    /// The correlated send whose drive this task owns. Compact tasks have none.
+    settlement: Option<Arc<SendSettlement>>,
     /// ep4-r6 (F2): a Compact drive's pre-drive-redo compensation settles
     /// through this channel from [`PreDriveRedoGuard`]'s drop. The abort paths
     /// AWAIT it after joining the aborted handle, so a following send can
@@ -513,12 +515,40 @@ impl TurnTask {
     /// `redoDestroyed:true` for a drive whose POST provably never existed,
     /// and the deferred restore would then resurrect `[canRedo: true]` behind
     /// it (destroy-at-submit treats the still-destroyed state as a no-op).
-    async fn abort_and_settle(self) {
+    async fn abort_and_settle(self) -> bool {
         self.handle.abort();
-        let _ = self.handle.await;
+        let cancelled = self.handle.await.is_err_and(|error| error.is_cancelled());
         if let Some(rx) = self.compact_settled_rx {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
         }
+        cancelled
+    }
+}
+
+/// A send may settle naturally or be stopped, but never both.
+struct SendSettlement {
+    fresh_agent: FreshAgentState,
+    session_id: String,
+    request_id: String,
+    emitted: AtomicBool,
+    drive_finished: AtomicBool,
+    prior_turn_unconfirmed: bool,
+}
+
+impl SendSettlement {
+    fn emit(&self, outcome: &str) {
+        if self.emitted.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.fresh_agent.broadcast(&event_frame(
+            &self.session_id,
+            json!({
+                "type": "freshAgent.turn.settled",
+                "sessionId": self.session_id,
+                "requestIds": [self.request_id],
+                "outcome": outcome,
+            }),
+        ));
     }
 }
 
@@ -873,6 +903,8 @@ type OpencodeSessions = Arc<TokioMutex<HashMap<String, Arc<OpencodeSessionCell>>
 struct RunningMirror {
     mint: std::sync::atomic::AtomicU64,
     current: std::sync::atomic::AtomicU64,
+    active: std::sync::atomic::AtomicUsize,
+    overlaps: std::sync::atomic::AtomicU64,
 }
 
 impl RunningMirror {
@@ -880,6 +912,8 @@ impl RunningMirror {
         Self {
             mint: std::sync::atomic::AtomicU64::new(0),
             current: std::sync::atomic::AtomicU64::new(0),
+            active: std::sync::atomic::AtomicUsize::new(0),
+            overlaps: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -940,21 +974,39 @@ fn session_cell(session: OpencodeSession) -> Arc<OpencodeSessionCell> {
 struct RunningClaimGuard {
     cell: Arc<OpencodeSessionCell>,
     token: u64,
+    overlapping_at_start: bool,
+    overlap_generation: u64,
 }
 
 impl RunningClaimGuard {
     fn arm(cell: &Arc<OpencodeSessionCell>) -> Self {
+        let overlapping_at_start = cell.running.active.fetch_add(1, Ordering::SeqCst) != 0;
+        let overlap_generation = if overlapping_at_start {
+            cell.running.overlaps.fetch_add(1, Ordering::SeqCst) + 1
+        } else {
+            cell.running.overlaps.load(Ordering::SeqCst)
+        };
         let token = cell.running.mint.fetch_add(1, Ordering::SeqCst) + 1;
         cell.running.current.store(token, Ordering::SeqCst);
         Self {
             cell: Arc::clone(cell),
             token,
+            overlapping_at_start,
+            overlap_generation,
         }
+    }
+
+    /// Call under the session mutex so another send cannot arm concurrently.
+    fn has_exclusive_settlement(&self) -> bool {
+        !self.overlapping_at_start
+            && self.cell.running.active.load(Ordering::SeqCst) == 1
+            && self.cell.running.overlaps.load(Ordering::SeqCst) == self.overlap_generation
     }
 }
 
 impl Drop for RunningClaimGuard {
     fn drop(&mut self) {
+        self.cell.running.active.fetch_sub(1, Ordering::SeqCst);
         // Clear only OUR claim and only while it is still the current one —
         // a newer send's claim has already overwritten `current`, and an
         // overlapping older drive's drop must not clear it.
@@ -1007,6 +1059,12 @@ fn turn_status_probe(sessions: &OpencodeSessions) -> crate::OpencodeTurnStatusPr
 }
 
 impl FreshOpencodeState {
+    /// Return the same host-agent admission gate installed on the REST state
+    /// that this WS provider wraps.
+    pub fn host_agent_admission(&self) -> crate::host_agent_admission::HostAgentAdmissionGate {
+        self.fresh_agent.host_agent_admission()
+    }
+
     /// b8ke e3 post-cap F2: test seam — retain a condemned-session
     /// witness (the kill path's retained accepted-daemon-turn evidence).
     /// Test-only seeding route for cross-crate consumers; production code
@@ -2562,6 +2620,10 @@ impl FreshOpencodeState {
     ) {
         let request_id = msg.request_id.clone();
         let checkpoint_identity = checkpoint_turn_identity(&msg);
+        // A previous local idle wait may have ended while its daemon-side
+        // turn is still running. Its later idle cannot settle this send.
+        let prior_turn_unconfirmed = session.daemon_turn_accepted.load(Ordering::SeqCst)
+            || session.orphaned_daemon_turn.load(Ordering::SeqCst);
         // materializeOrSend:334-335 -- a fresh turn starts un-aborted and un-errored;
         // `handle_interrupt` flips `turn_aborted` while we are parked on idle, and
         // the serve-stream bridge flips `turn_errored` if the turn reports an error.
@@ -3120,6 +3182,21 @@ impl FreshOpencodeState {
         let last_turn_complete_at = session.last_turn_complete_at.clone();
         let daemon_turn_accepted = session.daemon_turn_accepted.clone();
         let this = self.clone();
+        let settlement_cell = Arc::clone(session_arc);
+        let settlement = request_id
+            .as_ref()
+            .filter(|id| !id.is_empty())
+            .map(|request_id| {
+                Arc::new(SendSettlement {
+                    fresh_agent: fresh_agent.clone(),
+                    session_id: real_id.clone(),
+                    request_id: request_id.clone(),
+                    emitted: AtomicBool::new(false),
+                    drive_finished: AtomicBool::new(false),
+                    prior_turn_unconfirmed,
+                })
+            });
+        let task_settlement = settlement.clone();
         let settling = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let settling_task = Arc::clone(&settling);
 
@@ -3138,7 +3215,10 @@ impl FreshOpencodeState {
             // the probe's contended arm answers running exactly while this
             // turn is in flight, and the claim clears at the drive's end —
             // the settle tail's trailing idle broadcast — or on any abort.
-            let _running_claim = running_claim;
+            let running_claim = running_claim;
+            // This subscriber observes errors in the same ordered daemon
+            // stream as the idle waiter, independently of the UI bridge.
+            let mut settlement_events = manager.subscribe(&real_id);
             // `run_turn` (freshell-opencode/serve.rs) prompts + awaits idle against the
             // REAL opencode serve session (adapter.ts materializeOrSend:363-368). The
             // accepted witness (b8ke focused FR1 + round-2 R2-4) arms the session's
@@ -3207,7 +3287,59 @@ impl FreshOpencodeState {
             drop(released_at_dispatch);
             drop(op_guard.take()); // never-dispatched paths (errors, aborts)
             let result = turn_result;
+            if let Some(settlement) = &task_settlement {
+                settlement.drive_finished.store(true, Ordering::SeqCst);
+            }
             let outcome = classify_turn_outcome(&result, turn_errored.load(Ordering::SeqCst));
+            let mut stream_lagged = false;
+            let mut provider_error = false;
+            loop {
+                match settlement_events.try_recv() {
+                    Ok(SessionSignal::Event(event)) => {
+                        if event.kind == "session.error"
+                            || (event.kind == "message.updated"
+                                && event
+                                    .properties
+                                    .get("info")
+                                    .and_then(|info| info.get("error"))
+                                    .is_some_and(|error| !error.is_null()))
+                        {
+                            provider_error = true;
+                        }
+                    }
+                    Ok(SessionSignal::Lost) => {}
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                        stream_lagged = true
+                    }
+                    Err(
+                        tokio::sync::broadcast::error::TryRecvError::Empty
+                        | tokio::sync::broadcast::error::TryRecvError::Closed,
+                    ) => break,
+                }
+            }
+            let receipt_outcome = match &result {
+                Ok(()) if !stream_lagged => Some(if provider_error {
+                    "failed"
+                } else {
+                    "completed"
+                }),
+                Err(ServeError::SidecarLost { .. }) => Some("exited"),
+                Err(error) if error.never_dispatched() => Some("failed"),
+                _ => None,
+            };
+            if let (Some(settlement), Some(receipt_outcome)) = (&task_settlement, receipt_outcome) {
+                // Arming another send also takes this lock. When the daemon's
+                // idle/error is session-wide, overlapping drives cannot be
+                // attributed safely to an individual request.
+                let session = settlement_cell.lock().await;
+                if running_claim.has_exclusive_settlement()
+                    && !settlement.prior_turn_unconfirmed
+                    && !turn_aborted.load(Ordering::SeqCst)
+                    && !session.killed.load(Ordering::SeqCst)
+                {
+                    settlement.emit(receipt_outcome);
+                }
+            }
             match &result {
                 // The idle edge was observed (or the daemon itself is gone —
                 // nothing runs daemon-side): the accepted turn is settled.
@@ -3271,6 +3403,7 @@ impl FreshOpencodeState {
         session.turn_task = Some(TurnTask {
             kind: TurnTaskKind::Send,
             handle: turn_task,
+            settlement,
             compact_settled_rx: None,
             settling,
         });
@@ -5023,7 +5156,17 @@ impl FreshOpencodeState {
             guard.get(&msg.session_id).cloned()
         };
         let Some(session_arc) = session_arc else {
-            self.send_error(&None, "SESSION_NOT_FOUND", "opencode session not found");
+            if let Some(request_id) = msg.request_id.as_deref() {
+                self.broadcast(&interrupt_error_frame(
+                    &msg.session_id,
+                    request_id,
+                    "SESSION_NOT_FOUND",
+                    "opencode session not found",
+                    false,
+                ));
+            } else {
+                self.send_error(&None, "SESSION_NOT_FOUND", "opencode session not found");
+            }
             return;
         };
 
@@ -5175,7 +5318,16 @@ impl FreshOpencodeState {
                 // user's own stop; the aborted drive's settle tail never
                 // runs). COMPACT drives settled inside the take block.
                 if let InterruptedOp::SendTaken { task, .. } = taken {
-                    task.abort_and_settle().await;
+                    let settlement = task.settlement.clone();
+                    if task.abort_and_settle().await {
+                        if let Some(settlement) = settlement {
+                            if !settlement.drive_finished.load(Ordering::SeqCst)
+                                && !settlement.prior_turn_unconfirmed
+                            {
+                                settlement.emit("interrupted");
+                            }
+                        }
+                    }
                 }
                 // send-during-compact queue: an interrupted compact never
                 // runs its own settle tail (the TurnTask doc — an aborted
@@ -5193,6 +5345,23 @@ impl FreshOpencodeState {
                 // settle from this moment on rings naturally, then preserve
                 // the taken task's observation.
                 turn_aborted.store(false, Ordering::SeqCst);
+                tracing::warn!(
+                    target: "freshell_freshagent::opencode",
+                    provider = PROVIDER,
+                    session_id = %real_id,
+                    request_id = ?msg.request_id,
+                    outcome_uncertain = !serve_err.never_dispatched(),
+                    "freshagent.opencode.interrupt_failed"
+                );
+                if let Some(request_id) = msg.request_id.as_deref() {
+                    self.broadcast(&interrupt_error_frame(
+                        &real_id,
+                        request_id,
+                        "OPENCODE_INTERRUPT_FAILED",
+                        &interrupt_error_message(&serve_err),
+                        !serve_err.never_dispatched(),
+                    ));
+                }
                 if let InterruptedOp::SendTaken {
                     task,
                     clock,
@@ -5270,11 +5439,6 @@ impl FreshOpencodeState {
                         }
                     }
                 }
-                tracing::debug!(
-                    provider = PROVIDER,
-                    session_id = %real_id,
-                    "opencode.interrupt_abort_failed_silent"
-                );
                 // Same locked-critical-section discipline (episode 2
                 // round 3, Major 2): the deferral/release decision is
                 // atomic against idle observations.
@@ -5522,6 +5686,7 @@ impl FreshOpencodeState {
     /// Markers survive regardless (decision 6).
     pub async fn handle_compact(&self, msg: FreshAgentCompact) {
         let session_id = msg.session_id.clone();
+        let request_id = msg.request_id.clone();
         // b8ke ext r29 F2: the compact's delayed-request fence (the wire's
         // additive observedEpoch/observedGeneration pair — parity with
         // send/attach/kill): a half-sent pair is the typed INVALID_FENCE
@@ -5533,7 +5698,13 @@ impl FreshOpencodeState {
                     tracing::warn!(target: "freshell_freshagent::opencode",
                         session_id = %session_id, code = err.code(),
                         "fresh_agent_compact_refused: the observed fence is half-sent (invalid)");
-                    self.emit_fresh_agent_error(&session_id, err.code(), err.message());
+                    self.broadcast(&operation_error_frame(
+                        &session_id,
+                        request_id.as_deref(),
+                        err.code(),
+                        err.message(),
+                        false,
+                    ));
                     return;
                 }
             };
@@ -5556,11 +5727,13 @@ impl FreshOpencodeState {
             // (not a reply sink) is right here: the client routes nested frames by
             // sessionId, so post-restart stale panes and cross-device duplicates both
             // surface the recovery.
-            self.emit_fresh_agent_error(
+            self.broadcast(&operation_error_frame(
                 &session_id,
+                request_id.as_deref(),
                 "INVALID_SESSION_ID",
                 &format!("OpenCode fresh-agent session {session_id} is not available."),
-            );
+                false,
+            ));
             return;
         };
 
@@ -5577,13 +5750,15 @@ impl FreshOpencodeState {
         // D1-F1(a): REFUSE a compact while the session's turn is in flight.
         if session.turn_task.as_ref().is_some_and(|t| !t.is_finished()) {
             drop(session);
-            self.emit_fresh_agent_error(
+            self.broadcast(&operation_error_frame(
                 &session_id,
+                request_id.as_deref(),
                 "INTERNAL_ERROR",
                 &format!(
                     "compact while a turn is in progress is not supported (opencode session {session_id})"
                 ),
-            );
+                false,
+            ));
             return;
         }
 
@@ -5623,7 +5798,13 @@ impl FreshOpencodeState {
                     session_id = %session_id, real_id = %real_id,
                     "fresh_agent_compact_refused: the op guard refused to arm");
                 drop(session);
-                self.emit_fresh_agent_error(&session_id, "SESSION_RESERVED", &message);
+                self.broadcast(&operation_error_frame(
+                    &session_id,
+                    request_id.as_deref(),
+                    "SESSION_RESERVED",
+                    &message,
+                    false,
+                ));
                 return;
             }
         };
@@ -5668,13 +5849,15 @@ impl FreshOpencodeState {
             // Never leave the pane stuck busy on the failure path (and nothing was
             // ever registered on turn_task — the failure is inline, pre-spawn).
             self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
-            self.emit_fresh_agent_error(
+            self.broadcast(&operation_error_frame(
                 &real_id,
+                request_id.as_deref(),
                 "OPENCODE_COMPACT_FAILED",
                 &format!(
                     "Compact failed for opencode session {real_id}: no model/provider pair is resolvable (both the session model and the serve /config model are unset or unusable)"
                 ),
-            );
+                false,
+            ));
             return;
         };
 
@@ -5719,11 +5902,13 @@ impl FreshOpencodeState {
                 // ever registered on turn_task — the refusal is inline,
                 // pre-spawn).
                 self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
-                self.emit_fresh_agent_error(
+                self.broadcast(&operation_error_frame(
                     &real_id,
+                    request_id.as_deref(),
                     "OPENCODE_COMPACT_FAILED",
                     crate::rollback_record::LEDGER_WRITE_REFUSAL_COPY,
-                );
+                    false,
+                ));
                 return;
             }
         };
@@ -5912,14 +6097,12 @@ impl FreshOpencodeState {
                     error = %err,
                     "freshagent.opencode.compact_failed"
                 );
-                fresh_agent.broadcast(&event_frame(
+                fresh_agent.broadcast(&operation_error_frame(
                     &compact_id,
-                    json!({
-                        "type": "freshAgent.error",
-                        "sessionId": compact_id,
-                        "code": "OPENCODE_COMPACT_FAILED",
-                        "message": err.to_string(),
-                    }),
+                    request_id.as_deref(),
+                    "OPENCODE_COMPACT_FAILED",
+                    &err.to_string(),
+                    !err.never_dispatched(),
                 ));
             }
             // send-during-compact queue: the compact settled (success OR
@@ -5939,6 +6122,7 @@ impl FreshOpencodeState {
             .store(false, Ordering::SeqCst);
         session.turn_task = Some(TurnTask {
             kind: TurnTaskKind::Compact,
+            settlement: None,
             handle: compact_task,
             compact_settled_rx: Some(compact_settled_rx),
             settling,
@@ -9214,6 +9398,94 @@ pub(crate) fn event_frame(session_id: &str, inner: Value) -> ServerMessage {
     })
 }
 
+/// Compact retains its established error shape, including for legacy clients.
+fn operation_error_frame(
+    session_id: &str,
+    request_id: Option<&str>,
+    code: &str,
+    message: &str,
+    uncertain: bool,
+) -> ServerMessage {
+    operation_error_frame_with_type(
+        "freshAgent.error",
+        session_id,
+        request_id,
+        code,
+        message,
+        uncertain,
+    )
+}
+
+/// Newly reported Stop errors use a distinct type so older clients ignore
+/// them instead of treating the still-running turn as a terminal failure.
+fn interrupt_error_frame(
+    session_id: &str,
+    request_id: &str,
+    code: &str,
+    message: &str,
+    uncertain: bool,
+) -> ServerMessage {
+    operation_error_frame_with_type(
+        "freshAgent.operation.error",
+        session_id,
+        Some(request_id),
+        code,
+        message,
+        uncertain,
+    )
+}
+
+fn operation_error_frame_with_type(
+    event_type: &str,
+    session_id: &str,
+    request_id: Option<&str>,
+    code: &str,
+    message: &str,
+    uncertain: bool,
+) -> ServerMessage {
+    let mut event = json!({
+        "type": event_type,
+        "sessionId": session_id,
+        "code": code,
+        "message": message,
+    });
+    if let Some(request_id) = request_id {
+        event["requestId"] = json!(request_id);
+        event["operationReceipt"] = json!(true);
+        if uncertain {
+            event["operationOutcomeUncertain"] = json!(true);
+        }
+    }
+    event_frame(session_id, event)
+}
+
+/// Stop errors have not previously exposed the transport's arbitrary error
+/// strings. Report the failure type without publishing URLs or response bodies.
+fn interrupt_error_message(error: &ServeError) -> String {
+    match error {
+        ServeError::Undelivered(_) => "OpenCode could not receive the Stop request.".into(),
+        ServeError::Transport(_) => {
+            "The connection to OpenCode failed while stopping the turn.".into()
+        }
+        ServeError::Http { status, .. } => {
+            format!("OpenCode returned HTTP {status} while stopping the turn.")
+        }
+        ServeError::RequestTimeout { timeout_ms, .. } => {
+            format!("OpenCode did not respond to Stop within {timeout_ms}ms.")
+        }
+        ServeError::Decode(_) => {
+            "OpenCode returned an unreadable response while stopping the turn.".into()
+        }
+        ServeError::IdleTimeout { timeout_ms, .. } => {
+            format!("OpenCode did not report the turn idle within {timeout_ms}ms.")
+        }
+        ServeError::SidecarLost { .. } => {
+            "OpenCode stopped responding while stopping the turn.".into()
+        }
+        _ => "OpenCode was unavailable while stopping the turn.".into(),
+    }
+}
+
 /// `{type:'sdk.session.snapshot',...} → freshAgent.session.snapshot` (sdk-events.ts:49-50;
 /// emitted both by `emitStatus` and by `bindServeStream`'s SSE mapping, adapter.ts:301-303).
 fn snapshot_event(session_id: &str, status: &str) -> Value {
@@ -9442,6 +9714,10 @@ fn map_opencode_serve_error(
 
 #[cfg(test)]
 mod tests {
+    mod compact_receipt_tests;
+    mod interrupt_receipt_tests;
+    mod settlement_receipt_tests;
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -11814,6 +12090,7 @@ mod tests {
             let session_arc = sessions.get(placeholder).expect("session tracked").clone();
             session_arc.lock().await.turn_task = Some(TurnTask {
                 kind: TurnTaskKind::Compact,
+                settlement: None,
                 handle: tokio::spawn(std::future::pending::<()>()),
                 compact_settled_rx: Some(settled_rx),
                 settling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -13814,6 +14091,7 @@ mod tests {
             let session_arc = guard.get(placeholder).expect("session tracked").clone();
             session_arc.lock().await.turn_task = Some(TurnTask {
                 kind: TurnTaskKind::Send,
+                settlement: None,
                 handle: tokio::spawn(std::future::pending::<()>()),
                 compact_settled_rx: None,
                 settling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -17817,6 +18095,7 @@ mod tests {
             session.real_session_id = Some("ses_1".to_string());
             session.turn_task = Some(TurnTask {
                 kind: TurnTaskKind::Send,
+                settlement: None,
                 handle: tokio::spawn(async move {
                     let _ = probe_rx.await;
                 }),
@@ -18164,6 +18443,7 @@ mod tests {
             session.real_session_id = Some("ses_1".to_string());
             session.turn_task = Some(TurnTask {
                 kind: TurnTaskKind::Send,
+                settlement: None,
                 handle: tokio::spawn(async move {
                     let _ = probe_rx.await;
                 }),
@@ -19004,7 +19284,7 @@ mod tests {
                 if refused() {
                     return Box::pin(async move {
                         Err(ServeHttpError::Undelivered(
-                            "abort refused at the connect phase by the test knob".to_string(),
+                            "abort refused at the connect phase by the test knob PRIVATE_STOP_ERROR_SENTINEL".to_string(),
                         ))
                     });
                 }
@@ -19026,7 +19306,7 @@ mod tests {
                     // release it ambiguously (Transport semantics).
                     if ambiguates {
                         return Err(ServeHttpError::Ambiguous(
-                            "connection reset mid-exchange by the test knob".to_string(),
+                            "connection reset mid-exchange by the test knob PRIVATE_STOP_ERROR_SENTINEL".to_string(),
                         ));
                     }
                     // The refused knob is also read LIVE: a parked abort
@@ -19040,7 +19320,10 @@ mod tests {
                     // request time — the sibling-proof test lets one abort
                     // answer 200 while a later-settling abort answers 500.
                     if fail() {
-                        Ok(ServeHttpResponse::new(500, b"abort exploded".to_vec()))
+                        Ok(ServeHttpResponse::new(
+                            500,
+                            b"abort exploded PRIVATE_STOP_ERROR_SENTINEL".to_vec(),
+                        ))
                     } else {
                         Ok(ServeHttpResponse::new(200, b"{}".to_vec()))
                     }
@@ -21462,6 +21745,7 @@ mod tests {
         // driving task — the exact state a queued-send busy pane leaves behind.
         session_arc.lock().await.turn_task = Some(TurnTask {
             kind: TurnTaskKind::Send,
+            settlement: None,
             handle: tokio::spawn(std::future::pending::<()>()),
             compact_settled_rx: None,
             settling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -23006,6 +23290,7 @@ mod tests {
             .expect("registered session");
         session_arc.lock().await.turn_task = Some(TurnTask {
             kind: TurnTaskKind::Send,
+            settlement: None,
             handle: tokio::spawn(async { std::future::pending::<()>().await }),
             compact_settled_rx: None,
             settling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -27169,6 +27454,7 @@ mod tests {
             // (same-crate test style): the drain has not popped it.
             session.turn_task = Some(TurnTask {
                 kind: TurnTaskKind::Send,
+                settlement: None,
                 handle: tokio::spawn(std::future::pending::<()>()),
                 compact_settled_rx: None,
                 settling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -27214,6 +27500,7 @@ mod tests {
             let mut session = session_arc.lock().await;
             session.turn_task = Some(TurnTask {
                 kind: TurnTaskKind::Compact,
+                settlement: None,
                 handle: tokio::spawn(std::future::pending::<()>()),
                 compact_settled_rx: None,
                 settling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -27233,6 +27520,7 @@ mod tests {
             let mut session = session_arc.lock().await;
             session.turn_task = Some(TurnTask {
                 kind: TurnTaskKind::Compact,
+                settlement: None,
                 handle: tokio::spawn(std::future::pending::<()>()),
                 compact_settled_rx: None,
                 settling: Arc::new(std::sync::atomic::AtomicBool::new(true)),

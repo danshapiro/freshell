@@ -11,6 +11,7 @@ fresh-agent-fixtures = []
 opencode-docker-contract-tests = []
 managed-stop-contract-tests = []
 provider-startup-contract-tests = []
+provider-identity-boundary-tests = []
 
 [dependencies]
 freshell-opencode = { path = "../freshell-opencode", features = ["real-transport"] }
@@ -52,3 +53,8 @@ required-features = ["opencode-docker-contract-tests"]
 name = "provider_startup_retry"
 path = "tests/provider_startup_retry.rs"
 required-features = ["provider-startup-contract-tests"]
+
+[[test]]
+name = "provider_identity_boundary"
+path = "tests/provider_identity_boundary.rs"
+required-features = ["provider-identity-boundary-tests"]

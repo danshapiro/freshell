@@ -12,6 +12,7 @@ import {
   homeIsolationConflicts,
   type E2eServerInfo,
 } from './server-fixture-support.js'
+import { assertSubprocessCompleted, SYNC_BUILD_TIMEOUT_MS, SYNC_PROBE_TIMEOUT_MS } from '../../../scripts/testing/sync-subprocess.js'
 import type { E2eServerHandle } from './external-target.js'
 import { stripRuntimeWebEnvironment, type RuntimeWebConstructOptions } from '../../../scripts/testing/runtime-sandbox.js'
 import { runtimeCargoBuildAndCopy, runtimeCargoTargetDirectory } from '../../../scripts/testing/runtime-cargo-artifacts.js'
@@ -121,7 +122,7 @@ export function ensureRustServerBuilt(root: string = PROJECT_ROOT): string {
   try {
     runtimeCargoBuildAndCopy(root, 'cargo', ['build', '--release', '-p', 'freshell-server', '--locked'], [
       { source: bin, target: selected },
-    ])
+    ], process.env, SYNC_BUILD_TIMEOUT_MS)
   } catch (error) {
     fs.rmSync(directory, { recursive: true, force: true })
     throw new Error(
@@ -235,8 +236,9 @@ export function assertExpectedRustProvenance(
  */
 function listChildPids(parentPid: number): number[] {
   const result = spawnSync('ps', ['-o', 'pid=', '--ppid', String(parentPid)], {
-    encoding: 'utf8',
+    encoding: 'utf8', timeout: SYNC_PROBE_TIMEOUT_MS, killSignal: 'SIGKILL',
   })
+  assertSubprocessCompleted(result, 'Owned child-process scan')
   if (result.status !== 0 || !result.stdout) return []
   return result.stdout
     .split('\n')
@@ -491,10 +493,11 @@ export class RustServer implements E2eServerHandle {
 
     const proc = this.process
     const pid = proc?.pid
-    this.process = null
 
     if (proc && pid) {
       const childPidsBeforeKill = ownedDescendantPids(pid)
+      // A failed scan must retain the exact live handle for cleanup/retry.
+      this.process = null
 
       await new Promise<void>((resolve) => {
         // SIGKILL delivery is effectively immediate, but keep a hard cap so a
@@ -731,11 +734,12 @@ export class RustServer implements E2eServerHandle {
   private async killCurrentProcess(): Promise<void> {
     const proc = this.process
     const pid = proc?.pid
-    this.process = null
 
     if (!proc || !pid) return
 
     const childPidsBeforeKill = ownedDescendantPids(pid)
+    // A failed scan must retain the exact live handle for cleanup/retry.
+    this.process = null
 
     await new Promise<void>((resolve) => {
       const timeout = setTimeout(() => {

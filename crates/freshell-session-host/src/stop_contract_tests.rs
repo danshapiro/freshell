@@ -202,6 +202,7 @@ async fn child(capabilities: &[String], evidence: &Path) {
         child: Mutex::new(None),
         pty: Mutex::new(None),
         fresh_agent: Mutex::new(None),
+        fresh_agent_starting: Mutex::new(None),
         fresh_native_command: Mutex::new(()),
         provider_config_paths: ProviderConfigPaths::default(),
         opencode_transfer_mount: PathBuf::from(OPENCODE_TRANSFER_MOUNT),
@@ -401,5 +402,8 @@ fn managed_host_stop_reaps_its_different_uid_provider() {
             );
         }
     }
-    assert!(outcomes.into_iter().all(|ok|ok),"production managed runtime policy must allow real authenticated Stop and PTY Drop to finish before cleanup");
+    assert!(
+        outcomes.into_iter().all(|ok| ok),
+        "production managed runtime policy must allow real authenticated Stop and PTY Drop to finish before cleanup"
+    );
 }

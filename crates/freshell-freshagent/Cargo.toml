@@ -117,3 +117,6 @@ tower = { version = "0.5", features = ["util"] }
 # `freshell-server` owns.
 tracing-subscriber = "0.3"
 tempfile = "3"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }

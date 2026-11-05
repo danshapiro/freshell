@@ -698,20 +698,33 @@ async fn an_unflushed_ping_also_times_out_at_the_next_tick() {
 async fn answered_ping_retires_and_the_next_tick_queues_a_fresh_one() {
     let (sender, pump) = WriterSender::new(4096, 4096, Duration::from_secs(10));
     let mut keepalive = Keepalive::default();
+    for cycle in 0..4 {
+        keepalive.tick(&sender).unwrap();
+        let next = pump.take_next().unwrap().unwrap();
+        assert!(matches!(&next.frame, Message::Ping(_)));
+        assert!(pump.take_next().unwrap().is_none(), "one ping per tick");
+        let flushed = next.flushed.expect("every ping carries a flush receipt");
+
+        // Exercise both valid receipt/pong orders without letting elapsed
+        // wall time choose which cycle the pong belongs to.
+        if cycle % 2 == 0 {
+            keepalive.observe_pong();
+            flushed.send(()).unwrap();
+        } else {
+            flushed.send(()).unwrap();
+            keepalive.observe_pong();
+        }
+        pump.finish_frame(next.output_bytes, next.control_bytes);
+    }
+
+    // Every answered cycle retires independently; the next ping still has
+    // exactly the same one-cycle deadline and receives no prior-pong credit.
     keepalive.tick(&sender).unwrap();
     let next = pump.take_next().unwrap().unwrap();
-    // Pong observed BEFORE the flush receipt is processed still answers the
-    // ping (a pong carries no cookie; ordering with the receipt is the
-    // transport's business).
-    keepalive.observe_pong();
+    assert!(matches!(&next.frame, Message::Ping(_)));
+    assert!(pump.take_next().unwrap().is_none());
     next.flushed.unwrap().send(()).unwrap();
     pump.finish_frame(next.output_bytes, next.control_bytes);
-    keepalive.tick(&sender).unwrap();
-    // Healthy cadence: exactly one fresh ping queued for the new cycle.
-    let next = pump.take_next().unwrap().unwrap();
-    assert!(next.flushed.is_some());
-    assert!(pump.take_next().unwrap().is_none());
-    // The new ping's deadline is armed for this same one-cycle rule.
     assert_eq!(keepalive.tick(&sender), Err(KeepaliveError::TimedOut));
 }
 

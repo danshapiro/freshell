@@ -143,6 +143,24 @@ impl ClaudeRestLane {
                 error.owner = owner;
                 return Err(error);
             }
+            ClaudeSendOutcome::Ambiguous {
+                message,
+                submitted_turn_id,
+            } => {
+                let mut error = RestLaneError::new(
+                    RestLaneErrorKind::Conflict,
+                    "FRESH_AGENT_DELIVERY_AMBIGUOUS",
+                    message,
+                );
+                error.retryable = Some(false);
+                error.correlation = Some(Box::new(RestLaneErrorCorrelation {
+                    session_id: Some(request.session_id.clone()),
+                    request_id: Some(request.request_id.clone()),
+                    submitted_turn_id: Some(submitted_turn_id),
+                    ..Default::default()
+                }));
+                return Err(error);
+            }
         };
         let settled_key = wait_for_turn(
             &mut events,

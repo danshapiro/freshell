@@ -11,6 +11,8 @@ pub mod qualification_evidence;
 pub mod recovery;
 mod recovery_retry;
 pub mod registry;
+#[cfg(test)]
+mod registry_schema_migration_tests;
 pub mod repair;
 pub mod resume_catalog;
 mod retained_output;

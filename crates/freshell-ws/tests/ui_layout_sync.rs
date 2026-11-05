@@ -74,6 +74,7 @@ async fn spawn_server() -> (String, String, LayoutStore) {
     let rest_router = freshell_freshagent::router(rest_state);
 
     let state = WsState {
+        session_index_ready: None,
         layout: layout.clone(),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         terminal_meta: Default::default(),

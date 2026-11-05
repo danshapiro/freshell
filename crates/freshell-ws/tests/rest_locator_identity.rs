@@ -90,6 +90,7 @@ async fn spawn_merged_server(
         .map(|root| Arc::new(freshell_sessions::codex_locator::CodexLocator::new(root)));
 
     let state = WsState {
+        session_index_ready: None,
         layout: Default::default(),
         terminal_meta: Default::default(),
         pane_ledger: Arc::clone(&ledger),

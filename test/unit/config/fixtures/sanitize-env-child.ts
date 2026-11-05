@@ -16,6 +16,8 @@ const inner = spawnSync(
   process.execPath,
   ['-e', "fetch('data:text/plain,hi').then(() => process.stdout.write('inner alive'))\n"],
   {
+    timeout: 30_000,
+    killSignal: 'SIGKILL',
     encoding: 'utf8',
     // Pin the knobs ambient state cannot be trusted with: clear NODE_OPTIONS
     // (a --disable-warning=UNDICI-EHPA there would suppress the very warning
@@ -24,6 +26,8 @@ const inner = spawnSync(
     env: { ...process.env, NODE_OPTIONS: '', NODE_USE_ENV_PROXY: '1' },
   },
 )
+if (inner.error) throw inner.error
+if (inner.status !== 0) throw new Error(`sanitize fixture child failed: ${inner.signal ?? inner.status}`)
 const envReport: Record<string, string | undefined> = {}
 for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'FRESHELL_BIND_HOST']) {
   envReport[key] = process.env[key]

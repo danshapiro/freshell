@@ -44,11 +44,12 @@ pub fn probe(context: &RecoveryContext) -> RecoveryProbe {
 }
 
 /// Refine checkpoint viability with evidence gathered inside the provider
-/// enclosure. The native-session fixture probe can positively inspect both
-/// the primary state and independent checkpoint directory; a missing result
-/// from that probe overrides a stale registry locator. Other providers remain
-/// fail-closed on registry metadata until their checkpoint backend exposes the
-/// same concrete existence proof.
+/// enclosure. A provider reader must emit an exact `CheckpointRestore` row
+/// before its absence can rule out that path. The native-session fixture
+/// inspects primary state and an independent checkpoint directory; Codex's
+/// rollout-only policy lets its complete rollout census cover both native and
+/// checkpoint absence. Providers without a shared or independent checkpoint
+/// proof remain fail-closed on registry metadata.
 pub fn probe_after_provider(
     context: &RecoveryContext,
     provider_probe: &RecoveryProbe,

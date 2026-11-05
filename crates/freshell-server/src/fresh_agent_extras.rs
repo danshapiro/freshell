@@ -476,7 +476,12 @@ async fn run_git_diff(cwd: &str, file_path: Option<&str>) -> Result<String, Stri
     // survive the cancelled drain futures.
     let out_buf = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let err_buf = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
-    let drained = tokio::time::timeout(DIFF_TIMEOUT, async {
+    #[cfg(all(test, unix))]
+    let _ = tests::DIFF_TIMEOUT_CONTROL.try_with(|control| {
+        control.observe_buffers(Arc::clone(&out_buf), Arc::clone(&err_buf));
+        control.observe_driver_exit(&stderr);
+    });
+    let drained = with_diff_timeout(async {
         let (status, (), ()) = tokio::join!(
             child.wait(),
             drain_diff_stream(&mut stdout, std::sync::Arc::clone(&out_buf), DIFF_MAX_BYTES),
@@ -519,6 +524,36 @@ async fn run_git_diff(cwd: &str, file_path: Option<&str>) -> Result<String, Stri
     }
 }
 
+/// Production uses the normal deadline. The two timeout-contract tests
+/// control only its delivery, after the real pipes have reached their
+/// required state; capture, cancellation, kill, and response handling stay
+/// on the same path.
+fn with_diff_timeout<F>(
+    future: F,
+) -> impl std::future::Future<Output = Result<F::Output, tokio::time::error::Elapsed>>
+where
+    F: std::future::Future,
+{
+    #[cfg(all(test, unix))]
+    {
+        // Each real drain owns an 8 KiB read buffer. Heap-pin their joined
+        // future BEFORE constructing the test controller's async state so
+        // its select/deadline layers only carry a pointer-sized handle.
+        let future = Box::pin(future);
+        async move {
+            if let Ok(control) = tests::DIFF_TIMEOUT_CONTROL.try_with(Arc::clone) {
+                return control.run_to_timeout(future).await;
+            }
+            tokio::time::timeout(DIFF_TIMEOUT, future).await
+        }
+    }
+    #[cfg(not(all(test, unix)))]
+    {
+        // The production future remains the original, unboxed Tokio timer.
+        tokio::time::timeout(DIFF_TIMEOUT, future)
+    }
+}
+
 /// Drains one git stream into `buf`, keeping at most `cap` bytes (the
 /// captured prefix). Never kills: an over-cap stdout clips and keeps
 /// reading to EOF so the 15 s timeout can still fire the permissive branch
@@ -537,6 +572,8 @@ async fn drain_diff_stream(
                 let mut guard = buf.lock().await;
                 let room = cap.saturating_sub(guard.len());
                 guard.extend_from_slice(&chunk[..n.min(room)]);
+                #[cfg(all(test, unix))]
+                let _ = tests::DIFF_TIMEOUT_CONTROL.try_with(|control| control.notify_output());
             }
         }
     }
@@ -779,21 +816,239 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
-    /// A repo whose `*.txt` diffs run through an external diff driver
-    /// (`gitattributes` + `[diff "<name>"] command`), letting a test script
-    /// control git's stdout timing deterministically: the driver script's
-    /// stdout IS the diff output git streams out, so a driver that emits and
-    /// then sleeps makes git produce a partial prefix and hang. Unix-only
-    /// (POSIX `chmod` + an `sh` driver script), gated like the neighboring
-    /// unix-only tests.
     #[cfg(unix)]
-    fn git_repo_with_diff_driver(driver_body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    const DIFF_DRIVER_PREFIX: &[u8] = b"diff-driver-output\n";
+    #[cfg(unix)]
+    const DIFF_DRIVER_READY: &[u8] = b"diff-driver-ready\n";
+
+    #[cfg(unix)]
+    tokio::task_local! {
+        // Request-scoped: concurrent tests never replace each other's
+        // deadline, and unrelated requests retain the real 15 s timer.
+        pub(super) static DIFF_TIMEOUT_CONTROL: Arc<DiffTimeoutControl>;
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone)]
+    struct DiffBuffers {
+        stdout: Arc<tokio::sync::Mutex<Vec<u8>>>,
+        stderr: Arc<tokio::sync::Mutex<Vec<u8>>>,
+    }
+
+    #[cfg(unix)]
+    #[derive(Default)]
+    pub(super) struct DiffTimeoutControl {
+        buffers: std::sync::Mutex<Option<DiffBuffers>>,
+        driver_exit_pipe: std::sync::Mutex<Option<tokio::process::ChildStderr>>,
+        output_changed: tokio::sync::Notify,
+        expire: tokio::sync::Notify,
+        expired: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(unix)]
+    impl DiffTimeoutControl {
+        pub(super) fn observe_buffers(
+            &self,
+            stdout: Arc<tokio::sync::Mutex<Vec<u8>>>,
+            stderr: Arc<tokio::sync::Mutex<Vec<u8>>>,
+        ) {
+            *self.buffers.lock().unwrap() = Some(DiffBuffers { stdout, stderr });
+            self.notify_output();
+        }
+
+        pub(super) fn notify_output(&self) {
+            self.output_changed.notify_one();
+        }
+
+        pub(super) fn observe_driver_exit(&self, stderr: &tokio::process::ChildStderr) {
+            use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+            // SAFETY: stderr owns a live pipe descriptor. F_DUPFD_CLOEXEC
+            // atomically gives this test an independently owned read end.
+            let raw = unsafe { libc::fcntl(stderr.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+            assert!(
+                raw >= 0,
+                "duplicate diff stderr: {}",
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: fcntl returned a fresh descriptor whose ownership is
+            // transferred exactly once into this OwnedFd.
+            let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+            let pipe =
+                tokio::process::ChildStderr::from_std(std::process::ChildStderr::from(owned))
+                    .expect("register the diff-driver settlement pipe");
+            *self.driver_exit_pipe.lock().unwrap() = Some(pipe);
+        }
+
+        async fn wait_for_driver_exit(&self) -> std::io::Result<()> {
+            let pipe = self.driver_exit_pipe.lock().unwrap().take();
+            if let Some(mut pipe) = pipe {
+                // Never read this duplicate during production capture. Now
+                // the original readers are gone and Git has been killed.
+                // This fixture's driver creates no descendants and keeps
+                // stderr open until exit, so EOF observes writer teardown.
+                // Git/init owns reaping; this is not a waitpid claim.
+                tokio::io::copy(&mut pipe, &mut tokio::io::sink()).await?;
+            }
+            Ok(())
+        }
+
+        async fn wait_for_capture(&self, expected_stdout: &[u8]) {
+            loop {
+                let changed = self.output_changed.notified();
+                let buffers = self.buffers.lock().unwrap().clone();
+                if let Some(buffers) = buffers {
+                    let stdout = buffers.stdout.lock().await;
+                    let stderr = buffers.stderr.lock().await;
+                    let driver_ready = stderr
+                        .windows(DIFF_DRIVER_READY.len())
+                        .any(|part| part == DIFF_DRIVER_READY);
+                    if driver_ready && stdout.len() >= expected_stdout.len() {
+                        assert_eq!(stdout.as_slice(), expected_stdout);
+                        return;
+                    }
+                }
+                changed.await;
+            }
+        }
+
+        pub(super) async fn run_to_timeout<F>(
+            &self,
+            future: F,
+        ) -> Result<F::Output, tokio::time::error::Elapsed>
+        where
+            F: std::future::Future,
+        {
+            tokio::pin!(future);
+            tokio::select! {
+                _ = &mut future => panic!("diff exited before the controlled timeout"),
+                _ = self.expire.notified() => {},
+            }
+            // Deliver an actually elapsed Tokio timeout to the existing
+            // cancellation/kill branch, not a fabricated diff or error.
+            // The FIFO remains held, so normal completion is an error.
+            let result = tokio::time::timeout(std::time::Duration::ZERO, &mut future).await;
+            assert!(
+                result.is_err(),
+                "blocked diff completed instead of timing out"
+            );
+            self.expired
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            result
+        }
+    }
+
+    #[cfg(unix)]
+    async fn expire_after_diff_capture<F>(
+        driver: &GitDiffDriver,
+        expected_stdout: &[u8],
+        future: F,
+    ) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        use futures_util::FutureExt as _;
+
+        // The test controls scheduling, not the production policy. These
+        // same-budget watchdogs diagnose a broken fixture or cleanup; the
+        // ordering proof comes from capture/EOF, never elapsed wall time.
+        assert_eq!(DIFF_TIMEOUT, std::time::Duration::from_secs(15));
+        let control = Arc::new(DiffTimeoutControl::default());
+        // Callers heap-pin the route before this helper captures it, keeping
+        // the task-local scope and unwind/watchdog wrappers small as well.
+        let request = DIFF_TIMEOUT_CONTROL.scope(Arc::clone(&control), async {
+            tokio::pin!(future);
+            tokio::select! {
+                // A spawn/early-exit error must fail the expired assertion
+                // below, not leave the capture barrier waiting forever.
+                response = &mut future => response,
+                _ = control.wait_for_capture(expected_stdout) => {
+                    control.expire.notify_one();
+                    future.await
+                },
+            }
+        });
+        // Settle the fixture even if an ordering assertion inside the
+        // request panics, then propagate that original failure unchanged.
+        let response = std::panic::AssertUnwindSafe(tokio::time::timeout(DIFF_TIMEOUT, request))
+            .catch_unwind()
+            .await;
+        driver.release().expect("release the external diff driver");
+        tokio::time::timeout(DIFF_TIMEOUT, control.wait_for_driver_exit())
+            .await
+            .expect("external diff driver must close stderr after release")
+            .expect("observe external diff-driver stderr EOF");
+        let response = match response {
+            Ok(result) => result.expect("diff fixture must reach capture and controlled timeout"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        assert!(
+            control.expired.load(std::sync::atomic::Ordering::SeqCst),
+            "diff never entered the controlled timeout branch",
+        );
+        response
+    }
+
+    #[cfg(unix)]
+    struct GitDiffDriver {
+        _dir: tempfile::TempDir,
+        repo: PathBuf,
+        release: std::fs::File,
+    }
+
+    #[cfg(unix)]
+    impl GitDiffDriver {
+        fn release(&self) -> std::io::Result<()> {
+            use std::io::Write as _;
+            (&self.release).write_all(b"\n")
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for GitDiffDriver {
+        fn drop(&mut self) {
+            // Fallback for failure before the async settlement path. The
+            // driver opens this FIFO before readiness; the held read end
+            // and tiny release message make this write nonblocking.
+            let _ = self.release();
+        }
+    }
+
+    /// A real external diff driver with a controlled hang. Its ready marker
+    /// proves it opened the release FIFO; the drain observer separately
+    /// proves the desired stdout was captured before timeout delivery.
+    #[cfg(unix)]
+    fn git_repo_with_diff_driver(with_stdout: bool) -> GitDiffDriver {
+        use std::os::unix::{ffi::OsStrExt as _, fs::PermissionsExt as _};
+
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
         let driver = dir.path().join("driver.sh");
-        std::fs::write(&driver, driver_body).unwrap();
-        use std::os::unix::fs::PermissionsExt as _;
+        let release_path = dir.path().join("driver.sh.release");
+        let fifo_path = std::ffi::CString::new(release_path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo_path is a live, NUL-terminated path; this call creates
+        // only the FIFO inside this test's fresh temporary directory.
+        let created = unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) };
+        assert_eq!(created, 0, "{}", std::io::Error::last_os_error());
+        // Holding both ends avoids an open race. The parent never reads;
+        // only the driver consumes the release byte sent by Drop.
+        let release = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&release_path)
+            .unwrap();
+        let prefix = if with_stdout {
+            "printf 'diff-driver-output\\n'\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            &driver,
+            format!(
+                "#!/bin/sh\nexec 3< \"$0.release\"\n{prefix}printf 'diff-driver-ready\\n' >&2\nread -r release <&3\n"
+            ),
+        )
+        .unwrap();
         std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
         let run = |args: &[&str]| {
             let out = std::process::Command::new("git")
@@ -816,43 +1071,49 @@ mod tests {
         run(&["add", "."]);
         run(&["commit", "-q", "-m", "init"]);
         std::fs::write(repo.join("a.txt"), "two\n").unwrap();
-        (dir, repo)
+        GitDiffDriver {
+            _dir: dir,
+            repo,
+            release,
+        }
     }
 
-    // The permissive branch on the timeout path (delta round 6, Major 1):
-    // Node's `runGitDiff` rejects only when `error && !stdout`, so a git
-    // that already streamed a partial diff and then hangs past the 15 s
-    // timeout resolves `200 {diff: <captured prefix>}` — never a 500. The
-    // driver emits one line then sleeps 60 s; the 15 s timeout kills git
-    // with the prefix already captured.
+    // Node rejects only when error && !stdout. Capture the exact prefix
+    // before delivering timeout while the real driver remains blocked.
     #[tokio::test]
     #[cfg(unix)]
     async fn diff_timeout_with_partial_stdout_resolves_200_with_prefix() {
-        let (_d, repo) =
-            git_repo_with_diff_driver("#!/bin/sh\necho diff-driver-output\nsleep 60\n");
+        let driver = git_repo_with_diff_driver(true);
         let home = tempfile::tempdir().unwrap();
-        let resp = get_diff(
-            State(state(home.path())),
-            headers_with_token("tok"),
-            diff_query(&repo, Some("a.txt")),
+        let resp = expire_after_diff_capture(
+            &driver,
+            DIFF_DRIVER_PREFIX,
+            Box::pin(get_diff(
+                State(state(home.path())),
+                headers_with_token("tok"),
+                diff_query(&driver.repo, Some("a.txt")),
+            )),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let diff = body_json(resp).await["diff"].as_str().unwrap().to_string();
-        assert!(diff.contains("diff-driver-output"), "{diff}");
+        assert_eq!(body_json(resp).await["diff"], json!("diff-driver-output\n"));
     }
 
-    // The reject side of the same branch: a git that hangs WITHOUT any
-    // stdout keeps the oracle's 500 timeout contract.
+    // The same timeout with a ready driver and genuinely empty stdout
+    // keeps the oracle's exact 500 response contract.
     #[tokio::test]
     #[cfg(unix)]
     async fn diff_timeout_with_empty_stdout_is_a_500() {
-        let (_d, repo) = git_repo_with_diff_driver("#!/bin/sh\nsleep 60\n");
+        let driver = git_repo_with_diff_driver(false);
         let home = tempfile::tempdir().unwrap();
-        let resp = get_diff(
-            State(state(home.path())),
-            headers_with_token("tok"),
-            diff_query(&repo, Some("a.txt")),
+        let resp = expire_after_diff_capture(
+            &driver,
+            b"",
+            Box::pin(get_diff(
+                State(state(home.path())),
+                headers_with_token("tok"),
+                diff_query(&driver.repo, Some("a.txt")),
+            )),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);

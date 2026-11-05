@@ -2,16 +2,24 @@ import { test, expect } from '../helpers/fixtures.js'
 
 test.describe('Terminal Lifecycle', () => {
   async function selectShellForActiveTab(page: any): Promise<void> {
-    const shellNames = ['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash']
-    for (const name of shellNames) {
-      const button = page.locator(`button[aria-label="${name}"]`).first()
-      if (await button.isVisible().catch(() => false)) {
-        await button.click({ timeout: 5000 })
-        await page.locator('.xterm').last().waitFor({ state: 'visible', timeout: 30_000 })
-        return
-      }
+    const deadline = Date.now() + 30_000
+    const remaining = () => Math.max(1, deadline - Date.now())
+    let tabId = ''
+    await expect.poll(async () => {
+      tabId = await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.getState().tabs.activeTabId ?? '')
+      return tabId
+    }, { timeout: remaining() }).not.toBe('')
+    const content = page.locator(`[data-tab-content-id="${tabId}"]`)
+    const terminal = content.locator('.xterm').first()
+    const picker = content.getByRole('toolbar', { name: /pane type picker/i })
+    await expect.poll(async () => await terminal.isVisible() || await picker.isVisible(), {
+      timeout: remaining(),
+    }).toBe(true)
+    if (!(await terminal.isVisible())) {
+      await picker.getByRole('button', { name: /^(Shell|WSL|CMD|PowerShell|Bash)$/i })
+        .first().press('Enter', { timeout: Math.min(5_000, remaining()) })
     }
-    throw new Error('No shell option available for the active tab')
+    await terminal.waitFor({ state: 'visible', timeout: remaining() })
   }
 
   function getTerminalId(layout: any): string | null {
@@ -163,22 +171,58 @@ test.describe('Terminal Lifecycle', () => {
     await harness.waitForTabCount(2)
     await selectShellForActiveTab(page)
     const secondTabId = await harness.getActiveTabId()
+    // xterm can mount before terminal.created. Share the existing prompt
+    // window with the exact new pane's acknowledged terminal identity.
+    const secondReadyDeadline = Date.now() + 30_000
+    const secondReadyRemaining = () => Math.max(1, secondReadyDeadline - Date.now())
     const secondLayout = await harness.getPaneLayout(secondTabId!)
-    const secondTerminalId = getTerminalId(secondLayout)
-    expect(secondTerminalId).toBeTruthy()
-    await terminal.waitForPrompt({ timeout: 30_000, terminalId: secondTerminalId! })
+    expect(secondLayout).toMatchObject({ type: 'leaf', content: { kind: 'terminal' } })
+    const secondPaneId = secondLayout.id
+    let secondTerminalId: string | null = null
+    await expect.poll(async () => {
+      const layout = await harness.getPaneLayout(secondTabId!)
+      secondTerminalId = layout?.type === 'leaf' && layout.id === secondPaneId
+        ? getTerminalId(layout)
+        : null
+      return secondTerminalId
+    }, { timeout: secondReadyRemaining() }).toBeTruthy()
+    await terminal.waitForPrompt({ timeout: secondReadyRemaining(), terminalId: secondTerminalId! })
     await terminal.executeCommand('echo "other-tab-marker"', 1)
     await terminal.waitForOutput('other-tab-marker', { terminalId: secondTerminalId! })
 
     const tabs = page.locator('[data-context="tab"]')
-    await page.waitForTimeout(200)
     await harness.clearSentWsMessages()
 
     await page.setViewportSize({ width: 1600, height: 1200 })
-    await tabs.last().click()
-    await terminal.waitForOutput('other-tab-marker', { terminalId: secondTerminalId! })
+    // The second tab is active. Observe its actual ResizeObserver/layout
+    // work before revealing the first tab; cached terminal text does not
+    // acknowledge either geometry change. Each receipt shares the existing
+    // marker-output window rather than adding another wait budget.
+    const secondResizeDeadline = Date.now() + 10_000
+    const secondResizeRemaining = () => Math.max(1, secondResizeDeadline - Date.now())
+    await page.waitForFunction((terminalId) => {
+      const sent = window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
+      return sent.some((msg: any) => msg?.type === 'terminal.resize' && msg?.terminalId === terminalId)
+    }, secondTerminalId!, { timeout: secondResizeRemaining() })
+    await terminal.waitForOutput('other-tab-marker', {
+      terminalId: secondTerminalId!, timeout: secondResizeRemaining(),
+    })
     await tabs.first().click()
-    await terminal.waitForOutput('before-resize-marker', { terminalId: firstTerminalId! })
+    const firstResizeDeadline = Date.now() + 10_000
+    const firstResizeRemaining = () => Math.max(1, firstResizeDeadline - Date.now())
+    await page.waitForFunction((terminalId) => {
+      const sent = window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
+      return sent.some((msg: any) => msg?.type === 'terminal.resize' && msg?.terminalId === terminalId)
+    }, firstTerminalId!, { timeout: firstResizeRemaining() })
+    await terminal.waitForOutput('before-resize-marker', {
+      terminalId: firstTerminalId!, timeout: firstResizeRemaining(),
+    })
+
+    // Input is sent after the resize on the same socket. Complete the
+    // existing round trip before checking the complete wire observation.
+    await terminal.waitForPrompt()
+    await terminal.executeCommand('echo "after-resize"')
+    await terminal.waitForOutput('after-resize', { terminalId: firstTerminalId! })
 
     const sent = await harness.getSentWsMessages()
     const attachMessages = sent.filter((msg: any) => msg?.type === 'terminal.attach')
@@ -188,9 +232,6 @@ test.describe('Terminal Lifecycle', () => {
     expect(attachMessages).toHaveLength(0)
     expect(firstTerminalResizeMessages).toHaveLength(1)
 
-    await terminal.waitForPrompt()
-    await terminal.executeCommand('echo "after-resize"')
-    await terminal.waitForOutput('after-resize')
   })
 
   test('detached terminal keeps running', async ({ freshellPage, page, harness, terminal }) => {

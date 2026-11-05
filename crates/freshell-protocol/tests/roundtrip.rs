@@ -651,6 +651,194 @@ fn terminal_input_blocked_unknown_terminal_roundtrips_and_conforms() {
 }
 
 #[test]
+fn terminal_replaced_identity_disposition_is_optional_and_additive() {
+    // Focused repair round 2, Major 2: the auto-resume replacement
+    // announcement carries the replacement's identity disposition —
+    // `fresh_unbound` (the resume gate refused the recorded id; the
+    // respawn launched an identity-less fresh conversation whose stale
+    // claim was RELEASED) tells the client to CLEAR the pane's saved
+    // sessionRef so a later re-bind association (an association with a
+    // fresh id and no previousSessionId, where the provider's machinery
+    // emits one) folds instead of conflicting.
+    // Additive/optional: absent keeps the legacy frame byte-shape (the
+    // frozen client keeps the preserve-the-recorded-ref fold).
+    let legacy = r#"{"type":"terminal.replaced","oldTerminalId":"t1","newTerminalId":"t2","exitCode":137,"attempt":1,"maxAttempts":3}"#;
+    match server_roundtrip(legacy, "terminal.replaced") {
+        ServerMessage::TerminalReplaced(r) => {
+            assert_eq!(r.identity_disposition, None);
+        }
+        other => panic!("expected TerminalReplaced, got {other:?}"),
+    }
+    let wire = r#"{"type":"terminal.replaced","oldTerminalId":"t1","newTerminalId":"t2","exitCode":137,"attempt":1,"maxAttempts":3,"identityDisposition":"fresh_unbound"}"#;
+    match server_roundtrip(wire, "terminal.replaced") {
+        ServerMessage::TerminalReplaced(r) => {
+            assert_eq!(
+                r.identity_disposition,
+                Some(TerminalReplacedIdentityDisposition::FreshUnbound)
+            );
+        }
+        other => panic!("expected TerminalReplaced, got {other:?}"),
+    }
+}
+
+#[test]
+fn terminal_replaced_stale_session_notice_is_optional_and_additive() {
+    // Focused repair round 3, Major 2: the FreshUnbound replacement
+    // carries the gate's stale-id notice on the path the pane ACTUALLY
+    // consumes. The server also broadcasts a terminal.status{recovering}
+    // frame with the notice, but for the NEW terminal id — before
+    // terminal.replaced — so the pane (which knows the OLD id) can never
+    // match it and the replaced fold clears the recovery notice: without
+    // this field the fresh pane shows no explanation naming the lost
+    // conversation. Additive/optional: absent keeps the legacy frame
+    // byte-shape; Resumed/MintedReplacement frames omit it (their folds
+    // stay exactly as today).
+    //
+    // Wire-level (serde_json::Value) assertions so the contract failure is
+    // observable at RUNTIME against a pre-field build, not only as a
+    // compile error: a server that ignores the key drops it on
+    // re-serialization.
+    let legacy = r#"{"type":"terminal.replaced","oldTerminalId":"t1","newTerminalId":"t2","exitCode":137,"attempt":1,"maxAttempts":3}"#;
+    let msg: ServerMessage = serde_json::from_str(legacy).expect("parse legacy");
+    let reser = serde_json::to_value(&msg).expect("serialize legacy");
+    assert_eq!(reser["type"], "terminal.replaced");
+    assert!(
+        reser.get("staleSessionNotice").is_none(),
+        "absent notice keeps the legacy frame byte-shape — no key on the wire"
+    );
+    // The full FreshUnbound shape: disposition + notice naming the stale id
+    // ride through unchanged and conform to the frozen (regenerated) schema.
+    let wire = r#"{"type":"terminal.replaced","oldTerminalId":"t1","newTerminalId":"t2","exitCode":137,"attempt":1,"maxAttempts":3,"identityDisposition":"fresh_unbound","staleSessionNotice":"Saved antigravity session 11111111-2222-3333-4444-555555555555 could not be found on disk — started a fresh session instead."}"#;
+    let msg: ServerMessage = serde_json::from_str(wire).expect("parse fresh_unbound shape");
+    let reser = serde_json::to_value(&msg).expect("serialize fresh_unbound shape");
+    assert_eq!(
+        reser["staleSessionNotice"],
+        "Saved antigravity session 11111111-2222-3333-4444-555555555555 could not be found on disk — started a fresh session instead.",
+        "the stale-id notice must survive the round-trip on the wire"
+    );
+    assert_eq!(reser["identityDisposition"], "fresh_unbound");
+    // Struct-level pin (the field exists — round 3's green shape): the
+    // parsed frame carries the disposition and the notice; the legacy
+    // frame's wire-level absence assertion above pins the None shape.
+    match msg {
+        ServerMessage::TerminalReplaced(r) => {
+            assert_eq!(
+                r.identity_disposition,
+                Some(TerminalReplacedIdentityDisposition::FreshUnbound)
+            );
+            assert_eq!(
+                r.stale_session_notice.as_deref(),
+                Some("Saved antigravity session 11111111-2222-3333-4444-555555555555 could not be found on disk — started a fresh session instead.")
+            );
+        }
+        other => panic!("expected TerminalReplaced, got {other:?}"),
+    }
+    let schema = outbound_schema()["messages"]["terminal.replaced"].clone();
+    assert!(
+        !schema.is_null(),
+        "no frozen schema for server `terminal.replaced`"
+    );
+    assert_conforms(&validator(&schema), &reser, "terminal.replaced");
+}
+
+#[test]
+fn pane_reconcile_verdict_identity_disposition_is_optional_and_additive() {
+    // Focused repair round 5, Major: a browser DISCONNECTED during the
+    // server-side auto-resume (or reloaded after it) misses the transient
+    // terminal.replaced frame, so the reconnect path's identity-clearing
+    // signal rides the reconcile ATTACH VERDICT instead — same additive
+    // field name and enum as the replaced frame, set only on the
+    // identity-less FreshUnbound shape (never beside a sessionRef; a
+    // resumed/minted replacement carries its identity in sessionRef).
+    // Additive/optional: absent keeps the legacy verdict byte-shape and the
+    // legacy preserve-the-recorded-ref fold.
+    let legacy = r#"{"type":"pane.reconcile.result","reconcileId":"rec-1","bootId":"boot-1","serverInstanceId":"srv-1","verdicts":[{"paneKey":"tab:p","verdict":"attach","terminalId":"t2"}]}"#;
+    match server_roundtrip(legacy, "pane.reconcile.result") {
+        ServerMessage::PaneReconcileResult(r) => {
+            assert_eq!(r.verdicts[0].identity_disposition, None);
+        }
+        other => panic!("expected PaneReconcileResult, got {other:?}"),
+    }
+    let wire = r#"{"type":"pane.reconcile.result","reconcileId":"rec-1","bootId":"boot-1","serverInstanceId":"srv-1","verdicts":[{"paneKey":"tab:p","verdict":"attach","terminalId":"t2","identityDisposition":"fresh_unbound"}]}"#;
+    match server_roundtrip(wire, "pane.reconcile.result") {
+        ServerMessage::PaneReconcileResult(r) => {
+            assert_eq!(
+                r.verdicts[0].identity_disposition,
+                Some(TerminalReplacedIdentityDisposition::FreshUnbound)
+            );
+            // The wire key serializes camelCase (the struct is
+            // rename_all = camelCase; the enum values stay snake_case).
+            let reser =
+                serde_json::to_value(ServerMessage::PaneReconcileResult(r)).expect("re-serialize");
+            assert_eq!(
+                reser["verdicts"][0]["identityDisposition"], "fresh_unbound",
+                "the disposition must survive the round-trip on the wire"
+            );
+        }
+        other => panic!("expected PaneReconcileResult, got {other:?}"),
+    }
+}
+
+#[test]
+fn pane_reconcile_verdict_stale_session_notice_is_optional_and_additive() {
+    // Final-delta review round 2, Fix 1: the reconnect verdict carries the
+    // gate's stale-id notice BESIDE the fresh_unbound disposition — the
+    // same visible explanation naming the refused conversation that the
+    // missed terminal.replaced frame carried. Without it a pane that was
+    // disconnected during the server-side auto-resume re-attaches with
+    // its id cleared and no visible explanation at all. Additive/
+    // optional: absent keeps the legacy verdict byte-shape (an older
+    // server's fresh_unbound verdict still folds the clear; an older
+    // client ignores the key).
+    //
+    // Wire-level (serde_json::Value) assertions so the contract failure is
+    // observable at RUNTIME against a pre-field build, not only as a
+    // compile error: a server that ignores the key drops it on
+    // re-serialization.
+    let legacy = r#"{"type":"pane.reconcile.result","reconcileId":"rec-1","bootId":"boot-1","serverInstanceId":"srv-1","verdicts":[{"paneKey":"tab:p","verdict":"attach","terminalId":"t2","identityDisposition":"fresh_unbound"}]}"#;
+    let msg: ServerMessage = serde_json::from_str(legacy).expect("parse legacy");
+    let reser = serde_json::to_value(&msg).expect("serialize legacy");
+    assert!(
+        reser["verdicts"][0].get("staleSessionNotice").is_none(),
+        "absent notice keeps the legacy verdict byte-shape — no key on the wire"
+    );
+    // The full FreshUnbound reconnect shape: disposition + notice ride
+    // through unchanged and conform to the frozen (regenerated) schema.
+    let wire = r#"{"type":"pane.reconcile.result","reconcileId":"rec-1","bootId":"boot-1","serverInstanceId":"srv-1","verdicts":[{"paneKey":"tab:p","verdict":"attach","terminalId":"t2","identityDisposition":"fresh_unbound","staleSessionNotice":"Saved antigravity session 11111111-2222-3333-4444-555555555555 could not be found on disk — started a fresh session instead."}]}"#;
+    let msg: ServerMessage =
+        serde_json::from_str(wire).expect("parse fresh_unbound reconnect shape");
+    let reser = serde_json::to_value(&msg).expect("serialize fresh_unbound reconnect shape");
+    assert_eq!(
+        reser["verdicts"][0]["staleSessionNotice"],
+        "Saved antigravity session 11111111-2222-3333-4444-555555555555 could not be found on disk — started a fresh session instead.",
+        "the stale-id notice must survive the round-trip on the wire"
+    );
+    assert_eq!(reser["verdicts"][0]["identityDisposition"], "fresh_unbound");
+    // Struct-level pin: the parsed verdict carries both the disposition
+    // and the notice; the legacy wire-level absence assertion above pins
+    // the None shape.
+    match msg {
+        ServerMessage::PaneReconcileResult(r) => {
+            assert_eq!(
+                r.verdicts[0].identity_disposition,
+                Some(TerminalReplacedIdentityDisposition::FreshUnbound)
+            );
+            assert_eq!(
+                r.verdicts[0].stale_session_notice.as_deref(),
+                Some("Saved antigravity session 11111111-2222-3333-4444-555555555555 could not be found on disk — started a fresh session instead.")
+            );
+        }
+        other => panic!("expected PaneReconcileResult, got {other:?}"),
+    }
+    let schema = outbound_schema()["messages"]["pane.reconcile.result"].clone();
+    assert!(
+        !schema.is_null(),
+        "no frozen schema for server `pane.reconcile.result`"
+    );
+    assert_conforms(&validator(&schema), &reser, "pane.reconcile.result");
+}
+
+#[test]
 fn terminal_status_exited_settle_frame_roundtrips() {
     // znhn item 3: the auto-resume SETTLE frame — status 'exited' on the
     // existing terminal.status message, with the typed resumeCycles field
@@ -980,4 +1168,117 @@ fn combined_codex_controls_and_naming_fields_roundtrip_against_generated_contrac
         }]
     });
     server_roundtrip(&ready.to_string(), "ready");
+}
+
+// --------------------------------------------------------------------------
+// auto-restore-warming Task 2: `sessionIndexReadyV1` + `sessions.index.ready`.
+// --------------------------------------------------------------------------
+
+/// The readiness broadcast frame round-trips its exact marker shape, and the
+/// serialized marker the freshell-ws forward-site gate substring-matches is
+/// pinned HERE — a serialization change fails in this test, not silently
+/// in production. Extension-surface frame (beyond the generated frozen
+/// inventory until the next contract reconcile — see
+/// `EXTENSION_SERVER_MESSAGE_TYPES`), so this is a direct serde round-trip,
+/// not `server_roundtrip`'s frozen-schema validation.
+#[test]
+fn sessions_index_ready_frame_roundtrips() {
+    let msg = ServerMessage::SessionsIndexReady(SessionsIndexReady {});
+    let json = serde_json::to_value(&msg).unwrap();
+    assert_eq!(json, serde_json::json!({"type": "sessions.index.ready"}));
+    let back: ServerMessage = serde_json::from_value(json).unwrap();
+    assert!(matches!(back, ServerMessage::SessionsIndexReady(_)));
+    // The freshell-ws forward-site gate matches on this exact serialized
+    // marker; pin it so a serialization change fails HERE, not in prod.
+    assert!(serde_json::to_string(&msg)
+        .unwrap()
+        .contains(r#""type":"sessions.index.ready""#));
+}
+
+/// The `ready.sessionIndexReady` state field is additive-optional: the
+/// negotiated shape serializes it; `None` (the frozen-client shape) omits
+/// the key entirely, keeping legacy ready frames byte-identical.
+#[test]
+fn ready_serializes_session_index_ready_state_additively() {
+    let ready = Ready {
+        timestamp: "2026-11-02T00:00:00.000Z".to_string(),
+        boot_id: Some("boot-1".to_string()),
+        server_instance_id: Some("srv-1".to_string()),
+        build_id: None,
+        capabilities: None,
+        runtime_owners: None,
+        fresh_agent_attention: None,
+        session_index_ready: Some(true),
+    };
+    let wire = serde_json::to_value(ServerMessage::Ready(ready)).unwrap();
+    assert_eq!(wire["sessionIndexReady"], true, "{wire}");
+    let back: ServerMessage = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(
+        back,
+        ServerMessage::Ready(Ready {
+            timestamp: "2026-11-02T00:00:00.000Z".to_string(),
+            boot_id: Some("boot-1".to_string()),
+            server_instance_id: Some("srv-1".to_string()),
+            build_id: None,
+            capabilities: None,
+            runtime_owners: None,
+            fresh_agent_attention: None,
+            session_index_ready: Some(true),
+        })
+    );
+
+    let frozen = Ready {
+        timestamp: "2026-11-02T00:00:00.000Z".to_string(),
+        boot_id: Some("boot-1".to_string()),
+        server_instance_id: Some("srv-1".to_string()),
+        build_id: None,
+        capabilities: None,
+        runtime_owners: None,
+        fresh_agent_attention: None,
+        session_index_ready: None,
+    };
+    let wire = serde_json::to_value(ServerMessage::Ready(frozen)).unwrap();
+    assert!(
+        wire.get("sessionIndexReady").is_none(),
+        "the frozen ready shape omits the field entirely: {wire}"
+    );
+}
+
+/// `hello.capabilities.sessionIndexReadyV1` parses as an opt-in flag; an
+/// absent flag stays `None` and a round-trip never invents it.
+#[test]
+fn hello_capabilities_parse_session_index_ready_v1() {
+    let wire = json!({
+        "type": "hello",
+        "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
+        "token": "t",
+        "capabilities": { "sessionIndexReadyV1": true }
+    });
+    let msg: ClientMessage = serde_json::from_value(wire).expect("hello parses");
+    let ClientMessage::Hello(hello) = msg else {
+        panic!("expected hello");
+    };
+    assert_eq!(
+        hello.capabilities.and_then(|c| c.session_index_ready_v1),
+        Some(true)
+    );
+
+    // Frozen-client shape: no sessionIndexReadyV1 anywhere. Round-trip must
+    // not invent the field (skip_serializing_if).
+    let wire = json!({
+        "type": "hello",
+        "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
+        "token": "t",
+        "capabilities": { "terminalOutputBatchV1": true }
+    });
+    let msg: ClientMessage = serde_json::from_value(wire.clone()).expect("hello parses");
+    let back = serde_json::to_value(&msg).expect("serializes");
+    assert_eq!(back, wire);
+    let ClientMessage::Hello(hello) = msg else {
+        panic!("expected hello");
+    };
+    assert_eq!(
+        hello.capabilities.and_then(|c| c.session_index_ready_v1),
+        None
+    );
 }

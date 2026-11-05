@@ -1,6 +1,7 @@
 import type { Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { RawWsClient } from '../helpers/raw-clients.js'
 import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 
 // Delta round 3, finding 1: the live layout envelope is the page's
@@ -242,22 +243,18 @@ async function readStoredLayout(page: Page) {
   })
 }
 
-async function sendLegacyLayoutSync(page: Page) {
-  // This goes through the real WebSocket path so the server LayoutStore, not Redux, performs normalization.
-  await page.evaluate((layout) => {
-    window.__FRESHELL_TEST_HARNESS__?.sendWsMessage({
-      type: 'ui.layout.sync',
-      tabs: [{ id: 'tab-remote-legacy', title: 'Remote legacy' }],
-      activeTabId: 'tab-remote-legacy',
-      layouts: {
-        'tab-remote-legacy': layout.panes.layouts['tab-legacy'],
-      },
-      activePane: { 'tab-remote-legacy': 'pane-legacy-agent' },
-      paneTitles: {},
-      paneTitleSetByUser: {},
-      timestamp: Date.now(),
-    })
-  }, legacyLayoutPayload())
+function sendLegacyLayoutSync(client: RawWsClient) {
+  // One authenticated raw client owns this synthetic layout. Browser mirrors
+  // have distinct connection keys and cannot race its replacement boundary.
+  const layout = legacyLayoutPayload()
+  client.sendJson({
+    type: 'ui.layout.sync',
+    tabs: [{ id: 'tab-remote-legacy', title: 'Remote legacy' }],
+    activeTabId: 'tab-remote-legacy',
+    layouts: { 'tab-remote-legacy': layout.panes.layouts['tab-legacy'] },
+    activePane: { 'tab-remote-legacy': 'pane-legacy-agent' },
+    paneTitles: {}, paneTitleSetByUser: {}, timestamp: Date.now(),
+  })
 }
 
 async function fetchWithAuth(serverInfo: E2eServerInfo, path: string, init: RequestInit = {}) {
@@ -271,46 +268,24 @@ async function fetchWithAuth(serverInfo: E2eServerInfo, path: string, init: Requ
   })
 }
 
-async function fetchNormalizedLayoutProducedByLegacySync(page: Page, serverInfo: E2eServerInfo, tabId: string): Promise<LayoutSnapshot> {
+async function fetchNormalizedLayoutProducedByLegacySync(serverInfo: E2eServerInfo, tabId: string): Promise<LayoutSnapshot> {
+  let snapshot: LayoutSnapshot | undefined
   await expect.poll(async () => {
     const response = await fetchWithAuth(serverInfo, `/api/layout/snapshot?tabId=${encodeURIComponent(tabId)}`)
+    if (!response.ok) return []
     const body = await response.json()
-    const layout = body?.data?.layouts?.[tabId] as PaneNode | undefined
-    const leaves = collectLeaves(layout)
-    if (!leaves.some((leaf) => leaf.id === 'pane-legacy-agent')) {
-      // Same eviction exposure as the two reads above (same hazard window):
-      // re-craft — nothing re-inserts the pane before the render step.
-      await sendLegacyLayoutSync(page)
-    }
-    return leaves.map((leaf) => ({
-      id: leaf.id,
-      kind: leaf.content?.kind,
-      createRequestId: leaf.content?.createRequestId,
+    const candidate = body.data as LayoutSnapshot
+    const leaves = collectLeaves(candidate.layouts[tabId])
+    snapshot = candidate
+    return leaves.map(leaf => ({
+      id: leaf.id, kind: leaf.content?.kind, createRequestId: leaf.content?.createRequestId,
     }))
   }, { timeout: 30_000 }).toEqual(expect.arrayContaining([
     { id: 'pane-legacy-agent', kind: 'fresh-agent', createRequestId: 'req-legacy-agent' },
     { id: 'pane-legacy-agent-nested', kind: 'fresh-agent', createRequestId: 'req-legacy-agent-nested' },
     { id: 'pane-shell', kind: 'terminal', createRequestId: 'req-shell' },
   ]))
-
-  // The follow-up one-shot snapshot fetch has the SAME adjacent-read
-  // eviction exposure (an eviction can land between the poll's success and
-  // this fetch — plan review round 3, Finding 1): shield it too. The poll
-  // hands the snapshot out via closure once the entry is present.
-  let snapshot: LayoutSnapshot | undefined
-  await expect.poll(async () => {
-    const response = await fetchWithAuth(serverInfo, `/api/layout/snapshot?tabId=${encodeURIComponent(tabId)}`)
-    if (response.status !== 200) return { status: response.status, present: false }
-    const body = await response.json()
-    const candidate = body.data as LayoutSnapshot
-    if (!collectLeaves(candidate.layouts[tabId]).some((leaf) => leaf.id === 'pane-legacy-agent')) {
-      await sendLegacyLayoutSync(page)
-      return { status: response.status, present: false }
-    }
-    snapshot = candidate
-    return { status: response.status, present: true }
-  }, { timeout: 30_000 }).toMatchObject({ status: 200, present: true })
-
+  // Retain the exact snapshot whose normalization satisfied the predicate.
   const serialized = JSON.stringify(snapshot)
   expect(snapshot!.tabs).toEqual([expect.objectContaining({ id: tabId, title: 'Remote legacy' })])
   expect(snapshot!.activePane).toMatchObject({ [tabId]: 'pane-legacy-agent' })
@@ -443,98 +418,51 @@ test.describe('Fresh-agent centralization smoke', () => {
   test('normalizes remote legacy layout sync before exposing server pane snapshots', async ({ freshellPage: _freshellPage, page, harness, serverInfo }) => {
     await mockFreshAgentReadRoutes(page)
     await harness.waitForConnection()
+    const client = await RawWsClient.connect(serverInfo.wsUrl)
+    try {
+      const ready = client.nextJsonMessage('ready', 15_000)
+      client.hello(serverInfo.token)
+      await ready
+      sendLegacyLayoutSync(client)
+      await fetchNormalizedLayoutProducedByLegacySync(serverInfo, 'tab-remote-legacy')
+      const panes = await (await fetchWithAuth(serverInfo, '/api/panes?tabId=tab-remote-legacy')).json()
+      expect(panes.data.panes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: 'pane-legacy-agent', kind: 'fresh-agent' }),
+      ]))
 
-    await sendLegacyLayoutSync(page)
+      // Exercise same-connection replacement explicitly, rather than racing
+      // the page's debounced mirror or repeatedly writing inside a read poll.
+      client.sendJson({ type: 'ui.layout.sync', tabs: [], activeTabId: null,
+        layouts: {}, activePane: {}, paneTitles: {}, paneTitleSetByUser: {}, timestamp: Date.now() })
+      await expect.poll(async () => {
+        const response = await fetchWithAuth(serverInfo, '/api/panes/pane-legacy-agent/capture')
+        const body = await response.json()
+        return { status: response.status, message: body.message }
+      }, { timeout: 30_000 }).toEqual({ status: 404, message: 'pane not found' })
 
-    await expect.poll(async () => {
-      const response = await fetchWithAuth(serverInfo, '/api/panes?tabId=tab-remote-legacy')
-      const body = await response.json()
-      const panes: Array<{ id?: string }> = body?.data?.panes ?? []
-      if (!panes.some((pane) => pane.id === 'pane-legacy-agent')) {
-        // Evicted by the page's own debounced mirror sync (same WS
-        // connection key): the server's same-key ingest REPLACED the
-        // crafted entry, and no writer re-inserts it before the render
-        // step — re-craft it (per reports/load-bearing-validator-LB-2.md).
-        await sendLegacyLayoutSync(page)
-      }
-      return panes
-    }, { timeout: 30_000 }).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        id: 'pane-legacy-agent',
-        kind: 'fresh-agent',
-      }),
-    ]))
-
-    // Deterministic eviction exercise: dispatch a layout-visible change
-    // through the harness so the page's own mirror MUST re-sync
-    // (change-gated, 200ms debounce) and evict the crafted entry — the
-    // final-head lane window, now under the test's own control. The bound
-    // matches the family's other layout observations (related reads
-    // exceeded 5-10s under full-lane load).
-    await page.evaluate(() => {
-      window.__FRESHELL_TEST_HARNESS__?.dispatch({
-        type: 'tabs/addTab',
-        payload: { id: 'tab-eviction-trigger', title: 'Eviction trigger', status: 'running' },
-      })
-    })
-    // Eviction-dependency documentation (delta-review round-1 F11): this 404
-    // depends on the server layout store REPLACING same-connection-key
-    // ui.layout.sync payloads — no merge: the page's own debounced mirror
-    // sync overwrites the crafted entry wholesale, evicting
-    // pane-legacy-agent. A future change to MERGE same-key payloads instead
-    // would keep the crafted entry in the store (capture would answer the
-    // pinned 422, not 404) and surface as THIS poll timing out — a timeout
-    // here means the replace semantics changed, not a flake.
-    await expect.poll(async () => {
+      sendLegacyLayoutSync(client)
+      const normalized = await fetchNormalizedLayoutProducedByLegacySync(serverInfo, 'tab-remote-legacy')
+      // Current servers route visible normalized Claude panes through their
+      // real transcript gateway. This fixture deliberately owns no native
+      // history: distinguish that exact refusal from an evicted pane.
       const capture = await fetchWithAuth(serverInfo, '/api/panes/pane-legacy-agent/capture')
-      return capture.status
-    }, { timeout: 30_000 }).toBe(404)
+      expect(capture.status).toBe(404)
+      expect(await capture.json()).toMatchObject({ status: 'error', message: 'fresh-agent transcript was not found' })
 
-    // Capture contract: the pinned answer is 422 "pane kind \"fresh-agent\"
-    // is unsupported for capture-pane". The crafted entry is evictable at
-    // any pre-render moment by the page's own debounced ui.layout.sync (the
-    // mirror sends the REAL Redux layout on the same WsClient; the server
-    // keys layout-store entries by connection id and same-key ingest
-    // replaces the crafted entry). After eviction NO writer re-inserts
-    // pane-legacy-agent before the render step, so a bare poll would re-time
-    // the failure (every iteration 404 until the bound). Re-send the
-    // crafted sync whenever the evicted state (404) is observed and keep
-    // polling for the pinned contract answer; any other non-422 status
-    // fails the contract assertion loudly at the bound.
-    await expect.poll(async () => {
-      const capture = await fetchWithAuth(serverInfo, '/api/panes/pane-legacy-agent/capture')
-      if (capture.status === 404) {
-        await sendLegacyLayoutSync(page)
-        return { status: 404 }
-      }
-      const body = await capture.json().catch(() => undefined)
-      return { status: capture.status, bodyStatus: body?.status, message: body?.message }
-    }, { timeout: 30_000 }).toMatchObject({
-      status: 422,
-      bodyStatus: 'error',
-      message: expect.stringContaining('pane kind "fresh-agent"'),
-    })
-
-    const normalizedLegacySyncSnapshot = await fetchNormalizedLayoutProducedByLegacySync(page, serverInfo, 'tab-remote-legacy')
-    await renderNormalizedLegacySyncSnapshot(page, normalizedLegacySyncSnapshot, 'tab-remote-legacy')
-
-    await expect(page.locator('[data-context="fresh-agent"]')).toHaveCount(2, { timeout: 10_000 })
-    await expect(page.locator('[data-context="agent-chat"]')).toHaveCount(0)
-
-    const browserState = await harness.getState()
-    const renderedLayout = browserState.panes.layouts['tab-remote-legacy']
-    expect(JSON.stringify(renderedLayout)).toContain('"fresh-agent"')
-    expect(JSON.stringify(renderedLayout)).not.toContain('"agent-chat"')
-    expect(collectLeaves(renderedLayout)).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        id: 'pane-legacy-agent',
-        content: expect.objectContaining({ createRequestId: 'req-legacy-agent' }),
-      }),
-      expect.objectContaining({
-        id: 'pane-legacy-agent-nested',
-        content: expect.objectContaining({ createRequestId: 'req-legacy-agent-nested' }),
-      }),
-    ]))
+      await renderNormalizedLegacySyncSnapshot(page, normalized, 'tab-remote-legacy')
+      await expect(page.locator('[data-context="fresh-agent"]')).toHaveCount(2, { timeout: 10_000 })
+      await expect(page.locator('[data-context="agent-chat"]')).toHaveCount(0)
+      const browserState = await harness.getState()
+      const renderedLayout = browserState.panes.layouts['tab-remote-legacy']
+      expect(JSON.stringify(renderedLayout)).toContain('"fresh-agent"')
+      expect(JSON.stringify(renderedLayout)).not.toContain('"agent-chat"')
+      expect(collectLeaves(renderedLayout)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: 'pane-legacy-agent', content: expect.objectContaining({ createRequestId: 'req-legacy-agent' }) }),
+        expect.objectContaining({ id: 'pane-legacy-agent-nested', content: expect.objectContaining({ createRequestId: 'req-legacy-agent-nested' }) }),
+      ]))
+    } finally {
+      await client.dispose()
+    }
   })
 
   test('keeps fresh-agent settings and routes while legacy settings and routes are removed', async ({ freshellPage: _freshellPage, page, serverInfo }) => {

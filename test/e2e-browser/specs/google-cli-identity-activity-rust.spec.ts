@@ -1070,10 +1070,12 @@ test.describe('Google CLI identity + activity + attention + naming (Rust)', () =
         const staleWriteAt = new Date(Date.now() - 60_000).toISOString()
         const convOneTranscript = path.join(brainRootOf(info), convOne, '.system_generated', 'logs', 'transcript.jsonl')
         await fs.appendFile(convOneTranscript, `${JSON.stringify({
-          type: 'user_message',
-          conversationId: convOne,
-          text: 'bravo anchor prompt two',
-          at: staleWriteAt,
+          type: 'USER_INPUT',
+          source: 'USER_EXPLICIT',
+          status: 'DONE',
+          step_index: 99,
+          created_at: staleWriteAt,
+          content: 'bravo anchor prompt two',
         })}\n`)
         // Let the locator sweep (a 150 ms poll) see the write, plus settle.
         await settleWindow(page, 4_000)
@@ -1108,7 +1110,9 @@ test.describe('Google CLI identity + activity + attention + naming (Rust)', () =
         // discipline in freshell-ownership's begin). The supported
         // existing-conversation target mirrors the Task 6 rebind suite's
         // scenario 3c: a planted, never-owned conversation in the same
-        // cwd (the fake's own record format, an aged first record).
+        // cwd (the corrected record vocabulary — the fake-contract
+        // ownership anchor plus a real-shaped USER_INPUT record, an aged
+        // first record).
         const convExisting = 'conv-resume-existing-e2e'
         const plantedTranscriptDir = path.join(brainRootOf(info), convExisting, '.system_generated', 'logs')
         await fs.mkdir(plantedTranscriptDir, { recursive: true })
@@ -1122,10 +1126,12 @@ test.describe('Google CLI identity + activity + attention + naming (Rust)', () =
             startedAt: plantedAt,
           }),
           JSON.stringify({
-            type: 'user_message',
-            conversationId: convExisting,
-            text: 'the earlier conversation own prompt',
-            at: plantedAt,
+            type: 'USER_INPUT',
+            source: 'USER_EXPLICIT',
+            status: 'DONE',
+            step_index: 0,
+            created_at: plantedAt,
+            content: 'the earlier conversation own prompt',
           }),
         ].map((line) => `${line}\n`).join(''))
 
@@ -1154,6 +1160,35 @@ test.describe('Google CLI identity + activity + attention + naming (Rust)', () =
           'association #3 (the /resume: rebind to the existing conversation)',
         )
         expect(associated3.previousSessionId, 'the resume rebind names the superseded identity').toBe(convTwo)
+
+        // The resumed conversation's records CONTINUE the steps — the
+        // real binary's evidenced cross-process continuation (Task 1's
+        // receipts: USER_INPUT steps 0→2→5 across three separate resumed
+        // processes, no per-process reset). The pane's turn lands with
+        // step_index values strictly past every record already on disk,
+        // so in-file step_index uniqueness holds (a per-process counter
+        // reset would append a DUPLICATE of the planted step 0 instead).
+        const resumedTranscriptPath = path.join(
+          brainRootOf(info), convExisting, '.system_generated', 'logs', 'transcript.jsonl',
+        )
+        const readResumedStepIndexes = async (): Promise<number[]> => {
+          const raw = await fs.readFile(resumedTranscriptPath, 'utf8').catch(() => '')
+          const steps: number[] = []
+          for (const line of raw.split('\n')) {
+            if (!line.trim()) continue
+            try {
+              const record = JSON.parse(line) as { step_index?: unknown }
+              if (typeof record.step_index === 'number') steps.push(record.step_index)
+            } catch {
+              // malformed tail — skip
+            }
+          }
+          return steps
+        }
+        await expect.poll(async () => readResumedStepIndexes(), {
+          timeout: 15_000,
+          message: 'the resumed conversation continues the planted step 0 (steps 0,1,2,3 — never a per-process reset)',
+        }).toEqual([0, 1, 2, 3])
       } finally {
         capture.close()
         await server.stop().catch(() => {})
