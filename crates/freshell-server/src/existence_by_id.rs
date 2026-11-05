@@ -8,15 +8,29 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// By-id disk answer for the amplifier/codex fallbacks (mirrors
+/// By-id disk answer for the amplifier/codex/antigravity fallbacks (mirrors
 /// `OpencodeDbAnswer`'s shape). `Unreadable` is LOAD-BEARING: the probe maps
 /// it to `Unknown`, NEVER `Absent` — only positive absence (store readable,
 /// session definitively absent) may answer `Absent`.
+///
+/// `Defer` (focused repair round 3, Major 1) is the antigravity authority
+/// ladder's dual-root answer: the id WAS found (readable) in a candidate
+/// store root, but the binary's own read root cannot be determined, so the
+/// evidence can neither authorize `Present` (a wrong-root Present proceeds
+/// to the CLI, which silently starts a fresh conversation — GC3) nor
+/// `Absent`. The probe maps it to `Unknown` exactly like `Unreadable`:
+/// the gate fails open for user creates (the CLI's own missing-ID warning
+/// is visible in the pane — the documented pre-gate behavior) and managed
+/// recovery is blocked. Only the antigravity ladder produces it; the
+/// amplifier/codex locators never do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ByIdAnswer {
     Present,
     Absent,
     Unreadable,
+    /// Found on disk, but the store-root authority is ambiguous — defer to
+    /// the binary (see the enum doc). Maps to `Unknown`, never Present.
+    Defer,
 }
 
 /// Injected by-id amplifier session-dir check (kata 09v1 pattern: the probe

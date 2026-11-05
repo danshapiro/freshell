@@ -14,8 +14,9 @@ use crate::{
     },
     recovery_retry::{RecoveryRetry, TransientRecoveryFailure},
     registry::{
-        NativeImportState, OwnedRuntimeHandle, RecoveryContext, RecoveryWriteFence, RegistryError,
-        StoppedRepairOwnerCandidate, StoppedRepairRootReceipt,
+        NativeImportState, OwnedRuntimeHandle, RecoveryContext, RecoveryStart, RecoveryWriteFence,
+        RegistryError, ReplacementPreparation, StoppedRepairOwnerCandidate,
+        StoppedRepairRootReceipt,
     },
     resume_catalog,
     service::{map_backend, LaunchWorkload, Supervisor},
@@ -23,7 +24,7 @@ use crate::{
 use freshell_agent_runtime::{classify_provider_failure, recovery_paths};
 use freshell_runtime_protocol::{
     opencode_target_build_receipt, opencode_transfer_bundle_digest, CleanupState, CommandState,
-    DesiredState, EvidenceStoreState, HostCommand, HostResult, IncidentAnalysis,
+    DesiredState, EvidenceStoreState, HostCommand, HostResult, IncarnationId, IncidentAnalysis,
     IncidentTimelineEvent, LaunchState, LossBuildEvidence, LossCleanupReport, ManagedRolloutMode,
     OpenCodeAdoptionBaseline, OpenCodeTransferChunk, OpenCodeTransferDescriptor,
     OpenCodeTransferFile, ReattachHandle, RecoverRequest, RecoveryAttemptId, RecoveryBlockReason,
@@ -474,6 +475,41 @@ fn validate_native_identity_wait(
     }
 }
 
+fn committed_native_session_id_for_recovery(
+    context: &RecoveryContext,
+    target_incarnation_id: &freshell_runtime_protocol::IncarnationId,
+    target_launch_nonce: &str,
+    attempt_id: &RecoveryAttemptId,
+    intent_revision: u64,
+    expected_fence: &RecoveryWriteFence,
+) -> Result<String, &'static str> {
+    if context.desired_state != DesiredState::Running
+        || context.intent_revision != intent_revision
+        || context.recovery_attempt_id.as_ref() != Some(attempt_id)
+        || context.prior_handle.incarnation_id() != target_incarnation_id
+        || context.prior_handle.launch_nonce().as_str() != target_launch_nonce
+        || context.write_fence() != *expected_fence
+    {
+        return Err("current identity context is outside the committed recovery fence");
+    }
+    let launch = context
+        .native_identity_launch
+        .as_ref()
+        .ok_or("committed recovery has no native launch binding")?;
+    if launch.incarnation_id != *target_incarnation_id
+        || launch.launch_nonce != target_launch_nonce
+        || launch.evidence_revision != context.evidence_revision
+    {
+        return Err("committed recovery launch binding does not match its target fence");
+    }
+    context
+        .native_session_id
+        .as_deref()
+        .filter(|native_session_id| !native_session_id.is_empty())
+        .map(str::to_owned)
+        .ok_or("committed recovery has no native session identity")
+}
+
 #[derive(Debug)]
 pub(crate) enum CanonicalRootOwnerSelection<'a> {
     Chosen(&'a StoppedRepairOwnerCandidate),
@@ -888,6 +924,46 @@ fn verified_stopped_repair_receipt(
         incarnation_id: context.prior_handle.incarnation_id().clone(),
         execution_generation,
     })
+}
+
+enum ScheduledRecoveryPlan {
+    Finished(Box<RecoveryResult>),
+    Reserved(Box<ReservedRecoveryPlan>),
+}
+
+struct ReservedRecoveryPlan {
+    request: RecoverRequest,
+    reserved: RecoveryRetry,
+    context: RecoveryContext,
+    discovery_error: Option<RuntimeError>,
+    recovery_guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+enum RecoveryReplacementPreparation {
+    Finished(Box<RecoveryResult>),
+    Prepared(Box<RecoveryReplacementPlan>),
+}
+
+struct RecoveryReplacementPlan {
+    path: RecoveryPath,
+    probe: RecoveryProbe,
+    start: RecoveryStart,
+    prior_incarnation_id: IncarnationId,
+    attempt_id: RecoveryAttemptId,
+    verdict_fence: RecoveryWriteFence,
+    resume_spec: Option<freshell_runtime_protocol::ResumeSpec>,
+    prepared: ReplacementPreparation,
+    workload: LaunchWorkload,
+    opencode_readiness: bool,
+    recovery_started: Instant,
+}
+
+struct AbortTaskOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl Supervisor {
@@ -1826,6 +1902,81 @@ impl Supervisor {
         self.probe_recovery_inner(soul_id).await
     }
 
+    /// Take a fresh exact Codex store census while the caller holds the
+    /// per-soul lifecycle lock. This deliberately does not use
+    /// `classify_recovery`: a live host with an unqualified native observation
+    /// remains blocked by ordinary recovery policy, while this narrow
+    /// readiness path only needs an exact native-store proof before it asks
+    /// the current Codex runtime to resume or prove-not-found its recorded
+    /// thread. The caller still revalidates the returned write fence before
+    /// committing any resulting root transition.
+    pub(crate) async fn probe_codex_native_readiness_locked(
+        &self,
+        expected: &RecoveryContext,
+        host: &crate::service::AuthenticatedHost,
+    ) -> Result<(RecoveryProbe, RecoveryContext), RuntimeError> {
+        let context = self
+            .registry
+            .recovery_context(expected.soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        if context.write_fence() != expected.write_fence() {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::StaleIntentRevision,
+                "Codex readiness source changed before its native-store probe",
+            ));
+        }
+        let Some(candidate) = codex_readiness_candidate(&context) else {
+            return Ok((
+                blocked(
+                    RecoveryPath::NativeResume,
+                    RecoveryBlockReason::AmbiguousIdentity,
+                    "Codex readiness has no exact current native identity",
+                    None,
+                ),
+                context,
+            ));
+        };
+        let probe = self
+            .probe_host_store(&context, host, Some(candidate.clone()))
+            .await?;
+        let probe = match probe {
+            ready @ RecoveryProbe::ResumeReady { .. } => ready,
+            unavailable @ RecoveryProbe::DefinitivelyUnavailable { .. } => {
+                after_native_probe(&context, unavailable)
+            }
+            other => other,
+        };
+        let qualified = codex_readiness_probe_qualified(&context, &candidate, &probe);
+        crate::service::append_event(
+            &self.config.lifecycle_log,
+            "supervisor.recovery.codex_readiness_store_probe",
+            serde_json::json!({
+                "severity": if qualified { "info" } else { "warn" },
+                "soulId": context.soul_id,
+                "incarnationId": context.prior_handle.incarnation_id(),
+                "provider": context.provider,
+                "nativeSessionId": context.native_session_id,
+                "evidenceRevision": context.evidence_revision,
+                "qualified": qualified,
+                "probe": probe,
+            }),
+        );
+        if qualified {
+            Ok((probe, context))
+        } else {
+            Ok((
+                blocked(
+                    RecoveryPath::NativeResume,
+                    RecoveryBlockReason::StoreUnreadable,
+                    "Codex readiness requires a fresh exact readable store proof",
+                    None,
+                ),
+                context,
+            ))
+        }
+    }
+
     async fn probe_recovery_inner(&self, soul_id: SoulId) -> Result<RecoveryProbe, RuntimeError> {
         Ok(self.probe_recovery_observed(soul_id).await?.0)
     }
@@ -2236,9 +2387,6 @@ impl Supervisor {
                                 )
                                 .await;
                         }
-                        Err(_) if context.resume_spec.is_some() => {
-                            return offline_probe(context);
-                        }
                         Err(error)
                             if error.code == RuntimeErrorCode::HostUnreachable
                                 && context.fresh_agent.as_ref().is_some_and(|agent| {
@@ -2248,6 +2396,9 @@ impl Supervisor {
                                 && context.native_session_id.is_some() =>
                         {
                             return self.probe_unconfirmed_worker_store(context, &host).await;
+                        }
+                        Err(_) if context.resume_spec.is_some() => {
+                            return offline_probe(context);
                         }
                         Err(error) => {
                             *transient = TransientRecoveryFailure::from_runtime(&error);
@@ -2905,7 +3056,75 @@ impl Supervisor {
         only_due_retry: bool,
     ) -> Result<RecoveryResult, RuntimeError> {
         let lifecycle_lock = self.lifecycle_lock(&request.soul_id).await;
-        let _recovery_guard = lifecycle_lock.lock().await;
+        let recovery_guard = lifecycle_lock.lock_owned().await;
+        // Keep retry eligibility/reservation and the subsequent attempt in
+        // separate poll functions. Both phases have sizeable branch state;
+        // retaining the preflight branches while a replacement starts pushes
+        // the observer task close to Tokio's worker stack limit.
+        let plan =
+            Box::pin(self.prepare_scheduled_recovery(request, only_due_retry, recovery_guard))
+                .await?;
+        match plan {
+            ScheduledRecoveryPlan::Finished(result) => Ok(*result),
+            ScheduledRecoveryPlan::Reserved(plan) => {
+                let ReservedRecoveryPlan {
+                    request,
+                    reserved,
+                    context,
+                    discovery_error,
+                    recovery_guard,
+                } = *plan;
+                // Run the long attempt in its own Tokio poll stack. The
+                // per-soul guard moves with it, so cancellation cannot release
+                // the lifecycle lock while an activation task is still being
+                // canceled or finishing its current poll.
+                let soul_id = request.soul_id.clone();
+                let supervisor = self.clone();
+                let task = tokio::spawn(async move {
+                    supervisor
+                        .settle_scheduled_recovery_attempt(
+                            request,
+                            reserved,
+                            context,
+                            discovery_error,
+                            recovery_guard,
+                        )
+                        .await
+                });
+                let _abort_on_drop = AbortTaskOnDrop(task.abort_handle());
+                match task.await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        crate::service::append_event(
+                            &self.config.lifecycle_log,
+                            "supervisor.recovery.attempt_task_failed",
+                            serde_json::json!({
+                                "severity":"error",
+                                "soulId":soul_id,
+                                "reason":"attempt_task_did_not_complete",
+                            }),
+                        );
+                        Err(RuntimeError::new(
+                            RuntimeErrorCode::RecoveryBlocked,
+                            "scheduled recovery attempt did not complete",
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
+    async fn prepare_scheduled_recovery(
+        &self,
+        request: RecoverRequest,
+        only_due_retry: bool,
+        recovery_guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<ScheduledRecoveryPlan, RuntimeError> {
+        macro_rules! finish {
+            ($result:expr) => {
+                return Ok(ScheduledRecoveryPlan::Finished(Box::new($result)));
+            };
+        }
         #[cfg(test)]
         automatic_retry_tests::crash_boundary("before_reservation");
         self.registry
@@ -2928,7 +3147,7 @@ impl Supervisor {
                         || retry.is_due(self.registry.recovery_now_ms())
                 })
         {
-            return Ok(RecoveryResult {
+            finish!(RecoveryResult {
                 outcome: match before_retry.recovery_state {
                     freshell_runtime_protocol::RecoveryState::Live => RecoveryOutcome::Reattached,
                     freshell_runtime_protocol::RecoveryState::Lost => RecoveryOutcome::Lost,
@@ -2998,7 +3217,7 @@ impl Supervisor {
             .find(|view| view.soul_id == request.soul_id)
         {
             if view.recovery_state == freshell_runtime_protocol::RecoveryState::Lost {
-                return Ok(RecoveryResult {
+                finish!(RecoveryResult {
                     outcome: RecoveryOutcome::Lost,
                     incident_id: view.incident_id.clone(),
                     expected_native_session_id: view.native_session_id.clone(),
@@ -3017,7 +3236,7 @@ impl Supervisor {
                 )
                 && request.trigger != RecoveryTrigger::ManualRetry
             {
-                return Ok(RecoveryResult {
+                finish!(RecoveryResult {
                     outcome: RecoveryOutcome::Blocked,
                     probe: Some(blocked(
                         RecoveryPath::NativeResume,
@@ -3109,7 +3328,7 @@ impl Supervisor {
                 .recovery_context(request.soul_id)
                 .await
                 .map_err(map_registry)?;
-            return Ok(RecoveryResult {
+            finish!(RecoveryResult {
                 outcome: RecoveryOutcome::Blocked,
                 view: self.view_for(context.prior_handle.incarnation_id()).await?,
                 probe: Some(probe),
@@ -3126,8 +3345,8 @@ impl Supervisor {
             .await
             .map_err(map_registry)?;
         if context.desired_state == DesiredState::Stopped {
-            return self
-                .complete_recovery_probe(
+            finish!(
+                self.complete_recovery_probe(
                     request,
                     blocked(
                         RecoveryPath::Reattach,
@@ -3138,7 +3357,8 @@ impl Supervisor {
                     context,
                     None,
                 )
-                .await;
+                .await?
+            );
         }
         let mut discovery_error = None;
         let reserved = match self
@@ -3183,9 +3403,10 @@ impl Supervisor {
                                 retry_hint.automatic_after_ms = None;
                             }
                             self.log_recovery_preflight(&observed, &probe);
-                            return self
-                                .complete_recovery_probe(request, probe, observed, None)
-                                .await;
+                            finish!(
+                                self.complete_recovery_probe(request, probe, observed, None)
+                                    .await?
+                            );
                         }
                         Ok(_) => {}
                         // Discovery transport errors still consume and settle
@@ -3238,7 +3459,7 @@ impl Supervisor {
                     )
                 })
             });
-            return Ok(RecoveryResult {
+            finish!(RecoveryResult {
                 outcome: RecoveryOutcome::Blocked,
                 view: self.view_for(context.prior_handle.incarnation_id()).await?,
                 probe,
@@ -3258,6 +3479,25 @@ impl Supervisor {
         .await;
         #[cfg(test)]
         automatic_retry_tests::crash_boundary("after_reservation_before_dispatch");
+        Ok(ScheduledRecoveryPlan::Reserved(Box::new(
+            ReservedRecoveryPlan {
+                request,
+                reserved,
+                context,
+                discovery_error,
+                recovery_guard,
+            },
+        )))
+    }
+
+    async fn settle_scheduled_recovery_attempt(
+        &self,
+        request: RecoverRequest,
+        reserved: RecoveryRetry,
+        context: RecoveryContext,
+        discovery_error: Option<RuntimeError>,
+        recovery_guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<RecoveryResult, RuntimeError> {
         let mut result = match discovery_error {
             Some(error) => Err(error),
             None => Box::pin(self.run_reserved_recovery(request.clone())).await,
@@ -3342,6 +3582,7 @@ impl Supervisor {
         }
         #[cfg(test)]
         automatic_retry_tests::crash_boundary("after_settlement");
+        drop(recovery_guard);
         result
     }
 
@@ -3632,6 +3873,37 @@ impl Supervisor {
         probe: RecoveryProbe,
         probe_fence: RecoveryWriteFence,
     ) -> Result<RecoveryResult, RuntimeError> {
+        let outcome = Box::pin(self.prepare_recovery_replacement(
+            soul_id,
+            trigger,
+            path,
+            resume_spec,
+            probe,
+            probe_fence,
+        ))
+        .await?;
+        match outcome {
+            RecoveryReplacementPreparation::Finished(result) => Ok(*result),
+            RecoveryReplacementPreparation::Prepared(plan) => {
+                Box::pin(self.activate_recovery_replacement(plan)).await
+            }
+        }
+    }
+
+    async fn prepare_recovery_replacement(
+        &self,
+        soul_id: SoulId,
+        trigger: RecoveryTrigger,
+        path: RecoveryPath,
+        resume_spec: Option<freshell_runtime_protocol::ResumeSpec>,
+        probe: RecoveryProbe,
+        probe_fence: RecoveryWriteFence,
+    ) -> Result<RecoveryReplacementPreparation, RuntimeError> {
+        macro_rules! finish {
+            ($result:expr) => {
+                return Ok(RecoveryReplacementPreparation::Finished(Box::new($result)));
+            };
+        }
         let recovery_started = Instant::now();
         let start = match self
             .registry
@@ -3647,7 +3919,7 @@ impl Supervisor {
                     .recovery_context(soul_id)
                     .await
                     .map_err(map_registry)?;
-                return Ok(RecoveryResult {
+                finish!(RecoveryResult {
                     outcome: RecoveryOutcome::Stopped,
                     view: self.view_for(context.prior_handle.incarnation_id()).await?,
                     probe: Some(blocked(
@@ -3684,7 +3956,7 @@ impl Supervisor {
                 )
                 .await
                 .map_err(map_registry)?;
-            return Ok(RecoveryResult {
+            finish!(RecoveryResult {
                 outcome: RecoveryOutcome::Blocked,
                 view: self.view_for(&prior_incarnation_id).await?,
                 probe: Some(blocked(
@@ -3743,7 +4015,7 @@ impl Supervisor {
                     )
                     .await
                     .map_err(map_registry)?;
-                return Ok(RecoveryResult {
+                finish!(RecoveryResult {
                     outcome: RecoveryOutcome::Blocked,
                     view: self.view_for(&prior_incarnation_id).await?,
                     probe: Some(blocked(path, reason, &error.message, Some(2_000))),
@@ -3786,7 +4058,7 @@ impl Supervisor {
                 )
                 .await
                 .map_err(map_registry)?;
-            return Ok(RecoveryResult {
+            finish!(RecoveryResult {
                 outcome: RecoveryOutcome::Blocked,
                 view: self.view_for(&prior_incarnation_id).await?,
                 probe: Some(blocked(
@@ -3858,7 +4130,7 @@ impl Supervisor {
                             )
                             .await
                             .map_err(map_registry)?;
-                        return Ok(RecoveryResult {
+                        finish!(RecoveryResult {
                             outcome: RecoveryOutcome::Blocked,
                             view: self.view_for(&prior_incarnation_id).await?,
                             probe: Some(blocked(path, reason, &error.message, Some(2_000))),
@@ -3894,7 +4166,7 @@ impl Supervisor {
             Err(RegistryError::RecoveryBlocked { reason, .. })
                 if reason.contains("STOP_INTENT") || reason.contains("STALE_ATTEMPT") =>
             {
-                return Ok(RecoveryResult {
+                finish!(RecoveryResult {
                     outcome: RecoveryOutcome::Stopped,
                     view: self.view_for(&prior_incarnation_id).await?,
                     probe: Some(blocked(
@@ -3935,6 +4207,41 @@ impl Supervisor {
             resume_spec: prepared.resume_spec.clone(),
         };
         let opencode_readiness = workload.opencode_tui_readiness_required(&start.context.provider);
+        Ok(RecoveryReplacementPreparation::Prepared(Box::new(
+            RecoveryReplacementPlan {
+                path,
+                probe,
+                start,
+                prior_incarnation_id,
+                attempt_id,
+                verdict_fence,
+                resume_spec,
+                prepared,
+                workload,
+                opencode_readiness,
+                recovery_started,
+            },
+        )))
+    }
+
+    async fn activate_recovery_replacement(
+        &self,
+        plan: Box<RecoveryReplacementPlan>,
+    ) -> Result<RecoveryResult, RuntimeError> {
+        let RecoveryReplacementPlan {
+            path,
+            probe,
+            start,
+            prior_incarnation_id,
+            attempt_id,
+            mut verdict_fence,
+            resume_spec,
+            prepared,
+            workload,
+            opencode_readiness,
+            recovery_started,
+        } = *plan;
+        let soul_id = start.context.soul_id.clone();
         // Keep activation's owned launch/grant state off the replacement
         // polling frame, as at the other large recovery async boundaries.
         let launch = Box::pin(self.activate_prepared_observed(
@@ -4001,14 +4308,35 @@ impl Supervisor {
             }
         };
 
-        let expected_native_session_id = resume_spec
-            .as_ref()
-            .map(|spec| spec.provider_session.native_session_id.clone());
         let requires_native = start.context.fixture.is_none()
             && matches!(
                 start.context.provider.as_str(),
                 "claude" | "kilroy" | "codex" | "opencode" | "amplifier"
             );
+        let expected_native_session_id = if requires_native {
+            let current = self
+                .registry
+                .recovery_context(soul_id.clone())
+                .await
+                .map_err(map_registry)?;
+            Some(
+                committed_native_session_id_for_recovery(
+                    &current,
+                    &prepared.prepared.incarnation_id,
+                    prepared.prepared.launch_nonce.as_str(),
+                    &attempt_id,
+                    start.context.intent_revision,
+                    &verdict_fence,
+                )
+                .map_err(|message| {
+                    RuntimeError::new(RuntimeErrorCode::StaleExecutionGrant, message)
+                })?,
+            )
+        } else {
+            resume_spec
+                .as_ref()
+                .map(|spec| spec.provider_session.native_session_id.clone())
+        };
         let observed_native_session_id = if expected_native_session_id.is_some() || requires_native
         {
             let wait = self
@@ -5976,6 +6304,64 @@ pub(crate) fn after_native_probe(context: &RecoveryContext, probe: RecoveryProbe
     }
 }
 
+fn codex_readiness_candidate(
+    context: &RecoveryContext,
+) -> Option<freshell_runtime_protocol::ResumeSpec> {
+    if context.provider != "codex"
+        || context.desired_state != DesiredState::Running
+        || context.never_dispatched
+        || context.fixture.is_some()
+        || context
+            .native_session_id
+            .as_deref()
+            .is_none_or(str::is_empty)
+        || context.fresh_agent.as_ref().is_none_or(|agent| {
+            agent.provider != freshell_runtime_protocol::FreshProvider::Codex
+                || agent.native_session_id.as_deref() != context.native_session_id.as_deref()
+        })
+    {
+        return None;
+    }
+    let candidate = resume_catalog::exact_resume_candidate(context, None)
+        .ok()
+        .flatten()?;
+    (candidate.provider_session.provider == "codex"
+        && candidate.provider_session.provider_store_id == context.provider_store_id
+        && context.native_session_id.as_deref()
+            == Some(candidate.provider_session.native_session_id.as_str())
+        && candidate.evidence_revision == context.evidence_revision)
+        .then_some(candidate)
+}
+
+fn codex_readiness_probe_qualified(
+    context: &RecoveryContext,
+    candidate: &freshell_runtime_protocol::ResumeSpec,
+    probe: &RecoveryProbe,
+) -> bool {
+    if codex_readiness_candidate(context).as_ref() != Some(candidate) {
+        return false;
+    }
+    match probe {
+        RecoveryProbe::ResumeReady {
+            resume_spec,
+            evidence_revision,
+        } => **resume_spec == *candidate && *evidence_revision == context.evidence_revision,
+        RecoveryProbe::DefinitivelyUnavailable {
+            path: RecoveryPath::NativeResume,
+            ..
+        } => checkpoints::inspected_negative(probe, RecoveryPath::NativeResume)
+            .ok()
+            .is_some_and(|row| {
+                crate::loss_report::native_absence_matches(
+                    context,
+                    row.store_state,
+                    &row.evidence_refs,
+                )
+            }),
+        _ => false,
+    }
+}
+
 fn live_reattach_probe(
     context: &RecoveryContext,
     status: &crate::service::HostStatus,
@@ -6437,6 +6823,7 @@ pub(crate) mod tests {
     include!("retained_output_tests.rs");
     include!("host_restart_recovery_tests.rs");
     use super::*;
+    use crate::registry::Registry;
     use freshell_agent_runtime::host_actor::{
         ActorError, DispatchAck, DispatchFailure, FreshAgentHostActor, FreshAgentProfile,
         FreshAgentTransport, TransportStart,
@@ -6444,6 +6831,27 @@ pub(crate) mod tests {
     use freshell_runtime_protocol::{
         FreshAgentLaunchSpec, FreshProvider, IncarnationId, RequestId,
     };
+
+    const CODEX_READINESS_NATIVE_ID: &str = "11111111-2222-3333-4444-555555555555";
+
+    async fn codex_readiness_context(root: &Path) -> (Registry, RecoveryContext) {
+        let registry = Registry::open(root.join("registry"), None).unwrap();
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let soul = SoulId::new();
+        crate::registry::tests::materialize_fresh_runtime(&registry, soul.clone(), &workspace)
+            .await;
+        let mut context = registry.recovery_context(soul).await.unwrap();
+        context.provider = "codex".into();
+        context.native_session_id = Some(CODEX_READINESS_NATIVE_ID.into());
+        context.never_dispatched = false;
+        let agent = context.fresh_agent.as_mut().unwrap();
+        agent.provider = FreshProvider::Codex;
+        agent.session_type = "codex".into();
+        agent.runtime_variant = "codex-app-server".into();
+        agent.native_session_id = Some(CODEX_READINESS_NATIVE_ID.into());
+        (registry, context)
+    }
 
     pub(crate) fn stopped_source_options_for_targets(
         extraction_root: PathBuf,
@@ -6883,6 +7291,7 @@ pub(crate) mod tests {
                 source: NativeIdentitySource::OpencodeTui,
                 evidence_digest: "f".repeat(64),
             }),
+            native_readiness_receipt: None,
             host_boot_id: HostBootId::new(),
             worker_pid: Some(123),
             worker_launch_count: 1,
@@ -7112,6 +7521,7 @@ pub(crate) mod tests {
                             },
                             // Deterministic transport identity is never native proof.
                             native_identity_observation: None,
+                            native_readiness_receipt: None,
                             opencode_transfer_receipt: None,
                             opencode_adoption: Default::default(),
                         },
@@ -7307,6 +7717,7 @@ pub(crate) mod tests {
                         fixture_evidence: serde_json::json!({}),
                         exited: false,
                         native_session_id: Some("ses_requested".into()),
+                        native_readiness_receipt: None,
                         opencode_transfer_receipt: None,
                         opencode_adoption: Default::default(),
                     },
@@ -7672,6 +8083,7 @@ pub(crate) mod tests {
                             fixture_evidence: serde_json::json!({}),
                             exited: false,
                             native_session_id: hosted_actor.observed_native_session_id().await,
+                            native_readiness_receipt: None,
                             opencode_transfer_receipt: None,
                             opencode_adoption: Default::default(),
                         })
@@ -8017,6 +8429,133 @@ pub(crate) mod tests {
             native_import_authority: "exact_source_snapshot".into(),
             explicit_view_count: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn codex_readiness_requires_exact_resume_or_fresh_native_absence_proof() {
+        let root = tempfile::tempdir().unwrap();
+        let (_registry, context) = codex_readiness_context(root.path()).await;
+        let candidate = resume_catalog::exact_resume_candidate(&context, None)
+            .unwrap()
+            .unwrap();
+        let provider_home = tempfile::tempdir().unwrap();
+        let sessions = provider_home.path().join(".codex/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("exact.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"session_meta","payload":{"id":CODEX_READINESS_NATIVE_ID,"cwd":"/work"}})
+            ),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            freshell_agent_runtime::probe_provider_store(provider_home.path(), &candidate),
+            freshell_agent_runtime::ProviderStoreProbe::Ready { .. }
+        ));
+        let positive = RecoveryProbe::ResumeReady {
+            resume_spec: Box::new(candidate.clone()),
+            evidence_revision: context.evidence_revision,
+        };
+        assert!(codex_readiness_probe_qualified(
+            &context, &candidate, &positive
+        ));
+        let mut stale_positive = positive.clone();
+        if let RecoveryProbe::ResumeReady {
+            evidence_revision, ..
+        } = &mut stale_positive
+        {
+            *evidence_revision += 1;
+        }
+        assert!(!codex_readiness_probe_qualified(
+            &context,
+            &candidate,
+            &stale_positive
+        ));
+        let mut wrong_positive = positive.clone();
+        if let RecoveryProbe::ResumeReady { resume_spec, .. } = &mut wrong_positive {
+            resume_spec.provider_session.native_session_id = "different-root".into();
+        }
+        assert!(!codex_readiness_probe_qualified(
+            &context,
+            &candidate,
+            &wrong_positive
+        ));
+
+        std::fs::remove_file(sessions.join("exact.jsonl")).unwrap();
+        let unavailable =
+            match freshell_agent_runtime::probe_provider_store(provider_home.path(), &candidate) {
+                freshell_agent_runtime::ProviderStoreProbe::DefinitivelyUnavailable {
+                    reason,
+                    evidence,
+                    store_state,
+                    negative_paths,
+                } => RecoveryProbe::DefinitivelyUnavailable {
+                    path: RecoveryPath::NativeResume,
+                    reason,
+                    evidence,
+                    store_state,
+                    negative_paths,
+                },
+                other => panic!("expected exact native absence, got {other:?}"),
+            };
+        let unavailable = after_native_probe(&context, unavailable);
+        assert!(matches!(
+            unavailable,
+            RecoveryProbe::DefinitivelyUnavailable { .. }
+        ));
+        assert!(codex_readiness_probe_qualified(
+            &context,
+            &candidate,
+            &unavailable
+        ));
+
+        let mut stale_context = context.clone();
+        stale_context.evidence_revision += 1;
+        assert!(!codex_readiness_probe_qualified(
+            &stale_context,
+            &candidate,
+            &unavailable
+        ));
+
+        let mut unreadable = unavailable.clone();
+        if let RecoveryProbe::DefinitivelyUnavailable {
+            store_state,
+            negative_paths,
+            ..
+        } = &mut unreadable
+        {
+            *store_state = freshell_runtime_protocol::EvidenceStoreState::PresentUnreadable;
+            negative_paths[0].store_state =
+                freshell_runtime_protocol::EvidenceStoreState::PresentUnreadable;
+        }
+        assert!(!codex_readiness_probe_qualified(
+            &context,
+            &candidate,
+            &unreadable
+        ));
+
+        let mut ambiguous = unavailable.clone();
+        if let RecoveryProbe::DefinitivelyUnavailable { negative_paths, .. } = &mut ambiguous {
+            negative_paths.push(negative_paths[0].clone());
+        }
+        assert!(!codex_readiness_probe_qualified(
+            &context, &candidate, &ambiguous
+        ));
+
+        let wrong_path = RecoveryProbe::DefinitivelyUnavailable {
+            path: RecoveryPath::CheckpointRestore,
+            reason: "wrong path".into(),
+            evidence: vec!["not native absence".into()],
+            store_state: freshell_runtime_protocol::EvidenceStoreState::Missing,
+            negative_paths: Vec::new(),
+        };
+        assert!(!codex_readiness_probe_qualified(
+            &context,
+            &candidate,
+            &wrong_path
+        ));
     }
 
     #[test]
@@ -9028,7 +9567,12 @@ pub(crate) mod automatic_retry_tests {
     }
     impl Drop for RetryBackend {
         fn drop(&mut self) {
-            for (_, task) in self.hosts.get_mut().unwrap().drain(..) {
+            for (_, task) in self
+                .hosts
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .drain(..)
+            {
                 task.abort();
             }
         }
@@ -9137,6 +9681,7 @@ pub(crate) mod automatic_retry_tests {
             let retained_probe_failure = runtime.join("retained-probe-unreachable");
             let retained_post_read_failure = runtime.join("retained-fault-after-ready");
             let worker_exited = runtime.join("retained-worker-exited");
+            let worker_unconfirmed = runtime.join("retained-worker-unconfirmed");
             let retained_provider = self.root.join("native-reader-fixture").exists()
                 && (handle
                     .terminal()
@@ -9158,7 +9703,8 @@ pub(crate) mod automatic_retry_tests {
                     let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
                     if (retained_observation.exists()
                         || baseline_stop.is_some()
-                        || worker_exited.exists())
+                        || worker_exited.exists()
+                        || worker_unconfirmed.exists())
                         && !matches!(&request.body, HostCommand::Hello { .. })
                     {
                         assert_eq!(
@@ -9170,6 +9716,28 @@ pub(crate) mod automatic_retry_tests {
                                 &host_incarnation
                             ))
                         );
+                    }
+                    if worker_unconfirmed.exists()
+                        && matches!(&request.body, HostCommand::Status { .. })
+                    {
+                        RetryBackend::record_at(
+                            &facts_root,
+                            "unconfirmed-worker-status-requests",
+                            host_incarnation.as_str(),
+                        );
+                        write_frame(
+                            &mut socket,
+                            &HostReply {
+                                request_id: request.request_id,
+                                result: Err(RuntimeError::new(
+                                    RuntimeErrorCode::HostUnreachable,
+                                    "initialization was recorded but worker liveness is unconfirmed",
+                                )),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                        continue;
                     }
                     let generation: u64 = std::fs::read_to_string(&generation_path)
                         .unwrap_or_else(|_| "0".into())
@@ -9241,6 +9809,7 @@ pub(crate) mod automatic_retry_tests {
                                     host_boot_id: boot.clone(), worker_pid: 42, worker_launch_count: 1,
                                     fixture_evidence: serde_json::json!({}), native_session_id: None,
                                     native_identity_observation: None, opencode_transfer_receipt: None,
+                                    native_readiness_receipt: None,
                                     opencode_adoption: freshell_runtime_protocol::OpenCodeAdoptionStatus::AwaitingObservation,
                                 }
                             }
@@ -9276,6 +9845,7 @@ pub(crate) mod automatic_retry_tests {
                                     exited: false,
                                     native_session_id: Some(observation.native_session_id.clone()),
                                     native_identity_observation: Some(observation),
+                                    native_readiness_receipt: None,
                                     opencode_transfer_receipt: None,
                                     opencode_adoption: Default::default(),
                                 }
@@ -9354,6 +9924,7 @@ pub(crate) mod automatic_retry_tests {
                                 fixture_evidence: serde_json::json!({}),
                                 native_session_id: Some("retry-root".into()),
                                 native_identity_observation: None,
+                                native_readiness_receipt: None,
                                 opencode_transfer_receipt: None,
                                 opencode_adoption: Default::default(),
                             }
@@ -9409,6 +9980,7 @@ pub(crate) mod automatic_retry_tests {
                                     .map(|observation| observation.native_session_id.clone())
                                     .or_else(|| Some("retry-root".into())),
                                 native_identity_observation: observation,
+                                native_readiness_receipt: None,
                                 opencode_transfer_receipt: None,
                                 opencode_adoption: Default::default(),
                             }
@@ -9421,6 +9993,13 @@ pub(crate) mod automatic_retry_tests {
                             ..
                         } => {
                             let spec = resume_spec.unwrap();
+                            if worker_unconfirmed.exists() {
+                                RetryBackend::record_at(
+                                    &facts_root,
+                                    "unconfirmed-worker-store-probes",
+                                    host_incarnation.as_str(),
+                                );
+                            }
                             if retained_observation.exists() {
                                 assert_eq!((run_as_uid, run_as_gid), (65534, 0));
                                 assert_eq!(incarnation_id, host_incarnation);
@@ -9819,6 +10398,383 @@ pub(crate) mod automatic_retry_tests {
             .unwrap();
         soul
     }
+
+    async fn seed_unconfirmed_codex_host(
+        supervisor: &Supervisor,
+        backend: &RetryBackend,
+        root: &Path,
+        runtime_root: &Path,
+        block_store_probe: bool,
+    ) -> SoulId {
+        use crate::registry::{BackendCreatedRecord, LaunchPreparation};
+        use freshell_runtime_protocol::{
+            FreshAgentLaunchSpec, NativeIdentityLaunch, NativeIdentityObservation,
+            NativeIdentitySource, RuntimeLimits, RuntimeProfile,
+        };
+
+        let soul = SoulId::new();
+        let workspace = root.join("codex-workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let workspace = std::fs::canonicalize(workspace).unwrap();
+        let workspace = workspace.to_string_lossy().into_owned();
+        let provider_store_id = format!("codex-store-{}", soul.as_str());
+        let root_id = "retry-root";
+        let fresh_agent = FreshAgentLaunchSpec {
+            naming_handle: Some("pending-codex-name".into()),
+            collaboration_mode: None,
+            session_id: "codex-presentation".into(),
+            provider: freshell_runtime_protocol::FreshProvider::Codex,
+            session_type: "freshcodex".into(),
+            runtime_variant: "codex-cli".into(),
+            provider_store_id: provider_store_id.clone(),
+            cwd: workspace.clone(),
+            workspace_path: workspace,
+            git_common_dir: None,
+            run_as_uid: 65_534,
+            run_as_gid: 0,
+            model: Some("test-model".into()),
+            effort: None,
+            permission_mode: None,
+            sandbox: None,
+            native_session_id: Some(root_id.into()),
+            plugins: None,
+            model_selection: None,
+            session_ref: None,
+            fixture_transport: None,
+            provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
+            provider_launch_context: None,
+        };
+        let requested_limits = RuntimeLimits {
+            cpu_milli: 500,
+            memory_bytes: 64 * 1024 * 1024,
+            swap_bytes: 0,
+            pids_max: 32,
+        };
+        let prepared = supervisor
+            .registry
+            .prepare_launch(LaunchPreparation {
+                soul_id: soul.clone(),
+                provider: "codex".into(),
+                provider_store_id: provider_store_id.clone(),
+                native_session_id: Some(root_id.into()),
+                creation_seed_ref: "codex-host-restart-fixture".into(),
+                request_id: freshell_runtime_protocol::RequestId::new(),
+                payload_digest: "codex-host-restart-fixture".into(),
+                requested_limits,
+                profile: RuntimeProfile::Custom,
+                project_key: "codex-host-restart-fixture".into(),
+                fixture: None,
+                terminal: None,
+                fresh_agent: Some(fresh_agent),
+                view_intent: None,
+                admission: crate::admission::AdmissionPolicy::default(),
+            })
+            .await
+            .unwrap();
+        let runtime_dir = runtime_root.join(format!("codex-runtime-{}", prepared.incarnation_id));
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        supervisor
+            .registry
+            .commit_created(
+                prepared.incarnation_id.clone(),
+                BackendCreatedRecord {
+                    daemon_id: freshell_runtime_protocol::DockerDaemonId::new(),
+                    container_id: format!("container-{}", prepared.incarnation_id),
+                    image_ref: format!("sha256:{}", "a".repeat(64)),
+                    runtime_dir: runtime_dir.clone(),
+                    host_binary_path: std::env::current_exe().unwrap(),
+                    immutable_config_digest: format!("sha256:{}", "b".repeat(64)),
+                    launch_policy: Some(
+                        freshell_runtime_protocol::RuntimeLaunchPolicy::ProviderVolumeV1,
+                    ),
+                },
+            )
+            .await
+            .unwrap();
+        let grant = supervisor
+            .registry
+            .commit_execution_grant(
+                prepared.incarnation_id.clone(),
+                freshell_runtime_protocol::HostBootId::new(),
+                requested_limits,
+            )
+            .await
+            .unwrap();
+        let context = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        let native_launch = NativeIdentityLaunch {
+            incarnation_id: prepared.incarnation_id.clone(),
+            launch_nonce: prepared.launch_nonce.as_str().into(),
+            evidence_revision: context.evidence_revision,
+            execution_generation: grant.execution_generation,
+            requested_native_session_id: Some(root_id.into()),
+        };
+        supervisor
+            .registry
+            .bind_native_identity_launch(native_launch.clone())
+            .await
+            .unwrap();
+        let context = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        supervisor
+            .registry
+            .record_native_identity_observation(
+                soul.clone(),
+                NativeIdentityObservation {
+                    native_session_id: root_id.into(),
+                    incarnation_id: prepared.incarnation_id.clone(),
+                    launch_nonce: prepared.launch_nonce.as_str().into(),
+                    evidence_revision: context.evidence_revision,
+                    source: NativeIdentitySource::FreshProviderHandshake,
+                    evidence_digest: "a".repeat(64),
+                },
+                context.write_fence(),
+            )
+            .await
+            .unwrap();
+        supervisor
+            .registry
+            .mark_running(prepared.incarnation_id.clone())
+            .await
+            .unwrap();
+        let context = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        let resume_spec = resume_catalog::exact_resume_candidate(&context, None)
+            .unwrap()
+            .unwrap();
+        supervisor
+            .registry
+            .store_verified_resume_spec(soul.clone(), resume_spec)
+            .await
+            .unwrap();
+
+        std::fs::write(runtime_dir.join("secret"), b"synthetic-secret").unwrap();
+        std::fs::write(
+            runtime_dir.join("fixture-object"),
+            format!("container-{}", prepared.incarnation_id),
+        )
+        .unwrap();
+        std::fs::write(runtime_dir.join("fixture-started"), b"started").unwrap();
+        std::fs::write(
+            runtime_dir.join("fixture-generation"),
+            grant.execution_generation.to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            runtime_dir.join("native-launch.json"),
+            serde_json::to_vec(&native_launch).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            runtime_dir.join("retained-worker-unconfirmed"),
+            b"unconfirmed",
+        )
+        .unwrap();
+        if block_store_probe {
+            std::fs::write(runtime_dir.join("retained-store-unreadable"), b"blocked").unwrap();
+        }
+
+        let sessions = root.join("provider/.codex/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("rollout-retry-root.jsonl"),
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"retry-root\"}}\n",
+        )
+        .unwrap();
+        let current = supervisor
+            .registry
+            .owned_handle(prepared.incarnation_id)
+            .await
+            .unwrap();
+        backend.host(&current).await;
+        soul
+    }
+
+    #[tokio::test]
+    async fn codex_host_restart_with_saved_resume_requires_a_fresh_exact_store_probe() {
+        for block_store_probe in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let long_data_root = dir
+                .path()
+                .join("fresh-agent-recovery-test-data-root-is-deliberately-long");
+            std::fs::create_dir(&long_data_root).unwrap();
+            let runtime_root = tempfile::Builder::new()
+                .prefix("rt")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let (supervisor, backend, _) = open(&long_data_root, 0);
+            let soul = seed_unconfirmed_codex_host(
+                &supervisor,
+                &backend,
+                &long_data_root,
+                runtime_root.path(),
+                block_store_probe,
+            )
+            .await;
+            let mut context = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            assert!(context.resume_spec.is_some());
+
+            let mut transient = None;
+            let probe = supervisor
+                .probe_recovery_context(&mut context, &mut transient)
+                .await
+                .unwrap();
+
+            assert_eq!(backend.count("unconfirmed-worker-status-requests"), 1);
+            assert_eq!(backend.count("unconfirmed-worker-store-probes"), 1);
+            assert_eq!(backend.count("creates"), 0);
+            assert_eq!(backend.count("retained-stops"), 0);
+            if block_store_probe {
+                assert!(matches!(
+                    probe,
+                    RecoveryProbe::Blocked {
+                        reason: RecoveryBlockReason::StoreUnreadable,
+                        ..
+                    }
+                ));
+            } else {
+                assert!(matches!(
+                    probe,
+                    RecoveryProbe::ResumeReady { ref resume_spec, .. }
+                        if resume_spec.provider_session.provider == "codex"
+                            && resume_spec.provider_session.native_session_id == "retry-root"
+                ));
+            }
+            let lifecycle =
+                std::fs::read_to_string(long_data_root.join("lifecycle.jsonl")).unwrap();
+            assert!(lifecycle.contains("supervisor.recovery.unconfirmed_worker_store_probe"));
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_identity_wait_uses_only_the_fenced_registry_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, _, _) = open(dir.path(), 0);
+        let soul = seed(&supervisor).await;
+        let mut source = supervisor.registry.recovery_context(soul).await.unwrap();
+        let target_incarnation_id = source.prior_handle.incarnation_id().clone();
+        let target_launch_nonce = source.prior_handle.launch_nonce().as_str().to_owned();
+        let attempt_id = RecoveryAttemptId::new();
+        source.recovery_attempt_id = Some(attempt_id.clone());
+        source.native_identity_launch = Some(freshell_runtime_protocol::NativeIdentityLaunch {
+            incarnation_id: target_incarnation_id.clone(),
+            launch_nonce: target_launch_nonce.clone(),
+            execution_generation: 1,
+            evidence_revision: source.evidence_revision,
+            requested_native_session_id: source.native_session_id.clone(),
+        });
+        let source_fence = source.write_fence();
+
+        let source_expected = committed_native_session_id_for_recovery(
+            &source,
+            &target_incarnation_id,
+            &target_launch_nonce,
+            &attempt_id,
+            source.intent_revision,
+            &source_fence,
+        )
+        .unwrap();
+        assert_eq!(source_expected, "retry-root");
+        assert_eq!(
+            validate_native_identity_wait(
+                &source_expected,
+                NativeIdentityWait::Observed {
+                    native_session_id: "minted-root-without-registry-commit".into(),
+                    elapsed_ms: 1,
+                },
+            )
+            .unwrap_err()
+            .0,
+            RecoveryBlockReason::WrongNativeIdentity,
+            "a host observation alone cannot advance the expected root"
+        );
+
+        let mut committed = source.clone();
+        committed.native_session_id = Some("registry-committed-root".into());
+        committed.identity_revision += 1;
+        committed.evidence_revision += 1;
+        let launch = committed.native_identity_launch.as_mut().unwrap();
+        launch.evidence_revision = committed.evidence_revision;
+        launch.requested_native_session_id = committed.native_session_id.clone();
+        let committed_fence = committed.write_fence();
+        let committed_expected = committed_native_session_id_for_recovery(
+            &committed,
+            &target_incarnation_id,
+            &target_launch_nonce,
+            &attempt_id,
+            committed.intent_revision,
+            &committed_fence,
+        )
+        .unwrap();
+        assert_eq!(committed_expected, "registry-committed-root");
+        assert_eq!(
+            validate_native_identity_wait(
+                &committed_expected,
+                NativeIdentityWait::Observed {
+                    native_session_id: "registry-committed-root".into(),
+                    elapsed_ms: 1,
+                },
+            )
+            .unwrap(),
+            "registry-committed-root"
+        );
+
+        let wrong_attempt = RecoveryAttemptId::new();
+        assert!(committed_native_session_id_for_recovery(
+            &committed,
+            &target_incarnation_id,
+            &target_launch_nonce,
+            &wrong_attempt,
+            committed.intent_revision,
+            &committed_fence,
+        )
+        .is_err());
+        let mut stale_context = committed.clone();
+        stale_context.identity_revision -= 1;
+        let stale_fence = stale_context.write_fence();
+        assert!(committed_native_session_id_for_recovery(
+            &committed,
+            &target_incarnation_id,
+            &target_launch_nonce,
+            &attempt_id,
+            committed.intent_revision,
+            &stale_fence,
+        )
+        .is_err());
+        assert!(committed_native_session_id_for_recovery(
+            &committed,
+            &IncarnationId::new(),
+            &target_launch_nonce,
+            &attempt_id,
+            committed.intent_revision,
+            &committed_fence,
+        )
+        .is_err());
+        assert!(committed_native_session_id_for_recovery(
+            &committed,
+            &target_incarnation_id,
+            "different-launch-nonce",
+            &attempt_id,
+            committed.intent_revision,
+            &committed_fence,
+        )
+        .is_err());
+    }
+
     fn seed_native<'a>(
         supervisor: &'a Supervisor,
         root: &'a Path,
@@ -9841,7 +10797,7 @@ pub(crate) mod automatic_retry_tests {
             .unwrap();
             let agent: freshell_runtime_protocol::FreshAgentLaunchSpec = serde_json::from_value(serde_json::json!({
             "sessionId":"retry-fresh-codex", "provider":"codex", "sessionType":"freshcodex", "runtimeVariant":"codex-app-server-v1",
-            "providerStoreId":context.provider_store_id, "cwd":root, "workspacePath":root,
+            "providerStoreId":context.provider_store_id, "nativeSessionId":"retry-root", "cwd":root, "workspacePath":root,
             "runAsUid":65534, "runAsGid":0
         })).unwrap();
             agent.validate().unwrap();
@@ -11696,7 +12652,7 @@ pub(crate) mod automatic_retry_tests {
         Box::pin(reserved_exited_worker_retry_case(true, true)).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn reserved_retry_recovers_exited_worker_without_saved_proof() {
         Box::pin(reserved_exited_worker_retry_case(false, false)).await;
     }

@@ -182,6 +182,8 @@ fn reconcile_result_serializes_verdicts_with_optional_fields_omitted() {
                 corrected: Some(true),
                 reason: None,
                 duplicate: None,
+                identity_disposition: None,
+                stale_session_notice: None,
             },
             PaneVerdict {
                 pane_key: "tab3:paneB".to_string(),
@@ -191,6 +193,8 @@ fn reconcile_result_serializes_verdicts_with_optional_fields_omitted() {
                 corrected: None,
                 reason: Some("no_recoverable_identity".to_string()),
                 duplicate: None,
+                identity_disposition: None,
+                stale_session_notice: None,
             },
         ],
     });
@@ -236,6 +240,8 @@ fn error_verdict_carries_reason_and_no_retry_after_ms() {
         corrected: None,
         reason: Some("index_warming".to_string()),
         duplicate: None,
+        identity_disposition: None,
+        stale_session_notice: None,
     };
     let wire = serde_json::to_value(&verdict).expect("serializes");
     assert_eq!(wire["verdict"], "error");
@@ -255,6 +261,8 @@ fn unreadable_store_error_verdict_serializes_the_session_store_unreadable_reason
         corrected: None,
         reason: Some("session_store_unreadable".to_string()),
         duplicate: None,
+        identity_disposition: None,
+        stale_session_notice: None,
     };
     let wire = serde_json::to_value(&verdict).expect("serializes");
     assert_eq!(wire["verdict"], "error");

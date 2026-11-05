@@ -321,6 +321,7 @@ impl Fixture {
                                         native_session_id: (fault == Fault::WrongNativeIdentity)
                                             .then(|| "ses_unrelated".into()),
                                         native_identity_observation: None,
+                                        native_readiness_receipt: None,
                                         opencode_adoption: Default::default(),
                                         opencode_transfer_receipt: None,
                                     })
@@ -677,6 +678,8 @@ async fn retained_v1_does_not_receive_native_or_execution_operations() {
             &host,
             HostCommand::FreshAgentPrepareNative {
                 incarnation_id: fixture.incarnation.clone(),
+                expected_launch: None,
+                source_fence: None,
             },
         )
         .await;
@@ -707,6 +710,7 @@ async fn retained_v1_does_not_receive_native_or_execution_operations() {
                 resume_spec: None,
                 dispatch_budget_ms: None,
                 native_identity_launch: None,
+                native_readiness_recovery: None,
             },
         )
         .await;

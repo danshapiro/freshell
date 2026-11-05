@@ -206,8 +206,8 @@
         "antigravity"
       ],
       "executionBoundary": "legacy-extension",
-      "identityCapture": "terminal locator (candidate contract; managed identity unimplemented)",
-      "stateStore": "$HOME/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl (candidate)",
+      "identityCapture": "terminal locator (store real-binary-validated 2026-11-02; managed identity unimplemented)",
+      "stateStore": "$HOME/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl (real-binary-validated 2026-11-02)",
       "resumeCommand": null,
       "zeroTurnPolicy": "no-continuity-claim",
       "checkpointPolicy": "none",

@@ -197,9 +197,10 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
         "missing",
         "source-changes",
         "unavailable",
-        "admission-busy",
-        "admission-busy-source-changes",
         "rpc-busy",
+        "lifecycle-busy",
+        "lifecycle-busy-source-changes",
+        "lifecycle-busy-postflight-fails",
         "unsupported",
         "refused",
         "timeout",
@@ -216,6 +217,7 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let envelope: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+                let mut postflight_inventory_failed = false;
                 let result = match envelope.body {
                     AdminCommand::Health => AdminResult::Health {
                         control_epoch: 7,
@@ -223,8 +225,10 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
                     },
                     AdminCommand::Inventory => {
                         inventories += 1;
+                        postflight_inventory_failed =
+                            scenario == "lifecycle-busy-postflight-fails" && inventories > 1;
                         AdminResult::Inventory(vec![serde_json::from_value(serde_json::json!({
-                            "soulId":"name-soul","incarnationId":"name-incarnation","hostBootId":if (scenario=="source-changes"||scenario=="admission-busy-source-changes")&&inventories>1 {"replaced-boot"}else{"name-boot"},
+                            "soulId":"name-soul","incarnationId":"name-incarnation","hostBootId":if (scenario=="source-changes"||scenario=="lifecycle-busy-source-changes")&&inventories>1 {"replaced-boot"}else{"name-boot"},
                             "launchState":"running","cleanupState":"none","intentRevision":3,"executionGeneration":2,
                             "desiredState":"running","recoveryState":"live","durabilityState":"unknown","allocationState":"allocated",
                             "evidenceRevision":0,"successfulRecoveriesInWindow":0,"provider":"codex",
@@ -252,15 +256,17 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
                         seen.lock().await.push(request);
                         AdminResult::FreshAgentNativeName(match scenario {
                             "ok" | "source-changes" => Reply::Title(Some("Native title".into())),
-                            "admission-busy" | "admission-busy-source-changes" => {
-                                Reply::Failed(Error::AdmissionBusy)
+                            "unavailable" => Reply::Failed(Error::Unavailable {
+                                message: "current connection absent".into(),
+                            }),
+                            "lifecycle-busy"
+                            | "lifecycle-busy-source-changes"
+                            | "lifecycle-busy-postflight-fails" => {
+                                Reply::Failed(Error::LifecycleBusy)
                             }
                             "rpc-busy" => Reply::Failed(Error::Rpc {
                                 code: -32000,
-                                message: "native provider busy".into(),
-                            }),
-                            "unavailable" => Reply::Failed(Error::Unavailable {
-                                message: "current connection absent".into(),
+                                message: "busy".into(),
                             }),
                             "unsupported" => Reply::Failed(Error::Rpc {
                                 code: -32601,
@@ -287,7 +293,14 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
                     &mut stream,
                     &AdminReply {
                         request_id: envelope.request_id,
-                        result: Ok(result),
+                        result: if postflight_inventory_failed {
+                            Err(freshell_runtime_protocol::RuntimeError::new(
+                                RuntimeErrorCode::BackendUnavailable,
+                                "scripted postflight inventory failure",
+                            ))
+                        } else {
+                            Ok(result)
+                        },
                     },
                 )
                 .await
@@ -316,10 +329,14 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
             "ok" => assert!(
                 matches!(reply,NativeCallResult::Confirmed(value) if value.title.as_deref()==Some("Native title"))
             ),
-            "admission-busy" | "admission-busy-source-changes" => assert!(
-                matches!(reply, NativeCallResult::AdmissionBusy),
-                "{scenario}: {reply:?}"
-            ),
+            "lifecycle-busy"
+            | "lifecycle-busy-source-changes"
+            | "lifecycle-busy-postflight-fails" => {
+                assert!(
+                    matches!(reply, NativeCallResult::LifecycleBusy),
+                    "{scenario}: {reply:?}"
+                )
+            }
             "missing" | "unavailable" | "refused" | "transport" | "rpc-busy" => assert!(
                 matches!(reply, NativeCallResult::Undelivered(_)),
                 "{scenario}: {reply:?}"
@@ -332,6 +349,87 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
         }
         assert_eq!(calls.lock().await.len(), usize::from(scenario != "missing"));
     }
+}
+
+#[tokio::test]
+async fn hosted_native_name_probe_preserves_lifecycle_busy() {
+    use crate::session_name_native::{NativeNameTarget, NativeProbeResult};
+    use freshell_runtime_protocol::{
+        FreshAgentNativeNameError as Error, FreshAgentNativeNameOperation as Operation,
+        FreshAgentNativeNameReply as Reply,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("native-name-probe-busy.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let envelope: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            let result = match envelope.body {
+                AdminCommand::Health => AdminResult::Health {
+                    control_epoch: 7,
+                    installation_id: InstallationId::new(),
+                },
+                AdminCommand::Inventory => {
+                    AdminResult::Inventory(vec![serde_json::from_value(serde_json::json!({
+                        "soulId": "probe-soul",
+                        "incarnationId": "probe-incarnation",
+                        "hostBootId": "probe-boot",
+                        "launchState": "running",
+                        "cleanupState": "none",
+                        "intentRevision": 3,
+                        "executionGeneration": 2,
+                        "desiredState": "running",
+                        "recoveryState": "live",
+                        "durabilityState": "unknown",
+                        "allocationState": "allocated",
+                        "evidenceRevision": 0,
+                        "successfulRecoveriesInWindow": 0,
+                        "provider": "codex",
+                        "nativeSessionId": "probe-native",
+                        "freshAgentSessionId": "public-probe-session",
+                        "freshAgentSessionType": "freshcodex"
+                    }))
+                    .unwrap()])
+                }
+                AdminCommand::FreshAgentNativeName(request) => {
+                    assert_eq!(request.operation, Operation::Probe);
+                    assert_eq!(request.source.native_session_id, "probe-native");
+                    AdminResult::FreshAgentNativeName(Reply::Failed(Error::LifecycleBusy))
+                }
+                other => panic!("unexpected probe request: {other:?}"),
+            };
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: envelope.request_id,
+                    result: Ok(result),
+                },
+            )
+            .await
+            .unwrap();
+        }
+    });
+
+    let backend = snapshot_outage_proxy(&socket).native_name_backend();
+    let result = backend
+        .route_available(NativeNameTarget {
+            name_ref: freshell_protocol::session_names::SessionNameRef::Session {
+                provider: NamedProvider::Codex,
+                session_id: "probe-native".into(),
+            },
+            location: freshell_protocol::native_location::NativeLocation::Codex {
+                codex_home: "/owning/codex".into(),
+                native_thread_id: Some("probe-native".into()),
+                rollout_path: None,
+                persistence_evidence: None,
+            },
+            location_revision: 1,
+        })
+        .await;
+    assert_eq!(result, NativeProbeResult::LifecycleBusy);
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
 }
 
 #[tokio::test]

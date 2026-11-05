@@ -2,7 +2,7 @@
 use super::*;
 use crate::session_name_native::{
     classify_codex_error, NativeCallResult, NativeClassified, NativeFuture, NativeNameAttempt,
-    NativeNameBackend, NativeNameReadback, NativeNameTarget, NativeProbeFuture,
+    NativeNameBackend, NativeNameReadback, NativeNameTarget, NativeProbeFuture, NativeProbeResult,
 };
 use freshell_protocol::native_location::NativeLocation;
 use freshell_runtime_protocol::{
@@ -131,10 +131,13 @@ impl HostedCodexNameBackend {
                     "managed Codex naming request did not settle: {error}"
                 ))
             })?;
-        // This authenticated supervisor result proves it never dispatched to
-        // the host. Later inventory/owner changes cannot make it ambiguous.
-        if matches!(reply, Reply::Failed(NameError::AdmissionBusy)) {
-            return Err(NativeClassified::AdmissionBusy);
+        // The supervisor returns LifecycleBusy only when its per-soul
+        // lifecycle try-lock rejects the request before host dispatch. Keep
+        // that definitive no-dispatch result even if a later inventory
+        // snapshot would be unavailable or observe a changed source. Each
+        // retry still repeats these preflight source and owner fences.
+        if matches!(&reply, Reply::Failed(NameError::LifecycleBusy)) {
+            return Ok(reply);
         }
         let inventory = self
             .client
@@ -160,7 +163,7 @@ fn classify_name_error(error: NameError, method: &str) -> NativeClassified {
     use freshell_codex::app_server::CodexAppServerError as Error;
     let method = method.to_string();
     let error = match error {
-        NameError::AdmissionBusy => return NativeClassified::AdmissionBusy,
+        NameError::LifecycleBusy => return NativeClassified::LifecycleBusy,
         NameError::Unavailable { message } => return NativeClassified::Undelivered(message),
         NameError::Rpc { code, message } => Error::Rpc {
             method,
@@ -218,10 +221,11 @@ impl NativeNameBackend for HostedCodexNameBackend {
     fn route_available(&self, target: NativeNameTarget) -> NativeProbeFuture {
         let backend = self.clone();
         Box::pin(async move {
-            matches!(
-                backend.invoke(target, Operation::Probe).await,
-                Ok(Reply::Available)
-            )
+            match backend.invoke(target, Operation::Probe).await {
+                Ok(Reply::Available) => NativeProbeResult::Available,
+                Ok(Reply::Failed(NameError::LifecycleBusy)) => NativeProbeResult::LifecycleBusy,
+                _ => NativeProbeResult::Unavailable,
+            }
         })
     }
 }

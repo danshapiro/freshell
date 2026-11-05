@@ -6000,6 +6000,43 @@ impl TerminalRegistry {
         }
     }
 
+    /// Revocation-aware release for a respawn whose child ALREADY exists
+    /// (the auto-resume FreshUnbound discipline, focused repair round 4,
+    /// Major 2): release the holder's lease ONLY while it is still this
+    /// holder's and NOT revoked — the check and the release are one leases-
+    /// lock acquisition, mirroring [`Self::complete_session_ref_claim`]'s
+    /// own-check (a separate check-then-release pair would reopen the
+    /// atomicity window that primitive exists to close). `true` = the lease
+    /// was still ours and has been released (the caller's spawned child
+    /// stays; the replacement may be announced). `false` = the lease was
+    /// revoked, gone, or held elsewhere — the caller must kill its own
+    /// just-spawned orphan child, confirm the kill, then
+    /// [`Self::force_release_after_confirmed_kill`] (the mirror of
+    /// [`Self::complete_session_ref_claim`]'s false path). A revoked lease
+    /// is never released here: revoked-and-held-closed opens only on holder
+    /// conn death or spawn failure, both of which prove no orphan child
+    /// exists — the caller's confirmed kill is the release path.
+    pub fn release_session_ref_claim_if_held(
+        &self,
+        locator: &SessionLocator,
+        holder_create_request_id: &str,
+    ) -> bool {
+        let key = session_ref_key(locator);
+        let mut leases = self
+            .session_ref_leases
+            .lock()
+            .expect("session-ref lease lock");
+        match leases.get(&key) {
+            Some(lease)
+                if lease.holder_create_request_id == holder_create_request_id && !lease.revoked =>
+            {
+                leases.remove(&key);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Connection death: release this conn's leases. Returns (locator_key, pid)
     /// pairs whose in-flight children the caller must kill (kill-before-release
     /// applies: entries WITH a pid are returned still-held; caller kills,
@@ -15275,6 +15312,73 @@ mod tests {
         ));
         // The revoked holder's late completion is rejected.
         assert!(!reg.complete_session_ref_claim(&s, "cr-A", "term-late"));
+    }
+
+    /// Revocation-aware release (focused repair round 4, Major 2 — the
+    /// FreshUnbound auto-resume seam): a healthy own lease releases and
+    /// reports true; the NEXT claim then acquires (the release really
+    /// happened, not a phantom true).
+    #[test]
+    fn release_if_held_releases_a_healthy_own_lease() {
+        let reg = test_registry();
+        let s = locator("claude", "s1");
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-A", 1, 1000),
+            SessionRefClaim::Acquired
+        ));
+        assert!(
+            reg.release_session_ref_claim_if_held(&s, "cr-A"),
+            "a lease still held by this createRequestId releases with true"
+        );
+        assert!(
+            !reg.release_session_ref_claim_if_held(&s, "cr-A"),
+            "the second release finds no lease — the first really removed it"
+        );
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-B", 2, 2000),
+            SessionRefClaim::Acquired
+        ));
+    }
+
+    /// Revocation-aware release: a foreign holder's lease and a lease that is
+    /// gone both answer false without touching anything; a REVOKED own lease
+    /// (TTL-expired pid-less — held closed) is NOT released by this seam:
+    /// the caller must kill its own child and force-release instead.
+    #[test]
+    fn release_if_held_refuses_foreign_gone_and_revoked_leases() {
+        let reg = test_registry();
+        let s = locator("claude", "s1");
+        reg.claim_session_ref(&s, "cr-A", 1, 1000);
+        assert!(
+            !reg.release_session_ref_claim_if_held(&s, "cr-B"),
+            "a foreign holder's lease is never released"
+        );
+        assert!(
+            reg.release_session_ref_claim_if_held(&s, "cr-A"),
+            "the owner still releases its own lease"
+        );
+        assert!(
+            !reg.release_session_ref_claim_if_held(&s, "cr-A"),
+            "a gone lease answers false"
+        );
+        // The revoked shape: TTL expiry on a pid-less holder marks the lease
+        // revoked-and-held-closed — the revocation-aware release must refuse
+        // it (the caller's confirmed-kill + force-release is the only path).
+        reg.claim_session_ref(&s, "cr-C", 3, 1000);
+        let late = 1000 + SESSION_REF_LEASE_TTL_MS + 1;
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-D", 4, late),
+            SessionRefClaim::Held { .. }
+        ));
+        assert!(
+            !reg.release_session_ref_claim_if_held(&s, "cr-C"),
+            "a revoked own lease is held closed — never released by this seam"
+        );
+        reg.force_release_after_confirmed_kill(&s);
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-D", 4, late + 1),
+            SessionRefClaim::Acquired
+        ));
     }
 
     /// Fix round 1, finding 1: a KILLED winner must not strand the

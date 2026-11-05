@@ -683,6 +683,172 @@ describe('foldVerdicts stale-verdict identity guard (delta round 4, finding 2)',
   })
 })
 
+describe('foldVerdicts FreshUnbound reconnect carrier (focused repair round 5, Major)', () => {
+  // The cap-round hole: the live terminal.replaced fold clears the pane's
+  // stale session identity, but a browser DISCONNECTED during the
+  // server-side auto-resume (or reloaded after it) never sees that frame.
+  // Its reconnection goes through pane.reconcile, and the identity-less
+  // attach verdict must carry the same clearing signal — the pane attaches
+  // the NEW terminal while its saved sessionRef still names the deleted
+  // conversation; without the signal the stale id survives the fold, and
+  // the fresh conversation's later association (a new id with NO
+  // previousSessionId) is rejected by the conflict rule forever.
+  function realStorePanes() {
+    return configureStore({ reducer: { panes: panesReducer } })
+  }
+
+  function seedFreshUnboundReplacedPane(store: ReturnType<typeof realStorePanes>) {
+    store.dispatch(initLayout({
+      tabId: 'tab1',
+      paneId: 'p1',
+      content: {
+        kind: 'terminal',
+        mode: 'antigravity',
+        shell: 'system',
+        createRequestId: 'cr-keep',
+        status: 'running',
+        // The pane's pre-replacement view: the dead predecessor's handle and
+        // the stale identity the resume gate refused (the frames that would
+        // have corrected these never arrived — the browser was disconnected).
+        terminalId: 'term-crashed',
+        sessionRef: { provider: 'antigravity', sessionId: 'deleted-conversation' },
+        resumeSessionId: 'deleted-conversation',
+      },
+    }))
+  }
+
+  function leafContent(store: ReturnType<typeof realStorePanes>): TerminalPaneContent {
+    const layout = store.getState().panes.layouts['tab1'] as { type: 'leaf'; content: TerminalPaneContent }
+    return layout.content
+  }
+
+  it('the reconnect attach of a FreshUnbound-replaced pane clears the stale session identity', () => {
+    const store = realStorePanes()
+    seedFreshUnboundReplacedPane(store)
+    const req = buildReconcileRequest(asRootState(store.getState().panes))!
+    expect(req.panes[0].sessionRef).toEqual({
+      provider: 'antigravity',
+      sessionId: 'deleted-conversation',
+    })
+
+    // The server's verdict: row-1 attach of the identity-less replacement
+    // terminal, carrying the fresh_unbound disposition (the mirror of the
+    // terminal.replaced frame the pane missed).
+    const result = resultFor(req, [{
+      paneKey: req.panes[0].paneKey,
+      verdict: 'attach',
+      terminalId: 'term-fresh',
+      identityDisposition: 'fresh_unbound',
+    }])
+    foldVerdicts(store.dispatch, req, result)
+
+    const c = leafContent(store)
+    expect(c.terminalId).toBe('term-fresh')
+    expect(c.createRequestId).toBe('cr-keep') // council rule: never re-minted
+    expect(c.sessionRef).toBeUndefined()
+    expect(c.resumeSessionId).toBeUndefined()
+  })
+
+  it('a plain identity-less attach that is NOT a FreshUnbound replacement retains the pane\'s sessionRef', () => {
+    // The young-pane guard: an identity-less attach is ORDINARY while the
+    // terminal's identity has not been captured yet (e.g. a young resume
+    // pane waiting for the CLI's association) — no disposition, no
+    // clearing, or the fold would nuke a still-valid resume intent.
+    const store = realStorePanes()
+    seedFreshUnboundReplacedPane(store)
+    const req = buildReconcileRequest(asRootState(store.getState().panes))!
+    const result = resultFor(req, [{
+      paneKey: req.panes[0].paneKey,
+      verdict: 'attach',
+      terminalId: 'term-young',
+    }])
+    foldVerdicts(store.dispatch, req, result)
+
+    const c = leafContent(store)
+    expect(c.terminalId).toBe('term-young')
+    expect(c.sessionRef).toEqual({ provider: 'antigravity', sessionId: 'deleted-conversation' })
+    expect(c.resumeSessionId).toBe('deleted-conversation')
+  })
+
+  it('the attach fold maps the fresh_unbound disposition onto clearSessionIdentity in the dispatched payload', () => {
+    const store = realStorePanes()
+    seedFreshUnboundReplacedPane(store)
+    const req = buildReconcileRequest(asRootState(store.getState().panes))!
+    const { dispatch, dispatched } = recordingDispatch()
+    const result = resultFor(req, [{
+      paneKey: req.panes[0].paneKey,
+      verdict: 'attach',
+      terminalId: 'term-fresh',
+      identityDisposition: 'fresh_unbound',
+    }])
+    foldVerdicts(dispatch, req, result)
+    expect(dispatched.lastPayloadOf(applyReconcileAttach.type)).toMatchObject({
+      tabId: 'tab1',
+      paneId: 'p1',
+      terminalId: 'term-fresh',
+      clearSessionIdentity: true,
+    })
+  })
+
+  // Final-delta review round 2, Fix 1 (Major): the pane missed the live
+  // terminal.replaced frame entirely (disconnected during the server-side
+  // auto-resume), so it ALSO missed that frame's staleSessionNotice — the
+  // only operator-visible explanation naming the lost conversation. The
+  // reconnect verdict must carry the notice beside the fresh_unbound
+  // disposition, and the fold must surface it exactly as the live replaced
+  // fold does: the pane-level dismissible staleSessionNotice.
+  it('the reconnect attach of a FreshUnbound-replaced pane surfaces the stale-id notice the pane missed', () => {
+    const store = realStorePanes()
+    seedFreshUnboundReplacedPane(store)
+    const req = buildReconcileRequest(asRootState(store.getState().panes))!
+    const notice = 'Saved antigravity session 11111111-2222-3333-4444-555555555555 could not be found on disk — started a fresh session instead.'
+    const result = resultFor(req, [{
+      paneKey: req.panes[0].paneKey,
+      verdict: 'attach',
+      terminalId: 'term-fresh',
+      identityDisposition: 'fresh_unbound',
+      staleSessionNotice: notice,
+    }])
+    foldVerdicts(store.dispatch, req, result)
+
+    const c = leafContent(store)
+    expect(c.terminalId).toBe('term-fresh')
+    expect(c.staleSessionNotice).toBe(notice)
+  })
+
+  it('a fresh_unbound attach verdict without a notice (older server) surfaces no stale-session notice', () => {
+    const store = realStorePanes()
+    seedFreshUnboundReplacedPane(store)
+    const req = buildReconcileRequest(asRootState(store.getState().panes))!
+    const result = resultFor(req, [{
+      paneKey: req.panes[0].paneKey,
+      verdict: 'attach',
+      terminalId: 'term-fresh',
+      identityDisposition: 'fresh_unbound',
+    }])
+    foldVerdicts(store.dispatch, req, result)
+
+    expect(leafContent(store).staleSessionNotice).toBeUndefined()
+  })
+
+  it('a plain identity-less attach verdict carries no stale-session notice surface', () => {
+    // The young-pane guard's notice twin: an ORDINARY identity-less attach
+    // (no disposition) never writes a stale-session notice — only the
+    // FreshUnbound reconnect carrier does.
+    const store = realStorePanes()
+    seedFreshUnboundReplacedPane(store)
+    const req = buildReconcileRequest(asRootState(store.getState().panes))!
+    const result = resultFor(req, [{
+      paneKey: req.panes[0].paneKey,
+      verdict: 'attach',
+      terminalId: 'term-young',
+    }])
+    foldVerdicts(store.dispatch, req, result)
+
+    expect(leafContent(store).staleSessionNotice).toBeUndefined()
+  })
+})
+
 describe('foldVerdicts identity guards on every fold arm (auto-restore-warming round-2 findings 2+3)', () => {
   // The guards live in the reducers the fold dispatches to, and the warming
   // refs are minted identity-bound; these pins drive a REAL store through

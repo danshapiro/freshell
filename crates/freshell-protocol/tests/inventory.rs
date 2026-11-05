@@ -43,15 +43,39 @@ fn server_types_match_inventory_exactly() {
     );
 }
 
+/// Focused repair round 4, Nit (protocol array order): the freeze must pin
+/// ORDER, not just membership. `SERVER_MESSAGE_TYPES`'s doc claims "in the
+/// frozen inventory's order", but the set-based check above cannot see a
+/// reorder — the round 2 antigravity promotion landed its two entries
+/// BEFORE amplifier while the inventory lists amplifier first. Element-for-
+/// element, order-sensitive, against the committed inventory file (the same
+/// authority the membership test reads).
 #[test]
-fn combined_surface_is_115() {
+fn server_types_match_inventory_order_exactly() {
+    let inv = inventory();
+    let expected: Vec<&str> = inv["serverToClient"]["types"]
+        .as_array()
+        .expect("types array")
+        .iter()
+        .map(|v| v.as_str().expect("type is string"))
+        .collect();
+    let actual: Vec<&str> = SERVER_MESSAGE_TYPES.to_vec();
+    assert_eq!(
+        actual, expected,
+        "SERVER_MESSAGE_TYPES must list the frozen inventory's types in the \
+         inventory's exact order (the const's own doc claim)"
+    );
+}
+
+#[test]
+fn combined_surface_is_116() {
     let all = all_message_types();
-    assert_eq!(all.len(), 115, "42 client + 73 server = 115 discriminants");
+    assert_eq!(all.len(), 116, "43 client + 73 server = 116 discriminants");
     // sorted + unique
     let unique: BTreeSet<&str> = all.iter().copied().collect();
     assert_eq!(
         unique.len(),
-        115,
+        116,
         "no discriminant collides across directions"
     );
 }

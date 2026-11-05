@@ -638,21 +638,20 @@ describe('TerminalView lifecycle updates', () => {
     }
   })
 
-  it('registers the pane-scoped buffer key that survives terminalId loss (delta fix focused review, finding 2)', async () => {
-    // E2E notice-line assertions must read the xterm buffer API
-    // (renderer-independent), but the terminalId-keyed registration
-    // unregisters exactly when an exited pane clears its terminalId — the
-    // moment the durable-park notice line lands. The PANE-scoped registry
-    // keeps the same buffer reachable by pane id for the component's whole
-    // lifetime, and never leaks into getRegisteredTerminalIds (whose
-    // consumers treat every key as a terminal id).
+  it('registers the pane surface through terminalId loss, recovery, and unmount', async () => {
     const actual = await vi.importActual<typeof import('@xterm/xterm')>('@xterm/xterm')
-    const emulator = new actual.Terminal({ cols: 13, rows: 12, allowProposedApi: true })
+    const emulator = new actual.Terminal({ cols: 40, rows: 8, allowProposedApi: true })
     const { store, tabId, paneId, paneContent } = setupThemeTerminal({
-      terminalId: undefined, status: 'creating',
+      terminalId: undefined,
+      status: 'running',
+      restoreError: buildRestoreError('durable_artifact_missing'),
+      sessionRef: { provider: 'claude', sessionId: 'native-root' },
     })
+    expect(paneContent.terminalId).toBeUndefined()
     installTestHarness(store as never, () => 'ready', async () => {}, () => {}, () => {})
     const harness = window.__FRESHELL_TEST_HARNESS__!
+    const getPaneBuffer = harness.getPaneTerminalBuffer!
+    harness.setTerminalNetworkEffectsSuppressed(paneId, true)
     const view = render(<Provider store={store}>
       <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
     </Provider>)
@@ -660,15 +659,27 @@ describe('TerminalView lifecycle updates', () => {
     expect(term, 'xterm surface must be mounted without a terminalId').toBeTruthy()
     term.buffer = emulator.buffer
     try {
-      const line = 'pane-scoped-buffer-witness-line'
-      await new Promise<void>(done => emulator.write(line, done))
-      // The pane-scoped key reads the pane's rendered buffer.
-      expect(harness.getPaneTerminalBuffer?.(paneId)).toContain(line)
-      // The pane-scoped registry is SEPARATE: this pane registers no
-      // terminalId key at all.
+      // A dead-session pane has a current xterm surface even though its old
+      // runtime terminalId was stripped during restore.
+      expect(getPaneBuffer(paneId)).toEqual(expect.any(String))
+      expect(harness.getTerminalBuffer('term-after-recovery')).toBeNull()
       expect(harness.getRegisteredTerminalIds()).not.toContain(paneId)
+
+      const output = 'PANE_SURFACE_BUFFER'
+      await new Promise<void>(done => emulator.write(`${output}\r\n`, done))
+      expect(getPaneBuffer(paneId)).toContain(output)
+
+      const recoveredContent = { ...paneContent, terminalId: 'term-after-recovery' }
+      view.rerender(<Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={recoveredContent} />
+      </Provider>)
+      expect(getPaneBuffer(paneId)).toContain(output)
+      expect(harness.getTerminalBuffer('term-after-recovery')).toContain(output)
+      expect(harness.getRegisteredTerminalIds()).not.toContain(paneId)
+
       view.unmount()
-      expect(harness.getPaneTerminalBuffer?.(paneId)).toBeNull()
+      expect(getPaneBuffer(paneId)).toBeNull()
+      expect(harness.getTerminalBuffer('term-after-recovery')).toBeNull()
     } finally {
       view.unmount()
       emulator.dispose()
@@ -6512,6 +6523,117 @@ describe('TerminalView lifecycle updates', () => {
         terminalId: 'automatic-replacement-terminal', createRequestId: before.createRequestId, soulId: 'automatic-terminal-soul',
       })
       expect(store.getState().panes.layouts[tabId].content.sessionRef).toEqual(before.sessionRef)
+    })
+
+    // Focused repair round 2, Major 2 — the FreshUnbound replacement: the
+    // resume gate refused the recorded conversation (deleted on disk), the
+    // auto-resume respawn launched an identity-less FRESH conversation, and
+    // the server RELEASED the stale claim (never completing it against the
+    // fresh terminal). The replaced frame's identityDisposition
+    // 'fresh_unbound' must make the pane's fold CLEAR its saved sessionRef
+    // (mirroring the server's identity-less terminal) so the CLI's natural
+    // rebind — a terminal.session.associated with a fresh session id and NO
+    // previousSessionId — folds instead of hitting the association
+    // conflict rule and stranding the pane on the deleted conversation.
+    it('a fresh_unbound terminal.replaced clears the saved session identity and the natural rebind folds', async () => {
+      const { store, tabId, terminalId } = await renderTerminalHarness({
+        mode: 'antigravity', terminalId: 'unbound-old-terminal', fromStore: true, clearSends: false, ackInitialAttach: false,
+        sessionRef: { provider: 'antigravity', sessionId: 'deleted-conversation' },
+      })
+      const content = () => {
+        const root = store.getState().panes.layouts[tabId]
+        if (root.type !== 'leaf') throw new Error('Expected one pane')
+        return root.content
+      }
+      expect(content().sessionRef).toEqual({ provider: 'antigravity', sessionId: 'deleted-conversation' })
+
+      act(() => messageHandler!({ type: 'terminal.replaced', oldTerminalId: terminalId,
+        newTerminalId: 'unbound-fresh-terminal', exitCode: 137, attempt: 1, maxAttempts: 3,
+        identityDisposition: 'fresh_unbound' }))
+      expect(content().terminalId).toBe('unbound-fresh-terminal')
+      expect(content().sessionRef).toBeUndefined()
+      expect(content().createRequestId).toBe('req-v2-stream')   // council rule: never re-minted
+
+      // The natural rebind: the CLI binds the fresh conversation. The
+      // association carries no previousSessionId — the server cannot name
+      // the pane's stale ref — so it only folds because the pane is now
+      // identity-less.
+      act(() => messageHandler!({ type: 'terminal.session.associated', terminalId: 'unbound-fresh-terminal',
+        sessionRef: { provider: 'antigravity', sessionId: 'fresh-conversation' } }))
+      expect(content().sessionRef).toEqual({ provider: 'antigravity', sessionId: 'fresh-conversation' })
+    })
+
+    // Focused repair round 3, Major 2 — the FreshUnbound stale-id notice
+    // must reach the PANE. The server also broadcasts the gate's notice as
+    // a terminal.status{recovering} frame, but for the NEW terminal id
+    // BEFORE terminal.replaced — the pane matches frames by the OLD id it
+    // knows, never sees that frame, and the replaced fold clears the
+    // recovery notice — so the fresh pane shows no explanation naming the
+    // lost conversation. The replaced frame (the path the pane actually
+    // consumes) carries the notice as staleSessionNotice, and the client
+    // surfaces it as a pane-level DISMISSIBLE notice (the setPaneCrashTrace
+    // pattern sitting in the same fold block).
+    it('a fresh_unbound terminal.replaced with staleSessionNotice surfaces the visible dismissible notice', async () => {
+      const notice = 'Saved antigravity session deleted-conversation could not be found on disk — started a fresh session instead.'
+      const { store, tabId, terminalId } = await renderTerminalHarness({
+        mode: 'antigravity', terminalId: 'unbound-notice-old-terminal', fromStore: true, clearSends: false, ackInitialAttach: false,
+        sessionRef: { provider: 'antigravity', sessionId: 'deleted-conversation' },
+      })
+      const content = () => {
+        const root = store.getState().panes.layouts[tabId]
+        if (root.type !== 'leaf') throw new Error('Expected one pane')
+        return root.content
+      }
+
+      act(() => messageHandler!({ type: 'terminal.replaced', oldTerminalId: terminalId,
+        newTerminalId: 'unbound-notice-fresh-terminal', exitCode: 137, attempt: 1, maxAttempts: 3,
+        identityDisposition: 'fresh_unbound', staleSessionNotice: notice }))
+      // The notice is pane-level content (survives reload like the crash
+      // trace until dismissed) and names the stale conversation.
+      expect(content().terminalId).toBe('unbound-notice-fresh-terminal')
+      expect(content().staleSessionNotice).toBe(notice)
+      // It is VISIBLE: the banner renders the notice (priority over the
+      // generic crash trace, which is also set by this fold).
+      const banner = screen.getByTestId('stale-session-notice')
+      expect(banner).toHaveTextContent(notice)
+      expect(banner).toHaveAttribute('role', 'status')
+      // It is DISMISSIBLE (the crash-trace pattern's shape): the Dismiss
+      // button clears the pane-level notice.
+      fireEvent.click(screen.getByRole('button', { name: 'Dismiss antigravity stale session notice' }))
+      expect(content().staleSessionNotice).toBeUndefined()
+      expect(screen.queryByTestId('stale-session-notice')).not.toBeInTheDocument()
+    })
+
+    // The Resumed/MintedReplacement shapes pass NO staleSessionNotice:
+    // their folds stay exactly as today — nothing new surfaces on the
+    // pane, and the legacy replaced frame (no fields at all) does not
+    // either.
+    it('a replaced frame without staleSessionNotice surfaces no stale-session notice', async () => {
+      const { store, tabId, terminalId } = await renderTerminalHarness({
+        mode: 'antigravity', terminalId: 'unbound-silent-old-terminal', fromStore: true, clearSends: false, ackInitialAttach: false,
+        sessionRef: { provider: 'antigravity', sessionId: 'kept-conversation' },
+      })
+      const content = () => {
+        const root = store.getState().panes.layouts[tabId]
+        if (root.type !== 'leaf') throw new Error('Expected one pane')
+        return root.content
+      }
+
+      act(() => messageHandler!({ type: 'terminal.replaced', oldTerminalId: terminalId,
+        newTerminalId: 'unbound-silent-fresh-terminal', exitCode: 137, attempt: 1, maxAttempts: 3,
+        identityDisposition: 'resumed' }))
+      expect(content().terminalId).toBe('unbound-silent-fresh-terminal')
+      expect(content().sessionRef).toEqual({ provider: 'antigravity', sessionId: 'kept-conversation' })
+      expect(content().staleSessionNotice).toBeUndefined()
+      expect(screen.queryByTestId('stale-session-notice')).not.toBeInTheDocument()
+
+      // The legacy frame (no identityDisposition, no notice) stays silent
+      // too — the additive fields never disturb the legacy fold.
+      act(() => messageHandler!({ type: 'terminal.replaced', oldTerminalId: 'unbound-silent-fresh-terminal',
+        newTerminalId: 'unbound-legacy-terminal', exitCode: 137, attempt: 2, maxAttempts: 3 }))
+      expect(content().terminalId).toBe('unbound-legacy-terminal')
+      expect(content().staleSessionNotice).toBeUndefined()
+      expect(screen.queryByTestId('stale-session-notice')).not.toBeInTheDocument()
     })
 
     it('retains an attach target rejected after live to recovering and reattaches after live authority returns', async () => {

@@ -6,7 +6,12 @@
 //   surfaces the user-driven Reopen action (the-usual focused fix 2 —
 //   never an automatic relaunch)
 // - persistent, dismissible crash trace after a successful auto-resume
-//   (kata znhn item 1 — replaces the ephemeral 'resumed' strip).
+//   (kata znhn item 1 — replaces the ephemeral 'resumed' strip)
+// - persistent, dismissible FreshUnbound stale-session notice (focused
+//   repair round 3, Major 2 — the gate's notice naming the refused
+//   conversation, carried on terminal.replaced; rendered AHEAD of the
+//   generic crash trace because it explains what happened to the
+//   conversation)
 // Pure presentational: props in, callbacks out — TerminalView owns the render
 // conditions and the relaunch dispatch.
 import type { AutoResumeNotice } from '../store/terminalLifecycleSlice'
@@ -17,6 +22,10 @@ export interface TerminalExitBannerProps {
   exitCode: number | null
   notice: AutoResumeNotice | null
   crashTrace: CrashTrace | null
+  /** Focused repair round 3, Major 2: the gate's stale-id notice naming the
+   * refused conversation (the FreshUnbound replacement shape) — a
+   * pane-level dismissible notice, mirroring the crash trace. */
+  staleSessionNotice?: string | null
   settledDead: boolean
   /** The killed-session recovery shape (the-usual focused fix 2): the pane's
    * canonical runtime-owner record folded VACANT after a clean (code 0)
@@ -33,6 +42,7 @@ export interface TerminalExitBannerProps {
   onRelaunch: () => void
   onCancelAutoResume: () => void
   onDismissCrashTrace: () => void
+  onDismissStaleSessionNotice: () => void
 }
 
 export function TerminalExitBanner({
@@ -40,6 +50,7 @@ export function TerminalExitBanner({
   exitCode,
   notice,
   crashTrace,
+  staleSessionNotice,
   settledDead,
   vacantRecovery,
   resumeCycles,
@@ -47,6 +58,7 @@ export function TerminalExitBanner({
   onRelaunch,
   onCancelAutoResume,
   onDismissCrashTrace,
+  onDismissStaleSessionNotice,
 }: TerminalExitBannerProps) {
   if (notice) {
     return (
@@ -115,6 +127,30 @@ export function TerminalExitBanner({
           onClick={onRelaunch}
         >
           {canResume ? 'Relaunch — resumes this conversation' : 'Relaunch'}
+        </button>
+      </div>
+    )
+  }
+  // Focused repair round 3, Major 2: the FreshUnbound stale-session notice —
+  // the explanation of what happened to the conversation — renders AHEAD of
+  // the generic crash trace (both ride the same replaced fold; after the
+  // stale notice is dismissed the crash trace shows). role=status, never
+  // alert: e2e happy paths assert alert count 0 (the crash-trace rule).
+  if (staleSessionNotice) {
+    return (
+      <div
+        role="status"
+        data-testid="stale-session-notice"
+        className="flex items-center justify-between gap-2 border-t border-amber-500/30 bg-amber-500/15 px-3 py-1.5 text-sm text-amber-600 dark:text-amber-400"
+      >
+        <span>{staleSessionNotice}</span>
+        <button
+          type="button"
+          aria-label={`Dismiss ${mode} stale session notice`}
+          className="shrink-0 rounded border border-amber-500/40 px-2 py-0.5 text-xs font-medium hover:bg-amber-500/20"
+          onClick={onDismissStaleSessionNotice}
+        >
+          Dismiss
         </button>
       </div>
     )

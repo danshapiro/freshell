@@ -9,7 +9,7 @@ vi.mock('@/lib/api', () => ({
 }))
 
 import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
-import panesReducer, { initLayout, reconcileTerminalSessionRefByTerminalId } from '@/store/panesSlice'
+import panesReducer, { initLayout, applyReconcileAttach, reconcileTerminalSessionRefByTerminalId } from '@/store/panesSlice'
 import { resolvePaneNameRef } from '@/store/selectors/sessionNameSelectors'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { updateTab } from '@/store/tabsSlice'
@@ -103,6 +103,45 @@ describe('terminal-session-association', () => {
 
     expect(result).toBe('conflict')
     expect(dispatch).not.toHaveBeenCalled()
+  })
+
+  // Focused repair round 2, Major 2 — the FreshUnbound natural rebind:
+  // the resume gate refused the pane's recorded conversation (deleted on
+  // disk), the auto-resume respawn launched an identity-less FRESH
+  // conversation, and the server RELEASED the stale claim. The pane must
+  // mirror the identity-less terminal (the terminal.replaced fold with
+  // identityDisposition 'fresh_unbound' clears the saved sessionRef) so
+  // the CLI's later association — a fresh session id with NO
+  // previousSessionId, which the server cannot name the stale ref by —
+  // folds as the natural rebind instead of hitting the conflict rule.
+  it('a FreshUnbound-replaced pane (identity cleared) rebinds to the fresh conversation with no previousSessionId', () => {
+    let panes = panesReducer(undefined, initLayout({
+      tabId: 'tab-1', paneId: 'pane-1',
+      content: {
+        kind: 'terminal', mode: 'antigravity', shell: 'system',
+        createRequestId: 'req-1', terminalId: 'term-old', status: 'running',
+        sessionRef: { provider: 'antigravity', sessionId: 'deleted-conversation' },
+      },
+    }))
+    // The FreshUnbound replacement fold (TerminalView's terminal.replaced
+    // handler): the pane mirrors the server's identity-less replacement.
+    panes = panesReducer(panes, applyReconcileAttach({
+      tabId: 'tab-1', paneId: 'pane-1', terminalId: 'term-new', clearSessionIdentity: true,
+    }))
+    const dispatch = vi.fn((action) => { panes = panesReducer(panes, action) })
+    const getState = () => ({ ...createState({}), panes })
+
+    // The natural rebind: the fresh conversation's association carries no
+    // previousSessionId.
+    const result = reconcileTerminalSessionAssociation({
+      dispatch, getState, terminalId: 'term-new',
+      sessionRef: { provider: 'antigravity', sessionId: 'fresh-conversation' },
+    })
+
+    expect(result).toBe('reconciled')
+    const layout = panes.layouts['tab-1']
+    if (layout.type !== 'leaf') throw new Error('expected a pane')
+    expect(layout.content.sessionRef).toEqual({ provider: 'antigravity', sessionId: 'fresh-conversation' })
   })
 
   it('reconciles matching canonical identity and clears legacy resumeSessionId', () => {

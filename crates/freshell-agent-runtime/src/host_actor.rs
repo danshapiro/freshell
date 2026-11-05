@@ -9,10 +9,12 @@ pub use freshell_runtime_protocol::{
     NativeDispatchIdentity,
 };
 use freshell_runtime_protocol::{
-    CommandState, FreshAgentCapture, FreshAgentNativeNameError, FreshAgentNativeNameOperation,
-    FreshAgentNativeNameReply, FreshAgentRollbackDirection, FreshAgentRollbackMode,
-    FreshAgentTurnSettings, NativeIdentityLaunch, ProviderLaunchContext, ProviderModelSelection,
-    ProviderSecretReference, ProviderSessionReference, RequestId,
+    CommandState, EvidenceStoreState, FreshAgentCapture, FreshAgentNativeNameError,
+    FreshAgentNativeNameOperation, FreshAgentNativeNameReply, FreshAgentRollbackDirection,
+    FreshAgentRollbackMode, FreshAgentTurnSettings, NativeIdentityLaunch,
+    NativeReadinessAbsenceEvidence, NativeReadinessFence, NativeReadinessReceipt,
+    NativeReadinessRecoveryAuthorization, ProviderLaunchContext, ProviderModelSelection,
+    ProviderSecretReference, ProviderSessionReference, RecoveryBlockReason, RequestId, ResumeSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -166,6 +168,11 @@ impl FreshAgentProfile {
                         .as_ref()
                         .is_some_and(|native| native != &reference.session_id)
             })
+            || (self.provider == FreshProvider::Codex
+                && self
+                    .session_ref
+                    .as_ref()
+                    .is_some_and(|reference| reference.provider != "codex"))
         {
             return Err(ActorError::InvalidProfile);
         }
@@ -199,6 +206,73 @@ pub struct TransportStart {
     /// provider identity yet. The event pump records it before it is exposed
     /// as durable inventory.
     pub native_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeReadinessResumeStart {
+    Resumed(TransportStart),
+    PriorThreadNotFound,
+}
+
+/// Closed substep classification for provider startup during cold Codex
+/// native-readiness recovery. These values are safe to retain in host
+/// lifecycle diagnostics and never contain provider output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeReadinessProviderStartCause {
+    ExactResumeValidation,
+    ExactResumeAppServerStart,
+    ExactResumeRpc,
+    ExactResumeCreateRejected,
+    ExactResumeIdentity,
+    ExactResumeSettingsReapply,
+    ReplacementValidation,
+    ReplacementAppServerStart,
+    ReplacementThreadStart,
+    ReplacementCreateFinalize,
+    ReplacementCreateRejected,
+    ReplacementIdentity,
+    Unsupported,
+}
+
+impl NativeReadinessProviderStartCause {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExactResumeValidation => "exact_resume_validation",
+            Self::ExactResumeAppServerStart => "exact_resume_app_server_start",
+            Self::ExactResumeRpc => "exact_resume_rpc",
+            Self::ExactResumeCreateRejected => "exact_resume_create_rejected",
+            Self::ExactResumeIdentity => "exact_resume_identity",
+            Self::ExactResumeSettingsReapply => "exact_resume_settings_reapply",
+            Self::ReplacementValidation => "replacement_validation",
+            Self::ReplacementAppServerStart => "replacement_app_server_start",
+            Self::ReplacementThreadStart => "replacement_thread_start",
+            Self::ReplacementCreateFinalize => "replacement_create_finalize",
+            Self::ReplacementCreateRejected => "replacement_create_rejected",
+            Self::ReplacementIdentity => "replacement_identity",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+/// Safe provider-side classification paired with a recovery startup cause.
+/// The underlying error string is intentionally discarded at this boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeReadinessProviderStartFailure {
+    pub cause: NativeReadinessProviderStartCause,
+    pub diagnostic: ProviderStartDiagnostic,
+}
+
+impl NativeReadinessProviderStartFailure {
+    pub const fn new(
+        cause: NativeReadinessProviderStartCause,
+        diagnostic: ProviderStartDiagnostic,
+    ) -> Self {
+        Self { cause, diagnostic }
+    }
+
+    pub fn from_provider_error(cause: NativeReadinessProviderStartCause, error: &str) -> Self {
+        Self::new(cause, ProviderStartDiagnostic::from_provider_error(error))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,12 +380,62 @@ pub trait FreshAgentTransport: Send + Sync {
     async fn native_identity_evidence(&self) -> Option<Value> {
         None
     }
-    /// Restore provider readiness without sending a user turn or releasing a
-    /// retained permission/effect. The host revalidates native identity next.
-    async fn prepare_native_readiness(&self) -> Result<(), String> {
+    /// Rebind a restarted provider bridge to the next launch in an accepted
+    /// native-readiness receipt before the provider resumes its persisted
+    /// conversation. Implementations without a launch-bound bridge can ignore
+    /// this handoff.
+    async fn restore_native_readiness_receipt(
+        &self,
+        _receipt: &NativeReadinessReceipt,
+    ) -> Result<(), String> {
         Ok(())
     }
+    /// Restore provider readiness without sending a user turn or releasing a
+    /// retained permission/effect. The host revalidates native identity next.
+    async fn prepare_native_readiness(
+        &self,
+        _expected_launch: &NativeIdentityLaunch,
+    ) -> Result<Option<NativeDispatchIdentity>, String> {
+        Ok(None)
+    }
     async fn start(&self, profile: &FreshAgentProfile) -> Result<TransportStart, String>;
+    /// The replacement-only first phase: try the exact prior Codex root using
+    /// the immutable ResumeSpec CWD. A typed missing-root result is returned
+    /// separately so the actor can census the store and journal before minting.
+    async fn start_native_readiness_resume(
+        &self,
+        _profile: &FreshAgentProfile,
+        _resume_spec: &ResumeSpec,
+    ) -> Result<NativeReadinessResumeStart, NativeReadinessProviderStartFailure> {
+        Err(NativeReadinessProviderStartFailure::new(
+            NativeReadinessProviderStartCause::Unsupported,
+            ProviderStartDiagnostic::NoDiagnostic,
+        ))
+    }
+    /// Inspect native provider storage through the transport's existing
+    /// provider-identity boundary. Test transports may use the direct reader
+    /// when their fixture storage belongs to the test process.
+    async fn probe_native_store(
+        &self,
+        resume_spec: &ResumeSpec,
+    ) -> Result<crate::ProviderStoreProbe, String> {
+        Ok(crate::probe_provider_store(
+            Path::new(&resume_spec.provider_home),
+            resume_spec,
+        ))
+    }
+    /// Mint a replacement root only after the actor has persisted its
+    /// attempt-bound mint-in-progress journal.
+    async fn start_native_readiness_replacement(
+        &self,
+        _profile: &FreshAgentProfile,
+        _authorization: &NativeReadinessRecoveryAuthorization,
+    ) -> Result<TransportStart, NativeReadinessProviderStartFailure> {
+        Err(NativeReadinessProviderStartFailure::new(
+            NativeReadinessProviderStartCause::Unsupported,
+            ProviderStartDiagnostic::NoDiagnostic,
+        ))
+    }
     async fn dispatch(
         &self,
         request_id: &RequestId,
@@ -435,6 +559,182 @@ pub trait FreshAgentTransport: Send + Sync {
     fn take_event_stream(&self) -> Option<tokio::sync::mpsc::Receiver<AgentEvent>>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeReadinessProbeFailureCause {
+    ProviderRootNotDirectory,
+    ProviderPathInspectionFailed,
+    ProviderArtifactInspectionFailed,
+    ProviderSymlinkUnresolved,
+    ProviderTreeBoundExceeded,
+    ProviderDirectoryReadFailed,
+    ProviderDirectoryEntryFailed,
+    ProviderArtifactNotRegular,
+    ProviderArtifactMalformedOrOwnerMissing,
+    ProviderArtifactUnreadableOrConflicting,
+    ProviderHistoryIncomplete,
+    NativeClassificationChanged,
+    NativeGenerationUnreadable,
+    NativeGenerationChanged,
+    NativeCensusInvalid,
+}
+
+impl NativeReadinessProbeFailureCause {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderRootNotDirectory => "provider_root_not_directory",
+            Self::ProviderPathInspectionFailed => "provider_path_inspection_failed",
+            Self::ProviderArtifactInspectionFailed => "provider_artifact_inspection_failed",
+            Self::ProviderSymlinkUnresolved => "provider_symlink_unresolved",
+            Self::ProviderTreeBoundExceeded => "provider_tree_bound_exceeded",
+            Self::ProviderDirectoryReadFailed => "provider_directory_read_failed",
+            Self::ProviderDirectoryEntryFailed => "provider_directory_entry_failed",
+            Self::ProviderArtifactNotRegular => "provider_artifact_not_regular",
+            Self::ProviderArtifactMalformedOrOwnerMissing => {
+                "provider_artifact_malformed_or_owner_missing"
+            }
+            Self::ProviderArtifactUnreadableOrConflicting => {
+                "provider_artifact_unreadable_or_conflicting"
+            }
+            Self::ProviderHistoryIncomplete => "provider_history_incomplete",
+            Self::NativeClassificationChanged => "native_classification_changed",
+            Self::NativeGenerationUnreadable => "native_generation_unreadable",
+            Self::NativeGenerationChanged => "native_generation_changed",
+            Self::NativeCensusInvalid => "native_census_invalid",
+        }
+    }
+
+    fn from_probe_repair(repair: Option<&str>) -> Option<Self> {
+        Some(match repair? {
+            "provider store root is not a directory" => Self::ProviderRootNotDirectory,
+            "selected provider store has no established absolute root"
+            | "provider store path is not canonical"
+            | "provider store path could not be inspected"
+            | "repair provider-state volume permissions" => Self::ProviderPathInspectionFailed,
+            "provider native artifact could not be inspected" => {
+                Self::ProviderArtifactInspectionFailed
+            }
+            "provider native store contains an unresolved symlink" => {
+                Self::ProviderSymlinkUnresolved
+            }
+            "provider native store exceeds the bounded directory inspection"
+            | "provider store exceeded the bounded exact-identity probe" => {
+                Self::ProviderTreeBoundExceeded
+            }
+            "provider native directory could not be read" => Self::ProviderDirectoryReadFailed,
+            "provider native directory entry could not be inspected" => {
+                Self::ProviderDirectoryEntryFailed
+            }
+            "provider native artifact is not a regular file" => Self::ProviderArtifactNotRegular,
+            "the selected provider native root contains unreadable or conflicting records" => {
+                Self::ProviderArtifactUnreadableOrConflicting
+            }
+            "provider native artifact has no readable unambiguous owner" => {
+                Self::ProviderArtifactMalformedOrOwnerMissing
+            }
+            "provider native history contains companion or incompletely inspected artifacts; exact-root absence is unresolved" => {
+                Self::ProviderHistoryIncomplete
+            }
+            "native storage classification changed during inspection" => {
+                Self::NativeClassificationChanged
+            }
+            "complete native storage generation could not be inspected" => {
+                Self::NativeGenerationUnreadable
+            }
+            "native storage changed during inspection" => Self::NativeGenerationChanged,
+            "native absence census could not be bound to exact store selection" => {
+                Self::NativeCensusInvalid
+            }
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeReadinessRecoveryStage {
+    Authorization,
+    PersistedReceipt,
+    MissingAuthorization,
+    AbsenceCensus,
+    AbsenceProbeWorker,
+    AbsenceProbeReady,
+    AbsenceProbeBlocked {
+        reason: RecoveryBlockReason,
+        store_state: EvidenceStoreState,
+        failure_cause: Option<NativeReadinessProbeFailureCause>,
+    },
+    AbsenceProbeUnexpected,
+    AbsenceCensusSelectionMismatch,
+    AbsenceCensusEnvironmentMismatch,
+    AbsenceCensusReferenceMissing,
+    AbsenceEvidenceInvalid,
+    ReplacementIdentity,
+    BeforeRebindEvidence,
+    ReboundReceipt,
+    AfterRebindEvidence,
+    StartupEvidence,
+}
+
+impl NativeReadinessRecoveryStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Authorization => "authorization",
+            Self::PersistedReceipt => "persisted_receipt",
+            Self::MissingAuthorization => "missing_authorization",
+            Self::AbsenceCensus => "absence_census",
+            Self::AbsenceProbeWorker => "absence_probe_worker",
+            Self::AbsenceProbeReady => "absence_probe_ready",
+            Self::AbsenceProbeBlocked { .. } => "absence_probe_blocked",
+            Self::AbsenceProbeUnexpected => "absence_probe_unexpected",
+            Self::AbsenceCensusSelectionMismatch => "absence_census_selection_mismatch",
+            Self::AbsenceCensusEnvironmentMismatch => "absence_census_environment_mismatch",
+            Self::AbsenceCensusReferenceMissing => "absence_census_reference_missing",
+            Self::AbsenceEvidenceInvalid => "absence_evidence_invalid",
+            Self::ReplacementIdentity => "replacement_identity",
+            Self::BeforeRebindEvidence => "before_rebind_evidence",
+            Self::ReboundReceipt => "rebound_receipt",
+            Self::AfterRebindEvidence => "after_rebind_evidence",
+            Self::StartupEvidence => "startup_evidence",
+        }
+    }
+
+    pub const fn probe_kind(self) -> Option<&'static str> {
+        match self {
+            Self::AbsenceProbeReady => Some("ready"),
+            Self::AbsenceProbeBlocked { .. } => Some("blocked"),
+            Self::AbsenceProbeUnexpected => Some("unexpected"),
+            _ => None,
+        }
+    }
+
+    pub const fn probe_blocked_reason(self) -> Option<RecoveryBlockReason> {
+        match self {
+            Self::AbsenceProbeBlocked { reason, .. } => Some(reason),
+            _ => None,
+        }
+    }
+
+    pub const fn probe_store_state(self) -> Option<EvidenceStoreState> {
+        match self {
+            Self::AbsenceProbeReady => Some(EvidenceStoreState::PresentReadable),
+            Self::AbsenceProbeBlocked { store_state, .. } => Some(store_state),
+            _ => None,
+        }
+    }
+
+    pub const fn probe_failure_cause(self) -> Option<NativeReadinessProbeFailureCause> {
+        match self {
+            Self::AbsenceProbeBlocked { failure_cause, .. } => failure_cause,
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for NativeReadinessRecoveryStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ActorError {
     #[error("fresh-agent profile is incomplete")]
@@ -443,6 +743,16 @@ pub enum ActorError {
     WriterBusy,
     #[error("fresh-agent native identity mismatch")]
     NativeIdentityMismatch,
+    #[error("fresh-agent native readiness recovery failed during {stage}")]
+    NativeReadinessRecoveryFailed { stage: NativeReadinessRecoveryStage },
+    #[error("fresh-agent persisted profile identity mismatch")]
+    NativeProfileMismatch(NativeProfileMismatchFacts),
+    #[error("fresh-agent native session identity mismatch")]
+    NativeSessionIdentityMismatch {
+        expected_present: bool,
+        observed_present: bool,
+        matches: bool,
+    },
     #[error("request id was reused with different content")]
     RequestConflict,
     #[error("command dispatch is ambiguous and will not be replayed")]
@@ -455,6 +765,11 @@ pub enum ActorError {
     UnsupportedOperation,
     #[error("fresh-agent provider start failed (startup diagnostic: {diagnostic})")]
     ProviderStartFailed { diagnostic: ProviderStartDiagnostic },
+    #[error("fresh-agent native-readiness provider start failed during {cause:?}")]
+    NativeReadinessProviderStartFailed {
+        cause: NativeReadinessProviderStartCause,
+        diagnostic: ProviderStartDiagnostic,
+    },
     #[error("permission request is unknown")]
     UnknownDecision,
     #[error("permission request is already resolved")]
@@ -463,6 +778,230 @@ pub enum ActorError {
     Transport(String),
     #[error("durable fresh-agent state failed: {0}")]
     Persistence(String),
+}
+
+/// Closed classification for the two persisted-profile checks that run before
+/// the provider transport starts. The values are safe to include in lifecycle
+/// logs because they contain no profile data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeProfileMismatchReason {
+    NonConfigurationSecretReferences,
+    PersistedProfileFields,
+}
+
+impl NativeProfileMismatchReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NonConfigurationSecretReferences => "non_configuration_secret_references",
+            Self::PersistedProfileFields => "persisted_profile_fields",
+        }
+    }
+}
+
+/// Boolean equality facts for strict comparison of an incoming profile with
+/// the persisted profile. Never place either profile itself in diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeProfileFieldMatches {
+    pub naming_handle: bool,
+    pub collaboration_mode: bool,
+    pub provider: bool,
+    pub runtime_variant: bool,
+    pub cwd: bool,
+    pub model: bool,
+    pub effort: bool,
+    pub permission_mode: bool,
+    pub sandbox: bool,
+    pub provider_store_id: bool,
+    pub native_session_id: bool,
+    pub plugins: bool,
+    pub model_selection: bool,
+    pub session_ref: bool,
+    pub provider_launch_context: bool,
+    pub provider_secret_references: bool,
+}
+
+impl NativeProfileFieldMatches {
+    fn compare(candidate: &FreshAgentProfile, persisted: &FreshAgentProfile) -> Self {
+        Self {
+            naming_handle: candidate.naming_handle == persisted.naming_handle,
+            collaboration_mode: candidate.collaboration_mode == persisted.collaboration_mode,
+            provider: candidate.provider == persisted.provider,
+            runtime_variant: candidate.runtime_variant == persisted.runtime_variant,
+            cwd: candidate.cwd == persisted.cwd,
+            model: candidate.model == persisted.model,
+            effort: candidate.effort == persisted.effort,
+            permission_mode: candidate.permission_mode == persisted.permission_mode,
+            sandbox: candidate.sandbox == persisted.sandbox,
+            provider_store_id: candidate.provider_store_id == persisted.provider_store_id,
+            native_session_id: candidate.native_session_id == persisted.native_session_id,
+            plugins: candidate.plugins == persisted.plugins,
+            model_selection: candidate.model_selection == persisted.model_selection,
+            session_ref: candidate.session_ref == persisted.session_ref,
+            provider_launch_context: candidate.provider_launch_context
+                == persisted.provider_launch_context,
+            provider_secret_references: candidate.provider_secret_references
+                == persisted.provider_secret_references,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeProfileMismatchFacts {
+    pub reason: NativeProfileMismatchReason,
+    pub non_configuration_secret_references_match: bool,
+    pub profile_fields: Option<NativeProfileFieldMatches>,
+}
+
+impl NativeProfileMismatchFacts {
+    fn changed_non_configuration_secret_references() -> Self {
+        Self {
+            reason: NativeProfileMismatchReason::NonConfigurationSecretReferences,
+            non_configuration_secret_references_match: false,
+            profile_fields: None,
+        }
+    }
+
+    fn persisted_profile_fields(
+        candidate: &FreshAgentProfile,
+        persisted: &FreshAgentProfile,
+    ) -> Self {
+        Self {
+            reason: NativeProfileMismatchReason::PersistedProfileFields,
+            non_configuration_secret_references_match: non_configuration_secret_references_match(
+                &candidate.provider_secret_references,
+                &persisted.provider_secret_references,
+            ),
+            profile_fields: Some(NativeProfileFieldMatches::compare(candidate, persisted)),
+        }
+    }
+}
+
+fn non_configuration_secret_references_match(
+    candidate: &[ProviderSecretReference],
+    persisted: &[ProviderSecretReference],
+) -> bool {
+    candidate
+        .iter()
+        .filter(|reference| !reference.profile.is_configuration_file())
+        .eq(persisted
+            .iter()
+            .filter(|reference| !reference.profile.is_configuration_file()))
+}
+
+fn native_readiness_receipt_matches_source_profile(
+    source_profile: &FreshAgentProfile,
+    persisted: &PersistedActorState,
+) -> bool {
+    let Some(receipt) = persisted.native_readiness_receipt.as_ref() else {
+        return false;
+    };
+    let Some(expected_profile) =
+        native_readiness_receipt_expected_source_profile(source_profile, receipt)
+    else {
+        return false;
+    };
+    expected_profile == persisted.profile
+}
+
+fn native_readiness_receipt_matches_persisted_source_except_cwd_and_name(
+    source_profile: &FreshAgentProfile,
+    persisted: &PersistedActorState,
+    receipt: &NativeReadinessReceipt,
+) -> bool {
+    let Some(mut expected_profile) =
+        native_readiness_receipt_expected_source_profile(source_profile, receipt)
+    else {
+        return false;
+    };
+    let mut persisted_profile = persisted.profile.clone();
+    expected_profile.cwd.clear();
+    persisted_profile.cwd.clear();
+    // This checks that the prior actor profile is exactly the root-transition
+    // target already recorded in `receipt`. The new DB-authorized source
+    // profile may carry a newer accepted name; that name is copied into the
+    // rebound receipt and actor profile only after the full profile/fence
+    // checks below succeed.
+    expected_profile.naming_handle = persisted_profile.naming_handle.clone();
+    expected_profile == persisted_profile
+}
+
+fn native_readiness_receipt_expected_source_profile(
+    source_profile: &FreshAgentProfile,
+    receipt: &NativeReadinessReceipt,
+) -> Option<FreshAgentProfile> {
+    let source_native_session_id = source_profile.native_session_id.as_deref();
+    let previous_native_session_id = receipt.identity.previous_native_session_id.as_str();
+    if source_profile.provider != FreshProvider::Codex
+        || !receipt.is_valid()
+        || receipt.source_launch.execution_generation == 0
+        || receipt
+            .source_launch
+            .requested_native_session_id
+            .as_deref()
+            .is_some_and(|requested| requested != previous_native_session_id)
+        || source_native_session_id.is_some_and(|source| source != previous_native_session_id)
+        || source_profile
+            .session_ref
+            .as_ref()
+            .is_some_and(|reference| reference.session_id != previous_native_session_id)
+    {
+        return None;
+    }
+
+    let mut expected_profile = source_profile.clone();
+    expected_profile.native_session_id = Some(receipt.identity.native_session_id.clone());
+    expected_profile.naming_handle = receipt.identity.pending_naming_handle.clone();
+    if let Some(reference) = expected_profile.session_ref.as_mut() {
+        reference.session_id = receipt.identity.native_session_id.clone();
+    }
+    Some(expected_profile)
+}
+
+fn native_readiness_receipt_matches_next_profile(
+    profile: &FreshAgentProfile,
+    receipt: &NativeReadinessReceipt,
+) -> bool {
+    receipt.is_valid()
+        && profile.provider == FreshProvider::Codex
+        && receipt.absence_evidence.as_ref().is_none_or(|evidence| {
+            evidence.provider == FreshProvider::Codex.as_str()
+                && evidence.provider_store_id == profile.provider_store_id
+        })
+        && profile.native_session_id.as_deref() == Some(receipt.identity.native_session_id.as_str())
+        && profile.naming_handle == receipt.identity.pending_naming_handle
+        && profile.session_ref.as_ref().is_none_or(|reference| {
+            reference.provider == FreshProvider::Codex.as_str()
+                && reference.session_id == receipt.identity.native_session_id
+        })
+}
+
+fn native_readiness_receipt_can_be_superseded(
+    profile: &FreshAgentProfile,
+    receipt: &NativeReadinessReceipt,
+    recovery: Option<(&NativeReadinessRecoveryAuthorization, &ResumeSpec)>,
+) -> bool {
+    let Some(absence) = receipt.absence_evidence.as_ref() else {
+        return false;
+    };
+    if !native_readiness_receipt_matches_next_profile(profile, receipt) {
+        return false;
+    }
+    match recovery {
+        None => true,
+        Some((authorization, resume_spec)) => {
+            authorization.prior_incarnation_id == receipt.next_launch.incarnation_id
+                && authorization.source_launch.incarnation_id != receipt.next_launch.incarnation_id
+                && authorization.source_launch.evidence_revision
+                    == receipt.next_launch.evidence_revision
+                && authorization
+                    .source_launch
+                    .requested_native_session_id
+                    .as_deref()
+                    == Some(receipt.identity.native_session_id.as_str())
+                && absence.provider_store_id == resume_spec.provider_session.provider_store_id
+                && valid_native_readiness_recovery_source(profile, authorization, resume_spec)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -477,7 +1016,7 @@ pub enum ProviderStartDiagnostic {
 }
 
 impl ProviderStartDiagnostic {
-    fn from_provider_error(error: &str) -> Self {
+    pub fn from_provider_error(error: &str) -> Self {
         let Some((_, suffix)) = error.rsplit_once("startup diagnostic:") else {
             return Self::NoDiagnostic;
         };
@@ -494,6 +1033,18 @@ impl ProviderStartDiagnostic {
             "network" => Self::Network,
             "no-diagnostic" => Self::NoDiagnostic,
             _ => Self::Unclassified,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Authentication => "authentication",
+            Self::Arguments => "arguments",
+            Self::Listener => "listener",
+            Self::Configuration => "configuration",
+            Self::Network => "network",
+            Self::Unclassified => "unclassified",
+            Self::NoDiagnostic => "no_diagnostic",
         }
     }
 }
@@ -586,6 +1137,10 @@ struct PersistedActorState {
     #[serde(default = "new_actor_journal_id")]
     journal_id: String,
     profile: FreshAgentProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_readiness_receipt: Option<NativeReadinessReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_readiness_mint_in_progress: Option<NativeReadinessMintJournal>,
     #[serde(default)]
     initialization_state: Option<CommandState>,
     commands: BTreeMap<String, PersistedCommand>,
@@ -600,12 +1155,21 @@ struct PersistedActorState {
     retained_from: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NativeReadinessMintJournal {
+    authorization: NativeReadinessRecoveryAuthorization,
+    absence_evidence: NativeReadinessAbsenceEvidence,
+}
+
 impl PersistedActorState {
     fn new(profile: FreshAgentProfile) -> Self {
         Self {
             schema_version: 1,
             journal_id: new_actor_journal_id(),
             profile,
+            native_readiness_receipt: None,
+            native_readiness_mint_in_progress: None,
             initialization_state: None,
             commands: BTreeMap::new(),
             completed_forks: BTreeMap::new(),
@@ -678,6 +1242,225 @@ pub struct FreshAgentHostActor {
     _writer_lock: WriterLock,
 }
 
+fn valid_native_readiness_recovery_source(
+    profile: &FreshAgentProfile,
+    authorization: &NativeReadinessRecoveryAuthorization,
+    resume_spec: &ResumeSpec,
+) -> bool {
+    let Some(source_root) = authorization
+        .source_launch
+        .requested_native_session_id
+        .as_deref()
+    else {
+        return false;
+    };
+    authorization.is_valid()
+        && authorization.resume_spec_sha256
+            == freshell_runtime_protocol::resume_spec_sha256(resume_spec)
+        && profile.provider == FreshProvider::Codex
+        && profile.native_session_id.as_deref() == Some(source_root)
+        && profile.provider_store_id == resume_spec.provider_session.provider_store_id
+        && resume_spec.provider_session.provider == FreshProvider::Codex.as_str()
+        && resume_spec.provider_session.native_session_id == source_root
+        && resume_spec.mode == "freshcodex"
+        && resume_spec.runtime_variant == profile.runtime_variant
+        && resume_spec.evidence_revision == authorization.source_fence.evidence_revision
+        && profile.session_ref.as_ref().is_none_or(|reference| {
+            reference.provider == FreshProvider::Codex.as_str()
+                && reference.session_id == source_root
+        })
+}
+
+async fn codex_native_absence_evidence(
+    authorization: &NativeReadinessRecoveryAuthorization,
+    resume_spec: &ResumeSpec,
+    transport: &dyn FreshAgentTransport,
+) -> Result<NativeReadinessAbsenceEvidence, NativeReadinessRecoveryStage> {
+    if resume_spec.provider_session.provider != FreshProvider::Codex.as_str()
+        || resume_spec.evidence_revision != authorization.source_fence.evidence_revision
+    {
+        return Err(NativeReadinessRecoveryStage::AbsenceCensusSelectionMismatch);
+    }
+    let source_root = authorization
+        .source_launch
+        .requested_native_session_id
+        .as_deref()
+        .ok_or(NativeReadinessRecoveryStage::AbsenceCensusSelectionMismatch)?;
+    if resume_spec.provider_session.native_session_id != source_root {
+        return Err(NativeReadinessRecoveryStage::AbsenceCensusSelectionMismatch);
+    }
+    let probe = transport
+        .probe_native_store(resume_spec)
+        .await
+        .map_err(|_| NativeReadinessRecoveryStage::AbsenceProbeWorker)?;
+    let (evidence, store_state) = match probe {
+        crate::ProviderStoreProbe::DefinitivelyUnavailable {
+            evidence,
+            store_state,
+            ..
+        } => (evidence, store_state),
+        crate::ProviderStoreProbe::Ready { .. } => {
+            return Err(NativeReadinessRecoveryStage::AbsenceProbeReady);
+        }
+        crate::ProviderStoreProbe::Blocked {
+            reason, retry_hint, ..
+        } => {
+            let store_state = match reason {
+                RecoveryBlockReason::StoreMissing => EvidenceStoreState::Missing,
+                _ => EvidenceStoreState::Unknown,
+            };
+            return Err(NativeReadinessRecoveryStage::AbsenceProbeBlocked {
+                reason,
+                store_state,
+                failure_cause: NativeReadinessProbeFailureCause::from_probe_repair(
+                    retry_hint.repair.as_deref(),
+                ),
+            });
+        }
+        crate::ProviderStoreProbe::ParentBackedClaudeFork { .. } => {
+            return Err(NativeReadinessRecoveryStage::AbsenceProbeUnexpected);
+        }
+    };
+    if !crate::native_absence_census_matches(
+        FreshProvider::Codex.as_str(),
+        &resume_spec.provider_session.provider_store_id,
+        source_root,
+        authorization.source_fence.evidence_revision,
+        store_state,
+        &evidence,
+    ) {
+        return Err(NativeReadinessRecoveryStage::AbsenceCensusSelectionMismatch);
+    }
+    if !crate::native_absence_census_environment_matches(resume_spec, &evidence) {
+        return Err(NativeReadinessRecoveryStage::AbsenceCensusEnvironmentMismatch);
+    }
+    let census_reference = crate::canonical_native_absence_census_reference(&evidence)
+        .ok_or(NativeReadinessRecoveryStage::AbsenceCensusReferenceMissing)?;
+    let proof = NativeReadinessAbsenceEvidence {
+        prior_incarnation_id: authorization.prior_incarnation_id.clone(),
+        provider: FreshProvider::Codex.as_str().into(),
+        provider_store_id: resume_spec.provider_session.provider_store_id.clone(),
+        native_session_id: source_root.into(),
+        evidence_revision: authorization.source_fence.evidence_revision,
+        store_state,
+        census_reference,
+    };
+    if !proof.is_valid_for(&authorization.source_launch) {
+        return Err(NativeReadinessRecoveryStage::AbsenceEvidenceInvalid);
+    }
+    Ok(proof)
+}
+
+fn receipt_matches_startup_authorization(
+    receipt: &NativeReadinessReceipt,
+    authorization: &NativeReadinessRecoveryAuthorization,
+    profile: &FreshAgentProfile,
+    resume_spec: &ResumeSpec,
+) -> bool {
+    let Some(evidence) = receipt.absence_evidence.as_ref() else {
+        return false;
+    };
+    if !valid_native_readiness_recovery_source(profile, authorization, resume_spec)
+        || !receipt.is_valid()
+        || !receipt
+            .source_fence
+            .is_covered_by(&authorization.source_fence)
+        || receipt.source_launch != authorization.source_launch
+        || evidence.prior_incarnation_id != authorization.prior_incarnation_id
+        || evidence.provider_store_id != resume_spec.provider_session.provider_store_id
+        || evidence.native_session_id != resume_spec.provider_session.native_session_id
+        || evidence.evidence_revision != authorization.source_fence.evidence_revision
+        || receipt.resume_spec_sha256.as_deref() != Some(authorization.resume_spec_sha256.as_str())
+    {
+        return false;
+    }
+    let census_references = std::slice::from_ref(&evidence.census_reference);
+    crate::native_absence_census_matches(
+        &evidence.provider,
+        &evidence.provider_store_id,
+        &evidence.native_session_id,
+        evidence.evidence_revision,
+        evidence.store_state,
+        census_references,
+    ) && crate::native_absence_census_environment_matches(resume_spec, census_references)
+}
+
+async fn rebound_cold_readiness_receipt(
+    source_profile: &FreshAgentProfile,
+    persisted: &PersistedActorState,
+    receipt: &NativeReadinessReceipt,
+    authorization: &NativeReadinessRecoveryAuthorization,
+    resume_spec: &ResumeSpec,
+    transport: &dyn FreshAgentTransport,
+) -> Option<NativeReadinessReceipt> {
+    let source_root = authorization
+        .source_launch
+        .requested_native_session_id
+        .as_deref()?;
+    let old_absence = receipt.absence_evidence.as_ref()?;
+    let old_fence = &receipt.source_fence;
+    let current_fence = &authorization.source_fence;
+    if !valid_native_readiness_recovery_source(source_profile, authorization, resume_spec)
+        || !receipt.is_valid()
+        || !native_readiness_receipt_matches_next_profile(&persisted.profile, receipt)
+        || !native_readiness_receipt_matches_persisted_source_except_cwd_and_name(
+            source_profile,
+            persisted,
+            receipt,
+        )
+        || receipt.resume_spec_sha256.as_deref() != Some(authorization.resume_spec_sha256.as_str())
+        || receipt.source_launch.incarnation_id != old_fence.active_incarnation_id
+        || receipt.source_launch.incarnation_id == authorization.source_launch.incarnation_id
+        || receipt.source_launch.requested_native_session_id.as_deref() != Some(source_root)
+        || receipt.identity.previous_native_session_id != source_root
+        || receipt.source_launch.evidence_revision != authorization.source_launch.evidence_revision
+        || old_fence.control_epoch > current_fence.control_epoch
+        || old_fence.intent_revision != current_fence.intent_revision
+        || old_fence.identity_revision != current_fence.identity_revision
+        || old_fence.evidence_revision != current_fence.evidence_revision
+        || old_fence.native_import_revision != current_fence.native_import_revision
+        || old_fence.recovery_attempt_id.is_none()
+        || old_absence.provider != FreshProvider::Codex.as_str()
+        || old_absence.provider_store_id != resume_spec.provider_session.provider_store_id
+        || old_absence.native_session_id != source_root
+        || old_absence.evidence_revision != current_fence.evidence_revision
+        || !crate::native_absence_census_matches(
+            &old_absence.provider,
+            &old_absence.provider_store_id,
+            &old_absence.native_session_id,
+            old_absence.evidence_revision,
+            old_absence.store_state,
+            std::slice::from_ref(&old_absence.census_reference),
+        )
+        || !crate::native_absence_census_environment_matches(
+            resume_spec,
+            std::slice::from_ref(&old_absence.census_reference),
+        )
+    {
+        return None;
+    }
+
+    // The original receipt proves that R1 was accepted after R0 went missing.
+    // Re-census R0 under this attempt before rebinding the proof to its fence.
+    let absence_evidence = codex_native_absence_evidence(authorization, resume_spec, transport)
+        .await
+        .ok()?;
+    let mut next_launch = authorization.source_launch.clone();
+    next_launch.evidence_revision = next_launch.evidence_revision.checked_add(1)?;
+    next_launch.requested_native_session_id = Some(receipt.identity.native_session_id.clone());
+    let mut identity = receipt.identity.clone();
+    identity.pending_naming_handle = source_profile.naming_handle.clone();
+    let rebound = NativeReadinessReceipt {
+        source_fence: authorization.source_fence.clone(),
+        source_launch: authorization.source_launch.clone(),
+        next_launch,
+        identity,
+        absence_evidence: Some(absence_evidence),
+        resume_spec_sha256: Some(authorization.resume_spec_sha256.clone()),
+    };
+    rebound.is_valid().then_some(rebound)
+}
+
 impl FreshAgentHostActor {
     /// The deterministic qualification transport persists its decision in its
     /// owned provider store. This opening path is selected only after the
@@ -695,6 +1478,7 @@ impl FreshAgentHostActor {
             DEFAULT_EVENT_BYTES,
             DEFAULT_EVENT_COUNT,
             true,
+            None,
         )
         .await
     }
@@ -794,6 +1578,26 @@ impl FreshAgentHostActor {
             event_byte_cap,
             event_count_cap,
             false,
+            None,
+        )
+        .await
+    }
+
+    pub async fn open_with_native_readiness_recovery(
+        state_dir: impl Into<PathBuf>,
+        profile: FreshAgentProfile,
+        transport: Arc<dyn FreshAgentTransport>,
+        authorization: NativeReadinessRecoveryAuthorization,
+        resume_spec: ResumeSpec,
+    ) -> Result<Arc<Self>, ActorError> {
+        Self::open_with_callback_lifetime(
+            state_dir,
+            profile,
+            transport,
+            DEFAULT_EVENT_BYTES,
+            DEFAULT_EVENT_COUNT,
+            false,
+            Some((authorization, resume_spec)),
         )
         .await
     }
@@ -805,6 +1609,7 @@ impl FreshAgentHostActor {
         event_byte_cap: usize,
         event_count_cap: usize,
         deterministic_fixture: bool,
+        native_readiness_recovery: Option<(NativeReadinessRecoveryAuthorization, ResumeSpec)>,
     ) -> Result<Arc<Self>, ActorError> {
         profile.validate()?;
         if event_byte_cap == 0 || event_count_cap == 0 {
@@ -814,16 +1619,25 @@ impl FreshAgentHostActor {
         fs::create_dir_all(&state_dir).map_err(persist)?;
         let writer_lock = WriterLock::acquire(&state_dir.join("fresh-agent-writer.lock"))?;
         let state_path = state_dir.join("fresh-agent-state.json");
+        let launch_profile = profile.clone();
+        let mut startup_readiness_receipt = None;
         let (mut state, newly_initialized) = match fs::read(&state_path) {
             Ok(bytes) => {
                 let mut loaded: PersistedActorState =
                     serde_json::from_slice(&bytes).map_err(persist)?;
+                // A provider `thread/start` is not idempotent. If the actor
+                // crashed after writing its mint journal but before writing
+                // the receipt with the new root, never issue another start.
+                if loaded.native_readiness_mint_in_progress.is_some() {
+                    return Err(ActorError::AmbiguousDispatch);
+                }
                 // A successful transport start may still have returned no
                 // identity. Reopening that durable actor must not create a
                 // second conversation from missing metadata alone.
                 if loaded.profile.native_session_id.is_none() {
                     return Err(ActorError::AmbiguousDispatch);
                 }
+                let mut source_profile = profile.clone();
                 let mut expected_profile = profile.clone();
                 if expected_profile.native_session_id.is_none() {
                     expected_profile.native_session_id = loaded.profile.native_session_id.clone();
@@ -836,24 +1650,141 @@ impl FreshAgentHostActor {
                 if current_preparation.is_some() {
                     // Configuration-file references belong to the host-validated
                     // preparation. Legacy OneCLI grants remain durable settings.
-                    if !current_references
-                        .iter()
-                        .filter(|reference| !reference.profile.is_configuration_file())
-                        .eq(loaded
-                            .profile
-                            .provider_secret_references
-                            .iter()
-                            .filter(|reference| !reference.profile.is_configuration_file()))
-                    {
-                        return Err(ActorError::NativeIdentityMismatch);
+                    if !non_configuration_secret_references_match(
+                        &current_references,
+                        &loaded.profile.provider_secret_references,
+                    ) {
+                        return Err(ActorError::NativeProfileMismatch(
+                            NativeProfileMismatchFacts::changed_non_configuration_secret_references(
+                            ),
+                        ));
                     }
                     expected_profile.provider_secret_references =
                         loaded.profile.provider_secret_references.clone();
                     expected_profile.provider_launch_context =
                         loaded.profile.provider_launch_context.clone();
+                    source_profile.provider_secret_references =
+                        loaded.profile.provider_secret_references.clone();
+                    source_profile.provider_launch_context =
+                        loaded.profile.provider_launch_context.clone();
                 }
-                if loaded.profile != expected_profile {
-                    return Err(ActorError::NativeIdentityMismatch);
+                let persisted_profile_is_receipt_target = loaded
+                    .native_readiness_receipt
+                    .as_ref()
+                    .is_some_and(|receipt| {
+                        native_readiness_receipt_matches_next_profile(&loaded.profile, receipt)
+                    });
+                let persisted_cold_receipt_targets_launch = loaded
+                    .native_readiness_receipt
+                    .as_ref()
+                    .is_some_and(|receipt| {
+                        receipt.absence_evidence.is_some()
+                            && persisted_profile_is_receipt_target
+                            && loaded.profile.native_session_id
+                                == expected_profile.native_session_id
+                    });
+                let rebound_startup_receipt =
+                    if let (Some(receipt), Some((authorization, resume_spec))) = (
+                        loaded.native_readiness_receipt.as_ref(),
+                        native_readiness_recovery.as_ref(),
+                    ) {
+                        rebound_cold_readiness_receipt(
+                            &source_profile,
+                            &loaded,
+                            receipt,
+                            authorization,
+                            resume_spec,
+                            transport.as_ref(),
+                        )
+                        .await
+                    } else {
+                        None
+                    };
+                let authorized_codex_cwd_rebase = (loaded.native_readiness_receipt.is_none()
+                    && native_readiness_recovery.as_ref().is_some_and(
+                        |(authorization, resume_spec)| {
+                            valid_native_readiness_recovery_source(
+                                &expected_profile,
+                                authorization,
+                                resume_spec,
+                            ) && loaded.profile.native_session_id.as_deref()
+                                == authorization
+                                    .source_launch
+                                    .requested_native_session_id
+                                    .as_deref()
+                        },
+                    ))
+                    || persisted_cold_receipt_targets_launch;
+                let authorized_codex_cwd_rebase = authorized_codex_cwd_rebase
+                    && loaded.profile.provider == FreshProvider::Codex
+                    && expected_profile.provider == FreshProvider::Codex
+                    && loaded.profile.native_session_id == expected_profile.native_session_id
+                    && loaded.profile.cwd != expected_profile.cwd
+                    && {
+                        let mut persisted_without_cwd = loaded.profile.clone();
+                        let mut expected_without_cwd = expected_profile.clone();
+                        persisted_without_cwd.cwd.clear();
+                        expected_without_cwd.cwd.clear();
+                        persisted_without_cwd == expected_without_cwd
+                    };
+                let source_profile_matches_receipt = loaded.profile != expected_profile
+                    && native_readiness_receipt_matches_source_profile(&source_profile, &loaded);
+                if loaded.profile != expected_profile
+                    && !source_profile_matches_receipt
+                    && rebound_startup_receipt.is_none()
+                    && !authorized_codex_cwd_rebase
+                {
+                    return Err(ActorError::NativeProfileMismatch(
+                        NativeProfileMismatchFacts::persisted_profile_fields(
+                            &expected_profile,
+                            &loaded.profile,
+                        ),
+                    ));
+                }
+                if rebound_startup_receipt.is_some() {
+                    // The source receipt belongs to an earlier incarnation,
+                    // while this DB-issued attempt still fences the same old
+                    // root. Keep the accepted profile CWD and naming handle,
+                    // but rebind the receipt only after a fresh census and
+                    // exact R1 start.
+                    loaded.profile.cwd = expected_profile.cwd.clone();
+                    loaded.profile.naming_handle = expected_profile.naming_handle.clone();
+                } else if authorized_codex_cwd_rebase {
+                    // Keep the accepted launch CWD in the actor profile. For a
+                    // first cold replacement the authorization binds the old
+                    // resume proof; after a committed root replacement the
+                    // persisted receipt binds the exact current root. The old
+                    // ResumeSpec CWD remains immutable store-selection evidence.
+                    loaded.profile.cwd = expected_profile.cwd.clone();
+                }
+                let can_supersede_receipt =
+                    loaded
+                        .native_readiness_receipt
+                        .as_ref()
+                        .is_some_and(|receipt| {
+                            native_readiness_receipt_can_be_superseded(
+                                &loaded.profile,
+                                receipt,
+                                native_readiness_recovery
+                                    .as_ref()
+                                    .map(|(authorization, spec)| (authorization, spec)),
+                            ) && launch_profile.native_session_id.as_deref()
+                                == Some(receipt.identity.native_session_id.as_str())
+                                && loaded.profile == expected_profile
+                        });
+                if can_supersede_receipt {
+                    // The previous root transition is already represented by
+                    // the exact persisted profile. A later incarnation must
+                    // perform its own strict resume/readiness check instead of
+                    // replaying the previous incarnation's receipt.
+                    loaded.native_readiness_receipt = None;
+                } else if let Some(receipt) = rebound_startup_receipt {
+                    loaded.native_readiness_receipt = Some(receipt.clone());
+                    startup_readiness_receipt = Some(receipt);
+                } else if persisted_profile_is_receipt_target
+                    && (loaded.profile == expected_profile || source_profile_matches_receipt)
+                {
+                    startup_readiness_receipt = loaded.native_readiness_receipt.clone();
                 }
                 loaded.profile.provider_launch_context = current_preparation;
                 loaded.profile.provider_secret_references = current_references;
@@ -897,6 +1828,44 @@ impl FreshAgentHostActor {
             Err(error) => return Err(persist(error)),
         };
 
+        match native_readiness_recovery.as_ref() {
+            Some((authorization, resume_spec)) => {
+                if newly_initialized
+                    || !valid_native_readiness_recovery_source(
+                        &launch_profile,
+                        authorization,
+                        resume_spec,
+                    )
+                {
+                    return Err(ActorError::NativeReadinessRecoveryFailed {
+                        stage: NativeReadinessRecoveryStage::Authorization,
+                    });
+                }
+                if let Some(receipt) = state.native_readiness_receipt.as_ref() {
+                    if !receipt_matches_startup_authorization(
+                        receipt,
+                        authorization,
+                        &launch_profile,
+                        resume_spec,
+                    ) {
+                        return Err(ActorError::NativeReadinessRecoveryFailed {
+                            stage: NativeReadinessRecoveryStage::PersistedReceipt,
+                        });
+                    }
+                }
+            }
+            None if state
+                .native_readiness_receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.absence_evidence.is_some()) =>
+            {
+                return Err(ActorError::NativeReadinessRecoveryFailed {
+                    stage: NativeReadinessRecoveryStage::MissingAuthorization,
+                });
+            }
+            None => {}
+        }
+
         if let Some(context) = state.claude_fork_state.clone() {
             validate_claude_fork_state(&context, &state.profile)?;
             transport
@@ -929,15 +1898,169 @@ impl FreshAgentHostActor {
             state.initialization_state = Some(CommandState::Dispatching);
             write_state(&state_dir, &state)?;
         }
-        let started = transport.start(&state.profile).await.map_err(|error| {
-            ActorError::ProviderStartFailed {
-                diagnostic: ProviderStartDiagnostic::from_provider_error(&error),
+        if let Some(receipt) = startup_readiness_receipt.as_ref() {
+            transport
+                .restore_native_readiness_receipt(receipt)
+                .await
+                .map_err(ActorError::Transport)?;
+        }
+        let started = if startup_readiness_receipt.is_none() {
+            if let Some((authorization, resume_spec)) = native_readiness_recovery.as_ref() {
+                match transport
+                    .start_native_readiness_resume(&state.profile, resume_spec)
+                    .await
+                    .map_err(|failure| ActorError::NativeReadinessProviderStartFailed {
+                        cause: failure.cause,
+                        diagnostic: failure.diagnostic,
+                    })? {
+                    NativeReadinessResumeStart::Resumed(started) => started,
+                    NativeReadinessResumeStart::PriorThreadNotFound => {
+                        let absence_evidence = codex_native_absence_evidence(
+                            authorization,
+                            resume_spec,
+                            transport.as_ref(),
+                        )
+                        .await
+                        .map_err(|stage| ActorError::NativeReadinessRecoveryFailed { stage })?;
+                        state.native_readiness_mint_in_progress =
+                            Some(NativeReadinessMintJournal {
+                                authorization: authorization.clone(),
+                                absence_evidence: absence_evidence.clone(),
+                            });
+                        write_state(&state_dir, &state)?;
+
+                        let started = transport
+                            .start_native_readiness_replacement(&state.profile, authorization)
+                            .await
+                            .map_err(|failure| ActorError::NativeReadinessProviderStartFailed {
+                                cause: failure.cause,
+                                diagnostic: failure.diagnostic,
+                            })?;
+                        let previous = authorization
+                            .source_launch
+                            .requested_native_session_id
+                            .as_deref()
+                            .ok_or(ActorError::NativeReadinessRecoveryFailed {
+                                stage: NativeReadinessRecoveryStage::Authorization,
+                            })?;
+                        let Some(next_root) = started.native_session_id.as_deref() else {
+                            return Err(ActorError::NativeReadinessRecoveryFailed {
+                                stage: NativeReadinessRecoveryStage::ReplacementIdentity,
+                            });
+                        };
+                        if next_root.is_empty()
+                            || next_root == previous
+                            || next_root.chars().any(char::is_control)
+                        {
+                            return Err(ActorError::NativeReadinessRecoveryFailed {
+                                stage: NativeReadinessRecoveryStage::ReplacementIdentity,
+                            });
+                        }
+                        let before_rebind = transport.native_identity_evidence().await.ok_or(
+                            ActorError::NativeReadinessRecoveryFailed {
+                                stage: NativeReadinessRecoveryStage::BeforeRebindEvidence,
+                            },
+                        )?;
+                        let before_launch: NativeIdentityLaunch = serde_json::from_value(
+                            before_rebind["launch"].clone(),
+                        )
+                        .map_err(|_| ActorError::NativeReadinessRecoveryFailed {
+                            stage: NativeReadinessRecoveryStage::BeforeRebindEvidence,
+                        })?;
+                        if before_launch != authorization.source_launch
+                            || before_rebind["nativeSessionId"].as_str() != Some(next_root)
+                        {
+                            return Err(ActorError::NativeReadinessRecoveryFailed {
+                                stage: NativeReadinessRecoveryStage::BeforeRebindEvidence,
+                            });
+                        }
+                        let mut next_launch = authorization.source_launch.clone();
+                        next_launch.evidence_revision = next_launch
+                            .evidence_revision
+                            .checked_add(1)
+                            .ok_or(ActorError::NativeIdentityMismatch)?;
+                        next_launch.requested_native_session_id = Some(next_root.to_string());
+                        let receipt = NativeReadinessReceipt {
+                            source_fence: authorization.source_fence.clone(),
+                            source_launch: authorization.source_launch.clone(),
+                            next_launch: next_launch.clone(),
+                            identity: NativeDispatchIdentity {
+                                native_session_id: next_root.to_string(),
+                                previous_native_session_id: previous.to_string(),
+                                pending_naming_handle: state.profile.naming_handle.clone(),
+                            },
+                            absence_evidence: Some(absence_evidence),
+                            resume_spec_sha256: Some(authorization.resume_spec_sha256.clone()),
+                        };
+                        if !receipt.is_valid() {
+                            return Err(ActorError::NativeReadinessRecoveryFailed {
+                                stage: NativeReadinessRecoveryStage::ReboundReceipt,
+                            });
+                        }
+                        transport
+                            .restore_native_readiness_receipt(&receipt)
+                            .await
+                            .map_err(ActorError::Transport)?;
+                        let after_rebind = transport.native_identity_evidence().await.ok_or(
+                            ActorError::NativeReadinessRecoveryFailed {
+                                stage: NativeReadinessRecoveryStage::AfterRebindEvidence,
+                            },
+                        )?;
+                        let after_launch: NativeIdentityLaunch = serde_json::from_value(
+                            after_rebind["launch"].clone(),
+                        )
+                        .map_err(|_| ActorError::NativeReadinessRecoveryFailed {
+                            stage: NativeReadinessRecoveryStage::AfterRebindEvidence,
+                        })?;
+                        if after_launch != next_launch
+                            || after_rebind["nativeSessionId"].as_str() != Some(next_root)
+                        {
+                            return Err(ActorError::NativeReadinessRecoveryFailed {
+                                stage: NativeReadinessRecoveryStage::AfterRebindEvidence,
+                            });
+                        }
+                        state.profile.native_session_id = Some(next_root.to_string());
+                        state.profile.naming_handle =
+                            receipt.identity.pending_naming_handle.clone();
+                        if let Some(reference) = state.profile.session_ref.as_mut() {
+                            reference.session_id = next_root.to_string();
+                        }
+                        push_event_bounded(
+                            &mut state,
+                            AgentEvent::Started {
+                                native_session_id: next_root.to_string(),
+                            },
+                            event_byte_cap,
+                            event_count_cap,
+                        )?;
+                        state.native_readiness_receipt = Some(receipt);
+                        state.native_readiness_mint_in_progress = None;
+                        started
+                    }
+                }
+            } else {
+                transport.start(&state.profile).await.map_err(|error| {
+                    ActorError::ProviderStartFailed {
+                        diagnostic: ProviderStartDiagnostic::from_provider_error(&error),
+                    }
+                })?
             }
-        })?;
+        } else {
+            transport.start(&state.profile).await.map_err(|error| {
+                ActorError::ProviderStartFailed {
+                    diagnostic: ProviderStartDiagnostic::from_provider_error(&error),
+                }
+            })?
+        };
         let observed_native_session_id = started.native_session_id.clone();
         if let Some(expected) = state.profile.native_session_id.as_deref() {
-            if started.native_session_id.as_deref() != Some(expected) {
-                return Err(ActorError::NativeIdentityMismatch);
+            let matches = started.native_session_id.as_deref() == Some(expected);
+            if !matches {
+                return Err(ActorError::NativeSessionIdentityMismatch {
+                    expected_present: true,
+                    observed_present: started.native_session_id.is_some(),
+                    matches,
+                });
             }
         } else if let Some(native_session_id) = started.native_session_id {
             state.profile.native_session_id = Some(native_session_id.clone());
@@ -947,6 +2070,35 @@ impl FreshAgentHostActor {
                 event_byte_cap,
                 event_count_cap,
             )?;
+        }
+        if let Some(receipt) = startup_readiness_receipt
+            .as_ref()
+            .filter(|receipt| receipt.absence_evidence.is_some())
+        {
+            let evidence = transport.native_identity_evidence().await.ok_or(
+                ActorError::NativeReadinessRecoveryFailed {
+                    stage: NativeReadinessRecoveryStage::StartupEvidence,
+                },
+            )?;
+            let observed_launch: NativeIdentityLaunch =
+                serde_json::from_value(evidence["launch"].clone()).map_err(|_| {
+                    ActorError::NativeReadinessRecoveryFailed {
+                        stage: NativeReadinessRecoveryStage::StartupEvidence,
+                    }
+                })?;
+            if observed_launch != receipt.next_launch
+                || evidence["nativeSessionId"].as_str()
+                    != Some(receipt.identity.native_session_id.as_str())
+                || state.profile.native_session_id.as_deref()
+                    != Some(receipt.identity.native_session_id.as_str())
+            {
+                return Err(ActorError::NativeReadinessRecoveryFailed {
+                    stage: NativeReadinessRecoveryStage::StartupEvidence,
+                });
+            }
+            // Rebound receipts are written only after the fresh incarnation
+            // proves the exact target root under its own launch binding.
+            state.native_readiness_receipt = Some(receipt.clone());
         }
         state.initialization_state = Some(CommandState::Completed);
         if let Some(context) = transport.claude_fork_state().await {
@@ -997,18 +2149,211 @@ impl FreshAgentHostActor {
         self.state.lock().await.profile.clone()
     }
 
-    pub async fn prepare_native_readiness(&self) -> Result<(), ActorError> {
-        if self.stopped.load(Ordering::SeqCst) {
-            return Err(ActorError::NativeIdentityMismatch);
-        }
-        self.transport
-            .prepare_native_readiness()
+    pub async fn native_readiness_receipt(&self) -> Option<NativeReadinessReceipt> {
+        self.state.lock().await.native_readiness_receipt.clone()
+    }
+
+    pub async fn prepare_native_readiness(
+        &self,
+        expected_launch: &NativeIdentityLaunch,
+    ) -> Result<Option<NativeDispatchIdentity>, ActorError> {
+        self.prepare_native_readiness_inner(expected_launch, None)
             .await
-            .map_err(ActorError::Transport)?;
+            .map(|(identity, _)| identity)
+    }
+
+    pub async fn prepare_native_readiness_with_receipt(
+        &self,
+        expected_launch: &NativeIdentityLaunch,
+        source_fence: &NativeReadinessFence,
+    ) -> Result<Option<NativeReadinessReceipt>, ActorError> {
+        self.prepare_native_readiness_inner(expected_launch, Some(source_fence))
+            .await
+            .map(|(_, receipt)| receipt)
+    }
+
+    async fn prepare_native_readiness_inner(
+        &self,
+        expected_launch: &NativeIdentityLaunch,
+        source_fence: Option<&NativeReadinessFence>,
+    ) -> Result<
+        (
+            Option<NativeDispatchIdentity>,
+            Option<NativeReadinessReceipt>,
+        ),
+        ActorError,
+    > {
+        let _dispatch_guard = self.dispatch_lock.lock().await;
         if self.stopped.load(Ordering::SeqCst) {
             return Err(ActorError::NativeIdentityMismatch);
         }
-        Ok(())
+        if source_fence.is_some_and(|fence| {
+            fence.active_incarnation_id != expected_launch.incarnation_id
+                || fence.evidence_revision != expected_launch.evidence_revision
+        }) {
+            return Err(ActorError::NativeIdentityMismatch);
+        }
+        self.native_identity_transition
+            .store(true, Ordering::SeqCst);
+        let result = async {
+            let (prior, persisted_receipt) = {
+                let state = self.state.lock().await;
+                (
+                    state.profile.clone(),
+                    state.native_readiness_receipt.clone(),
+                )
+            };
+            if let (Some(source_fence), Some(receipt)) = (source_fence, persisted_receipt) {
+                let profile_matches = prior.provider == FreshProvider::Codex
+                    && prior.native_session_id.as_deref()
+                        == Some(receipt.identity.native_session_id.as_str())
+                    && prior.naming_handle == receipt.identity.pending_naming_handle
+                    && prior.session_ref.as_ref().is_none_or(|reference| {
+                        reference.session_id == receipt.identity.native_session_id
+                    });
+                if receipt.is_valid()
+                    && receipt.source_launch == *expected_launch
+                    && receipt.source_fence.is_covered_by(source_fence)
+                    && profile_matches
+                {
+                    *self.observed_native_session_id.lock().await =
+                        Some(receipt.identity.native_session_id.clone());
+                    return Ok((Some(receipt.identity.clone()), Some(receipt)));
+                }
+            }
+            if prior.provider == FreshProvider::Codex {
+                let Some(previous_native_session_id) = prior.native_session_id.clone() else {
+                    return Err(ActorError::NativeIdentityMismatch);
+                };
+                if expected_launch.launch_nonce.is_empty()
+                    || expected_launch.execution_generation == 0
+                    || expected_launch
+                        .requested_native_session_id
+                        .as_deref()
+                        .is_some_and(|requested| requested != previous_native_session_id)
+                {
+                    return Err(ActorError::NativeIdentityMismatch);
+                }
+                let evidence = self
+                    .transport
+                    .native_identity_evidence()
+                    .await
+                    .ok_or(ActorError::NativeIdentityMismatch)?;
+                let actual_launch: NativeIdentityLaunch =
+                    serde_json::from_value(evidence["launch"].clone())
+                        .map_err(|_| ActorError::NativeIdentityMismatch)?;
+                if actual_launch != *expected_launch
+                    || evidence["nativeSessionId"].as_str()
+                        != Some(previous_native_session_id.as_str())
+                {
+                    return Err(ActorError::NativeIdentityMismatch);
+                }
+            }
+            let transition = self
+                .transport
+                .prepare_native_readiness(expected_launch)
+                .await
+                .map_err(ActorError::Transport)?;
+            if self.stopped.load(Ordering::SeqCst) {
+                return Err(ActorError::NativeIdentityMismatch);
+            }
+            if prior.provider != FreshProvider::Codex {
+                if transition.is_some() {
+                    return Err(ActorError::NativeIdentityMismatch);
+                }
+                return Ok((None, None));
+            }
+
+            let evidence = self
+                .transport
+                .native_identity_evidence()
+                .await
+                .ok_or(ActorError::NativeIdentityMismatch)?;
+            let actual_launch: NativeIdentityLaunch =
+                serde_json::from_value(evidence["launch"].clone())
+                    .map_err(|_| ActorError::NativeIdentityMismatch)?;
+            let Some(previous_native_session_id) = prior.native_session_id.clone() else {
+                return Err(ActorError::NativeIdentityMismatch);
+            };
+            match transition {
+                Some(identity) => {
+                    let mut expected_next = expected_launch.clone();
+                    expected_next.evidence_revision = expected_next
+                        .evidence_revision
+                        .checked_add(1)
+                        .ok_or(ActorError::NativeIdentityMismatch)?;
+                    expected_next.requested_native_session_id =
+                        Some(identity.native_session_id.clone());
+                    if identity.previous_native_session_id != previous_native_session_id
+                        || identity.native_session_id.is_empty()
+                        || identity.native_session_id == previous_native_session_id
+                        || identity.native_session_id.chars().any(char::is_control)
+                        || identity
+                            .pending_naming_handle
+                            .as_ref()
+                            .is_some_and(|handle| {
+                                handle.is_empty() || handle.chars().any(char::is_control)
+                            })
+                        || actual_launch != expected_next
+                        || evidence["nativeSessionId"].as_str()
+                            != Some(identity.native_session_id.as_str())
+                    {
+                        return Err(ActorError::NativeIdentityMismatch);
+                    }
+                    let receipt = source_fence.map(|source_fence| NativeReadinessReceipt {
+                        source_fence: source_fence.clone(),
+                        source_launch: expected_launch.clone(),
+                        next_launch: expected_next.clone(),
+                        identity: identity.clone(),
+                        absence_evidence: None,
+                        resume_spec_sha256: None,
+                    });
+                    if receipt.as_ref().is_some_and(|receipt| !receipt.is_valid()) {
+                        return Err(ActorError::NativeIdentityMismatch);
+                    }
+                    let mut state = self.state.lock().await;
+                    if state.profile.provider != FreshProvider::Codex
+                        || state.profile.native_session_id.as_deref()
+                            != Some(identity.previous_native_session_id.as_str())
+                    {
+                        return Err(ActorError::NativeIdentityMismatch);
+                    }
+                    let mut updated = state.clone();
+                    updated.native_readiness_receipt = receipt.clone();
+                    updated.profile.native_session_id = Some(identity.native_session_id.clone());
+                    updated.profile.naming_handle = identity.pending_naming_handle.clone();
+                    if let Some(reference) = updated.profile.session_ref.as_mut() {
+                        reference.session_id = identity.native_session_id.clone();
+                    }
+                    *self.observed_native_session_id.lock().await =
+                        Some(identity.native_session_id.clone());
+                    push_event_bounded(
+                        &mut updated,
+                        AgentEvent::Started {
+                            native_session_id: identity.native_session_id.clone(),
+                        },
+                        self.event_byte_cap,
+                        self.event_count_cap,
+                    )?;
+                    write_state(&self.state_dir, &updated)?;
+                    *state = updated;
+                    Ok((Some(identity), receipt))
+                }
+                None => {
+                    if actual_launch != *expected_launch
+                        || evidence["nativeSessionId"].as_str()
+                            != Some(previous_native_session_id.as_str())
+                    {
+                        return Err(ActorError::NativeIdentityMismatch);
+                    }
+                    Ok((None, None))
+                }
+            }
+        }
+        .await;
+        self.native_identity_transition
+            .store(false, Ordering::SeqCst);
+        result
     }
 
     async fn prepare_claude_effect(
@@ -2215,11 +3560,11 @@ impl FreshAgentHostActor {
                 DecisionState::Resolved
                     if pending.response_digest.as_deref() == Some(&response_digest) =>
                 {
-                    return Ok(())
+                    return Ok(());
                 }
                 DecisionState::Resolved => return Err(ActorError::DecisionAlreadyResolved),
                 DecisionState::Dispatching | DecisionState::Ambiguous => {
-                    return Err(ActorError::AmbiguousDispatch)
+                    return Err(ActorError::AmbiguousDispatch);
                 }
             }
             pending.state = DecisionState::Dispatching;

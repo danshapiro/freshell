@@ -6836,27 +6836,24 @@ if (args.includes('app-server')) {{
     // promotion into the launch resume path only ever sees ids derived from
     // an accepted, provider-matched `sessionRef`.
 
-    /// `is_session_provider_mode` covers antigravity (opaque ids — the
-    /// gemini/kimi class: no published id-shape contract, so the plausibility
-    /// gate is the honest minimum of non-empty + no whitespace), and the
-    /// door-3 gate stays DEFERRED for it: `validate_rest_resume` passes a
-    /// stale antigravity id through untouched even against a
-    /// definitively-absent probe (the plan's load-bearing A2 — antigravity is
-    /// NOT in `resume_gate.rs VALIDATED_PROVIDERS` until real-binary
-    /// transcript-store evidence exists).
+    /// Antigravity is a session-provider mode with opaque plausible ids
+    /// (the gemini/kimi class minimum: non-empty, no whitespace), and
+    /// door 3 is GATED for it (activated 2026-11-03 on real-binary
+    /// transcript evidence (2026-11-02) + a proven settings-conformant
+    /// real resume (2026-11-03; Provider Contract Record rows 74/75/76;
+    /// evidence: real-binary-transcript-evidence.md)): a stale
+    /// antigravity id against positive absence answers SpawnFresh with
+    /// NO fresh id minted — the consumer's typed-refusal shape, never
+    /// passthrough.
     #[test]
-    fn antigravity_is_a_session_provider_mode_with_opaque_plausible_ids_and_ungated_resume() {
+    fn antigravity_is_a_session_provider_mode_with_opaque_plausible_ids_and_gated_resume() {
         use freshell_platform::resume_gate::{ResumeExistence, ResumeIntent};
         assert!(is_session_provider_mode("antigravity"));
-        // The opaque-id honest minimum (the gemini/kimi arm).
         assert!(plausible_resume_session_id("antigravity", "conv-1"));
         assert!(!plausible_resume_session_id("antigravity", ""));
         assert!(!plausible_resume_session_id("antigravity", "conv 1"));
-        // Non-session modes stay out; raw codex ids never claim (never-alias).
         assert!(!is_session_provider_mode("shell"));
         assert!(!is_session_provider_mode("codex"));
-        // Door-3 deferral pin: a stale antigravity id passes through even
-        // against positive absence — never blocked, never substituted.
         let probe = probe_answering(ResumeExistence::Absent, true);
         let out = validate_rest_resume(
             "antigravity",
@@ -6865,9 +6862,13 @@ if (args.includes('app-server')) {{
             Some(&probe),
             ResumeIntent::UserCreate,
         );
-        assert_eq!(out.resume_session_id.as_deref(), Some("stale-agy"));
-        assert!(out.stale_session_id.is_none());
+        assert_eq!(out.resume_session_id, None);
+        assert_eq!(out.stale_session_id.as_deref(), Some("stale-agy"));
         assert!(!out.blocked_recovery);
+        // (No `notice` field on the REST outcome: the typed refusal's
+        // operator notice is pinned by the WS-outcome unit test in
+        // freshell-ws's resume_validation.rs — the REST consumer composes
+        // its typed SESSION_MISSING outcome from `stale_session_id`.)
     }
 
     /// A fresh (no identity) antigravity tab.create is a session-provider

@@ -203,9 +203,7 @@ async fn an_adopted_native_status_keeps_its_status_only_projection() {
         .expect("manual name has an armed native series");
     let synced = remote
         .fold_native_outcome(
-            target.clone(),
-            claim.location_revision,
-            claim.series_epoch,
+            claim.clone(),
             NativeOutcomeFold::Read {
                 observed: Some(before.record.name.clone()),
                 receipt: None,

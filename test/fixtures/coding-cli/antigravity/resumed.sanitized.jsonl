@@ -1,8 +1,5 @@
-{"type":"session_start","conversationId":"22222222-3333-4444-5555-666666666666","workspacePaths":["/home/u/resumed"],"model":"gemini-3-pro","startedAt":"2026-10-29T21:00:00.000Z"}
-{"type":"user_message","conversationId":"22222222-3333-4444-5555-666666666666","text":"First prompt before exit","at":"2026-10-29T21:00:01.000Z"}
-{"type":"assistant_message","conversationId":"22222222-3333-4444-5555-666666666666","text":"First reply.","at":"2026-10-29T21:00:02.000Z","usage":{"inputTokens":5,"outputTokens":7,"cachedTokens":0,"totalTokens":12}}
-{"type":"turn_settled","conversationId":"22222222-3333-4444-5555-666666666666","at":"2026-10-29T21:00:02.500Z","outcome":"completed","fullyIdle":true}
-{"type":"session_start","conversationId":"22222222-3333-4444-5555-666666666666","workspacePaths":["/home/u/resumed"],"model":"gemini-3-pro","startedAt":"2026-10-29T21:30:00.000Z","source":"resume"}
-{"type":"user_message","conversationId":"22222222-3333-4444-5555-666666666666","text":"Continue after resume","at":"2026-10-29T21:30:01.000Z"}
-{"type":"assistant_message","conversationId":"22222222-3333-4444-5555-666666666666","text":"Second reply.","at":"2026-10-29T21:30:02.000Z","usage":{"inputTokens":15,"outputTokens":25,"cachedTokens":0,"totalTokens":40}}
-{"type":"turn_settled","conversationId":"22222222-3333-4444-5555-666666666666","at":"2026-10-29T21:30:02.500Z","outcome":"completed","fullyIdle":true}
+{"type":"USER_INPUT","source":"USER_EXPLICIT","status":"DONE","step_index":0,"created_at":"2026-10-29T21:00:01Z","content":"First prompt before exit"}
+{"type":"PLANNER_RESPONSE","source":"MODEL","status":"DONE","step_index":1,"created_at":"2026-10-29T21:00:05Z","content":"First reply.","input_tokens":15,"output_tokens":25,"cache_read_tokens":0}
+{"type":"CHECKPOINT","source":"SYSTEM","status":"DONE","step_index":2,"created_at":"2026-10-29T21:00:06Z","content":"<checkpoint summary placeholder>"}
+{"type":"USER_INPUT","source":"USER_EXPLICIT","status":"DONE","step_index":3,"created_at":"2026-10-31T18:00:01Z","content":"Second prompt after restart"}
+{"type":"PLANNER_RESPONSE","source":"MODEL","status":"DONE","step_index":4,"created_at":"2026-10-31T18:00:04Z","content":"Second reply.","input_tokens":40,"output_tokens":5,"cache_read_tokens":2}

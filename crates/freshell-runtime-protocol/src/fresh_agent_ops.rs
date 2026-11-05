@@ -98,9 +98,9 @@ pub enum FreshAgentNativeNameOperation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FreshAgentNativeNameError {
-    /// Supervisor admission refused before any host/native operation. A host
-    /// reply must never use this as evidence that an operation was not sent.
-    AdmissionBusy,
+    /// Supervisor-only refusal before any host/native operation was dispatched.
+    /// Host replies cannot use this variant as no-dispatch evidence.
+    LifecycleBusy,
     Unavailable {
         message: String,
     },
