@@ -840,6 +840,7 @@ mod initial_grant_reference_tests {
                             assert_eq!(&incarnation_id, handle.incarnation_id());
                             statuses.fetch_add(1, Ordering::SeqCst);
                             HostResult::Status {
+                                fresh_agent_recovery_source: None,
                                 host_boot_id: boot.clone(),
                                 worker_pid: Some(123),
                                 worker_launch_count: 1,

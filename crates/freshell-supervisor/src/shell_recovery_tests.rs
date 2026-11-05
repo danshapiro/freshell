@@ -414,7 +414,7 @@ async fn recovery_host_status(
                     capabilities: capabilities.clone(),
                     effective_limits: checkpoints::tests::limits(),
                 },
-                HostCommand::Status { .. } => HostResult::Status {
+                HostCommand::Status { .. } => HostResult::Status { fresh_agent_recovery_source: None,
                     native_identity_observation: native_observation.clone(),
                     opencode_adoption:
                         freshell_runtime_protocol::OpenCodeAdoptionStatus::NotRequired,

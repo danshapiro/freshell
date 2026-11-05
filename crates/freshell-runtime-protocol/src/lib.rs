@@ -5360,6 +5360,12 @@ pub enum HostCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_fence: Option<NativeReadinessFence>,
     },
+    /// Resume only the already retained Codex root for Compact readiness.
+    /// This command does not authorize recovery or creation of a replacement
+    /// root.
+    FreshAgentPrepareSameRootNative {
+        incarnation_id: IncarnationId,
+    },
     FreshAgentResumePending {
         incarnation_id: IncarnationId,
     },
@@ -5512,6 +5518,11 @@ pub enum HostResult {
     FreshAgentNativeName(FreshAgentNativeNameReply),
     FreshAgentChildSnapshot(serde_json::Value),
     Status {
+        /// Ephemeral settled source retained by an attached Codex actor after
+        /// native exit. Authorizes only an attempt at its guarded SEND recovery;
+        /// it does not assert native liveness or confirmed process cleanup.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fresh_agent_recovery_source: Option<NativeIdentityObservation>,
         host_boot_id: HostBootId,
         worker_pid: Option<u32>,
         worker_launch_count: u64,

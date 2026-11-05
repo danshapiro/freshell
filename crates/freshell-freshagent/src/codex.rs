@@ -1261,6 +1261,12 @@ enum EnsureAliveOutcome {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrashRecoveryPolicy {
+    AllowNewThread,
+    SameRootOnly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeadThreadCachePolicy {
     Respect,
     /// The supervisor has just established a current positive provider-store
@@ -5116,7 +5122,12 @@ impl FreshCodexState {
             };
 
         match self
-            .ensure_session_alive(&session_id, send_fence, DeadThreadCachePolicy::Respect)
+            .ensure_session_alive(
+                &session_id,
+                send_fence,
+                CrashRecoveryPolicy::AllowNewThread,
+                DeadThreadCachePolicy::Respect,
+            )
             .await
         {
             Ok(EnsureAliveOutcome::AlreadyRunning) => {}
@@ -6216,6 +6227,16 @@ impl FreshCodexState {
     /// `FreshAgentLostSessionError` parity) so the pane engages `markSessionLost`
     /// recovery rather than showing a dead-end banner.
     pub async fn handle_compact(&self, msg: FreshAgentCompact) {
+        self.handle_compact_with_recovery(msg, true).await;
+    }
+
+    /// Hosted compact has no typed root-transition result. Never mint a
+    /// conversation if its native runtime exits after the host's live check.
+    pub async fn handle_compact_current_native(&self, msg: FreshAgentCompact) {
+        self.handle_compact_with_recovery(msg, false).await;
+    }
+
+    async fn handle_compact_with_recovery(&self, msg: FreshAgentCompact, recover: bool) {
         let mut session_id = msg.session_id.clone();
 
         // b8ke ext r21 F2: the compact's delayed-request fence (the new
@@ -6242,10 +6263,20 @@ impl FreshCodexState {
                 }
             };
 
-        match self
-            .ensure_session_alive(&session_id, compact_fence, DeadThreadCachePolicy::Respect)
+        let alive = if recover {
+            self.ensure_session_alive(
+                &session_id,
+                compact_fence,
+                CrashRecoveryPolicy::AllowNewThread,
+                DeadThreadCachePolicy::Respect,
+            )
             .await
-        {
+        } else if self.has_live_session(&session_id).await {
+            Ok(EnsureAliveOutcome::AlreadyRunning)
+        } else {
+            Err(EnsureAliveError::Reserved)
+        };
+        match alive {
             Ok(EnsureAliveOutcome::AlreadyRunning) => {}
             // A resume-recovered session keeps its ORIGINAL id — nothing to re-key,
             // same as the already-running case.
@@ -6510,6 +6541,7 @@ impl FreshCodexState {
             .ensure_session_alive(
                 &op.session_id,
                 rollback_fence,
+                CrashRecoveryPolicy::AllowNewThread,
                 DeadThreadCachePolicy::Respect,
             )
             .await
@@ -6903,7 +6935,12 @@ impl FreshCodexState {
             };
 
         let parent_id = match self
-            .ensure_session_alive(&msg.session_id, fork_fence, DeadThreadCachePolicy::Respect)
+            .ensure_session_alive(
+                &msg.session_id,
+                fork_fence,
+                CrashRecoveryPolicy::AllowNewThread,
+                DeadThreadCachePolicy::Respect,
+            )
             .await
         {
             Ok(EnsureAliveOutcome::AlreadyRunning) | Ok(EnsureAliveOutcome::Recovered) => {
@@ -8570,6 +8607,7 @@ impl FreshCodexState {
                 .ensure_session_alive(
                     &msg.session_id,
                     attach_fence,
+                    CrashRecoveryPolicy::AllowNewThread,
                     DeadThreadCachePolicy::Respect,
                 )
                 .await
@@ -8751,6 +8789,7 @@ impl FreshCodexState {
             .ensure_session_alive(
                 session_id,
                 observed,
+                CrashRecoveryPolicy::AllowNewThread,
                 DeadThreadCachePolicy::RecheckAfterFreshNativeEvidence,
             )
             .await
@@ -8811,6 +8850,7 @@ impl FreshCodexState {
         // map cannot confirm → the Adopt double-check), never a silent
         // recreation.
         observed: Option<freshell_ownership::ObservedFence>,
+        policy: CrashRecoveryPolicy,
         dead_thread_cache_policy: DeadThreadCachePolicy,
     ) -> Result<EnsureAliveOutcome, EnsureAliveError> {
         if self.notification_drain_pending(session_id).await {
@@ -9003,6 +9043,9 @@ impl FreshCodexState {
                         if live_session_key == session_id {
                             return Ok(EnsureAliveOutcome::Recovered);
                         }
+                        if policy == CrashRecoveryPolicy::SameRootOnly {
+                            return Err(EnsureAliveError::Reserved);
+                        }
                         return Ok(EnsureAliveOutcome::Respawned {
                             new_session_id: live_session_key,
                         });
@@ -9076,26 +9119,31 @@ impl FreshCodexState {
         // genuinely gone within its negative-cache TTL window -- skip the doomed resume
         // attempt (and the sidecar it would burn to re-prove it) and go straight to the
         // mint-new-thread fallback, which needs a fresh sidecar of its own regardless.
-        if dead_thread_cache_policy == DeadThreadCachePolicy::Respect
-            && self.is_known_dead_thread(session_id).await
-        {
-            // kata b8ke Task 3: the mint-new fallback registers under a NEW
-            // thread id — fail this OLD key's coordinator claim (RAII drop)
-            // so it reopens; the fallback claims the new key itself.
-            drop(own_ticket.take());
-            return self
-                .respawn_as_new_thread_after_crash(
-                    session_id,
-                    cwd,
-                    model,
-                    effort,
-                    sandbox,
-                    permission_mode,
-                    collaboration_mode,
-                    lease_guard,
-                    session_provenance,
-                )
-                .await;
+        if self.is_known_dead_thread(session_id).await {
+            if policy == CrashRecoveryPolicy::SameRootOnly {
+                return Err(EnsureAliveError::RespawnFailed(
+                    "same-root native history is unavailable".into(),
+                ));
+            }
+            if dead_thread_cache_policy == DeadThreadCachePolicy::Respect {
+                // kata b8ke Task 3: the mint-new fallback registers under a NEW
+                // thread id — fail this OLD key's coordinator claim (RAII drop)
+                // so it reopens; the fallback claims the new key itself.
+                drop(own_ticket.take());
+                return self
+                    .respawn_as_new_thread_after_crash(
+                        session_id,
+                        cwd,
+                        model,
+                        effort,
+                        sandbox,
+                        permission_mode,
+                        collaboration_mode,
+                        lease_guard,
+                        session_provenance,
+                    )
+                    .await;
+            }
         }
 
         // F4: the spawn hook arms the mid-startup evidence the moment the
@@ -9260,6 +9308,16 @@ impl FreshCodexState {
                 // NEW thread id — fail this OLD key's coordinator claim
                 // (RAII drop) so it reopens.
                 drop(own_ticket.take());
+                if policy == CrashRecoveryPolicy::SameRootOnly {
+                    // The failed resume's exact tree was confirmed dead above.
+                    // Unlike mint recovery, no successor consumes this guard.
+                    if let Some(mut guard) = lease_guard.take() {
+                        guard.fail();
+                    }
+                    return Err(EnsureAliveError::RespawnFailed(
+                        "same-root native history is unavailable".into(),
+                    ));
+                }
                 return self
                     .respawn_as_new_thread_after_crash(
                         session_id,
@@ -9539,6 +9597,39 @@ impl FreshCodexState {
 
         resume_fence.disarm();
         Ok(EnsureAliveOutcome::Recovered)
+    }
+
+    /// Prepare only an already established exact native root, without a user
+    /// turn. The mapped provider settings include accepted explicit clears.
+    pub async fn prepare_same_root_native_session(&self, session_id: &str) -> Result<(), String> {
+        match self
+            .ensure_session_alive(
+                session_id,
+                None,
+                CrashRecoveryPolicy::SameRootOnly,
+                DeadThreadCachePolicy::Respect,
+            )
+            .await
+        {
+            Ok(EnsureAliveOutcome::AlreadyRunning | EnsureAliveOutcome::Recovered)
+                if self.has_live_session(session_id).await =>
+            {
+                Ok(())
+            }
+            Ok(_) => {
+                Err("same-root native preparation did not confirm its original runtime".into())
+            }
+            Err(EnsureAliveError::Reserved) => {
+                Err("SESSION_RESERVED: native cleanup or ownership is unsettled".into())
+            }
+            Err(error @ EnsureAliveError::Draining) => {
+                Err(format!("SESSION_RESERVED: {}", error.reservation_message()))
+            }
+            Err(EnsureAliveError::NotFound) => {
+                Err("same-root native session is not registered".into())
+            }
+            Err(EnsureAliveError::RespawnFailed(error)) => Err(error),
+        }
     }
 
     /// The ORIGINAL crash-recovery fallback (kept verbatim in behavior, just extracted so
@@ -19704,7 +19795,12 @@ pub(crate) mod tests {
         let alive_reserved = matches!(
             tokio::time::timeout(
                 Duration::from_secs(1),
-                state.ensure_session_alive("thread-1", None, DeadThreadCachePolicy::Respect),
+                state.ensure_session_alive(
+                    "thread-1",
+                    None,
+                    CrashRecoveryPolicy::AllowNewThread,
+                    DeadThreadCachePolicy::Respect,
+                ),
             )
             .await,
             Ok(Err(EnsureAliveError::Draining))
@@ -19787,6 +19883,9 @@ pub(crate) mod tests {
         let _process_fixture = crate::session_lease::process_fixture::lock().await;
         let dir = tempfile::tempdir().expect("owned fake app-server files");
         let port_file = dir.path().join("port");
+        let request_log = dir.path().join("requests.jsonl");
+        configure_fake_codex_cmd(&json!({"appendRequestLogPath": request_log}).to_string());
+        let capture = tracing_capture::capture_by_session("thread-real-drain");
         let ownership_id = mint_ownership_id();
         let message = "Selected model is at capacity. Please try a different model.";
         let mut command = tokio::process::Command::new("node");
@@ -19799,6 +19898,7 @@ pub(crate) mod tests {
             .env(
                 "FAKE_CODEX_APP_SERVER_BEHAVIOR",
                 json!({
+                    "appendRequestLogPath": request_log,
                     "notificationsAfterMethods": {"model/list": [{
                         "method":"error", "params":{"threadId":"thread-real-drain",
                         "turnId":"turn-1", "willRetry":false,"error":{"message":message}}
@@ -19890,9 +19990,37 @@ pub(crate) mod tests {
         .await;
         let reserved = matches!(
             state
-                .ensure_session_alive("thread-real-drain", None, DeadThreadCachePolicy::Respect)
+                .ensure_session_alive(
+                    "thread-real-drain",
+                    None,
+                    CrashRecoveryPolicy::AllowNewThread,
+                    DeadThreadCachePolicy::Respect,
+                )
                 .await,
             Err(EnsureAliveError::Draining)
+        );
+        let requests_before = std::fs::read(&request_log).unwrap();
+        let prepare_reserved = tokio::time::timeout(
+            Duration::from_secs(1),
+            state.prepare_same_root_native_session("thread-real-drain"),
+        )
+        .await
+        .expect("same-root preparation refuses without waiting for the drain");
+        assert_eq!(
+            prepare_reserved,
+            Err(format!(
+                "SESSION_RESERVED: {CODEX_DRAIN_RESERVATION_MESSAGE}"
+            )),
+        );
+        assert_eq!(
+            spawn_count(&capture),
+            0,
+            "a drain cannot start a replacement"
+        );
+        assert_eq!(
+            std::fs::read(&request_log).unwrap(),
+            requests_before,
+            "reserved preparation cannot resume, mint, compact or send input",
         );
         assert!(
             warning.matched,
@@ -19923,6 +20051,17 @@ pub(crate) mod tests {
         })
         .await;
         let retained = state.retained_state("thread-real-drain").await.unwrap();
+        let prepared = tokio::time::timeout(
+            Duration::from_secs(15),
+            state.prepare_same_root_native_session("thread-real-drain"),
+        )
+        .await;
+        if matches!(&prepared, Ok(Ok(()))) {
+            state
+                .handle_compact_current_native(compact_msg("thread-real-drain"))
+                .await;
+        }
+        let current_roots: Vec<_> = state.sessions.lock().await.keys().cloned().collect();
         state.shutdown().await;
         tokio::time::timeout(Duration::from_secs(2), relay)
             .await
@@ -19945,6 +20084,39 @@ pub(crate) mod tests {
             "the crash rings exactly once"
         );
         assert!(retained["snapshot"]["turns"].to_string().contains(message));
+        assert!(
+            matches!(prepared, Ok(Ok(()))),
+            "settled drain permits exact-root preparation: {prepared:?}"
+        );
+        assert_eq!(current_roots, vec!["thread-real-drain"]);
+        assert_eq!(
+            spawn_count(&capture),
+            1,
+            "only the post-drain preparation may spawn"
+        );
+        let requests: Vec<Value> = std::fs::read_to_string(&request_log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let effects: Vec<_> = requests
+            .iter()
+            .filter(|request| {
+                matches!(
+                    request["method"].as_str(),
+                    Some("thread/start" | "thread/resume" | "thread/compact/start" | "turn/start")
+                )
+            })
+            .collect();
+        assert_eq!(
+            effects.len(),
+            2,
+            "only exact resume and Compact are allowed: {requests:?}"
+        );
+        assert_eq!(effects[0]["method"], "thread/resume");
+        assert_eq!(effects[0]["params"]["threadId"], "thread-real-drain");
+        assert_eq!(effects[1]["method"], "thread/compact/start");
+        assert_eq!(effects[1]["params"]["threadId"], "thread-real-drain");
     }
 
     #[tokio::test]
@@ -20048,6 +20220,7 @@ pub(crate) mod tests {
                     .ensure_session_alive(
                         "thread-handoff-drain",
                         None,
+                        CrashRecoveryPolicy::AllowNewThread,
                         DeadThreadCachePolicy::Respect,
                     )
                     .await,
@@ -20640,7 +20813,12 @@ pub(crate) mod tests {
         .expect("exit begins draining");
         let reserved = matches!(
             state
-                .ensure_session_alive("thread-1", None, DeadThreadCachePolicy::Respect)
+                .ensure_session_alive(
+                    "thread-1",
+                    None,
+                    CrashRecoveryPolicy::AllowNewThread,
+                    DeadThreadCachePolicy::Respect,
+                )
                 .await,
             Err(EnsureAliveError::Draining)
         );

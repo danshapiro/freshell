@@ -657,6 +657,7 @@ async fn native_send_host(
                         } else {
                             boot.clone()
                         },
+                        fresh_agent_recovery_source: None,
                         worker_pid: Some(123),
                         worker_launch_count: 1,
                         max_control_epoch: control_epoch,
@@ -1185,6 +1186,7 @@ async fn codex_readiness_reconciles_receipt_after_host_commit_reply_is_lost() {
                                 .as_ref()
                                 .map(|observation| observation.native_session_id.clone()),
                             native_identity_observation: observation,
+                            fresh_agent_recovery_source: None,
                             host_boot_id: boot.clone(),
                             worker_pid: Some(123),
                             worker_launch_count: 1,
@@ -2314,6 +2316,146 @@ fn host_configure_gets_the_fresh_agent_command_budget() {
 }
 
 #[tokio::test]
+async fn verified_resume_capture_preserves_cleared_settings_and_history_anchors() {
+    let fixture =
+        running_fresh_provider_with_name(FreshProvider::Codex, None, "resume-native").await;
+    let context = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    let mut candidate = crate::resume_catalog::exact_resume_candidate(&context, None)
+        .unwrap()
+        .unwrap();
+    candidate.model = Some("cached-model".into());
+    candidate.reasoning_effort = Some("high".into());
+    candidate.permission_mode = Some("untrusted".into());
+    let saved = fixture
+        .supervisor
+        .registry
+        .store_verified_resume_spec_fenced(fixture.soul.clone(), candidate, context.write_fence())
+        .await
+        .unwrap();
+    let mut current = saved.clone();
+    current.model = None;
+    current.reasoning_effort = None;
+    current.permission_mode = Some("never".into());
+    let fence = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap()
+        .write_fence();
+    let captured = fixture
+        .supervisor
+        .registry
+        .store_verified_resume_spec_fenced(fixture.soul.clone(), current, fence)
+        .await
+        .unwrap();
+    assert_eq!(captured.model, None);
+    assert_eq!(captured.reasoning_effort, None);
+    assert_eq!(captured.permission_mode.as_deref(), Some("never"));
+    assert_eq!(captured.provider_session, saved.provider_session);
+    assert_eq!(captured.durable_position, saved.durable_position);
+    assert_eq!(captured.checkpoint_references, saved.checkpoint_references);
+    assert!(captured.evidence_revision > saved.evidence_revision);
+    let fence = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap()
+        .write_fence();
+    let repeated = fixture
+        .supervisor
+        .registry
+        .store_verified_resume_spec_fenced(fixture.soul.clone(), captured.clone(), fence)
+        .await
+        .unwrap();
+    assert_eq!(
+        repeated, captured,
+        "an identical recapture stays idempotent"
+    );
+}
+
+#[tokio::test]
+async fn native_name_lifecycle_contention_is_undispatched_and_fresh_retry_succeeds() {
+    let fixture = running_fresh_provider_with_name(FreshProvider::Codex, None, "name-native").await;
+    let view = fixture
+        .supervisor
+        .registry
+        .inventory()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|view| view.soul_id == fixture.soul)
+        .unwrap();
+    let source = FreshAgentNativeNameSource {
+        incarnation_id: view.incarnation_id,
+        host_boot_id: view.host_boot_id.unwrap(),
+        execution_generation: view.execution_generation,
+        intent_revision: view.intent_revision,
+        native_session_id: "name-native".into(),
+    };
+    let (received, host) =
+        fake_host_with_boot(&fixture.runtime_dir, false, source.host_boot_id.clone());
+    let mut request = Envelope::new(
+        RequestId::new(),
+        ControlRole::Web,
+        AdminCommand::FreshAgentNativeName(FreshAgentNativeNameRequest {
+            soul_id: fixture.soul.clone(),
+            source,
+            codex_home: "/owning/codex".into(),
+            operation: FreshAgentNativeNameOperation::Write {
+                title: "Manual title".into(),
+            },
+            deadline_unix_ms: None,
+            expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
+        }),
+    );
+    request.auth = Some(SECRET.into());
+    let lifecycle = fixture.supervisor.lifecycle_lock(&fixture.soul).await;
+    let held = lifecycle.lock().await;
+    let reply = fixture
+        .supervisor
+        .dispatch(request.clone())
+        .await
+        .result
+        .unwrap();
+    let AdminResult::FreshAgentNativeName(reply) = reply else {
+        panic!("wrong reply")
+    };
+    assert_eq!(
+        serde_json::to_value(&reply).unwrap()["data"]["kind"],
+        "lifecycle_busy"
+    );
+    assert!(
+        received.lock().unwrap().is_empty(),
+        "contention must dispatch no host command"
+    );
+    drop(held);
+
+    let retried = fixture.supervisor.dispatch(request).await.result.unwrap();
+    assert!(matches!(
+        retried,
+        AdminResult::FreshAgentNativeName(FreshAgentNativeNameReply::Renamed)
+    ));
+    assert_eq!(
+        received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|command| matches!(command, HostCommand::FreshAgentNativeName { .. }))
+            .count(),
+        1
+    );
+    host.abort();
+    let _ = host.await;
+}
+
+#[tokio::test]
 async fn native_name_transient_lifecycle_admission_preserves_the_current_request() {
     let fixture = running_fresh_provider_with_name(FreshProvider::Codex, None, "name-native").await;
     let request = native_name_request(&fixture).await;
@@ -2363,7 +2505,6 @@ async fn native_name_transient_lifecycle_admission_preserves_the_current_request
         1
     );
 }
-
 #[tokio::test]
 async fn admin_native_name_rejects_stale_authority_before_host_work_and_preserves_recovery() {
     for scenario in [

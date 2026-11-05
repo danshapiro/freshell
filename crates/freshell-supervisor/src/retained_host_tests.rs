@@ -302,6 +302,7 @@ impl Fixture {
                                         Connection::open(&database).unwrap().execute("UPDATE souls SET evidence_revision=evidence_revision+1 WHERE soul_id=?1",[soul.as_str()]).unwrap();
                                     }
                                     Ok(HostResult::Status {
+                                        fresh_agent_recovery_source: None,
                                         host_boot_id: if fault == Fault::WrongStatusBoot {
                                             HostBootId::new()
                                         } else {

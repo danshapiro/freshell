@@ -3191,6 +3191,32 @@ impl Registry {
         .map(|_| ())
     }
 
+    /// Check the retained actor's ephemeral source against the current durable
+    /// owner. Unlike native capture this read cannot create a missing writer.
+    pub(crate) async fn validate_fresh_codex_recovery_source(
+        &self,
+        soul_id: SoulId,
+        source: freshell_runtime_protocol::NativeIdentityObservation,
+        host_boot_id: HostBootId,
+        fence: RecoveryWriteFence,
+    ) -> Result<bool, RegistryError> {
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction()?;
+            validate_recovery_write_fence(&tx, &soul_id, &fence)?;
+            let launch: Option<String> = tx.query_row(
+                "SELECT i.native_identity_launch FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id JOIN writer_claims w ON w.soul_id=s.soul_id AND w.incarnation_id=i.incarnation_id WHERE s.soul_id=?1 AND i.incarnation_id=?2 AND i.host_boot_id=?3 AND i.launch_state='running' AND s.desired_state='running' AND s.provider='codex' AND i.fixture_kind IS NULL AND json_extract(i.fresh_agent_spec,'$.provider')='codex' AND w.provider=s.provider AND w.provider_store_id=s.provider_store_id AND w.native_session_id=s.native_session_id AND w.native_session_id=?4 AND w.intent_revision=s.intent_revision AND i.launch_nonce=?5 AND i.execution_generation=json_extract(i.native_identity_launch,'$.executionGeneration')",
+                params![soul_id.as_str(),source.incarnation_id.as_str(),host_boot_id.as_str(),source.native_session_id,source.launch_nonce],
+                |row| row.get(0),
+            ).optional()?.flatten();
+            let launch = launch.map(|encoded| serde_json::from_str::<freshell_runtime_protocol::NativeIdentityLaunch>(&encoded)).transpose()?;
+            Ok(launch.is_some_and(|launch| {
+                source.matches_launch(&launch)
+                    && source.matches_provider("codex", true)
+                    && source.incarnation_id == fence.active_incarnation_id
+            }))
+        }).await
+    }
+
     pub async fn record_fresh_agent_dispatch_identity(
         &self,
         soul_id: SoulId,
@@ -3711,6 +3737,9 @@ impl Registry {
                     && existing.claude_fork == resume_spec.claude_fork
                     && existing.program == resume_spec.program
                     && existing.cwd == resume_spec.cwd
+                    && existing.model == resume_spec.model
+                    && existing.reasoning_effort == resume_spec.reasoning_effort
+                    && existing.permission_mode == resume_spec.permission_mode
                     && existing.workspace_path == resume_spec.workspace_path
                     && existing.environment == resume_spec.environment
                     && existing.opencode_adoption_baseline
