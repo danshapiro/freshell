@@ -455,6 +455,61 @@ describe('FreshAgentView hidden-pane rebind (F8)', () => {
     expect(screen.queryByText('late old transcript')).not.toBeInTheDocument()
   })
 
+  it('restarts a dirty reveal after its deadline expires while hidden and ignores the old completion', async () => {
+    let releaseOldRequest!: (value: ReturnType<typeof snapshotWithText>) => void
+    const oldRequest = new Promise<ReturnType<typeof snapshotWithText>>((resolve) => { releaseOldRequest = resolve })
+    let releaseResumedRequest!: (value: ReturnType<typeof snapshotWithText>) => void
+    const resumedRequest = new Promise<ReturnType<typeof snapshotWithText>>((resolve) => { releaseResumedRequest = resolve })
+    apiMock.getFreshAgentThreadSnapshot
+      .mockResolvedValueOnce(snapshotWithText('saved transcript', 5))
+      .mockImplementationOnce(() => oldRequest)
+      .mockImplementationOnce(() => resumedRequest)
+    const paneContent = { ...basePaneContent, sessionId: SESS_1, status: 'idle' as const }
+    const { rerender } = renderView({ paneContent, hidden: true })
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+    emitWsMessage({
+      type: 'freshAgent.event',
+      sessionId: SESS_1,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      event: { type: 'freshAgent.session.changed', sessionId: SESS_1 },
+    })
+    rerenderView(rerender, { paneContent, hidden: false })
+    await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+    expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[1]?.[3]).toMatchObject({ trigger: 'reveal' })
+    expect(screen.getByRole('status', { name: 'Refreshing conversation' })).toBeInTheDocument()
+
+    rerenderView(rerender, { paneContent, hidden: true })
+    // Both the view deadline (15s from reveal) and shared scheduler deadline
+    // (250ms later) expire while hidden; the old transport promise stays held.
+    await act(async () => { await vi.advanceTimersByTimeAsync(15_500) })
+    expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument()
+
+    rerenderView(rerender, { paneContent, hidden: false })
+    await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(3)
+    expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[2]?.[3]).toMatchObject({ trigger: 'reveal' })
+    expect(screen.getByRole('status', { name: 'Refreshing conversation' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument()
+
+    await act(async () => {
+      releaseResumedRequest(snapshotWithText('refreshed transcript', 6))
+      for (let index = 0; index < 5; index++) await Promise.resolve()
+    })
+    expect(screen.getByText('refreshed transcript')).toBeInTheDocument()
+    expect(screen.queryByRole('status', { name: 'Refreshing conversation' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument()
+
+    await act(async () => {
+      releaseOldRequest(snapshotWithText('late hidden-timeout transcript', 7))
+      for (let index = 0; index < 5; index++) await Promise.resolve()
+    })
+    expect(screen.getByText('refreshed transcript')).toBeInTheDocument()
+    expect(screen.queryByText('late hidden-timeout transcript')).not.toBeInTheDocument()
+  })
+
   it('keeps the timeout and Retry surface when a response arrives before the shared scheduler deadline', async () => {
     let releaseLateResponse!: (value: ReturnType<typeof snapshotWithText>) => void
     const lateResponse = new Promise<ReturnType<typeof snapshotWithText>>((resolve) => { releaseLateResponse = resolve })
@@ -649,6 +704,48 @@ describe('FreshAgentView hidden-pane rebind (F8)', () => {
       expect(repeatedRevealTriggers, 'the same approval surface refresh must not be re-armed by a later reveal')
         .toEqual([])
       expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBe(callsBeforeRequest + 1)
+    })
+
+    it('settles a dirty reveal when a permission event arrives during its held snapshot read', async () => {
+      let releaseHeldReveal!: (value: ReturnType<typeof snapshotWithText>) => void
+      const heldReveal = new Promise<ReturnType<typeof snapshotWithText>>((resolve) => { releaseHeldReveal = resolve })
+      const { rerender, paneContent } = await mountHiddenSurfacePane(surfaceSnapshot())
+      apiMock.getFreshAgentThreadSnapshot
+        .mockImplementationOnce(() => heldReveal)
+        .mockResolvedValueOnce({
+          ...snapshotWithText('permission updated transcript', 6),
+          pendingApprovals: [bashApproval],
+        })
+      const callsBeforeReveal = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+
+      emitSurfaceEvent('freshAgent.session.changed')
+      rerenderView(rerender, { paneContent, hidden: false })
+      await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls).toHaveLength(callsBeforeReveal + 1)
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[callsBeforeReveal]?.[3]).toMatchObject({ trigger: 'reveal' })
+      expect(screen.getByRole('status', { name: 'Refreshing conversation' })).toBeInTheDocument()
+
+      emitSurfaceEvent('freshAgent.permission.request', { requestId: 'perm-1', toolName: 'Bash' })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls).toHaveLength(callsBeforeReveal + 1)
+      await act(async () => {
+        releaseHeldReveal(snapshotWithText('superseded reveal response', 6))
+        for (let index = 0; index < 5; index++) await Promise.resolve()
+        await vi.advanceTimersByTimeAsync(500)
+        for (let index = 0; index < 5; index++) await Promise.resolve()
+      })
+
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls).toHaveLength(callsBeforeReveal + 2)
+      expect(screen.getByText('permission updated transcript')).toBeInTheDocument()
+      expect(screen.getByRole('alert', { name: 'Permission request for Bash' })).toBeInTheDocument()
+      expect(screen.queryByRole('status', { name: 'Refreshing conversation' })).not.toBeInTheDocument()
+
+      // The exact reveal deadline remains the only deadline. Applying the
+      // current surface snapshot must settle it instead of timing out later.
+      await act(async () => { await vi.advanceTimersByTimeAsync(14_100) })
+      expect(screen.queryByRole('alert', { name: 'The conversation could not be refreshed.' })).not.toBeInTheDocument()
+      expect(screen.getByRole('alert', { name: 'Permission request for Bash' })).toBeInTheDocument()
+      expect(screen.queryByRole('status', { name: 'Refreshing conversation' })).not.toBeInTheDocument()
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls).toHaveLength(callsBeforeReveal + 2)
     })
 
     it('reveals a question raised while hidden with one fetch and no blocking overlay', async () => {

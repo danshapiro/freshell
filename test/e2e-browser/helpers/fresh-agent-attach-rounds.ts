@@ -693,7 +693,8 @@ export function analyzeFreshAgentAttachRounds(
  * Check the authoritative action for one reconcile recovery result. An
  * `attach` verdict needs exactly one current-fence attach. A
  * `recovery_in_progress` verdict needs its matching handoff-started fence,
- * one attach under that fence, and the matching commit afterward. A
+ * one attach under that fence after the result, and a matching commit after
+ * the result. The attach and commit may arrive in either order. A
  * `respawn` verdict completes through the exact pane create acknowledgment
  * plus a current committed owner, or through one exact target attach sent
  * after a matching current owner commits in that same reconcile round.
@@ -721,8 +722,9 @@ export function hasAuthoritativeFreshAgentRecoveryAction(
       && attachment.observedGeneration === expectedFence.generation)
     if (authoritativeAttaches.length !== 1) return false
     const attachFrameIndex = authoritativeAttaches[0].frameIndex
+    if (attachFrameIndex <= round.authorizationFrameIndex) return false
     return round.recoveryJoinCommittedOwnerFrames?.some((owner) =>
-      owner.frameIndex > attachFrameIndex && sameFence(owner.fence, expectedFence)) ?? false
+      owner.frameIndex > round.authorizationFrameIndex && sameFence(owner.fence, expectedFence)) ?? false
   }
   if (round.targetVerdict !== 'respawn') return false
   const matchingOwnerFrames = round.respawnCommittedOwnerFrames?.filter((owner) =>
