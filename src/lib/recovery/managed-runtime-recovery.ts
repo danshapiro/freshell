@@ -8,6 +8,7 @@ import type { FreshAgentSessionLocator } from '@/store/freshAgentTypes'
 import { memoryWarningSourceChanged } from '@/store/freshAgentSlice'
 import { findPaneContent } from '@/lib/pane-utils'
 import { streamBatcherFor } from '@/lib/fresh-agent-stream-batcher'
+import { getFreshAgentViewSnapshotThreadId } from '@/lib/fresh-agent-snapshot-thread'
 import type { PaneContent, PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import type { Tab, TerminalStatus } from '@/store/types'
 import { isScopedPaneContent } from '@/store/selectors/sessionNameSelectors'
@@ -553,14 +554,23 @@ function invalidateChangedInventorySources(
   const previousSouls = [...latestSoulViews(state.managedRuntime.souls).values()]
   const nextSouls = [...latestSoulViews(snapshot.souls).values()]
   for (const { content } of collectPaneLocations(state.panes.layouts)) {
-    if (content.kind !== 'fresh-agent' || content.provider !== 'codex' || !content.sessionId) continue
-    const locator = { sessionId: content.sessionId, sessionType: content.sessionType, provider: content.provider }
+    if (content.kind !== 'fresh-agent' || content.provider !== 'codex') continue
+    const sessionId = getFreshAgentViewSnapshotThreadId(content, undefined)
+    if (!sessionId) continue
+    const locator = { sessionId, sessionType: content.sessionType, provider: content.provider }
     const key = makeFreshAgentSessionKey(locator)
     if (checked.has(key)) continue
     checked.add(key)
     const previous = inventoryCodexSource(previousSouls, locator.sessionType, locator.sessionId)
     const next = inventoryCodexSource(nextSouls, locator.sessionType, locator.sessionId)
-    if (!previous || !next) continue
+    if (!next) continue
+    if (!previous) {
+      // The earlier inventory did not establish an owner. A response may
+      // still have used the gateway's native fallback before this route was
+      // recorded, so a newly recognized route cannot inherit its authority.
+      if (state.managedRuntime.readiness !== undefined) invalidateCodexSource(store, locator, invalidated)
+      continue
+    }
     const changed = previous.soulId !== next.soulId
       || Boolean(previous.incarnationId && next.incarnationId && previous.incarnationId !== next.incarnationId)
       || Boolean(previous.nativeSessionId && next.nativeSessionId && previous.nativeSessionId !== next.nativeSessionId)

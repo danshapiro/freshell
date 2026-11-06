@@ -1927,7 +1927,7 @@ describe('FreshAgentView', () => {
     })
   }
 
-  async function mountProjectionReviewRoute(name: string, withSoul = true, withNativeRef = false, noSoulPublicId = 'native-b', hidden = false) {
+  async function mountProjectionReviewRoute(name: string, withSoul = true, withNativeRef = false, noSoulPublicId = 'native-b', hidden = false, overrides: Partial<FreshAgentPaneContent> = {}) {
     const { WsClient } = await vi.importActual<typeof import('@/lib/ws-client')>('@/lib/ws-client')
     const client = new WsClient(`ws://${name}.test/ws`)
     const store = createStore()
@@ -1941,6 +1941,7 @@ describe('FreshAgentView', () => {
       kind: 'fresh-agent', ...locator, createRequestId: name, status: 'idle',
       ...(withSoul ? { soulId: 'soul-one', viewIntentId: 'view-one' } : {}),
       ...(withNativeRef ? { sessionRef: { provider: 'codex' as const, sessionId: 'native-b' } } : {}),
+      ...overrides,
     } }))
     const view = render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden={hidden} /></Provider>)
     await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
@@ -2955,6 +2956,231 @@ describe('FreshAgentView', () => {
       route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial snapshot'))
       beforeReplacement.resolve(hostedCodexSnapshot('native-b', 'Previous snapshot'))
       current.resolve(hostedCodexSnapshot('native-b', 'Current snapshot'))
+    }
+  })
+
+  it.each(['same', 'replacement'] as const)('fences a native fallback when its presentation is recorded with the %s incarnation', async (incarnation) => {
+    const route = await mountProjectionReviewRoute(`inventory-native-claim-${incarnation}`, false, false, 'native-b')
+    const current = createDeferred<unknown>()
+    const key = 'freshcodex:codex:native-b'
+    try {
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith('freshcodex', 'codex', 'native-b', expect.anything())
+      const previous = managedCodexInventory('native-b')
+      // No primary or recorded presentation owns native-b: the running first
+      // soul is the gateway's native fallback for this request.
+      previous.souls = [previous.souls[0]]
+      previous.viewIntents[0].kind = 'explicit'
+      previous.viewIntents[0].visibility = 'hidden'
+      apiMock.getManagedRuntimeInventory.mockResolvedValueOnce(previous)
+      await act(async () => queueManagedRuntimeRefresh(route.store as any, 'before claim'))
+      expect(getFreshAgentPaneContent(route.store).soulId).toBeUndefined()
+      const status = route.store.getState().freshAgent.sessions[key]?.status
+
+      const replacement = managedCodexInventory('native-b')
+      replacement.souls = [replacement.souls[0]]
+      replacement.revision += 1
+      if (incarnation === 'replacement') replacement.souls[0].incarnationId = 'incarnation-replacement'
+      replacement.souls[0].freshAgentPresentationIds = ['native-b']
+      replacement.viewIntents[0].kind = 'explicit'
+      replacement.viewIntents[0].visibility = 'hidden'
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(current.promise)
+      apiMock.getManagedRuntimeInventory.mockResolvedValueOnce(replacement)
+      await act(async () => queueManagedRuntimeRefresh(route.store as any, 'claim and replacement'))
+      expect(getFreshAgentPaneContent(route.store).soulId).toBeUndefined()
+      await act(async () => route.initial.resolve({ ...hostedCodexProjectionSnapshot('native-b', 'old-q', 'Old native fallback', 1), status: 'running' }))
+      expect(screen.queryByText('Old native fallback')).not.toBeInTheDocument()
+      expect(route.store.getState().freshAgent.sessions[key]?.status).toBe(status)
+      expect(route.store.getState().freshAgentLive.bySession[key]?.projection).toBeUndefined()
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === current.promise)).toBe(true))
+      await act(async () => current.resolve(hostedCodexProjectionSnapshot('native-b', 'new-q', 'Current claimed presentation', 1)))
+      await expectRenderedText('Current claimed presentation')
+      expect(route.store.getState().freshAgentLive.bySession[key]?.projection?.id).toBe('new-q')
+      const calls = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+      apiMock.getManagedRuntimeInventory.mockResolvedValueOnce(replacement)
+      await act(async () => queueManagedRuntimeRefresh(route.store as any, 'unchanged claim'))
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(calls)
+      expect(screen.getByText('Current claimed presentation')).toBeInTheDocument()
+    } finally {
+      cleanup()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial snapshot'))
+      current.resolve(hostedCodexSnapshot('native-b', 'Current snapshot'))
+    }
+  })
+
+  it('fences a reference-only no-soul read when inventory replaces its primary route source', async () => {
+    const route = await mountProjectionReviewRoute('inventory-reference-only', false, false, 'managed-public', false, {
+      sessionId: undefined, sessionRef: { provider: 'codex', sessionId: 'managed-public' },
+    })
+    const current = createDeferred<unknown>()
+    const key = 'freshcodex:codex:managed-public'
+    try {
+      expect(getFreshAgentPaneContent(route.store)).toMatchObject({
+        sessionId: undefined, sessionRef: { provider: 'codex', sessionId: 'managed-public' },
+      })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith('freshcodex', 'codex', 'managed-public', expect.anything())
+      const previous = managedCodexInventory('native-b')
+      previous.viewIntents[0].kind = 'explicit'
+      previous.viewIntents[0].visibility = 'hidden'
+      apiMock.getManagedRuntimeInventory.mockResolvedValueOnce(previous)
+      await act(async () => queueManagedRuntimeRefresh(route.store as any, 'reference previous'))
+      expect(getFreshAgentPaneContent(route.store).soulId).toBeUndefined()
+      const status = route.store.getState().freshAgent.sessions[key]?.status
+
+      const replacement = managedCodexInventory('native-b')
+      replacement.revision += 1
+      replacement.souls[0].incarnationId = 'incarnation-replacement'
+      replacement.viewIntents[0].kind = 'explicit'
+      replacement.viewIntents[0].visibility = 'hidden'
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(current.promise)
+      apiMock.getManagedRuntimeInventory.mockResolvedValueOnce(replacement)
+      await act(async () => queueManagedRuntimeRefresh(route.store as any, 'reference replacement'))
+      expect(getFreshAgentPaneContent(route.store).soulId).toBeUndefined()
+      await act(async () => route.initial.resolve({ ...hostedCodexProjectionSnapshot('native-b', 'old-q', 'Old reference-only response', 1), status: 'running' }))
+      expect(screen.queryByText('Old reference-only response')).not.toBeInTheDocument()
+      expect(route.store.getState().freshAgent.sessions[key]?.status).toBe(status)
+      expect(route.store.getState().freshAgentLive.bySession[key]?.projection).toBeUndefined()
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === current.promise)).toBe(true))
+      await act(async () => current.resolve(hostedCodexProjectionSnapshot('native-b', 'new-q', 'Current reference-only response', 1)))
+      await expectRenderedText('Current reference-only response')
+      expect(route.store.getState().freshAgentLive.bySession[key]?.projection?.id).toBe('new-q')
+    } finally {
+      cleanup()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial snapshot'))
+      current.resolve(hostedCodexSnapshot('native-b', 'Current snapshot'))
+    }
+  })
+
+  it('does not use a reference-only pane to resolve a collided inventory route', async () => {
+    const route = await mountProjectionReviewRoute('inventory-reference-collision', false, false, 'managed-public', false, {
+      sessionId: undefined, sessionRef: { provider: 'codex', sessionId: 'managed-public' },
+    })
+    try {
+      const previous = managedCodexInventory('native-b')
+      previous.viewIntents[0].kind = 'explicit'
+      previous.viewIntents[0].visibility = 'hidden'
+      apiMock.getManagedRuntimeInventory.mockResolvedValueOnce(previous)
+      await act(async () => queueManagedRuntimeRefresh(route.store as any, 'reference previous'))
+      const collided = managedCodexInventory('native-b')
+      collided.revision += 1
+      collided.souls[0].incarnationId = 'incarnation-replacement'
+      collided.souls[1].freshAgentPresentationIds = ['managed-public']
+      collided.viewIntents[0].kind = 'explicit'
+      collided.viewIntents[0].visibility = 'hidden'
+      apiMock.getManagedRuntimeInventory.mockResolvedValueOnce(collided)
+      await act(async () => queueManagedRuntimeRefresh(route.store as any, 'reference collision'))
+      expect(getFreshAgentPaneContent(route.store)).toMatchObject({
+        sessionId: undefined, sessionRef: { provider: 'codex', sessionId: 'managed-public' },
+      })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+      await act(async () => route.initial.resolve(hostedCodexProjectionSnapshot('native-b', 'unassigned-q', 'Reference collision response', 1)))
+      await expectRenderedText('Reference collision response')
+    } finally {
+      cleanup()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial snapshot'))
+    }
+  })
+
+  it.each(['bootstrap', 'stopped'] as const)('fences the actual %s history route when inventory replaces its source', async (mode) => {
+    const overrides: Partial<FreshAgentPaneContent> = mode === 'bootstrap'
+      ? { sessionId: undefined, sessionRef: { provider: 'codex', sessionId: 'native-b' },
+        status: 'creating', pendingReconcile: 'fresh', viewIntentId: 'unmatched-view' }
+      : { sessionRef: { provider: 'codex', sessionId: 'native-b' },
+        recoverySummary: { desiredState: 'stopped', recoveryState: 'stopped', durabilityState: 'resume_captured', allocationState: 'verified_durable' } }
+    const route = await mountProjectionReviewRoute(`inventory-${mode}-history`, mode === 'bootstrap', false, 'managed-public', false, overrides)
+    const current = createDeferred<unknown>()
+    const key = 'freshcodex:codex:native-b'
+    try {
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith('freshcodex', 'codex', 'native-b', expect.anything())
+      const previous = managedCodexInventory('native-b')
+      previous.souls = [previous.souls[0]]
+      previous.souls[0].freshAgentSessionId = 'native-b'
+      previous.viewIntents[0].kind = 'explicit'
+      previous.viewIntents[0].visibility = 'hidden'
+      apiMock.getManagedRuntimeInventory.mockResolvedValueOnce(previous)
+      await act(async () => queueManagedRuntimeRefresh(route.store as any, `${mode} previous`))
+      const replacement = managedCodexInventory('native-b')
+      replacement.souls = [replacement.souls[0]]
+      replacement.souls[0].freshAgentSessionId = 'native-b'
+      replacement.souls[0].incarnationId = 'incarnation-replacement'
+      replacement.revision += 1
+      replacement.viewIntents[0].kind = 'explicit'
+      replacement.viewIntents[0].visibility = 'hidden'
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(current.promise)
+      apiMock.getManagedRuntimeInventory.mockResolvedValueOnce(replacement)
+      await act(async () => queueManagedRuntimeRefresh(route.store as any, `${mode} replacement`))
+      await act(async () => route.initial.resolve(hostedCodexProjectionSnapshot('native-b', 'old-q', `Old ${mode} history`, 1)))
+      expect(screen.queryByText(`Old ${mode} history`)).not.toBeInTheDocument()
+      expect(route.store.getState().freshAgentLive.bySession[key]?.projection).toBeUndefined()
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === current.promise)).toBe(true))
+      await act(async () => current.resolve(hostedCodexProjectionSnapshot('native-b', 'new-q', `Current ${mode} history`, 1)))
+      await expectRenderedText(`Current ${mode} history`)
+    } finally {
+      cleanup()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial history'))
+      current.resolve(hostedCodexSnapshot('native-b', 'Current history'))
+    }
+  })
+
+  it.each(['creating', 'starting'] as const)('does not read or invalidate a stale reference while %s a new Codex session', async (status) => {
+    const store = createStore()
+    const locator = { sessionId: 'managed-public', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    store.dispatch(sessionInit(locator))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex', createRequestId: `new-${status}`, status,
+      sessionRef: { provider: 'codex', sessionId: 'managed-public' },
+    } }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    try {
+      const previous = managedCodexInventory('native-b')
+      previous.viewIntents[0].kind = 'explicit'
+      previous.viewIntents[0].visibility = 'hidden'
+      apiMock.getManagedRuntimeInventory.mockResolvedValueOnce(previous)
+      await act(async () => queueManagedRuntimeRefresh(store as any, `${status} previous`))
+      const replacement = managedCodexInventory('native-b')
+      replacement.revision += 1
+      replacement.souls[0].incarnationId = 'incarnation-replacement'
+      replacement.viewIntents[0].kind = 'explicit'
+      replacement.viewIntents[0].visibility = 'hidden'
+      apiMock.getManagedRuntimeInventory.mockResolvedValueOnce(replacement)
+      await act(async () => queueManagedRuntimeRefresh(store as any, `${status} replacement`))
+      expect(apiMock.getFreshAgentThreadSnapshot).not.toHaveBeenCalled()
+      expect(store.getState().freshAgentLive.snapshotSourceRevisionBySession['freshcodex:codex:managed-public']).toBeUndefined()
+    } finally {
+      cleanup()
+    }
+  })
+
+  it.each(['primary', 'presentation', 'collision'] as const)('keeps the competing %s owner ahead of a matching native route', async (ownerKind) => {
+    const route = await mountProjectionReviewRoute(`inventory-native-competing-${ownerKind}`, false, false, 'native-b')
+    try {
+      const previous = managedCodexInventory('native-b')
+      if (ownerKind === 'presentation') {
+        previous.souls[1].freshAgentSessionId = 'other-public'
+        previous.souls[1].freshAgentPresentationIds = ['native-b']
+      }
+      previous.viewIntents[0].kind = 'explicit'
+      previous.viewIntents[0].visibility = 'hidden'
+      apiMock.getManagedRuntimeInventory.mockResolvedValueOnce(previous)
+      await act(async () => queueManagedRuntimeRefresh(route.store as any, 'competing owner'))
+      const replacement = managedCodexInventory('native-b')
+      if (ownerKind === 'presentation') {
+        replacement.souls[1].freshAgentSessionId = 'other-public'
+        replacement.souls[1].freshAgentPresentationIds = ['native-b']
+      }
+      if (ownerKind === 'collision') replacement.souls[0].freshAgentPresentationIds = ['native-b']
+      replacement.revision += 1
+      replacement.souls[0].incarnationId = 'incarnation-replacement'
+      replacement.viewIntents[0].kind = 'explicit'
+      replacement.viewIntents[0].visibility = 'hidden'
+      apiMock.getManagedRuntimeInventory.mockResolvedValueOnce(replacement)
+      await act(async () => queueManagedRuntimeRefresh(route.store as any, 'competing owner unchanged'))
+      expect(getFreshAgentPaneContent(route.store).soulId).toBeUndefined()
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+      await act(async () => route.initial.resolve(hostedCodexProjectionSnapshot('other-current-native', 'owner-q', 'Competing owner output', 1)))
+      await expectRenderedText('Competing owner output')
+    } finally {
+      cleanup()
+      route.initial.resolve(hostedCodexSnapshot('other-current-native', 'Owner snapshot'))
     }
   })
 

@@ -1,12 +1,27 @@
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import { getCanonicalDurableSessionId, type SessionIdentityState } from '@/store/persistControl'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
+import { isManagedRuntimeRecoveryPending } from '@/lib/managed-runtime-recovery-message'
 import { isDurableProviderSessionId } from '@shared/session-flavor'
 
 // Same create/start gate the FreshAgentView/panesSlice early-state sets apply:
 // while a new session is still being created, the pane must not read an older
 // durable ref.
 const EARLY_STATES = new Set(['creating', 'starting'])
+
+/** Ordinary Stop retains history without authorizing any provider lifecycle work. */
+export function isManagedFreshAgentStopped(pane: FreshAgentPaneContent): boolean {
+  return pane.recoverySummary?.desiredState === 'stopped'
+    || pane.recoverySummary?.recoveryState === 'stopped'
+}
+
+/** The durable identity claim carried by create/attach: prefer sessionRef and
+ * promote the legacy resumeSessionId only when no sessionRef exists. */
+export function effectiveSessionRef(pane: FreshAgentPaneContent) {
+  if (pane.sessionRef) return pane.sessionRef
+  if (pane.resumeSessionId) return { provider: pane.provider, sessionId: pane.resumeSessionId }
+  return undefined
+}
 
 /** A known managed conversation remains readable while its same-request
  * bootstrap has no live handle. This is exclusively an owned history source;
@@ -68,6 +83,19 @@ export function getFreshAgentSnapshotThreadId(
   }
   return pane.sessionId
     ?? sessionRefId
+}
+
+/** The actual view read route, including stopped and bootstrap history. */
+export function getFreshAgentViewSnapshotThreadId(
+  pane: FreshAgentPaneContent,
+  claudeSession: SessionIdentityState,
+): string | undefined {
+  if (isManagedFreshAgentStopped(pane)) {
+    const ref = effectiveSessionRef(pane)
+    if (ref?.provider === pane.provider && isDurableProviderSessionId(pane.provider, ref.sessionId)) return ref.sessionId
+    if (!isManagedRuntimeRecoveryPending(pane.recoverySummary)) return undefined
+  }
+  return getManagedBootstrapHistoryThreadId(pane) ?? getFreshAgentSnapshotThreadId(pane, claudeSession)
 }
 
 /** The pane's canonical claude resume id (sessionRef → legacy resumeSessionId

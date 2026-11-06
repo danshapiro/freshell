@@ -114,9 +114,11 @@ import FreshAgentModelDialog from '@/components/fresh-agent/FreshAgentModelDialo
 import { buildRestoreError, type RestoreErrorReason } from '@shared/session-contract'
 import { isDurableProviderSessionId } from '@shared/session-flavor'
 import {
+  effectiveSessionRef,
   getCanonicalPaneResumeSessionId,
-  getFreshAgentSnapshotThreadId,
+  getFreshAgentViewSnapshotThreadId,
   getManagedBootstrapHistoryThreadId,
+  isManagedFreshAgentStopped,
 } from '@/lib/fresh-agent-snapshot-thread'
 import { isFreshAgentRevealRevisionFresh } from '@/lib/fresh-agent-reveal-freshness'
 import { CLAUDE_PERMISSION_MODE_VALUES, DEFAULT_FRESH_AGENT_STYLE, normalizeFreshAgentStyle } from '@shared/settings'
@@ -210,21 +212,8 @@ function isSupervisorRecoveryOwned(content: FreshAgentPaneContent): boolean {
 function isSupervisorRecoveryActive(content: FreshAgentPaneContent, sessionLost?: boolean): boolean {
   return isManagedRuntimeRecoveryPending(content.recoverySummary) || Boolean(content.soulId && sessionLost)
 }
-/** Ordinary Stop retains history without authorizing any provider lifecycle work. */
-function isManagedFreshAgentStopped(content: FreshAgentPaneContent): boolean {
-  return content.recoverySummary?.desiredState === 'stopped'
-    || content.recoverySummary?.recoveryState === 'stopped'
-}
-
 function isFreshAgentLifecycleBlocked(content: FreshAgentPaneContent): boolean {
   return isManagedFreshAgentStopped(content) || isManagedRuntimeRecoveryPending(content.recoverySummary)
-}
-
-function getStoppedHistoryThreadId(content: FreshAgentPaneContent): string | undefined {
-  const ref = effectiveSessionRef(content)
-  return ref?.provider === content.provider && isDurableProviderSessionId(content.provider, ref.sessionId)
-    ? ref.sessionId
-    : undefined
 }
 
 // Context usage validity window for the strip meter: at 60s the strip triggers
@@ -714,21 +703,6 @@ function persistDurableFreshAgentFlavor(
       err,
     })
   })
-}
-
-/// The ONE durable-identity claim an outgoing create/attach carries: the
-/// canonical sessionRef, with a legacy-only pane's `resumeSessionId` promoted
-/// into it ({provider, sessionId} — the same §5.2 promotion rule the server's
-/// reconcile door applies). The legacy wire field itself is no longer sent;
-/// every server door resolves its resume input from sessionRef
-/// (claude.rs/codex.rs/opencode_ws.rs create paths, claude.rs
-/// attach_durable_id, Node runtime-manager.ts:106-108).
-function effectiveSessionRef(content: FreshAgentPaneContent) {
-  if (content.sessionRef) return content.sessionRef
-  if (content.resumeSessionId) {
-    return { provider: content.provider, sessionId: content.resumeSessionId }
-  }
-  return undefined
 }
 
 type AttachmentAttempt = {
@@ -1871,14 +1845,7 @@ export function FreshAgentView({
   const managedLostStatusVersion = supervisorRecoveryOwned && !snapshotReadOnly && agentSession?.lost
     ? agentSession.statusVersion ?? 0
     : undefined
-  // Prefer the saved canonical locator even during stopped intervention. Keep
-  // intervention history's existing native/legacy fallback and its guards.
-  const stoppedHistoryThreadId = managedStopped ? getStoppedHistoryThreadId(paneContent) : undefined
-  const snapshotThreadId = stoppedHistoryThreadId ?? (
-    managedStopped && !managedRecoveryPending
-      ? undefined
-      : bootstrapHistoryThreadId ?? getFreshAgentSnapshotThreadId(paneContent, claudeSession)
-  )
+  const snapshotThreadId = getFreshAgentViewSnapshotThreadId(paneContent, claudeSession)
   const snapshotThreadIdRef = useRef(snapshotThreadId)
   snapshotThreadIdRef.current = snapshotThreadId
   const codexSnapshotKey = paneContent.provider === 'codex' && snapshotThreadId
