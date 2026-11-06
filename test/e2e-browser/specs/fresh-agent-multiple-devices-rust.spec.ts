@@ -1895,6 +1895,146 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
       expect(native.runtimeStartCount(session.sessionId)).toBe(runtimeStartsBefore + 1)
     }))
 
+    test(`stage2 stale authority ${mode}: delayed desktop attach joins mobile recovery`, withTwoDeviceSession(mode, async ({
+      desktop,
+      mobile,
+      native,
+      session,
+      frames,
+      restartServer,
+    }) => {
+      const desktopReady = await desktop.harness.getLastReadyAt()
+      const mobileReady = await mobile.harness.getLastReadyAt()
+      const desktopCursor = frames.desktop.length
+      const mobileCursor = frames.mobile.length
+      const attemptsBefore = native.recoveryAttemptCount(session.sessionId)
+      const runtimeStartsBefore = native.runtimeStartCount(session.sessionId)
+      const oldBinding = await native.readBinding(session.sessionId)
+      const oldAuthority = {
+        epoch: await native.readBootEpoch(),
+        generation: typeof oldBinding.ownerGeneration === 'number' ? oldBinding.ownerGeneration : undefined,
+      }
+      expect(oldAuthority.generation, 'the existing owner has a durable generation before restart').toEqual(expect.any(Number))
+
+      desktop.attachRequests.holdNext(desktop.viewId)
+      await native.holdNextRecovery(session.sessionId)
+      await restartServer()
+      await Promise.all([
+        desktop.harness.waitForConnectionAfter(desktopReady, 60_000),
+        mobile.harness.waitForConnectionAfter(mobileReady, 60_000),
+      ])
+
+      const [heldDesktopAttach, mobileActionResult, recoveryAttemptResult] = await Promise.allSettled([
+        desktop.attachRequests.waitForHeld(45_000),
+        recoveryAction(frames.mobile, mobile, session, mobileCursor),
+        native.waitForRecoveryAttempt(session.sessionId),
+      ])
+      if (heldDesktopAttach.status === 'rejected') throw heldDesktopAttach.reason
+      if (mobileActionResult.status === 'rejected') throw mobileActionResult.reason
+      if (recoveryAttemptResult.status === 'rejected') throw recoveryAttemptResult.reason
+      const staleRequestId = heldDesktopAttach.value.requestId
+      const mobileAction = mobileActionResult.value
+      expect(heldDesktopAttach.value).toMatchObject({
+        type: 'freshAgent.attach',
+        viewId: desktop.viewId,
+        provider: session.provider,
+        sessionType: session.sessionType,
+        sessionId: session.sessionId,
+      })
+      expect(staleRequestId).toEqual(expect.any(String))
+      expect(staleRequestId).not.toBe(mobileAction.requestId)
+
+      // Mobile completes the one shared recovery while desktop's older attach
+      // is still held outside the server. Releasing it with the pre-restart
+      // fence makes the late request exercise the stale-authority refusal.
+      await native.releaseRecovery()
+      const mobileResult = await recoveryOutcome(frames.mobile, mobileAction, true)
+      expect(mobileResult.sessionId).toBe(session.sessionId)
+      await waitForPaneStatus(mobile, /^(connected|idle)$/)
+
+      desktop.attachRequests.release({ epoch: oldAuthority.epoch, generation: oldAuthority.generation! })
+      const staleDesktopAttach = frames.desktop.slice(desktopCursor).find((frame) => frame.direction === 'sent'
+        && frame.type === 'freshAgent.attach'
+        && frame.requestId === staleRequestId)
+      expect(staleDesktopAttach).toMatchObject({
+        requestId: staleRequestId,
+        viewId: desktop.viewId,
+        observedEpoch: oldAuthority.epoch,
+        observedGeneration: oldAuthority.generation,
+      })
+      let staleRefusal: JsonRow | undefined
+      await expect.poll(() => {
+        staleRefusal = frames.desktop.find((frame) => frame.direction === 'received'
+          && frame.requestId === staleRequestId
+          && frame.type === 'freshAgent.attach.failed')
+        return staleRefusal ?? null
+      }, {
+        timeout: 30_000,
+        message: 'the delayed pre-restart attach receives its own complete stale-owner refusal',
+      }).not.toBeNull()
+      expect(staleRefusal).toMatchObject({
+        requestId: staleRequestId,
+        viewId: desktop.viewId,
+        ownerKind: 'fresh-agent',
+        ownerEpoch: expect.any(Number),
+        ownerGeneration: expect.any(Number),
+      })
+      const winnerAuthority = {
+        epoch: staleRefusal!.ownerEpoch as number,
+        generation: staleRefusal!.ownerGeneration as number,
+      }
+      expect(winnerAuthority.epoch).toBeGreaterThan(oldAuthority.epoch)
+
+      let winningDesktopAttach: JsonRow | undefined
+      await expect.poll(() => {
+        winningDesktopAttach = frames.desktop.slice(desktopCursor).find((frame) => frame.direction === 'sent'
+          && frame.type === 'freshAgent.attach'
+          && frame.viewId === desktop.viewId
+          && frame.requestId !== staleRequestId)
+        return winningDesktopAttach ?? null
+      }, {
+        timeout: 30_000,
+        message: 'desktop attaches to the recovered owner with a distinct immutable request',
+      }).not.toBeNull()
+      expect(winningDesktopAttach).toMatchObject({
+        type: 'freshAgent.attach',
+        viewId: desktop.viewId,
+        provider: session.provider,
+        sessionType: session.sessionType,
+        sessionId: session.sessionId,
+        observedEpoch: winnerAuthority.epoch,
+        observedGeneration: winnerAuthority.generation,
+      })
+      expect(winningDesktopAttach?.requestId).not.toBe(staleRequestId)
+      const desktopResult = await recoveryOutcome(frames.desktop, winningDesktopAttach!, true)
+      expect(desktopResult.sessionId).toBe(session.sessionId)
+      await waitForPaneStatus(desktop, /^(connected|idle)$/)
+
+      const desktopAttachRequests = frames.desktop.slice(desktopCursor).filter((frame) => frame.direction === 'sent'
+        && frame.type === 'freshAgent.attach'
+        && frame.viewId === desktop.viewId
+        && frame.provider === session.provider
+        && frame.sessionType === session.sessionType
+        && frame.sessionId === session.sessionId)
+      expect(desktopAttachRequests).toHaveLength(2)
+      expect(desktopAttachRequests.map((frame) => frame.requestId).sort()).toEqual([
+        staleRequestId,
+        winningDesktopAttach?.requestId,
+      ].sort())
+      expect(native.recoveryAttemptCount(session.sessionId)).toBe(attemptsBefore + 1)
+      expect(native.runtimeStartCount(session.sessionId)).toBe(runtimeStartsBefore + 1)
+
+      const state = await desktop.harness.getState()
+      const ownerRecords = Object.values(state.freshAgent?.runtimeOwners ?? {}) as Array<Record<string, unknown>>
+      const currentOwner = ownerRecords.find((owner) => owner.provider === session.provider
+        && owner.sessionId === session.sessionId)
+      expect(currentOwner).toMatchObject({
+        ownerKind: 'fresh-agent',
+        epoch: winnerAuthority.epoch,
+        generation: winnerAuthority.generation,
+      })
+    }))
+
     test(`stage2 shared failure ${mode}: both views receive one failed recovery result`, withTwoDeviceSession(mode, async ({
       desktop,
       mobile,

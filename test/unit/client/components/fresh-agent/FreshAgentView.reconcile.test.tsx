@@ -5,11 +5,12 @@ import { configureStore } from '@reduxjs/toolkit'
 import panesReducer, {
   applyFreshAgentReconcileAttach,
   initLayout,
+  requestPaneRefresh,
   resetFreshAgentPaneForReconcileCreate,
   setReconcilePendingPanes,
 } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
-import freshAgentReducer, { markSessionLost, setSessionStatus } from '@/store/freshAgentSlice'
+import freshAgentReducer, { applyRuntimeOwner, markSessionLost, setSessionStatus } from '@/store/freshAgentSlice'
 import tabsReducer from '@/store/tabsSlice'
 import connectionReducer, { setStatus } from '@/store/connectionSlice'
 import {
@@ -605,6 +606,185 @@ describe('FreshAgentView SESSION_RESERVED re-drive (Task 14)', () => {
       await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS + 20)
     })
     expect(sentOfType('freshAgent.attach').length).toBeGreaterThan(attachesBefore) // re-driven
+  })
+})
+
+describe('FreshAgentView obsolete attach authority retry', () => {
+  const initialOwner = {
+    type: 'session.runtimeOwner' as const,
+    provider: 'claude' as const,
+    sessionId: DURABLE,
+    epoch: 4,
+    generation: 2,
+    ownerKind: 'fresh-agent' as const,
+    operationId: 'owner-before-attach',
+    transition: 'handoff-committed' as const,
+  }
+
+  it('captures a new attach decision with both authority fields from a typed obsolete-owner refusal', async () => {
+    act(() => { store.dispatch(applyRuntimeOwner(initialOwner)) })
+    renderFreshAgentPane({
+      sessionId: DURABLE,
+      status: 'connected',
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+    })
+    await flush()
+    const first = sentOfType('freshAgent.attach').at(-1)!
+    expect(first).toMatchObject({ observedEpoch: 4, observedGeneration: 2 })
+
+    // Deliver to the view's correlated handler first. It must not rely on an
+    // uncorrelated global projection to repair an obsolete owner decision.
+    receiveWs({
+      type: 'freshAgent.attach.failed',
+      requestId: first.requestId,
+      viewId: first.viewId,
+      provider: 'claude',
+      sessionType: 'freshclaude',
+      sessionId: DURABLE,
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+      status: 'failed',
+      code: 'SESSION_RESERVED',
+      message: 'retry with current owner authority',
+      retryable: true,
+      ownerKind: 'fresh-agent',
+      ownerEpoch: 5,
+      ownerGeneration: 3,
+    })
+    await flush()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS + 20)
+    })
+
+    const retry = sentOfType('freshAgent.attach').at(-1)!
+    expect(retry.requestId).not.toBe(first.requestId)
+    expect(retry).toMatchObject({
+      type: 'freshAgent.attach',
+      sessionId: DURABLE,
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+      viewId: first.viewId,
+      observedEpoch: 5,
+      observedGeneration: 3,
+    })
+  })
+
+  it('ignores a late refusal from an older attach request after the view has a newer decision', async () => {
+    act(() => { store.dispatch(applyRuntimeOwner(initialOwner)) })
+    renderFreshAgentPane({
+      sessionId: DURABLE,
+      status: 'connected',
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+    })
+    await flush()
+    const first = sentOfType('freshAgent.attach').at(-1)!
+
+    act(() => { store.dispatch(requestPaneRefresh({ tabId, paneId })) })
+    await flush()
+    const current = sentOfType('freshAgent.attach').at(-1)!
+    expect(current.requestId).not.toBe(first.requestId)
+
+    const lateRefusal = {
+      type: 'freshAgent.attach.failed',
+      requestId: first.requestId,
+      viewId: first.viewId,
+      provider: 'claude',
+      sessionType: 'freshclaude',
+      sessionId: DURABLE,
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+      status: 'failed',
+      code: 'SESSION_RESERVED',
+      message: 'obsolete request refused after recovery won',
+      retryable: true,
+      ownerKind: 'fresh-agent',
+      ownerEpoch: 5,
+      ownerGeneration: 3,
+    }
+    act(() => {
+      handleFreshAgentMessage(store.dispatch, lateRefusal)
+      for (const call of wsMock.onMessage.mock.calls) call[0](lateRefusal)
+    })
+    await flush()
+
+    expect(sentOfType('freshAgent.attach')).toHaveLength(2)
+    expect(store.getState().freshAgent.runtimeOwners?.[`claude:${DURABLE}`]).toMatchObject({
+      epoch: 4,
+      generation: 2,
+      ownerKind: 'fresh-agent',
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS + 20)
+    })
+    expect(sentOfType('freshAgent.attach')).toHaveLength(2)
+  })
+
+  it('uses one read-only reconcile when typed stale authority is incomplete', async () => {
+    act(() => { store.dispatch(applyRuntimeOwner(initialOwner)) })
+    renderFreshAgentPane({
+      sessionId: DURABLE,
+      status: 'connected',
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+    })
+    await flush()
+    const first = sentOfType('freshAgent.attach').at(-1)!
+
+    receiveWs({
+      type: 'freshAgent.attach.failed',
+      requestId: first.requestId,
+      viewId: first.viewId,
+      provider: 'claude',
+      sessionType: 'freshclaude',
+      sessionId: DURABLE,
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+      status: 'failed',
+      code: 'SESSION_RESERVED',
+      message: 'refresh owner before retrying',
+      retryable: true,
+      ownerKind: 'fresh-agent',
+      ownerGeneration: 3,
+    })
+    await flush()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS * 2)
+    })
+
+    expect(sentOfType('pane.reconcile.request')).toHaveLength(1)
+    expect(sentOfType('freshAgent.attach')).toHaveLength(1)
+    expect(sentOfType('freshAgent.create')).toHaveLength(0)
+  })
+
+  it('shows terminal divergence and sends no retry when the refusal names a terminal owner', async () => {
+    act(() => { store.dispatch(applyRuntimeOwner(initialOwner)) })
+    renderFreshAgentPane({
+      sessionId: DURABLE,
+      status: 'connected',
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+    })
+    await flush()
+    const first = sentOfType('freshAgent.attach').at(-1)!
+
+    receiveWs({
+      type: 'freshAgent.attach.failed',
+      requestId: first.requestId,
+      viewId: first.viewId,
+      provider: 'claude',
+      sessionType: 'freshclaude',
+      sessionId: DURABLE,
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+      status: 'failed',
+      code: 'SESSION_RESERVED',
+      message: 'a terminal owns this conversation',
+      retryable: true,
+      ownerKind: 'terminal',
+      ownerEpoch: 5,
+      ownerGeneration: 3,
+    })
+    await flush()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS + 20)
+    })
+
+    expect(screen.getByRole('alert', { name: 'Session open as a terminal on another device' })).toBeVisible()
+    expect(sentOfType('freshAgent.attach')).toHaveLength(1)
+    expect(sentOfType('freshAgent.create')).toHaveLength(0)
   })
 })
 

@@ -26,14 +26,21 @@ type Device = {
   viewId: string
   frames: JsonRow[]
   createdReplies: CreatedReplyGate
+  attachRequests: AttachRequestGate
 }
 
-type DevicePage = Pick<Device, 'context' | 'page' | 'harness' | 'frames' | 'createdReplies'>
+type DevicePage = Pick<Device, 'context' | 'page' | 'harness' | 'frames' | 'createdReplies' | 'attachRequests'>
 
 type CreatedReplyGate = {
   holdNext: () => void
   waitForHeld: (timeoutMs?: number) => Promise<JsonRow>
   release: () => void
+}
+
+type AttachRequestGate = {
+  holdNext: (viewId: string) => void
+  waitForHeld: (timeoutMs?: number) => Promise<JsonRow>
+  release: (authority?: { epoch: number; generation: number }) => void
 }
 
 type NativeFixture = {
@@ -262,10 +269,19 @@ export function wireFreshAgentWebSocketRoute(
     message: unknown,
     recordReceived: (message: unknown) => void,
   ) => boolean,
+  interceptSent?: (
+    client: WebSocketRoute,
+    message: unknown,
+    sendToServer: (message: unknown) => void,
+  ) => boolean,
 ): void {
   client.onMessage((message) => {
-    appendFrame(frames, 'sent', message)
-    server.send(message)
+    const sendToServer = (payload: unknown) => {
+      appendFrame(frames, 'sent', payload)
+      server.send(payload)
+    }
+    if (interceptSent?.(client, message, sendToServer)) return
+    sendToServer(message)
   })
   server.onMessage((message) => {
     const recordReceived = (payload: unknown) => appendFrame(frames, 'received', payload)
@@ -282,6 +298,7 @@ async function openDevicePage(
   info: E2eServerInfo,
   frames: JsonRow[],
   createdReplies: CreatedReplyGate,
+  attachRequests: AttachRequestGate,
 ): Promise<DevicePage> {
   const page = await context.newPage()
   await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
@@ -297,7 +314,7 @@ async function openDevicePage(
   const harness = new TestHarness(page)
   await harness.waitForHarness()
   await harness.waitForConnection()
-  return { context, page, harness, frames, createdReplies }
+  return { context, page, harness, frames, createdReplies, attachRequests }
 }
 
 export function createCreatedReplyGate(): {
@@ -363,16 +380,82 @@ export function createCreatedReplyGate(): {
   }
 }
 
+export function createAttachRequestGate(): {
+  gate: AttachRequestGate
+  intercept: (
+    client: WebSocketRoute,
+    message: unknown,
+    sendToServer: (message: unknown) => void,
+  ) => boolean
+} {
+  let targetViewId: string | undefined
+  let held: { frame: JsonRow } | undefined
+  let resolveHeld: ((frame: JsonRow) => void) | undefined
+  let heldPromise: Promise<JsonRow> | undefined
+  let sendHeld: ((message: unknown) => void) | undefined
+
+  const gate: AttachRequestGate = {
+    holdNext: (viewId) => {
+      if (targetViewId || held) throw new Error('a freshAgent.attach request is already held or armed')
+      targetViewId = viewId
+      heldPromise = new Promise<JsonRow>((resolve) => { resolveHeld = resolve })
+    },
+    waitForHeld: (timeoutMs = 45_000) => {
+      if (held) return Promise.resolve(held.frame)
+      if (!heldPromise) throw new Error('holdNext must be called before waiting for a freshAgent.attach request')
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const timeout = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(
+          `Timed out after ${timeoutMs}ms waiting for a freshAgent.attach request`,
+        )), timeoutMs)
+      })
+      return Promise.race([heldPromise, timeout]).finally(() => {
+        if (timer) clearTimeout(timer)
+      })
+    },
+    release: (authority) => {
+      if (!held || !sendHeld) throw new Error('no freshAgent.attach request is currently held')
+      const pending = held
+      const frame = authority
+        ? { ...pending.frame, observedEpoch: authority.epoch, observedGeneration: authority.generation }
+        : pending.frame
+      held = undefined
+      sendHeld(JSON.stringify(frame))
+      sendHeld = undefined
+      resolveHeld = undefined
+      heldPromise = undefined
+    },
+  }
+
+  return {
+    gate,
+    intercept: (_client, message, sendToServer) => {
+      if (!targetViewId || typeof message !== 'string') return false
+      let frame: unknown
+      try { frame = JSON.parse(message) } catch { return false }
+      if (!frame || typeof frame !== 'object'
+        || (frame as { type?: unknown }).type !== 'freshAgent.attach'
+        || (frame as { viewId?: unknown }).viewId !== targetViewId) return false
+      held = { frame: frame as JsonRow }
+      targetViewId = undefined
+      sendHeld = sendToServer
+      resolveHeld?.(held.frame)
+      return true
+    },
+  }
+}
+
 async function installCreatedReplyGate(
   context: BrowserContext,
   info: E2eServerInfo,
   frames: JsonRow[],
   gate: ReturnType<typeof createCreatedReplyGate>,
+  attachGate: ReturnType<typeof createAttachRequestGate>,
 ): Promise<void> {
   const wsOrigin = new URL(info.baseUrl.replace(/^http/, 'ws')).origin
   await context.routeWebSocket((url) => url.origin === wsOrigin && url.pathname === '/ws', (client) => {
     const server = client.connectToServer()
-    wireFreshAgentWebSocketRoute(client, server, frames, gate.intercept)
+    wireFreshAgentWebSocketRoute(client, server, frames, gate.intercept, attachGate.intercept)
   })
 }
 
@@ -906,6 +989,8 @@ async function startTwoDeviceSession(
   let session: FreshAgentMultipleDeviceSession['session']
   let desktopCreatedReplyGate: ReturnType<typeof createCreatedReplyGate> | undefined
   let mobileCreatedReplyGate: ReturnType<typeof createCreatedReplyGate> | undefined
+  let desktopAttachRequestGate: ReturnType<typeof createAttachRequestGate> | undefined
+  let mobileAttachRequestGate: ReturnType<typeof createAttachRequestGate> | undefined
   let closed = false
   const close = async () => {
     if (closed) return
@@ -928,10 +1013,16 @@ async function startTwoDeviceSession(
     mobileContext = await newDeviceContext(browser, true)
     desktopCreatedReplyGate = createCreatedReplyGate()
     mobileCreatedReplyGate = createCreatedReplyGate()
-    await installCreatedReplyGate(desktopContext, info, desktopFrames, desktopCreatedReplyGate)
-    await installCreatedReplyGate(mobileContext, info, mobileFrames, mobileCreatedReplyGate)
-    desktopOpen = await openDevicePage(desktopContext, info, desktopFrames, desktopCreatedReplyGate.gate)
-    mobileOpen = await openDevicePage(mobileContext, info, mobileFrames, mobileCreatedReplyGate.gate)
+    desktopAttachRequestGate = createAttachRequestGate()
+    mobileAttachRequestGate = createAttachRequestGate()
+    await installCreatedReplyGate(desktopContext, info, desktopFrames, desktopCreatedReplyGate, desktopAttachRequestGate)
+    await installCreatedReplyGate(mobileContext, info, mobileFrames, mobileCreatedReplyGate, mobileAttachRequestGate)
+    desktopOpen = await openDevicePage(
+      desktopContext, info, desktopFrames, desktopCreatedReplyGate.gate, desktopAttachRequestGate.gate,
+    )
+    mobileOpen = await openDevicePage(
+      mobileContext, info, mobileFrames, mobileCreatedReplyGate.gate, mobileAttachRequestGate.gate,
+    )
 
     const desktopDeviceId = await desktopOpen.page.evaluate(() => localStorage.getItem('freshell.device-id.v2'))
     const mobileDeviceId = await mobileOpen.page.evaluate(() => localStorage.getItem('freshell.device-id.v2'))

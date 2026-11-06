@@ -50,11 +50,17 @@ import { buildReconcileRequestForPanes, foldVerdicts, isFreshAgentReconcileActiv
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import {
+  clearFreshAgentAttachDecisionRoute,
   captureFreshAgentAttachDecision,
   detachFreshAgentView,
+  freshAgentAttachResultMatchesLocator,
   freshAgentAttachResultMatchesDecision,
+  hasFreshAgentAttachOwnerAuthority,
+  readFreshAgentAttachOwnerAuthority,
+  registerFreshAgentAttachDecisionRoute,
   freshAgentViewAttachmentForPane,
   type FreshAgentAttachDecision,
+  type FreshAgentAttachDecisionRoute,
 } from '@/lib/fresh-agent-view-attachment'
 import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
 import { getRebindQueue } from '@/lib/rebind-queue'
@@ -937,18 +943,6 @@ function isRestoreUnavailableSnapshotError(error: unknown): boolean {
     ? (details as { ownerKind?: unknown }).ownerKind
     : undefined
   return status === 409 && code === 'RESTORE_UNAVAILABLE' && ownerKind === 'fresh-agent'
-}
-
-// The 409 refusal always names its fence-relevant generation; a malformed
-// envelope without one cannot fence the recovery attach, so the caller skips
-// the recovery (the honest error surfaces below take it) instead of sending an
-// attach bound to a stale or absent generation.
-function readRestoreRefusalOwnerGeneration(error: unknown): number | undefined {
-  if (!error || typeof error !== 'object' || !('details' in error)) return undefined
-  const details = (error as { details?: unknown }).details
-  if (!details || typeof details !== 'object' || !('ownerGeneration' in details)) return undefined
-  const ownerGeneration = (details as { ownerGeneration?: unknown }).ownerGeneration
-  return typeof ownerGeneration === 'number' ? ownerGeneration : undefined
 }
 
 function getRestoreErrorMessage(reason: RestoreErrorReason): string {
@@ -1857,6 +1851,7 @@ export function FreshAgentView({
   // key changes for a new durable identity, create round, server boot, or
   // explicit recovery decision; queued/timer retries keep the same attempt.
   const attachmentAttemptRef = useRef<AttachmentAttempt | null>(null)
+  const attachmentDecisionRouteRef = useRef<FreshAgentAttachDecisionRoute | null>(null)
   const blockedAttachmentAttemptRef = useRef<{ attempt: AttachmentAttempt, owner: RuntimeOwnerRecord } | null>(null)
   const lastConnectionAttachSentKeyRef = useRef<string | null>(null)
   const currentOwnerAttachForPendingReconcileRef = useRef<{
@@ -2041,6 +2036,11 @@ export function FreshAgentView({
         clearTimeout(verdictWaitTimerRef.current)
         verdictWaitTimerRef.current = null
       }
+      const attachRoute = attachmentDecisionRouteRef.current
+      if (attachRoute) {
+        clearFreshAgentAttachDecisionRoute(attachRoute.viewId, attachRoute.requestId)
+        attachmentDecisionRouteRef.current = null
+      }
       if (revealRefreshRetryTimerRef.current !== null) {
         clearTimeout(revealRefreshRetryTimerRef.current)
         revealRefreshRetryTimerRef.current = null
@@ -2096,14 +2096,34 @@ export function FreshAgentView({
   // sends (the lost-session retry's resend) can skip them.
   const captureFreshAgentAttachmentAttempt = useCallback((content: FreshAgentPaneContent) => {
     const state = appStore.getState()
+    const currentContent = currentAttachmentPaneContent(state, tabId, paneId, content)
     const attempt = captureAttachmentAttempt(
       state,
-      currentAttachmentPaneContent(state, tabId, paneId, content),
+      currentContent,
       attachmentAttemptRef.current,
       attachDecisionSerialRef.current,
     )
     if (attachmentAttemptRef.current !== attempt) blockedAttachmentAttemptRef.current = null
     attachmentAttemptRef.current = attempt
+    const canonical = resolveCanonicalPaneSession(state, currentContent)
+    const sessionId = canonical?.sessionId ?? currentContent.sessionId
+    const nextRoute = currentContent.sessionId && sessionId
+      ? {
+          requestId: attempt.requestId,
+          viewId: currentContent.viewId ?? currentContent.createRequestId,
+          provider: canonical?.provider ?? currentContent.provider,
+          sessionType: currentContent.sessionType,
+          sessionId,
+        }
+      : null
+    const previousRoute = attachmentDecisionRouteRef.current
+    if (previousRoute && (!nextRoute
+      || previousRoute.viewId !== nextRoute.viewId
+      || previousRoute.requestId !== nextRoute.requestId)) {
+      clearFreshAgentAttachDecisionRoute(previousRoute.viewId, previousRoute.requestId)
+    }
+    if (nextRoute) registerFreshAgentAttachDecisionRoute(nextRoute)
+    attachmentDecisionRouteRef.current = nextRoute
     return attempt
   }, [appStore, paneId, tabId])
 
@@ -2891,6 +2911,7 @@ export function FreshAgentView({
   // triggerRecovery heuristics. Same pattern as TerminalView's exhaustion
   // reconcile.
   const lostReconcileRef = useRef<PaneReconcileRequest | null>(null)
+  const attachAuthorityRefreshRequestsRef = useRef<Set<string>>(new Set())
 
   const reconcileLostPane = useCallback(() => {
     if (isFreshAgentLifecycleBlocked(paneContentRef.current) || isSupervisorRecoveryOwned(paneContentRef.current)) return
@@ -2905,6 +2926,23 @@ export function FreshAgentView({
     ws.send(request)
   }, [appStore, paneId, tabId, triggerRecovery, ws])
 
+  const reconcileAttachAuthorityReadOnly = useCallback((attempt: AttachmentAttempt) => {
+    const key = `${attempt.content.viewId ?? attempt.content.createRequestId}:${attempt.requestId}`
+    const requested = attachAuthorityRefreshRequestsRef.current
+    if (requested.has(key)) return
+    requested.add(key)
+    // The existing pane reconcile is read-only. Share an already-running
+    // reconcile for this pane rather than starting a second recovery path.
+    if (lostReconcileRef.current) return
+    const request = buildReconcileRequestForPanes(appStore.getState(), [{ tabId, paneId }])
+    if (!request) {
+      setNotice('The current conversation owner could not be confirmed.')
+      return
+    }
+    lostReconcileRef.current = request
+    ws.send(request)
+  }, [appStore, paneId, tabId, ws])
+
   // Task 14: SESSION_RESERVED bounded re-drive. A transient reservation (the
   // server's D8 lease loser answer) re-drives the SAME create/attach after a
   // fixed floor; when the window exhausts, a single-pane reconcile resolves
@@ -2915,11 +2953,13 @@ export function FreshAgentView({
   const reserveRedriveRef = useRef<{
     windowStart: number | null
     timer: ReturnType<typeof setTimeout> | null
-  }>({ windowStart: null, timer: null })
+    scheduledAttempt: AttachmentAttempt | null
+  }>({ windowStart: null, timer: null, scheduledAttempt: null })
 
   const clearReserveRedrive = useCallback(() => {
     const state = reserveRedriveRef.current
     state.windowStart = null
+    state.scheduledAttempt = null
     if (state.timer !== null) {
       clearTimeout(state.timer)
       state.timer = null
@@ -2928,7 +2968,7 @@ export function FreshAgentView({
 
   useEffect(() => clearReserveRedrive, [clearReserveRedrive]) // unmount
 
-  const redriveAfterSessionReserved = useCallback(() => {
+  const redriveAfterSessionReserved = useCallback((nextAttempt?: AttachmentAttempt) => {
     if (isFreshAgentLifecycleBlocked(paneContentRef.current)) return
     const state = reserveRedriveRef.current
     if (state.windowStart === null) state.windowStart = Date.now()
@@ -2937,14 +2977,16 @@ export function FreshAgentView({
       reconcileLostPane() // Task 10's single-pane reconcile + fold = the auto-resolve
       return
     }
-    if (state.timer !== null) return
     const scheduledContent = paneContentRef.current
-    const scheduledAttempt = scheduledContent.sessionId
-      ? captureFreshAgentAttachmentAttempt(scheduledContent)
+    state.scheduledAttempt = scheduledContent.sessionId
+      ? nextAttempt ?? captureFreshAgentAttachmentAttempt(scheduledContent)
       : null
+    if (state.timer !== null) return
     state.timer = setTimeout(() => {
       state.timer = null
       const current = paneContentRef.current
+      const scheduledAttempt = state.scheduledAttempt
+      state.scheduledAttempt = null
       if (isFreshAgentLifecycleBlocked(current)) return
       if (current.sessionId) {
         // Attach loser: re-send the (fenced, divergence-gated) attach
@@ -3357,12 +3399,18 @@ export function FreshAgentView({
         const attempt = attachmentAttemptRef.current
         const current = paneContentRef.current
         const viewId = current.viewId ?? current.createRequestId
+        const canonical = resolveCanonicalPaneSession(appStore.getState(), current)
         if (
           !attempt
+          || !canonical
           || attempt.content.createRequestId !== current.createRequestId
           || (attempt.content.viewId ?? attempt.content.createRequestId) !== viewId
           || result.provider !== current.provider
           || result.sessionType !== current.sessionType
+          || !freshAgentAttachResultMatchesLocator(
+            result as { provider?: unknown; sessionType?: unknown; sessionId?: unknown; sessionRef?: unknown },
+            { ...canonical, sessionType: current.sessionType },
+          )
           || attachmentAttemptKey(appStore.getState(), current, attachDecisionSerialRef.current) !== attempt.key
         ) return false
         return freshAgentAttachResultMatchesDecision(result, {
@@ -3543,20 +3591,63 @@ export function FreshAgentView({
       if (message.type === 'freshAgent.attach.failed') {
         if (!attachResultMatchesCurrentView(message)) return
         const current = paneContentRef.current
-        if (
-          message.sessionId === current.sessionId
-          && message.ownerKind
-          && typeof message.ownerGeneration === 'number'
-        ) {
-          const canonicalSession = resolveCanonicalPaneSession(appStore.getState(), current)
+        const canonicalSession = resolveCanonicalPaneSession(appStore.getState(), current)
+        const ownerAuthority = readFreshAgentAttachOwnerAuthority(message)
+        if (hasFreshAgentAttachOwnerAuthority(message)) {
+          const attempt = attachmentAttemptRef.current
+          if (!attempt || !canonicalSession || !ownerAuthority || ownerAuthority.ownerEpoch === undefined) {
+            if (attempt) reconcileAttachAuthorityReadOnly(attempt)
+            else setNotice(message.message || 'The conversation owner could not be confirmed.')
+            return
+          }
+          const ownerBefore = selectSessionRuntimeOwner(
+            appStore.getState(),
+            canonicalSession.provider,
+            canonicalSession.sessionId,
+          )
+          if (!ownerBefore) {
+            reconcileAttachAuthorityReadOnly(attempt)
+            return
+          }
           dispatch(applyRefusalFence({
-            provider: canonicalSession?.provider ?? current.provider,
-            sessionId: canonicalSession?.sessionId ?? message.sessionRef?.sessionId ?? message.sessionId,
-            ownerKind: message.ownerKind,
-            ownerGeneration: message.ownerGeneration,
+            provider: canonicalSession.provider,
+            sessionId: canonicalSession.sessionId,
+            ownerKind: ownerAuthority.ownerKind,
+            ownerEpoch: ownerAuthority.ownerEpoch,
+            ownerGeneration: ownerAuthority.ownerGeneration,
           }))
+          const ownerAfter = selectSessionRuntimeOwner(
+            appStore.getState(),
+            canonicalSession.provider,
+            canonicalSession.sessionId,
+          )
+          if (!ownerAfter) {
+            reconcileAttachAuthorityReadOnly(attempt)
+            return
+          }
+          if (ownerAfter.ownerKind === 'terminal') {
+            clearReserveRedrive()
+            return
+          }
+          if (ownerAfter.ownerKind !== 'fresh-agent') {
+            reconcileAttachAuthorityReadOnly(attempt)
+            return
+          }
+          if (message.retryable === false) {
+            clearReserveRedrive()
+            setNotice(message.message || 'The conversation could not be attached.')
+            return
+          }
+
+          // A typed owner refusal is a new attach decision. Capture its full
+          // refreshed authority in a new immutable attempt; delayed replies
+          // for the old request can no longer settle it.
+          attachDecisionSerialRef.current += 1
+          const nextAttempt = captureFreshAgentAttachmentAttempt(current)
+          redriveAfterSessionReserved(nextAttempt)
+          return
         }
-        if (message.ownerKind !== 'terminal' && message.code === 'SESSION_RESERVED' && message.retryable !== false) {
+        if (message.code === 'SESSION_RESERVED' && message.retryable !== false) {
           // A transient reservation re-drives only the matching view's
           // immutable attach decision. Default provider attach refusals keep
           // the legacy shape, which omits retryable; an explicit false still
@@ -3878,7 +3969,7 @@ export function FreshAgentView({
       }
     })
     return unsubscribe
-  }, [agentSession?.cwd, appStore, captureFreshAgentAttachmentAttempt, clearReserveRedrive, commitSnapshot, descriptor?.label, dispatch, markSnapshotDirty, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, redriveAfterSessionReserved, releasePendingRebind, requestRevealRefresh, requestSnapshotRefresh, resendPendingMessage, sendFencedFreshAgentAttach, sendFreshAgentMessage, setLocalEcho, tabId, ws])
+  }, [agentSession?.cwd, appStore, captureFreshAgentAttachmentAttempt, clearReserveRedrive, commitSnapshot, descriptor?.label, dispatch, markSnapshotDirty, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, reconcileAttachAuthorityReadOnly, redriveAfterSessionReserved, releasePendingRebind, requestRevealRefresh, requestSnapshotRefresh, resendPendingMessage, sendFencedFreshAgentAttach, sendFreshAgentMessage, setLocalEcho, tabId, ws])
 
   useEffect(() => {
     if (!snapshotThreadId) {
@@ -4331,18 +4422,20 @@ export function FreshAgentView({
       if (paneContent.provider === 'opencode' && isRestoreUnavailableSnapshotError(error)) {
         const fresh = paneContentRef.current
         const recoveryKey = `${fresh.createRequestId}:${sessionId}`
-        const refusalOwnerGeneration = readRestoreRefusalOwnerGeneration(error)
+        const refusalDetails = error && typeof error === 'object' && 'details' in error
+          ? (error as { details?: unknown }).details
+          : undefined
+        const refusalAuthority = readFreshAgentAttachOwnerAuthority(refusalDetails)
         if (
-          refusalOwnerGeneration !== undefined
+          refusalAuthority !== undefined
           && restoreUnavailableRecoveryRef.current !== recoveryKey
         ) {
           const previousRecoveryKey = restoreUnavailableRecoveryRef.current
           restoreUnavailableRecoveryRef.current = recoveryKey
-          // Bind the fence to the 409's CURRENT generation — refresh the
-          // observed owner fence from the refusal itself (the refusal names
-          // the coordinator's live generation; the record's epoch is
-          // preserved). Without this, a stale owner record sends a
-          // stale-generation attach the wired server refuses with
+          // Bind the fence to the refusal's current owner authority. Modern
+          // 409s carry epoch and generation; legacy responses still preserve
+          // the observed epoch while advancing generation. Without this, a
+          // stale owner record sends an attach the wired server refuses with
           // FENCE_REQUIRED — preserving the dead-end. The fold keys the
           // CANONICAL session (Task 5 review M2): the recovery attach's
           // fence read resolves the stored aliasOf chain, so a pane holding
@@ -4352,8 +4445,9 @@ export function FreshAgentView({
           dispatch(applyRefusalFence({
             provider: canonicalSession?.provider ?? fresh.provider,
             sessionId: canonicalSession?.sessionId ?? sessionId,
-            ownerKind: 'fresh-agent',
-            ownerGeneration: refusalOwnerGeneration,
+            ownerKind: refusalAuthority.ownerKind,
+            ...(refusalAuthority.ownerEpoch !== undefined ? { ownerEpoch: refusalAuthority.ownerEpoch } : {}),
+            ownerGeneration: refusalAuthority.ownerGeneration,
           }))
           attachDecisionSerialRef.current += 1
           const attempt = captureFreshAgentAttachmentAttempt(fresh)

@@ -12,6 +12,7 @@ import {
   handleFreshAgentMessage,
   registerFreshAgentCreate,
 } from '@/lib/fresh-agent-ws'
+import { registerFreshAgentAttachDecisionRoute } from '@/lib/fresh-agent-view-attachment'
 import { ReadyMessageSchema } from '@/lib/ready-message-schema'
 import { cancelCreate, consumeCancelledCreate, consumeCreateRoute, _resetCancelledCreates } from '@/lib/create-cancellation'
 import type { SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
@@ -25,6 +26,16 @@ function createFreshAgentStore() {
       freshAgentLive: freshAgentLiveReducer,
     },
   })
+}
+
+function registerAttachRoute(input: {
+  requestId: string
+  viewId: string
+  provider: string
+  sessionType: string
+  sessionId: string
+}) {
+  registerFreshAgentAttachDecisionRoute(input)
 }
 
 function emptyPanesState(): PanesState {
@@ -63,6 +74,13 @@ function createFreshAgentPaneStore(seenActionTypes: string[] = []) {
 describe('fresh-agent-ws', () => {
   it('folds a requester attach result and its snapshot into the shared session', () => {
     const store = createFreshAgentStore()
+    registerAttachRoute({
+      requestId: 'attach-result-1',
+      viewId: 'view-mobile',
+      provider: 'claude',
+      sessionType: 'freshclaude',
+      sessionId: 'thread-attach-result',
+    })
     expect(handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.attached',
       requestId: 'attach-result-1',
@@ -127,6 +145,23 @@ describe('fresh-agent-ws', () => {
       sessionId: 'old-thread-key',
       event: { type: 'freshAgent.session.snapshot', sessionId: 'old-thread-key', status: 'running' },
     })
+    foldSessionRuntimeOwnerFrame(store.dispatch, {
+      type: 'session.runtimeOwner',
+      provider: 'codex',
+      sessionId: 'native-thread-key',
+      epoch: 2,
+      generation: 11,
+      ownerKind: 'fresh-agent',
+      operationId: 'owner-before-refusal',
+      transition: 'handoff-committed',
+    })
+    registerAttachRoute({
+      requestId: 'attach-result-2',
+      viewId: 'view-mobile',
+      provider: 'codex',
+      sessionType: 'freshcodex',
+      sessionId: 'native-thread-key',
+    })
     expect(handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.attach.failed',
       requestId: 'attach-result-2',
@@ -161,6 +196,11 @@ describe('fresh-agent-ws', () => {
       ...locator,
       event: { type: 'freshAgent.session.snapshot', sessionId: locator.sessionId, status: 'running' },
     })
+    registerAttachRoute({
+      requestId: 'attach-lost-thread',
+      viewId: 'requesting-view',
+      ...locator,
+    })
 
     expect(handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.attach.failed',
@@ -187,11 +227,16 @@ describe('fresh-agent-ws', () => {
         ...locator,
         event: { type: 'freshAgent.session.snapshot', sessionId: locator.sessionId, status: 'running' },
       })
+      registerAttachRoute({
+        requestId: `attach-${code}`,
+        viewId: 'current-view',
+        ...locator,
+      })
 
       handleFreshAgentMessage(store.dispatch, {
         type: 'freshAgent.attach.failed',
         requestId: `attach-${code}`,
-        viewId: 'requesting-view',
+        viewId: 'current-view',
         ...locator,
         status: 'failed',
         code,
@@ -218,6 +263,11 @@ describe('fresh-agent-ws', () => {
       aliasOf: 'thread-native-owner',
       operationId: 'handoff-9',
       transition: 'handoff-committed',
+    })
+    registerAttachRoute({
+      requestId: 'attach-same-fence',
+      viewId: 'fresh-view',
+      ...locator,
     })
 
     handleFreshAgentMessage(store.dispatch, {

@@ -43,6 +43,112 @@ export type FreshAgentAttachDecision<T> = {
   requestId: string
 }
 
+export type FreshAgentAttachDecisionRoute = {
+  requestId: string
+  viewId: string
+  provider: string
+  sessionType: string
+  sessionId: string
+}
+
+export type FreshAgentAttachOwnerAuthority = {
+  ownerKind: 'terminal' | 'fresh-agent'
+  ownerGeneration: number
+  ownerEpoch?: number
+}
+
+const currentAttachDecisionByView = new Map<string, FreshAgentAttachDecisionRoute | null>()
+
+/** Register the immutable attach decision a modern requester reply may settle. */
+export function registerFreshAgentAttachDecisionRoute(route: FreshAgentAttachDecisionRoute): void {
+  currentAttachDecisionByView.set(route.viewId, route)
+}
+
+/** Retire only the exact route, so an old view cleanup cannot clear a newer decision. */
+export function clearFreshAgentAttachDecisionRoute(viewId: string, requestId: string): void {
+  const current = currentAttachDecisionByView.get(viewId)
+  if (current?.requestId === requestId) currentAttachDecisionByView.set(viewId, null)
+}
+
+/**
+ * Modern attach results are useful only while they still name the decision
+ * currently owned by that view. An absent result id is the legacy frame shape;
+ * an unknown or retired modern route is stale.
+ */
+export function freshAgentAttachResultMatchesCurrentDecisionRoute(
+  result: {
+    requestId?: unknown
+    viewId?: unknown
+    provider?: unknown
+    sessionType?: unknown
+    sessionId?: unknown
+    sessionRef?: unknown
+  },
+): boolean | undefined {
+  if (typeof result.requestId !== 'string') return undefined
+  const route = typeof result.viewId === 'string'
+    ? currentAttachDecisionByView.get(result.viewId)
+    : [...currentAttachDecisionByView.values()].find((candidate) => candidate?.requestId === result.requestId)
+  if (!route) return false
+  if (
+    route.requestId !== result.requestId
+    || (typeof result.viewId === 'string' && route.viewId !== result.viewId)
+    || route.provider !== result.provider
+    || route.sessionType !== result.sessionType
+  ) return false
+
+  const resultRef = result.sessionRef && typeof result.sessionRef === 'object'
+    ? result.sessionRef as { provider?: unknown; sessionId?: unknown }
+    : undefined
+  if (resultRef?.sessionId !== undefined) {
+    return resultRef.provider === route.provider && resultRef.sessionId === route.sessionId
+  }
+  return result.sessionId === route.sessionId
+}
+
+/** Read a typed owner tuple, retaining a legacy generation-only 409 shape. */
+export function readFreshAgentAttachOwnerAuthority(value: unknown): FreshAgentAttachOwnerAuthority | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const record = value as Record<string, unknown>
+  if (record.ownerKind !== 'terminal' && record.ownerKind !== 'fresh-agent') return undefined
+  if (!Number.isInteger(record.ownerGeneration) || (record.ownerGeneration as number) < 0) return undefined
+  if (record.ownerEpoch !== undefined && (!Number.isInteger(record.ownerEpoch) || (record.ownerEpoch as number) < 0)) return undefined
+  return {
+    ownerKind: record.ownerKind,
+    ownerGeneration: record.ownerGeneration as number,
+    ...(record.ownerEpoch !== undefined ? { ownerEpoch: record.ownerEpoch as number } : {}),
+  }
+}
+
+/** True when a refusal tried to provide owner authority, even if it is incomplete. */
+export function hasFreshAgentAttachOwnerAuthority(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false
+  const record = value as Record<string, unknown>
+  return record.ownerKind !== undefined
+    || record.ownerEpoch !== undefined
+    || record.ownerGeneration !== undefined
+}
+
+/** Verify that a requester result names the view's canonical conversation. */
+export function freshAgentAttachResultMatchesLocator(
+  result: {
+    provider?: unknown
+    sessionType?: unknown
+    sessionId?: unknown
+    sessionRef?: unknown
+  },
+  locator: { provider: string; sessionType: string; sessionId: string },
+): boolean {
+  if (result.provider !== locator.provider || result.sessionType !== locator.sessionType) return false
+  const resultRef = result.sessionRef && typeof result.sessionRef === 'object'
+    ? result.sessionRef as { provider?: unknown; sessionId?: unknown }
+    : undefined
+  if (resultRef?.sessionId !== undefined) {
+    return resultRef.provider === locator.provider && resultRef.sessionId === locator.sessionId
+  }
+  return result.sessionId === locator.sessionId
+}
+
 /** A result settles only the current view's immutable attach decision. */
 export function freshAgentAttachResultMatchesDecision(
   result: { requestId?: unknown; viewId?: unknown },

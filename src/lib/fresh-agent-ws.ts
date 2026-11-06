@@ -11,7 +11,10 @@ import {
   hasCreateRoute,
   rememberCreateRoute,
 } from '@/lib/create-cancellation'
-import { consumeCancelledFreshAgentCreateRoute } from '@/lib/fresh-agent-view-attachment'
+import {
+  consumeCancelledFreshAgentCreateRoute,
+  freshAgentAttachResultMatchesCurrentDecisionRoute,
+} from '@/lib/fresh-agent-view-attachment'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { KILL_FAILED_MESSAGE } from '@/lib/kill-ack'
 import { materializeFreshAgentSession as materializeFreshAgentPaneSession } from '@/store/panesSlice'
@@ -30,6 +33,7 @@ import {
   addElicitationRequest,
   removeElicitation,
   applyRuntimeOwner,
+  applyRefusalFence,
   refreshRuntimeOwnerFacts,
   clearPendingCreate,
   clearPendingCreateFailure,
@@ -326,6 +330,7 @@ export function handleFreshAgentMessage(
     }
     case 'freshAgent.attached': {
       const attached = msg as FreshAgentAttached
+      if (freshAgentAttachResultMatchesCurrentDecisionRoute(attached) === false) return true
       const locator = {
         sessionId: attached.sessionId,
         sessionType: attached.sessionType,
@@ -359,21 +364,19 @@ export function handleFreshAgentMessage(
     }
     case 'freshAgent.attach.failed': {
       const failed = msg as FreshAgentAttachFailed
+      if (freshAgentAttachResultMatchesCurrentDecisionRoute(failed) === false) return true
       const locator = {
         sessionId: failed.sessionId,
         sessionType: failed.sessionType,
         provider: failed.provider,
       }
       if (failed.ownerKind && typeof failed.ownerGeneration === 'number' && typeof failed.ownerEpoch === 'number') {
-        dispatch(refreshRuntimeOwnerFacts({
-          type: 'session.runtimeOwner',
+        dispatch(applyRefusalFence({
           provider: failed.provider,
           sessionId: failed.sessionRef?.sessionId ?? failed.sessionId,
-          epoch: failed.ownerEpoch,
-          generation: failed.ownerGeneration,
           ownerKind: failed.ownerKind,
-          operationId: failed.operationId ?? failed.requestId,
-          transition: 'handoff-committed',
+          ownerEpoch: failed.ownerEpoch,
+          ownerGeneration: failed.ownerGeneration,
         }))
       }
       if (failed.code === 'INVALID_SESSION_ID') {
