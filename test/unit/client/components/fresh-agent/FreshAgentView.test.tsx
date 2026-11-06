@@ -1913,13 +1913,13 @@ describe('FreshAgentView', () => {
     })
   }
 
-  function hostedCodexProjectionSnapshot(nativeId: string, projectionId: string, text: string, revision: number) {
+  function hostedCodexProjectionSnapshot(nativeId: string, projectionId: string, text: string, revision: number, historyGeneration = 0) {
     const base = hostedCodexSnapshot(nativeId, text)
     return FreshAgentSnapshotSchema.parse({ ...base,
       turns: [{ id: 'turn', turnId: 'turn', role: 'assistant', summary: '',
         items: [{ id: 'answer', kind: 'text', text }] }],
       extensions: { codex: { ...base.extensions?.codex, statusFromLiveState: true, projection: {
-        id: projectionId, historyGeneration: 0, eventRevision: revision, eventOwnedTurnIds: ['turn'],
+        id: projectionId, historyGeneration, eventRevision: revision, eventOwnedTurnIds: ['turn'],
         nativePreviewTurnIds: [], nativeFinalTurnIds: [], turnRows: { turn: ['turn'] },
         turnOutputStates: { turn: { provenance: 'retained', diagnostic: 'unsaved', refreshPending: false } },
         settledTurnIds: [],
@@ -1950,11 +1950,27 @@ describe('FreshAgentView', () => {
     const event = (value: Record<string, unknown>) => receive({ type: 'freshAgent.event', ...locator,
       event: { sessionId: locator.sessionId, ...value } })
     const init = (projectionId: string) => event({ type: 'freshAgent.session.init', projectionId, historyGeneration: 0 })
-    const patch = (projectionId: string, revision: number, answer: string) => event({ type: 'freshAgent.transcript.patch',
-      projectionId, historyGeneration: 0, ops: [{ op: 'resetTurn', nativeTurnId: 'turn', revision,
+    const patch = (projectionId: string, revision: number, answer: string, historyGeneration = 0) => event({ type: 'freshAgent.transcript.patch',
+      projectionId, historyGeneration, ops: [{ op: 'resetTurn', nativeTurnId: 'turn', revision,
         turns: [{ id: 'turn', turnId: 'turn', role: 'assistant', summary: '',
           items: [{ id: 'answer', kind: 'text', text: answer }] }] }] })
     return { store, locator, initial, announce, event, init, patch }
+  }
+
+  async function prepareUncertainProjection(route: Awaited<ReturnType<typeof mountProjectionReviewRoute>>, withEventTurn = true) {
+    act(() => {
+      route.init('racing-q')
+      if (withEventTurn) route.patch('racing-q', 1, 'Unannounced prefix')
+    })
+    if (withEventTurn) await expectRenderedText('Unannounced prefix')
+    const baseline = hostedCodexSnapshot('native-b', 'Baseline without projection')
+    const trailing = vi.fn().mockResolvedValue(baseline)
+    apiMock.getFreshAgentThreadSnapshot.mockImplementation(trailing)
+    act(() => route.announce('native-b'))
+    await act(async () => route.initial.resolve(baseline))
+    await expectRenderedText('Baseline without projection')
+    await waitFor(() => expect(trailing).toHaveBeenCalledTimes(1))
+    await act(async () => { await Promise.resolve() })
   }
 
   function codexGatewayWarningFrames() {
@@ -2670,16 +2686,7 @@ describe('FreshAgentView', () => {
     const captured = createDeferred<unknown>()
     const covering = createDeferred<unknown>()
     try {
-      act(() => { route.init('racing-q'); route.patch('racing-q', 1, 'Unannounced prefix') })
-      await expectRenderedText('Unannounced prefix')
-      const baseline = hostedCodexSnapshot('native-b', 'Baseline without projection')
-      const trailing = vi.fn().mockResolvedValue(baseline)
-      apiMock.getFreshAgentThreadSnapshot.mockImplementation(trailing)
-      act(() => route.announce('native-b'))
-      await act(async () => route.initial.resolve(baseline))
-      await expectRenderedText('Baseline without projection')
-      await waitFor(() => expect(trailing).toHaveBeenCalledTimes(1))
-      await act(async () => { await Promise.resolve() })
+      await prepareUncertainProjection(route)
       apiMock.getFreshAgentThreadSnapshot.mockClear()
       apiMock.getFreshAgentThreadSnapshot.mockReturnValue(captured.promise)
       act(() => route.event({ type: 'freshAgent.host.journal.reset' }))
@@ -2693,6 +2700,82 @@ describe('FreshAgentView', () => {
       await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
       await act(async () => covering.resolve(hostedCodexProjectionSnapshot('native-b', 'racing-q', 'B revision two', 2)))
       await expectRenderedText('B revision two')
+    } finally {
+      cleanup()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial snapshot'))
+      captured.resolve(hostedCodexSnapshot('native-b', 'Captured snapshot'))
+      covering.resolve(hostedCodexSnapshot('native-b', 'Covering snapshot'))
+    }
+  })
+
+  it('review covers a later revision when the generation changes during recovery', async () => {
+    const route = await mountProjectionReviewRoute('projection-generation-race', true, true)
+    const captured = createDeferred<unknown>()
+    const newerGeneration = createDeferred<unknown>()
+    const covering = createDeferred<unknown>()
+    try {
+      await prepareUncertainProjection(route)
+
+      apiMock.getFreshAgentThreadSnapshot.mockClear().mockReturnValue(captured.promise)
+      act(() => route.event({ type: 'freshAgent.host.journal.reset' }))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+      apiMock.getFreshAgentThreadSnapshot.mockClear().mockReturnValue(newerGeneration.promise)
+      act(() => route.patch('racing-q', 2, 'Unverified revision two'))
+      await act(async () => captured.resolve(hostedCodexProjectionSnapshot('native-b', 'racing-q', 'B generation zero revision one', 1)))
+      await expectRenderedText('B generation zero revision one')
+      expect(route.store.getState().freshAgentLive.bySession['freshcodex:codex:managed-public']?.projection?.needsResnapshot).toBe(true)
+
+      // Compaction precedes this covering read; another patch arrives after
+      // the read captured generation 1 revision 3 but before it returns.
+      act(() => route.patch('racing-q', 3, 'Unverified generation one revision three', 1))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+      apiMock.getFreshAgentThreadSnapshot.mockClear().mockReturnValue(covering.promise)
+      act(() => route.patch('racing-q', 4, 'Unverified generation one revision four', 1))
+      expect(screen.queryByText('Unverified generation one revision four')).not.toBeInTheDocument()
+      await act(async () => newerGeneration.resolve(hostedCodexProjectionSnapshot('native-b', 'racing-q', 'B generation one revision three', 3, 1)))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+      await act(async () => covering.resolve(hostedCodexProjectionSnapshot('native-b', 'racing-q', 'B generation one revision four', 4, 1)))
+      await expectRenderedText('B generation one revision four')
+    } finally {
+      cleanup()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial snapshot'))
+      captured.resolve(hostedCodexSnapshot('native-b', 'Captured snapshot'))
+      newerGeneration.resolve(hostedCodexSnapshot('native-b', 'Newer generation snapshot'))
+      covering.resolve(hostedCodexSnapshot('native-b', 'Covering snapshot'))
+    }
+  })
+
+  it.each(['event-owned', 'saved-only'] as const)('review requests newer %s history after an empty generation patch during source proof', async (history) => {
+    const route = await mountProjectionReviewRoute('projection-empty-generation-race', true, true)
+    const captured = createDeferred<unknown>()
+    const covering = createDeferred<unknown>()
+    const snapshot = (text: string, generation: number) => {
+      const current = hostedCodexProjectionSnapshot('native-b', 'racing-q', text, 1, generation)
+      if (history === 'event-owned') return current
+      return FreshAgentSnapshotSchema.parse({ ...current, extensions: { ...current.extensions, codex: {
+        ...current.extensions?.codex, projection: { ...(current.extensions?.codex?.projection as Record<string, unknown>),
+          eventOwnedTurnIds: [], nativeFinalTurnIds: ['turn'],
+          turnOutputStates: { turn: { provenance: 'saved', refreshPending: false } },
+        },
+      } } })
+    }
+    try {
+      await prepareUncertainProjection(route, history === 'event-owned')
+
+      apiMock.getFreshAgentThreadSnapshot.mockClear().mockReturnValue(captured.promise)
+      act(() => route.event({ type: 'freshAgent.host.journal.reset' }))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+      apiMock.getFreshAgentThreadSnapshot.mockClear().mockReturnValue(covering.promise)
+      // Empty compaction patches still announce the newer generation even
+      // when there are no event-owned turns and no operation body to retain.
+      act(() => route.event({ type: 'freshAgent.transcript.patch', projectionId: 'racing-q',
+        historyGeneration: 1, afterRevision: 0, ops: [] }))
+      expect(route.store.getState().freshAgentLive.bySession['freshcodex:codex:managed-public']?.projection).toBeUndefined()
+      await act(async () => captured.resolve(snapshot('B old generation', 0)))
+      await expectRenderedText('B old generation')
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+      await act(async () => covering.resolve(snapshot('B covered newer generation', 1)))
+      await expectRenderedText('B covered newer generation')
     } finally {
       cleanup()
       route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial snapshot'))

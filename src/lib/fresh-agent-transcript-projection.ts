@@ -33,7 +33,12 @@ export function applyFreshAgentTranscriptPatch(state: TranscriptProjection, inpu
   // After a gap, consumed revisions describe coverage owed to the client.
   // They cannot authorize another append until a snapshot covers that prefix.
   if (state.needsResnapshot || patch.afterRevision !== undefined && patch.afterRevision > state.eventRevision) {
-    return { ...state, needsResnapshot: true, eventRevision: Math.max(state.eventRevision, ...patch.ops.map((op) => op.revision)) }
+    // A generation change invalidates the old bodies and revision. Retain
+    // only the new generation's coverage requirement, never the patch body.
+    const recovery = patch.historyGeneration > state.historyGeneration
+      ? bindTranscriptProjection(state, state.id, patch.historyGeneration)
+      : state
+    return { ...recovery, needsResnapshot: true, eventRevision: Math.max(recovery.eventRevision, ...patch.ops.map((op) => op.revision)) }
   }
   const next: TranscriptProjection = patch.historyGeneration > state.historyGeneration
     ? { id: state.id, historyGeneration: patch.historyGeneration, eventRevision: state.eventRevision, turns: [], turnRows: {}, closedItems: {}, settledTurns: {}, removedTurns: {}, turnRevisions: {}, deferredOps: [] }

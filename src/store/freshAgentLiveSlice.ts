@@ -152,14 +152,15 @@ function isCurrentNativeAnnouncement(
 
 /** An uncertain ID still cannot render event bodies. Record only the newest
  * observed coverage for its announced source so a proving snapshot cannot
- * silently omit an event that arrived while that snapshot was in flight. */
+ * silently omit an event that arrived while that snapshot was in flight.
+ * Even an empty patch can announce a newer history generation. */
 function observeUncertainProjection(
   session: FreshAgentLiveSession,
   patch: FreshAgentTranscriptPatch,
   nativeSessionId?: string,
 ): void {
   const uncertain = session.uncertainProjectionIds?.[patch.projectionId]
-  if (!uncertain || !nativeSessionId || session.awaitingNativeSessionId || !patch.ops.length) return
+  if (!uncertain || !nativeSessionId || session.awaitingNativeSessionId) return
   const revision = patch.ops.reduce((maximum, op) => Math.max(maximum, op.revision), 0)
   const observed = uncertain.observed
   if (!observed || observed.nativeSessionId !== nativeSessionId || patch.historyGeneration > observed.historyGeneration) {
