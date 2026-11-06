@@ -2,7 +2,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   captureFreshAgentAttachDecision,
   detachFreshAgentView,
+  freshAgentAttachResultMatchesCurrentDecisionRoute,
   freshAgentAttachResultMatchesDecision,
+  hasFreshAgentAttachOwnerAuthority,
+  readFreshAgentAttachOwnerAuthority,
+  registerFreshAgentAttachDecisionRoute,
+  clearFreshAgentAttachDecisionRoute,
 } from '@/lib/fresh-agent-view-attachment'
 
 type MessageHandler = (message: unknown) => void
@@ -203,5 +208,44 @@ describe('fresh-agent attach decision correlation', () => {
     expect(freshAgentAttachResultMatchesDecision({ ...decision }, decision)).toBe(true)
     expect(freshAgentAttachResultMatchesDecision({ requestId: 'attach-old', viewId: 'view-a' }, decision)).toBe(false)
     expect(freshAgentAttachResultMatchesDecision({ requestId: 'attach-current', viewId: 'view-b' }, decision)).toBe(false)
+  })
+
+  it('routes modern replies only to the current immutable decision and canonical locator', () => {
+    registerFreshAgentAttachDecisionRoute({
+      requestId: 'attach-current',
+      viewId: 'view-a',
+      provider: 'codex',
+      sessionType: 'freshcodex',
+      sessionId: 'canonical-session',
+    })
+    const current = {
+      requestId: 'attach-current',
+      viewId: 'view-a',
+      provider: 'codex',
+      sessionType: 'freshcodex',
+      sessionId: 'alias-session',
+      sessionRef: { provider: 'codex', sessionId: 'canonical-session' },
+    }
+
+    expect(freshAgentAttachResultMatchesCurrentDecisionRoute(current)).toBe(true)
+    expect(freshAgentAttachResultMatchesCurrentDecisionRoute({ ...current, requestId: 'attach-old' })).toBe(false)
+    expect(freshAgentAttachResultMatchesCurrentDecisionRoute({
+      ...current,
+      sessionRef: { provider: 'codex', sessionId: 'different-session' },
+    })).toBe(false)
+
+    clearFreshAgentAttachDecisionRoute('view-a', 'attach-current')
+    expect(freshAgentAttachResultMatchesCurrentDecisionRoute(current)).toBe(false)
+  })
+
+  it('reads complete typed owner authority and identifies incomplete tuples', () => {
+    const complete = { ownerKind: 'fresh-agent', ownerEpoch: 9, ownerGeneration: 4 }
+    expect(readFreshAgentAttachOwnerAuthority(complete)).toEqual(complete)
+    expect(readFreshAgentAttachOwnerAuthority({ ownerKind: 'fresh-agent', ownerGeneration: 4 })).toEqual({
+      ownerKind: 'fresh-agent', ownerGeneration: 4,
+    })
+    expect(hasFreshAgentAttachOwnerAuthority({ ownerKind: 'fresh-agent' })).toBe(true)
+    expect(readFreshAgentAttachOwnerAuthority({ ownerKind: 'fresh-agent', ownerGeneration: -1 })).toBeUndefined()
+    expect(readFreshAgentAttachOwnerAuthority({ ownerKind: 'vacant', ownerEpoch: 9, ownerGeneration: 4 })).toBeUndefined()
   })
 })
