@@ -761,6 +761,9 @@ enum ResumeOpencodeError {
     /// timeout, ...) -- NOT evidence the session is gone; safe to retry, never mapped to
     /// `INVALID_SESSION_ID`.
     Manager(freshell_opencode::ServeError),
+    /// The native resume succeeded, but a stop or newer owner superseded its
+    /// publication. Preserve the diagnostic without charging a failed launch.
+    Superseded(freshell_opencode::ServeError),
     /// Task 13 (D8): another create/attach holds this sessionRef's lease -- the caller
     /// answers `freshAgent.error { code: "SESSION_RESERVED" }` (retryable, never lost).
     Reserved,
@@ -2390,7 +2393,10 @@ impl FreshOpencodeState {
                             );
                             return;
                         }
-                        Err(ResumeOpencodeError::Manager(error)) => {
+                        Err(
+                            ResumeOpencodeError::Manager(error)
+                            | ResumeOpencodeError::Superseded(error),
+                        ) => {
                             self.fail_create(
                                 &request_id,
                                 view_id,
@@ -2528,7 +2534,7 @@ impl FreshOpencodeState {
                     );
                     return;
                 }
-                Err(ResumeOpencodeError::Manager(err)) => {
+                Err(ResumeOpencodeError::Manager(err) | ResumeOpencodeError::Superseded(err)) => {
                     self.fail_create(
                         &request_id,
                         view_id,
@@ -4756,7 +4762,7 @@ impl FreshOpencodeState {
                 "opencode session not known to the shared serve".to_string(),
                 session_id.to_string(),
             )),
-            Err(ResumeOpencodeError::Manager(err)) => {
+            Err(ResumeOpencodeError::Manager(err) | ResumeOpencodeError::Superseded(err)) => {
                 Err(("opencode serve failure".to_string(), err.to_string()))
             }
             Err(ResumeOpencodeError::Reserved) => Err((
@@ -8188,7 +8194,10 @@ impl FreshOpencodeState {
                             self.broadcast(&lost_session_frame(&msg.session_id));
                             return;
                         }
-                        Err(ResumeOpencodeError::Manager(error)) => {
+                        Err(
+                            ResumeOpencodeError::Manager(error)
+                            | ResumeOpencodeError::Superseded(error),
+                        ) => {
                             self.send_error(
                                 &None,
                                 "OPENCODE_ATTACH_RESUME_FAILED",
@@ -8463,7 +8472,7 @@ impl FreshOpencodeState {
                     self.broadcast(&lost_session_frame(&msg.session_id));
                     return;
                 }
-                Err(ResumeOpencodeError::Manager(err)) => {
+                Err(ResumeOpencodeError::Manager(err) | ResumeOpencodeError::Superseded(err)) => {
                     self.send_error(&None, "OPENCODE_ATTACH_RESUME_FAILED", &err.to_string());
                     return;
                 }
@@ -8648,6 +8657,11 @@ impl FreshOpencodeState {
                         Err(ResumeOpencodeError::Reserved) => {
                             Err(crate::session_recovery::RecoveryAttemptFailure::refusal(
                                 OpencodeRecoveryFailure::Reserved,
+                            ))
+                        }
+                        Err(ResumeOpencodeError::Superseded(error)) => {
+                            Err(crate::session_recovery::RecoveryAttemptFailure::superseded(
+                                OpencodeRecoveryFailure::Manager(error),
                             ))
                         }
                         Err(ResumeOpencodeError::Manager(error)) => {
@@ -9103,7 +9117,7 @@ impl FreshOpencodeState {
                 drop(binding_guard.take());
             }
             lease_guard.fail();
-            return Err(ResumeOpencodeError::Manager(
+            return Err(ResumeOpencodeError::Superseded(
                 freshell_opencode::ServeError::Transport(format!(
                     "opencode session {session_id} closed while the resume was in flight; torn down"
                 )),
@@ -9197,7 +9211,7 @@ impl FreshOpencodeState {
                     drop(binding_guard.take());
                 }
 
-                return Err(ResumeOpencodeError::Manager(
+                return Err(ResumeOpencodeError::Superseded(
                     freshell_opencode::ServeError::Transport(format!(
                         "opencode session {session_id} ownership changed during resume; torn down"
                     )),
@@ -9244,7 +9258,7 @@ impl FreshOpencodeState {
             .await,
             TransitionalBridgeRescue::Refused
         ) {
-            return Err(ResumeOpencodeError::Manager(
+            return Err(ResumeOpencodeError::Superseded(
                 freshell_opencode::ServeError::Transport(format!(
                     "opencode session {session_id} ownership changed during resume; \
                      the session was retired mid-operation"
@@ -19194,9 +19208,10 @@ mod tests {
             let stall = sink.arm_binding_stall_result(PROVIDER, id, !cancel);
             let mut task = {
                 let st = st.clone();
-                tokio::spawn(
-                    async move { st.resume_durable_session(id, None, None, None, None).await },
-                )
+                tokio::spawn(async move {
+                    st.resume_durable_session_once(id, None, None, None, None)
+                        .await
+                })
             };
             stall.entered.recv_timeout(Duration::from_secs(15)).unwrap();
             let old = st.sessions.lock().await.remove(id).unwrap();
@@ -19234,6 +19249,13 @@ mod tests {
             let owner = registry.observe(PROVIDER, id);
             if cancel {
                 cancel_parked_startup(&mut task).await;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !old.lock().await.killed.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("canceling the provider operation tears down its old session before the binding stall is released");
             }
             let _ = stall.release.send(());
             if !cancel {
@@ -29209,6 +29231,123 @@ mod tests {
         assert!(session_serve_bridge_alive(&state, id).await);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn public_resume_after_kill_joins_superseded_operation_without_spending_launch_budget() {
+        let (mut state, _rx, _exited, spawns, manager) = selfheal_state(60_000, 120_000).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        state.set_ownership(registry.clone());
+        state.set_identity_sink(Arc::new(crate::identity_sink::FakeIdentitySink::default()));
+        let id = "ses_public_resume_after_kill";
+        let stall = state.arm_rescue_lookup_stall(id);
+        let st = state.clone();
+        let first =
+            tokio::spawn(
+                async move { st.resume_durable_session(id, None, None, None, None).await },
+            );
+        stall.entered.recv_timeout(Duration::from_secs(15)).unwrap();
+        let original_generation = registry.observe(PROVIDER, id).generation;
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            state.handle_kill(FreshAgentKill {
+                provider: AgentProvider::Opencode,
+                session_id: id.into(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+                observed_epoch: None,
+                observed_generation: None,
+            }),
+        )
+        .await
+        .expect("kill settles before another public resume is requested");
+        assert!(!state.has_live_session(id).await);
+        let killed_owner = registry.observe(PROVIDER, id);
+        let key = state.recovery_map_key(id);
+        let operation_id = state
+            .session_recovery
+            .status(&key)
+            .await
+            .unwrap()
+            .operation_id;
+        let st = state.clone();
+        let second =
+            tokio::spawn(
+                async move { st.resume_durable_session(id, None, None, None, None).await },
+            );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.session_recovery.waiter_count_for_test(&key).await != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the new public requester joins the still-settling operation");
+        assert!(!second.is_finished());
+        assert_eq!(
+            state
+                .session_recovery
+                .status(&key)
+                .await
+                .unwrap()
+                .operation_id,
+            operation_id
+        );
+        assert_eq!(registry.observe(PROVIDER, id), killed_owner);
+        assert!(!state.has_live_session(id).await);
+        stall.release.send(()).unwrap();
+        let results = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(first, second)
+        })
+        .await
+        .expect("both requesters receive the superseded operation's refusal");
+        let mut messages = Vec::new();
+        for result in [results.0.unwrap(), results.1.unwrap()] {
+            match result {
+                Err(ResumeOpencodeError::Manager(freshell_opencode::ServeError::Transport(message))) => {
+                    assert!(message.contains("ownership changed during resume"), "{message}");
+                    messages.push(message);
+                }
+                _ => panic!("a superseded resume must refuse both requesters without reviving the retired instance"),
+            }
+        }
+        assert_eq!(messages[0], messages[1]);
+        let settled = state.session_recovery.status(&key).await.unwrap();
+        assert!(!settled.in_flight);
+        assert_eq!(
+            settled.failed_launches, 0,
+            "a completed launch superseded by kill is not a failed provider launch"
+        );
+        assert!(
+            settled.retry_after_ms.is_none(),
+            "supersession imposes no provider retry cooldown"
+        );
+        assert!(!settled.exhausted);
+        let retry = tokio::time::timeout(
+            Duration::from_secs(15),
+            state.resume_durable_session(id, None, None, None, None),
+        )
+        .await
+        .expect("an immediate public retry may establish the newer lifecycle");
+        let Ok(replacement) = retry else {
+            panic!("the immediate retry must resume successfully");
+        };
+        assert!(Arc::ptr_eq(&state.sessions.lock().await[id], &replacement));
+        let owner = registry.observe(PROVIDER, id);
+        assert!(matches!(
+            owner.state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ));
+        assert!(owner.generation > original_generation);
+        assert!(
+            state.session_recovery.status(&key).await.is_none(),
+            "the successful retry closes the recovery episode"
+        );
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            1,
+            "the shared daemon remains the same"
+        );
+        manager.shutdown().await;
+    }
+
     /// fresheyes ep2-r5 Major (the rescue adopts a same-key replacement
     /// for the committed session): the post-commit rescue verified
     /// whichever session currently occupies the durable id — not the
@@ -29319,7 +29458,7 @@ mod tests {
             .await.expect("the independent replacement resume settles")
         {
             Ok(arc) => arc,
-            Err(ResumeOpencodeError::Manager(err)) => panic!(
+            Err(ResumeOpencodeError::Manager(err) | ResumeOpencodeError::Superseded(err)) => panic!(
                 "fixture: the replacement resume commits a fresh instance under the vacated key: {err:?}"
             ),
             Err(ResumeOpencodeError::NotFound) => {
@@ -29502,7 +29641,7 @@ mod tests {
                 .await
             {
                 Ok(arc) => arc,
-                Err(ResumeOpencodeError::Manager(err)) => panic!(
+                Err(ResumeOpencodeError::Manager(err) | ResumeOpencodeError::Superseded(err)) => panic!(
                     "fixture: the replacement resume commits a fresh instance under the vacated key: {err:?}"
                 ),
                 Err(ResumeOpencodeError::NotFound) => {

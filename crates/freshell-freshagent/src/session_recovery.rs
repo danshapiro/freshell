@@ -26,6 +26,7 @@ type SharedResult<T, E> = Arc<Result<T, RecoveryFailure<E>>>;
 pub struct RecoveryAttemptFailure<E> {
     pub error: E,
     pub counts_as_failed_launch: bool,
+    apply_retry_floor: bool,
 }
 
 impl<E> RecoveryAttemptFailure<E> {
@@ -33,6 +34,7 @@ impl<E> RecoveryAttemptFailure<E> {
         Self {
             error,
             counts_as_failed_launch: true,
+            apply_retry_floor: true,
         }
     }
 
@@ -40,6 +42,17 @@ impl<E> RecoveryAttemptFailure<E> {
         Self {
             error,
             counts_as_failed_launch: false,
+            apply_retry_floor: true,
+        }
+    }
+
+    /// A stop or newer lifecycle superseded a successful provider start.
+    /// It must preserve the previous failure budget without delaying a retry.
+    pub fn superseded(error: E) -> Self {
+        Self {
+            error,
+            counts_as_failed_launch: false,
+            apply_retry_floor: false,
         }
     }
 }
@@ -328,15 +341,17 @@ impl<T, E> SessionRecoveryMap<T, E> {
                         .clone(),
                     entry: entry.clone(),
                 }
-            } else if state.result.as_ref().is_some_and(|result| result.is_ok())
-                && state.waiters > 0
+            } else if state.waiters > 0
+                && (state.result.as_ref().is_some_and(|result| result.is_ok())
+                    || state.retry_until.is_none())
             {
-                // A slow requester from the just-completed successful cohort
-                // is still consuming that result; a late view may join it.
+                // Keep the result stable while its cohort consumes a success
+                // or a no-delay refusal. A later operation starts only after
+                // those waiters finish; no retry timer is needed for supersession.
                 let operation = state
                     .current
                     .as_ref()
-                    .expect("successful recovery has an operation");
+                    .expect("settled recovery has an operation");
                 let receiver = operation.result_tx.subscribe();
                 let operation_id = operation.operation_id.clone();
                 state.waiters += 1;
@@ -468,18 +483,23 @@ impl<T, E> SessionRecoveryMap<T, E> {
                 let operation_tx = operation.result_tx.clone();
                 tokio::spawn(async move {
                     let settled = AssertUnwindSafe(start()).catch_unwind().await;
-                    let (outcome, failed_launch): (SharedResult<T, E>, bool) = match settled {
-                        Ok(Ok(value)) => (Arc::new(Ok(value)), false),
+                    let (outcome, failed_launch, apply_retry_floor): (
+                        SharedResult<T, E>,
+                        bool,
+                        bool,
+                    ) = match settled {
+                        Ok(Ok(value)) => (Arc::new(Ok(value)), false, false),
                         Ok(Err(failure)) => (
                             Arc::new(Err(RecoveryFailure::Attempt(failure.error))),
                             failure.counts_as_failed_launch,
+                            failure.apply_retry_floor,
                         ),
                         Err(_) => {
                             tracing::error!(target: "freshell_freshagent::session_recovery",
                                 event = "freshagent.recovery_operation_panicked",
                                 operation_id = %operation_id,
                                 "the shared recovery operation panicked before settling");
-                            (Arc::new(Err(RecoveryFailure::Panicked)), false)
+                            (Arc::new(Err(RecoveryFailure::Panicked)), false, true)
                         }
                     };
                     let mut current = state
@@ -502,7 +522,8 @@ impl<T, E> SessionRecoveryMap<T, E> {
                                     current.failed_launches >= maximum_failed_launches;
                             }
                             Err(_) => {
-                                current.retry_until = Some(Instant::now() + retry_floor);
+                                current.retry_until =
+                                    apply_retry_floor.then(|| Instant::now() + retry_floor);
                                 current.exhausted =
                                     current.failed_launches >= maximum_failed_launches;
                             }
@@ -909,6 +930,98 @@ mod tests {
             .await;
         assert_eq!(exhausted.operation_id, third_failure.operation_id);
         assert!(exhausted.status.exhausted);
+    }
+
+    #[tokio::test]
+    async fn shared_recovery_supersession_preserves_prior_failures_and_allows_immediate_retry() {
+        let recovery = TestRecovery::with_policy(3, Duration::from_secs(1));
+        let failed = recovery
+            .run("opencode:after-kill", || async {
+                Err(RecoveryAttemptFailure::launch("real provider failure"))
+            })
+            .await;
+        assert_eq!(failed.status.failed_launches, 1);
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let superseded = recovery
+            .run("opencode:after-kill", || async {
+                Err(RecoveryAttemptFailure::superseded(
+                    "a stop superseded the completed resume",
+                ))
+            })
+            .await;
+        assert_ne!(superseded.operation_id, failed.operation_id);
+        assert!(matches!(
+            superseded.result.as_ref(),
+            Err(RecoveryFailure::Attempt(
+                "a stop superseded the completed resume"
+            ))
+        ));
+        assert_eq!(
+            superseded.status.failed_launches, 1,
+            "supersession neither charges nor erases a prior actual failure"
+        );
+        assert!(
+            superseded.status.retry_after_ms.is_none(),
+            "a completed provider launch needs no retry delay after stop supersession"
+        );
+        let starts = Arc::new(AtomicUsize::new(0));
+        let attempt_starts = starts.clone();
+        let retry = recovery
+            .run("opencode:after-kill", move || async move {
+                attempt_starts.fetch_add(1, Ordering::SeqCst);
+                Ok("new owner ready".to_string())
+            })
+            .await;
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            1,
+            "an immediate retry executes instead of reusing the superseded result"
+        );
+        assert_ne!(retry.operation_id, superseded.operation_id);
+        assert_eq!(retry.result.as_ref().as_ref().unwrap(), "new owner ready");
+        assert_eq!(
+            retry.status.failed_launches, 0,
+            "successful establishment resets the episode"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_recovery_supersession_keeps_its_result_until_the_cohort_consumes_it() {
+        let recovery = TestRecovery::with_policy(3, Duration::from_secs(1));
+        let mut first = Box::pin(recovery.run("opencode:slow-cohort", || async {
+            Err(RecoveryAttemptFailure::superseded("stopped"))
+        }));
+        assert!(futures_util::poll!(&mut first).is_pending());
+        let settled = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = recovery.status("opencode:slow-cohort").await.unwrap();
+                if !status.in_flight {
+                    return status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the server-owned operation settles while its requester is unpolled");
+        let joined = recovery
+            .run("opencode:slow-cohort", || async {
+                panic!("a slow requester still owns the completed cohort result");
+            })
+            .await;
+        assert_eq!(joined.operation_id, settled.operation_id);
+        let first = first.await;
+        assert!(Arc::ptr_eq(&joined.result, &first.result));
+        assert!(matches!(
+            first.result.as_ref(),
+            Err(RecoveryFailure::Attempt("stopped"))
+        ));
+        let next = recovery
+            .run("opencode:slow-cohort", || async {
+                Ok("next lifecycle".into())
+            })
+            .await;
+        assert_ne!(next.operation_id, first.operation_id);
+        assert_eq!(next.result.as_ref().as_ref().unwrap(), "next lifecycle");
     }
 
     #[tokio::test]

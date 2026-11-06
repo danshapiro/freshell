@@ -936,6 +936,185 @@ async fn task009_rest_lane_http_create_refusal_names_the_actual_owner() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_claim_refusal_preserves_owner_for_native_requester_and_rest_create() {
+    use freshell_ownership::{
+        BeginOutcome, CommitOutcome, OwnerIdentity, RuntimeOwnerKind, RuntimeOwnershipRegistry,
+    };
+    for is_send in [false, true] {
+        let id = if is_send {
+            "claim-owner-send"
+        } else {
+            "claim-owner-attach"
+        };
+        let (mut state, _peer) = if is_send {
+            let (state, peer, _) = channel_session(id).await;
+            state
+                .sessions
+                .lock()
+                .await
+                .get(id)
+                .unwrap()
+                .exited
+                .store(true, Ordering::SeqCst);
+            (state, Some(peer))
+        } else {
+            (super::tests::state_with_bus().0, None)
+        };
+        let registry = Arc::new(RuntimeOwnershipRegistry::with_epoch(191));
+        state.set_ownership(registry.clone());
+        let mut bus = state.broadcast_tx.subscribe();
+        // Admit recovery while vacant, then hold its actual claim behind the
+        // provider-operation lock. The refusal must come from the claim, not
+        // the shared holder's requester preflight.
+        let gate = Arc::new(TokioMutex::new(()));
+        state.resuming.lock().await.insert(id.into(), gate.clone());
+        let held = gate.lock().await;
+        let captured = Arc::new(StdMutex::new(Vec::<ServerMessage>::new()));
+        let replies = captured.clone();
+        let st = state.clone();
+        let native = tokio::spawn(async move {
+            if is_send {
+                Some(st.handle_send(send(id, "native-claim-request")).await)
+            } else {
+                let attach = serde_json::from_value(json!({
+                    "provider":"codex", "sessionType":"freshcodex", "sessionId":id,
+                    "requestId":"native-claim-request", "viewId":"native-claim-view"
+                }))
+                .unwrap();
+                st.handle_attach(
+                    attach,
+                    Arc::new(move |frame| replies.lock().unwrap().push(frame)),
+                )
+                .await;
+                None
+            }
+        });
+        let key = state.recovery_map_key(id);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.session_recovery.waiter_count_for_test(&key).await != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the native requester is admitted before the owner changes");
+        let (router, _) = http_pane(state.clone(), id);
+        let rest = tokio::spawn(async move {
+            post_http(
+                router,
+                "/api/tabs",
+                json!({"agent":"codex","sessionRef":{"provider":"codex","sessionId":id}}),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.session_recovery.waiter_count_for_test(&key).await != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("REST create joins the admitted native operation");
+        let BeginOutcome::Granted { generation } = registry.begin_start(
+            PROVIDER,
+            id,
+            RuntimeOwnerKind::Terminal,
+            "claim-owner",
+            None,
+            "fixture",
+            1,
+        ) else {
+            panic!("fixture terminal owner is granted");
+        };
+        assert_eq!(
+            registry.commit_live(
+                PROVIDER,
+                id,
+                "claim-owner",
+                generation,
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("claim-owner-terminal".into()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None,
+                }
+            ),
+            CommitOutcome::Committed
+        );
+        drop(held);
+        let native = tokio::time::timeout(Duration::from_secs(5), native)
+            .await
+            .unwrap()
+            .unwrap();
+        let (status, body) = tokio::time::timeout(Duration::from_secs(5), rest)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "SESSION_RESERVED");
+        assert_eq!(
+            json!([
+                body["ownerKind"],
+                body["ownerEpoch"],
+                body["ownerGeneration"]
+            ]),
+            json!(["terminal", 191, generation]),
+            "the REST joiner preserves the operation's refusal owner: {body}"
+        );
+        if let Some(CodexSendOutcome::Refused { owner, .. }) = native {
+            assert_eq!(
+                owner,
+                Some(crate::ownership_lane::TerminalOwnerFields {
+                    owner_kind: "terminal",
+                    owner_epoch: 191,
+                    owner_generation: generation,
+                })
+            );
+            let frames: Vec<Value> = std::iter::from_fn(|| bus.try_recv().ok())
+                .map(|raw| serde_json::from_str::<Value>(&raw).unwrap())
+                .filter(|frame| frame["requestId"] == "native-claim-request")
+                .collect();
+            assert_eq!(frames.len(), 1, "one native send refusal: {frames:?}");
+            assert_eq!(frames[0]["type"], "error");
+            assert!(frames[0]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("SESSION_RESERVED:"));
+            assert_eq!(
+                json!([
+                    frames[0]["ownerKind"],
+                    frames[0]["ownerEpoch"],
+                    frames[0]["ownerGeneration"]
+                ]),
+                json!(["terminal", 191, generation])
+            );
+        } else if is_send {
+            panic!("the native send must be refused");
+        } else {
+            let frames = captured.lock().unwrap();
+            assert_eq!(frames.len(), 1);
+            let ServerMessage::FreshAgentAttachFailed(failed) = &frames[0] else {
+                panic!("attach must be refused: {frames:?}");
+            };
+            assert_eq!(failed.request_id, "native-claim-request");
+            assert_eq!(failed.code, "SESSION_RESERVED");
+            assert_eq!(failed.owner_kind.as_deref(), Some("terminal"));
+            assert_eq!(failed.owner_epoch, Some(191));
+            assert_eq!(failed.owner_generation, Some(generation));
+        }
+        assert_eq!(
+            state
+                .session_recovery
+                .status(&key)
+                .await
+                .unwrap()
+                .failed_launches,
+            0
+        );
+        state.shutdown().await;
+    }
+}
+
 #[tokio::test]
 async fn task009_rest_lane_headless_create_and_resume_publish_the_native_effective_settings() {
     let _environment = super::tests::ENV_LOCK.lock().await;
