@@ -130,6 +130,14 @@ export const ManagedRuntimeReadinessSchema = z.object({
   initialScanDurationMs: NonNegativeIntSchema.optional(),
 }).strict()
 
+export const ManagedRuntimeRecoveryStatusSchema = z.object({
+  operationId: NonEmptyIdSchema,
+  inFlight: z.boolean(),
+  failedLaunches: NonNegativeIntSchema,
+  retryAfterMs: NonNegativeIntSchema.optional(),
+  exhausted: z.boolean(),
+}).strict()
+
 export const ManagedRuntimeNativeIdentityObservationSchema = z.object({
   nativeSessionId: NonEmptyIdSchema,
   incarnationId: NonEmptyIdSchema,
@@ -162,6 +170,7 @@ export const ManagedRuntimeSoulSchema = z.object({
   freshAgentCreateRequestId: z.string().optional(),
   freshAgentSessionType: z.string().optional(),
   freshAgentRuntimeVariant: z.string().optional(),
+  freshAgentRecovery: ManagedRuntimeRecoveryStatusSchema.optional(),
   projectKey: z.string().optional(),
   profile: z.enum(['default_agent', 'test_fixture', 'custom']).optional(),
   desiredState: ManagedRuntimeDesiredStateSchema,
@@ -249,6 +258,7 @@ export const ManagedRuntimeProjectionFieldsSchema = z.object({
   placementGroup: z.string().optional(),
   resourceSummary: ManagedRuntimeResourceSummarySchema.optional(),
   recoverySummary: ManagedRuntimeRecoverySummarySchema.optional(),
+  freshAgentRecovery: ManagedRuntimeRecoveryStatusSchema.optional(),
 }).strict()
 
 export const ManagedRuntimeRevisionMutationSchema = z.object({
@@ -382,6 +392,7 @@ export const ManagedRuntimeViewChangedMessageSchema = z.object({
 export type ManagedRuntimeLimits = z.infer<typeof ManagedRuntimeLimitsSchema>
 export type ManagedRuntimeMetrics = z.infer<typeof ManagedRuntimeMetricsSchema>
 export type ManagedRuntimeReadiness = z.infer<typeof ManagedRuntimeReadinessSchema>
+export type ManagedRuntimeRecoveryStatus = z.infer<typeof ManagedRuntimeRecoveryStatusSchema>
 export type ManagedRuntimeSoul = z.infer<typeof ManagedRuntimeSoulSchema>
 export type ManagedRuntimeViewIntent = z.infer<typeof ManagedRuntimeViewIntentSchema>
 export type ManagedRuntimeViewVisibility = z.infer<typeof ManagedRuntimeViewVisibilitySchema>

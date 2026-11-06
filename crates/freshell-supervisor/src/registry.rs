@@ -8456,6 +8456,7 @@ pub(crate) fn load_inventory(conn: &Connection) -> Result<Vec<RuntimeView>, Regi
             fresh_agent_runtime_variant: fresh_agent_spec
                 .as_ref()
                 .map(|spec| spec.runtime_variant.clone()),
+            fresh_agent_recovery: None,
             project_key: Some(row.get(10)?),
             profile: Some(parse_runtime_profile(&profile)?),
             desired_state: parse_desired_state(&row.get::<_, String>(12)?)?,

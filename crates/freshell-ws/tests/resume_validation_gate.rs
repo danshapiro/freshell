@@ -197,7 +197,6 @@ async fn spawn_server_with_probe(
         activity: None,
         session_existence: probe,
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-        fresh_agent_respawn_counts: Default::default(),
         ownership: None,
     };
 
@@ -393,7 +392,6 @@ async fn spawn_managed_codex_server_with_probe(
         activity: None,
         session_existence: probe,
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-        fresh_agent_respawn_counts: Default::default(),
         ownership: None,
     };
 

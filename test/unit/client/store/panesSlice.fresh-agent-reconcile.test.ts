@@ -242,6 +242,48 @@ describe('applyFreshAgentReconcileAttach', () => {
     expect(c.reconcileNotice).toBeTruthy() // corrected is user-visible
   })
 
+  it('folds the same live locator independently for two legal views', () => {
+    const secondTabId = 'tab2'
+    const secondPaneId = 'p2'
+    let state = stateWithFreshAgentPane()
+    state = panesReducer(state, initLayout({
+      tabId: secondTabId,
+      paneId: secondPaneId,
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'cr-second-view',
+        status: 'creating',
+      } as PaneContentInput,
+    }))
+
+    state = panesReducer(state, applyFreshAgentReconcileAttach({
+      tabId, paneId,
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+      serverInstanceId: 'srv-1',
+    }))
+    state = panesReducer(state, applyFreshAgentReconcileAttach({
+      tabId: secondTabId,
+      paneId: secondPaneId,
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+      serverInstanceId: 'srv-1',
+    }))
+
+    expect(leafContent(state, tabId)).toMatchObject({
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+      resumeSessionId: DURABLE,
+      createRequestId: ORIGINAL_CREATE_REQUEST_ID,
+      status: 'connected',
+    })
+    expect(leafContent(state, secondTabId)).toMatchObject({
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+      resumeSessionId: DURABLE,
+      createRequestId: 'cr-second-view',
+      status: 'connected',
+    })
+  })
+
   it('sets the duplicate notice when the verdict is a duplicate', () => {
     const next = panesReducer(stateWithFreshAgentPane(), applyFreshAgentReconcileAttach({
       tabId, paneId,
@@ -292,9 +334,11 @@ describe('resetFreshAgentPaneForReconcileCreate', () => {
     expect(leafContent(next, tabId).serverInstanceId).toBeUndefined()
   })
 
-  it.each(['duplicate_session_claim', 'no_recoverable_identity'])('clears managed durable identity for genuine fresh %s', (reason) => {
+  it('clears managed durable identity when there is no recoverable locator', () => {
     const state = stateWithFreshAgentPane({ soulId: 'owned-soul', sessionRef: { provider: 'claude', sessionId: DURABLE }, resumeSessionId: DURABLE })
-    const next = panesReducer(state, resetFreshAgentPaneForReconcileCreate({ tabId, paneId, intent: 'fresh', reason }))
+    const next = panesReducer(state, resetFreshAgentPaneForReconcileCreate({
+      tabId, paneId, intent: 'fresh', reason: 'no_recoverable_identity',
+    }))
     expect(leafContent(next, tabId).sessionRef).toBeUndefined()
     expect(leafContent(next, tabId).resumeSessionId).toBeUndefined()
     expect(leafContent(next, tabId).createRequestId).toBe(ORIGINAL_CREATE_REQUEST_ID)

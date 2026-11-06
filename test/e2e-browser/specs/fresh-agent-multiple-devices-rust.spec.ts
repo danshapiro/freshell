@@ -18,8 +18,13 @@ type JsonRow = Record<string, unknown>
 const MODES: FreshAgentMultipleDeviceMode[] = ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode']
 
 type FreshAgentDeviceView = {
-  harness: { getPaneLayout(tabId: string): Promise<any> }
+  harness: {
+    getPaneLayout(tabId: string): Promise<any>
+    getState(): Promise<any>
+  }
   tabId: string
+  paneId: string
+  viewId: string
 }
 
 function findFreshAgentLeaf(node: any): any {
@@ -1544,6 +1549,452 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
       }, { timeout: 45_000, message: 'the joined turn adds one user row and one assistant row' })
         .toEqual({ user: 1, assistant: 1 })
       expect(mode === 'freshopencode' ? native.bootCount() : native.bootCount(session.sessionId)).toBe(1)
+    }))
+  }
+
+  const recoveryAction = async (
+    deviceFrames: JsonRow[],
+    device: FreshAgentDeviceView,
+    session: { provider: string; sessionType: string; sessionId: string },
+    cursor: number,
+  ) => {
+    const recoveryActionStartedAtMs = Date.now()
+    const frameCountAtEntry = deviceFrames.length
+    let action: JsonRow | undefined
+    try {
+      await expect.poll(() => {
+        action = deviceFrames.slice(cursor).find((frame) => frame.direction === 'sent'
+          && (frame.type === 'freshAgent.create' || frame.type === 'freshAgent.attach')
+          && frame.viewId === device.viewId
+          && frame.provider === session.provider
+          && frame.sessionType === session.sessionType
+          && (frame.sessionId === session.sessionId
+            || (frame.sessionRef as Record<string, unknown> | undefined)?.sessionId === session.sessionId))
+        return action ?? null
+      }, {
+        timeout: 45_000,
+        message: `${session.sessionType} view sends its own recovery request`,
+      }).not.toBeNull()
+    } catch (error) {
+      const timedOutAtMs = Date.now()
+      const frameCountAtTimeout = deviceFrames.length
+      const framesAtTimeout = deviceFrames.slice(cursor, frameCountAtTimeout)
+      const [state, layout] = await Promise.all([
+        device.harness.getState(),
+        device.harness.getPaneLayout(device.tabId),
+      ])
+      const content = findFreshAgentLeaf(layout)?.content
+      const ownerRecords = Object.values(state.freshAgent?.runtimeOwners ?? {})
+        .filter((owner: any) => owner?.provider === session.provider && owner?.sessionId === session.sessionId)
+        .map((owner: any) => ({
+          ownerKind: owner.ownerKind,
+          transition: owner.transition,
+          epoch: owner.epoch,
+          generation: owner.generation,
+          fenced: owner.fenced,
+        }))
+      const observedWireFrames = framesAtTimeout.map((frame, offset) => {
+          const sessionRef = frame.sessionRef as Record<string, unknown> | undefined
+          return {
+            frameIndex: cursor + offset,
+            capturedAtMs: frame.capturedAtMs,
+            direction: frame.direction,
+            type: frame.type,
+            requestId: frame.requestId,
+            reconcileId: frame.reconcileId,
+            viewId: frame.viewId,
+            provider: frame.provider,
+            sessionType: frame.sessionType,
+            sessionId: frame.sessionId,
+            bootId: frame.bootId,
+            verdict: frame.verdict,
+            sessionRef: sessionRef && {
+              provider: sessionRef.provider,
+              sessionId: sessionRef.sessionId,
+            },
+            code: frame.code,
+          }
+        })
+      const recoveryActionCandidates = framesAtTimeout
+        .flatMap((frame, offset) => {
+          if (frame.type !== 'freshAgent.create' && frame.type !== 'freshAgent.attach') return []
+          const sessionRefId = (frame.sessionRef as Record<string, unknown> | undefined)?.sessionId
+          const predicates = {
+            direction: { actual: frame.direction, expected: 'sent', matches: frame.direction === 'sent' },
+            viewId: { actual: frame.viewId, expected: device.viewId, matches: frame.viewId === device.viewId },
+            provider: { actual: frame.provider, expected: session.provider, matches: frame.provider === session.provider },
+            sessionType: { actual: frame.sessionType, expected: session.sessionType, matches: frame.sessionType === session.sessionType },
+            sessionId: {
+              actual: frame.sessionId,
+              sessionRefId,
+              expected: session.sessionId,
+              matches: frame.sessionId === session.sessionId || sessionRefId === session.sessionId,
+            },
+          }
+          return [{
+            frameIndex: cursor + offset,
+            capturedAtMs: frame.capturedAtMs,
+            requestId: frame.requestId,
+            type: frame.type,
+            viewId: frame.viewId,
+            provider: frame.provider,
+            sessionType: frame.sessionType,
+            sessionId: frame.sessionId,
+            sessionRefId,
+            predicates,
+          }]
+        })
+      const paneSessionRef = content?.sessionRef as Record<string, unknown> | undefined
+      const diagnostic = {
+        expectedRecoveryAction: {
+          viewId: device.viewId,
+          provider: session.provider,
+          sessionType: session.sessionType,
+          sessionId: session.sessionId,
+          cursor,
+          frameCountAtEntry,
+          frameCountAtTimeout,
+          frameCountDelta: frameCountAtTimeout - frameCountAtEntry,
+          recoveryActionStartedAtMs,
+          timedOutAtMs,
+          framesAppendedDuringDiagnostic: deviceFrames.slice(frameCountAtTimeout).map((frame, offset) => ({
+            frameIndex: frameCountAtTimeout + offset,
+            capturedAtMs: frame.capturedAtMs,
+            direction: frame.direction,
+            type: frame.type,
+            requestId: frame.requestId,
+            viewId: frame.viewId,
+            provider: frame.provider,
+            sessionType: frame.sessionType,
+            sessionId: frame.sessionId,
+            sessionRef: frame.sessionRef,
+          })),
+        },
+        connection: {
+          status: state.connection?.status,
+          bootId: state.connection?.bootId,
+          readySequence: state.connection?.readySequence,
+          lastReadyAt: state.connection?.lastReadyAt,
+        },
+        activeTabId: state.tabs?.activeTabId,
+        activePaneId: state.panes?.activePane?.[device.tabId],
+        pane: {
+          tabId: device.tabId,
+          paneId: device.paneId,
+          viewId: content?.viewId,
+          createRequestId: content?.createRequestId,
+          provider: content?.provider,
+          sessionType: content?.sessionType,
+          sessionId: content?.sessionId,
+          sessionRef: paneSessionRef && {
+            provider: paneSessionRef.provider,
+            sessionId: paneSessionRef.sessionId,
+          },
+          status: content?.status,
+          reconcileEpoch: content?.reconcileEpoch,
+          recoveryDesiredState: content?.recoverySummary?.desiredState,
+          recoveryState: content?.recoverySummary?.recoveryState,
+          pendingReconcile: state.panes?.reconcilePendingPanes?.[`${device.tabId}:${device.paneId}`],
+        },
+        ownerRecords,
+        recoveryActionCandidates,
+        observedWireFrames,
+      }
+      throw new Error(
+        `${session.sessionType} recovery request not found for view ${device.viewId}; `
+        + `metadata-only reconnect trace: ${JSON.stringify(diagnostic)}`,
+        { cause: error },
+      )
+    }
+    return action!
+  }
+
+  const recoveryOutcome = async (
+    deviceFrames: JsonRow[],
+    action: JsonRow,
+    success: boolean,
+  ) => {
+    let outcome: JsonRow | undefined
+    await expect.poll(() => {
+      outcome = deviceFrames.find((frame) => frame.direction === 'received'
+        && frame.requestId === action.requestId
+        && (frame.type === 'freshAgent.created'
+          || frame.type === 'freshAgent.create.failed'
+          || frame.type === 'freshAgent.attached'
+          || frame.type === 'freshAgent.attach.failed'))
+      return outcome?.type ?? null
+    }, {
+      timeout: 60_000,
+      message: `request ${String(action.requestId)} gets its own ${success ? 'success' : 'failure'} result`,
+    }).toMatch(success
+      ? /^(freshAgent\.created|freshAgent\.attached)$/
+      : /^(freshAgent\.create\.failed|freshAgent\.attach\.failed)$/)
+    expect(outcome?.viewId).toBe(action.viewId)
+    return outcome!
+  }
+
+  const assertJoinedRecoveryCohort = async (
+    mode: FreshAgentMultipleDeviceMode,
+    native: FreshAgentMultipleDeviceSession['native'],
+    sessionId: string,
+    actions: [JsonRow, JsonRow],
+    attemptsBefore: number,
+  ): Promise<JsonRow[]> => {
+    if (mode !== 'freshcodex' && mode !== 'freshopencode') return []
+    const requestIds = actions.map((action) => action.requestId as string)
+    const admissions = await native.waitForSharedRecoveryAdmissions(sessionId, requestIds)
+    const cohort = requestIds.map((requestId) => admissions.find((row) => row.request_id === requestId)!)
+    const admittedAt = cohort.map((row) => Number(row.admitted_at_ms))
+    const firstNativeAttempt = native.recoveryAttemptRows(sessionId)[attemptsBefore]
+    const nativeAttemptAt = Number(mode === 'freshopencode' ? firstNativeAttempt?.t : firstNativeAttempt?.at)
+    const safeWindowMs = mode === 'freshopencode' ? 8_000 : 28_000
+
+    expect(cohort.map((row) => row.operation_id).every((operationId) => operationId === cohort[0]?.operation_id))
+      .toBe(true)
+    expect(new Set(cohort.map((row) => row.admission))).toEqual(new Set(['started', 'joined']))
+    expect(Math.max(...admittedAt) - Math.min(...admittedAt)).toBeLessThan(safeWindowMs)
+    expect(Math.max(...admittedAt) - nativeAttemptAt).toBeLessThan(safeWindowMs)
+    return cohort
+  }
+
+  for (const mode of MODES) {
+    test(`stage2 cold open ${mode}: desktop and mobile join one held recovery`, withTwoDeviceSession(mode, async ({
+      desktop,
+      mobile,
+      native,
+      session,
+      frames,
+      restartServer,
+    }) => {
+      const desktopReady = await desktop.harness.getLastReadyAt()
+      const mobileReady = await mobile.harness.getLastReadyAt()
+      const desktopCursor = frames.desktop.length
+      const mobileCursor = frames.mobile.length
+      const recoveryAttemptsBefore = native.recoveryAttemptCount(session.sessionId)
+      const runtimeStartsBefore = native.runtimeStartCount(session.sessionId)
+      await native.holdNextRecovery(session.sessionId)
+      await restartServer()
+      await Promise.all([
+        desktop.harness.waitForConnectionAfter(desktopReady, 60_000),
+        mobile.harness.waitForConnectionAfter(mobileReady, 60_000),
+      ])
+
+      const [attemptResult, desktopActionResult, mobileActionResult] = await Promise.allSettled([
+        native.waitForRecoveryAttempt(session.sessionId),
+        recoveryAction(frames.desktop, desktop, session, desktopCursor),
+        recoveryAction(frames.mobile, mobile, session, mobileCursor),
+      ])
+      const actionFailures = [
+        desktopActionResult.status === 'rejected'
+          ? `desktop(${desktop.viewId}): ${String(desktopActionResult.reason)}`
+          : null,
+        mobileActionResult.status === 'rejected'
+          ? `mobile(${mobile.viewId}): ${String(mobileActionResult.reason)}`
+          : null,
+      ].filter((failure): failure is string => failure !== null)
+      expect(actionFailures, 'both desktop and mobile send their own recovery request').toEqual([])
+      if (desktopActionResult.status === 'rejected') throw desktopActionResult.reason
+      if (mobileActionResult.status === 'rejected') throw mobileActionResult.reason
+      const desktopAction = desktopActionResult.value
+      const mobileAction = mobileActionResult.value
+      if (attemptResult.status === 'rejected') {
+        const recoveryRows = native.rows().filter((row) => row.event === 'session_get_started'
+          || row.event === 'session_get_failed'
+          || row.event === 'session_get')
+        throw new Error(
+          `expected a held native recovery attempt for ${session.sessionId}; `
+          + `actions=${JSON.stringify([desktopAction, mobileAction].map((action) => ({
+            type: action.type,
+            requestId: action.requestId,
+            viewId: action.viewId,
+            sessionId: action.sessionId,
+            sessionRef: action.sessionRef,
+            capturedAtMs: action.capturedAtMs,
+          })))}; native recovery rows=${JSON.stringify(recoveryRows)}`,
+          { cause: attemptResult.reason },
+        )
+      }
+      expect(desktopAction.requestId).not.toBe(mobileAction.requestId)
+      const cohort = await assertJoinedRecoveryCohort(
+        mode,
+        native,
+        session.sessionId,
+        [desktopAction, mobileAction],
+        recoveryAttemptsBefore,
+      )
+      const recoveryTrace = {
+        requestIds: [desktopAction.requestId, mobileAction.requestId],
+        joinedOperation: cohort,
+        allAdmissions: await native.recoveryAdmissions(session.sessionId),
+        nativeAttempts: native.recoveryAttemptRows(session.sessionId).slice(recoveryAttemptsBefore),
+        allSessionGets: native.rows().filter((row) => row.event === 'session_get_started'
+          && row.sessionId === session.sessionId),
+      }
+      const recoveryRequestId = cohort.find((row) => row.admission === 'started')?.request_id
+      expect(native.recoveryAttemptCount(session.sessionId),
+        `one native attempt before releasing the held operation; trace=${JSON.stringify(recoveryTrace)}`)
+        .toBe(recoveryAttemptsBefore + 1)
+      if (mode === 'freshopencode') {
+        expect(recoveryTrace.nativeAttempts.map((row) => row.recoveryRequestId),
+          `the one OpenCode GET belongs to the server request that started the shared operation; trace=${JSON.stringify(recoveryTrace)}`)
+          .toEqual([recoveryRequestId])
+      }
+      await native.releaseRecovery()
+
+      const [desktopResult, mobileResult] = await Promise.all([
+        recoveryOutcome(frames.desktop, desktopAction, true),
+        recoveryOutcome(frames.mobile, mobileAction, true),
+      ])
+      expect(desktopResult.sessionId).toBe(session.sessionId)
+      expect(mobileResult.sessionId).toBe(session.sessionId)
+      await Promise.all([
+        waitForPaneStatus(desktop, /^(connected|idle)$/),
+        waitForPaneStatus(mobile, /^(connected|idle)$/),
+      ])
+      const recoveryAttemptsAfterRelease = native.recoveryAttemptRows(session.sessionId)
+        .slice(recoveryAttemptsBefore)
+      const browserRecoveryActions = [
+        ...frames.desktop.slice(desktopCursor).map((frame) => ({ device: 'desktop', frame })),
+        ...frames.mobile.slice(mobileCursor).map((frame) => ({ device: 'mobile', frame })),
+      ].filter(({ frame }) => frame.direction === 'sent'
+        && (frame.type === 'freshAgent.create' || frame.type === 'freshAgent.attach'))
+        .map(({ device, frame }) => ({
+          device,
+          type: frame.type,
+          requestId: frame.requestId,
+          viewId: frame.viewId,
+          provider: frame.provider,
+          sessionType: frame.sessionType,
+          sessionId: frame.sessionId,
+          sessionRef: (frame.sessionRef as Record<string, unknown> | undefined)?.sessionId,
+          capturedAtMs: frame.capturedAtMs,
+        }))
+      const finalRecoveryTrace = {
+        baselineAttemptCount: recoveryAttemptsBefore,
+        finalAttemptCount: native.recoveryAttemptCount(session.sessionId),
+        browserRequestIds: [desktopAction.requestId, mobileAction.requestId],
+        browserRecoveryActions,
+        admissions: await native.recoveryAdmissions(session.sessionId),
+        allCodexResumeRows: mode === 'freshcodex'
+          ? native.codexResumeRows().map((row) => ({
+            auditSource: row.auditSource,
+            at: row.at,
+            threadId: (row.params as Record<string, unknown> | undefined)?.threadId,
+            cwd: row.cwd,
+          }))
+          : undefined,
+        recoveryAttemptsAfterBaseline: recoveryAttemptsAfterRelease.map((row) => ({
+          at: row.at,
+          threadId: (row.params as Record<string, unknown> | undefined)?.threadId,
+          cwd: row.cwd,
+        })),
+      }
+      expect(native.recoveryAttemptCount(session.sessionId),
+        `one native recovery attempt after releasing the shared operation; trace=${JSON.stringify(finalRecoveryTrace)}`)
+        .toBe(recoveryAttemptsBefore + 1)
+      expect(native.runtimeStartCount(session.sessionId)).toBe(runtimeStartsBefore + 1)
+    }))
+
+    test(`stage2 shared failure ${mode}: both views receive one failed recovery result`, withTwoDeviceSession(mode, async ({
+      desktop,
+      mobile,
+      native,
+      session,
+      frames,
+      restartServer,
+    }) => {
+      const desktopReady = await desktop.harness.getLastReadyAt()
+      const mobileReady = await mobile.harness.getLastReadyAt()
+      const desktopCursor = frames.desktop.length
+      const mobileCursor = frames.mobile.length
+      const recoveryAttemptsBefore = native.recoveryAttemptCount(session.sessionId)
+      await native.holdNextRecovery(session.sessionId)
+      await native.failNextRecovery()
+      await restartServer()
+      await Promise.all([
+        desktop.harness.waitForConnectionAfter(desktopReady, 60_000),
+        mobile.harness.waitForConnectionAfter(mobileReady, 60_000),
+      ])
+
+      const [attemptResult, desktopActionResult, mobileActionResult] = await Promise.allSettled([
+        native.waitForRecoveryAttempt(session.sessionId),
+        recoveryAction(frames.desktop, desktop, session, desktopCursor),
+        recoveryAction(frames.mobile, mobile, session, mobileCursor),
+      ])
+      const actionFailures = [
+        desktopActionResult.status === 'rejected'
+          ? `desktop(${desktop.viewId}): ${String(desktopActionResult.reason)}`
+          : null,
+        mobileActionResult.status === 'rejected'
+          ? `mobile(${mobile.viewId}): ${String(mobileActionResult.reason)}`
+          : null,
+      ].filter((failure): failure is string => failure !== null)
+      expect(actionFailures, 'both desktop and mobile send their own recovery request').toEqual([])
+      if (desktopActionResult.status === 'rejected') throw desktopActionResult.reason
+      if (mobileActionResult.status === 'rejected') throw mobileActionResult.reason
+      const desktopAction = desktopActionResult.value
+      const mobileAction = mobileActionResult.value
+      if (attemptResult.status === 'rejected') {
+        const recoveryRows = native.rows().filter((row) => row.event === 'session_get_started'
+          || row.event === 'session_get_failed'
+          || row.event === 'session_get')
+        throw new Error(
+          `expected a held native recovery attempt for ${session.sessionId}; `
+          + `actions=${JSON.stringify([desktopAction, mobileAction].map((action) => ({
+            type: action.type,
+            requestId: action.requestId,
+            viewId: action.viewId,
+            sessionId: action.sessionId,
+            sessionRef: action.sessionRef,
+            capturedAtMs: action.capturedAtMs,
+          })))}; native recovery rows=${JSON.stringify(recoveryRows)}`,
+          { cause: attemptResult.reason },
+        )
+      }
+      expect(desktopAction.requestId).not.toBe(mobileAction.requestId)
+      const cohort = await assertJoinedRecoveryCohort(
+        mode,
+        native,
+        session.sessionId,
+        [desktopAction, mobileAction],
+        recoveryAttemptsBefore,
+      )
+      const recoveryTrace = {
+        requestIds: [desktopAction.requestId, mobileAction.requestId],
+        joinedOperation: cohort,
+        allAdmissions: await native.recoveryAdmissions(session.sessionId),
+        nativeAttempts: native.recoveryAttemptRows(session.sessionId).slice(recoveryAttemptsBefore),
+        allSessionGets: native.rows().filter((row) => row.event === 'session_get_started'
+          && row.sessionId === session.sessionId),
+      }
+      const recoveryRequestId = cohort.find((row) => row.admission === 'started')?.request_id
+      expect(native.recoveryAttemptCount(session.sessionId),
+        `one native attempt before releasing the held operation; trace=${JSON.stringify(recoveryTrace)}`)
+        .toBe(recoveryAttemptsBefore + 1)
+      if (mode === 'freshopencode') {
+        expect(recoveryTrace.nativeAttempts.map((row) => row.recoveryRequestId),
+          `the one OpenCode GET belongs to the server request that started the shared operation; trace=${JSON.stringify(recoveryTrace)}`)
+          .toEqual([recoveryRequestId])
+      }
+      await native.releaseRecovery()
+
+      const [desktopFailure, mobileFailure] = await Promise.all([
+        recoveryOutcome(frames.desktop, desktopAction, false),
+        recoveryOutcome(frames.mobile, mobileAction, false),
+      ])
+      expect(desktopFailure.code).toEqual(expect.any(String))
+      expect(mobileFailure.code).toEqual(expect.any(String))
+      expect(native.recoveryAttemptCount(session.sessionId)).toBe(recoveryAttemptsBefore + 1)
+      if (desktopAction.type === 'freshAgent.attach') {
+        expect(frames.mobile.some((frame) => frame.direction === 'received'
+          && frame.type === 'freshAgent.attach.failed'
+          && frame.requestId === desktopAction.requestId)).toBe(false)
+      }
+      if (mobileAction.type === 'freshAgent.attach') {
+        expect(frames.desktop.some((frame) => frame.direction === 'received'
+          && frame.type === 'freshAgent.attach.failed'
+          && frame.requestId === mobileAction.requestId)).toBe(false)
+      }
     }))
   }
 

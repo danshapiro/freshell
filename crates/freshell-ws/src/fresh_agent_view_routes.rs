@@ -36,6 +36,11 @@ pub(crate) struct FreshAgentViewRoutes {
 impl FreshAgentViewRoutes {
     pub(crate) fn negotiate_fresh_agent_reconciliation_v1(&mut self) {
         self.fresh_agent_reconciliation_v1 = true;
+        // V1 clients identify each pane by viewId during reconciliation,
+        // before they send any direct attach/create frames. Scope request
+        // acknowledgments from the handshake so a foreign create failure
+        // cannot leak to a reconnecting V1 view during that gap.
+        self.uses_view_ids = true;
     }
 
     pub(crate) fn fresh_agent_reconciliation_v1(&self) -> bool {
@@ -337,6 +342,25 @@ mod tests {
         assert!(routes
             .pending_creates
             .contains_key(&("reused".into(), "view-new".into())));
+    }
+
+    #[test]
+    fn negotiated_reconcile_clients_scope_foreign_create_failures_before_attach() {
+        let mut routes = FreshAgentViewRoutes::default();
+        routes.negotiate_fresh_agent_reconciliation_v1();
+
+        assert!(!routes.should_deliver(&frame(json!({
+            "type":"freshAgent.create.failed", "requestId":"other-view-create",
+            "viewId":"other-view", "code":"CLAUDE_ATTACH_RESUME_FAILED"
+        }))));
+
+        routes.observe_client_value(&json!({
+            "type":"freshAgent.create", "requestId":"this-view-create", "viewId":"this-view"
+        }));
+        assert!(routes.should_deliver(&frame(json!({
+            "type":"freshAgent.create.failed", "requestId":"this-view-create",
+            "viewId":"this-view", "code":"CLAUDE_ATTACH_RESUME_FAILED"
+        }))));
     }
 
     #[test]

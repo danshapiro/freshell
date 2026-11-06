@@ -31,7 +31,7 @@ import { buildReconcileRequest, collectTerminalPaneTargets, foldVerdicts, RECONC
 import { reassertAllOpenPanes } from '@/lib/kill-ack'
 import { foldReadyRuntimeOwners, foldSessionRuntimeOwnerFrame } from '@/lib/fresh-agent-ws'
 import { shouldSkipRuntimeOwnerBroadcastFold } from '@/lib/owner-fence-freeze-seam'
-import { selectOwnerFence, selectPaneOwnerDivergence } from '@/store/selectors/runtimeOwner'
+import { resolveCanonicalPaneSession, selectOwnerFence, selectPaneOwnerDivergence, selectSessionRuntimeOwner } from '@/store/selectors/runtimeOwner'
 import { PaneReconcileResultSchema, type PaneReconcileRequest, type HostStatsRefreshResponseMessage, type HostStatsSnapshotMessage, type SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import { getShareAction, ensureShareUrlToken, isRemoteAccessEnabledStatus } from '@/lib/share-utils'
 import { getWsClient } from '@/lib/ws-client'
@@ -1570,6 +1570,19 @@ export default function App() {
               provider: pane.mode,
               sessionRef: pane.sessionRef,
             }),
+            getRecoveryJoinFence: (pane, sessionRef) => {
+              const state = appStore.getState()
+              const canonical = resolveCanonicalPaneSession(state, {
+                provider: pane.mode,
+                sessionRef,
+              })
+              if (!canonical) return undefined
+              const owner = selectSessionRuntimeOwner(state, canonical.provider, canonical.sessionId)
+              if (owner?.ownerKind !== 'fresh-agent'
+                || owner.transition !== 'handoff-started'
+                || owner.fenced) return undefined
+              return { epoch: owner.epoch, generation: owner.generation }
+            },
           })
           // Fold reducers self-clear per-pane pending flags; these two catch
           // what they can't — skipped verdicts and cardinality-violation

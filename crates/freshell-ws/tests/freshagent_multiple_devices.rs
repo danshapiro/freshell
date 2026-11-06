@@ -628,12 +628,138 @@ async fn two_authenticated_cli_views_join_one_running_claude_runtime() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_recovery_failure_is_reused_by_concurrent_attach_views() {
+    let failure_gate = tempfile::tempdir().expect("create recovery failure gate");
+    let failure_path = failure_gate.path().join("fail-resume");
+    let failure_path_string = failure_path.to_string_lossy().to_string();
+    let mut rig = ClaudeRig::start_with_env(
+        RigKind::Sim,
+        &[("FRESHELL_CLAUDE_SIM_FAIL_RESUME_PATH", &failure_path_string)],
+    )
+    .await;
+    let capabilities = json!({ (FRESH_AGENT_RECONCILIATION_CAPABILITY): true });
+    let mut seeder = rig.connect().await;
+    let session_id = create_mode(
+        &mut seeder,
+        ProviderMode::Freshclaude,
+        "shared-recovery-seed",
+    )
+    .await;
+    let seed_start = seeder.frames.len();
+    send_mode_text(
+        &mut seeder,
+        ProviderMode::Freshclaude,
+        &session_id,
+        "shared-recovery-seed-turn",
+        "Persist one turn before recovery",
+    )
+    .await;
+    seeder
+        .wait_for_since(seed_start, "the seeded transcript turn", |frame| {
+            frame["type"] == "freshAgent.event"
+                && frame["sessionId"] == session_id
+                && frame["event"]["type"] == "freshAgent.result"
+        })
+        .await;
+
+    // Recover from the same durable transcript after a server restart. Both
+    // devices begin without an in-memory session and must join one provider
+    // recovery operation for this locator.
+    rig.restart().await;
+    std::fs::write(&failure_path, "fail the next resume")
+        .expect("arm the provider's transient recovery failure");
+    let mut desktop = rig.connect_with_capabilities(capabilities.clone()).await;
+    let mut mobile = rig.connect_with_capabilities(capabilities).await;
+    let desktop_start = desktop.frames.len();
+    let mobile_start = mobile.frames.len();
+    let desktop_request = "shared-recovery-desktop";
+    let mobile_request = "shared-recovery-mobile";
+
+    tokio::join!(
+        desktop.send(attach_request(
+            "claude",
+            "freshclaude",
+            &session_id,
+            "desktop-recovery-view",
+            desktop_request,
+        )),
+        mobile.send(attach_request(
+            "claude",
+            "freshclaude",
+            &session_id,
+            "mobile-recovery-view",
+            mobile_request,
+        )),
+    );
+
+    let (desktop_result, mobile_result) = tokio::join!(
+        wait_for_attach_result(
+            &mut desktop,
+            desktop_start,
+            desktop_request,
+            "freshAgent.attach.failed",
+        ),
+        wait_for_attach_result(
+            &mut mobile,
+            mobile_start,
+            mobile_request,
+            "freshAgent.attach.failed",
+        ),
+    );
+    for (result, request_id, view_id) in [
+        (&desktop_result, desktop_request, "desktop-recovery-view"),
+        (&mobile_result, mobile_request, "mobile-recovery-view"),
+    ] {
+        assert_eq!(result["requestId"], request_id);
+        assert_eq!(result["viewId"], view_id);
+        assert_eq!(result["sessionId"], session_id);
+    }
+
+    let failed_resume_attempts = rig
+        .ledger_rows("resume_failure")
+        .into_iter()
+        .filter(|row| row["sessionId"] == session_id)
+        .count();
+    assert_eq!(
+        failed_resume_attempts,
+        1,
+        "both view failures must reuse one failed provider resume operation; \
+         desktop={desktop_result}, mobile={mobile_result}, \
+         ledger={:?}",
+        rig.ledger_rows("query")
+    );
+    eprintln!(
+        "{}",
+        json!({
+            "severity": "info",
+            "event": "freshagent.multiple_devices.shared_recovery_failure",
+            "provider": "claude",
+            "selectedCases": 1,
+            "executedCases": 1,
+            "requesterResults": 2,
+            "failedNativeLaunches": failed_resume_attempts,
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attach_requester_isolation() {
     let rig = ClaudeRig::start(RigKind::Sim).await;
     let mut first = rig
         .connect_with_capabilities(json!({ (FRESH_AGENT_RECONCILIATION_CAPABILITY): true }))
         .await;
-    let session = first.create("create-multiple-device-attach").await;
+    let created = first
+        .request_create(
+            "create-multiple-device-attach",
+            json!({"viewId":"desktop-view"}),
+        )
+        .await;
+    assert_eq!(created["type"], "freshAgent.created");
+    assert_eq!(created["viewId"], "desktop-view");
+    let session = created["sessionId"]
+        .as_str()
+        .expect("create response includes the session id")
+        .to_string();
     let mut second = rig
         .connect_with_capabilities(json!({ (FRESH_AGENT_RECONCILIATION_CAPABILITY): true }))
         .await;

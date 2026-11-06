@@ -84,7 +84,10 @@ function recoverySummary(soul: ManagedRuntimeSoul): ManagedRuntimeRecoverySummar
 }
 
 function terminalStatus(soul: ManagedRuntimeSoul): TerminalStatus {
-  const fallback = soul.recoveryState === 'recovering' ? 'recovering'
+  const fallback = soul.freshAgentRecovery?.exhausted ? 'error'
+    : soul.freshAgentRecovery?.inFlight
+      || (soul.freshAgentRecovery?.retryAfterMs ?? 0) > 0 ? 'recovering'
+    : soul.recoveryState === 'recovering' ? 'recovering'
     : soul.launchState === 'running' && soul.recoveryState === 'live' ? 'running'
     : soul.launchState === 'failed' ? 'error' : 'creating'
   return managedTerminalPaneStatus({ soulId: soul.soulId, recoverySummary: recoverySummary(soul) }, fallback)
@@ -112,6 +115,7 @@ export function managedProjectionFields(
       effective: soul.effectiveLimits,
     },
     recoverySummary: recoverySummary(soul),
+    freshAgentRecovery: soul.freshAgentRecovery,
   }
 }
 

@@ -32,6 +32,7 @@ pub mod host_actor;
 pub mod opencode_transfer;
 pub mod snapshot_projection;
 pub mod snapshot_text;
+pub use freshell_runtime_protocol::RecoveryStatus;
 pub use freshell_runtime_protocol::{ClaudeForkRecipe, ClaudeForkTarget};
 
 #[cfg(test)]

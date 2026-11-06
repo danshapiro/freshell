@@ -1,7 +1,7 @@
 {
   "description": "Generated from shared/managed-runtime.ts. Do not edit by hand.",
   "generator": "port/contract/generate-managed-runtime-contract.ts",
-  "schemaCount": 43,
+  "schemaCount": 44,
   "schemas": {
     "ManagedRuntimeAllocationStateSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -440,6 +440,39 @@
               },
               "freshAgentCreateRequestId": {
                 "type": "string"
+              },
+              "freshAgentRecovery": {
+                "additionalProperties": false,
+                "properties": {
+                  "exhausted": {
+                    "type": "boolean"
+                  },
+                  "failedLaunches": {
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "inFlight": {
+                    "type": "boolean"
+                  },
+                  "operationId": {
+                    "maxLength": 160,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "retryAfterMs": {
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "operationId",
+                  "inFlight",
+                  "failedLaunches",
+                  "exhausted"
+                ],
+                "type": "object"
               },
               "freshAgentRuntimeVariant": {
                 "type": "string"
@@ -1259,6 +1292,39 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
+        "freshAgentRecovery": {
+          "additionalProperties": false,
+          "properties": {
+            "exhausted": {
+              "type": "boolean"
+            },
+            "failedLaunches": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "inFlight": {
+              "type": "boolean"
+            },
+            "operationId": {
+              "maxLength": 160,
+              "minLength": 1,
+              "type": "string"
+            },
+            "retryAfterMs": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "operationId",
+            "inFlight",
+            "failedLaunches",
+            "exhausted"
+          ],
+          "type": "object"
+        },
         "incarnationId": {
           "maxLength": 160,
           "minLength": 1,
@@ -1585,6 +1651,40 @@
         "data_repair_complete"
       ],
       "type": "string"
+    },
+    "ManagedRuntimeRecoveryStatusSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "exhausted": {
+          "type": "boolean"
+        },
+        "failedLaunches": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "inFlight": {
+          "type": "boolean"
+        },
+        "operationId": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retryAfterMs": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "operationId",
+        "inFlight",
+        "failedLaunches",
+        "exhausted"
+      ],
+      "type": "object"
     },
     "ManagedRuntimeRecoverySummarySchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2513,6 +2613,39 @@
             "freshAgentCreateRequestId": {
               "type": "string"
             },
+            "freshAgentRecovery": {
+              "additionalProperties": false,
+              "properties": {
+                "exhausted": {
+                  "type": "boolean"
+                },
+                "failedLaunches": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "inFlight": {
+                  "type": "boolean"
+                },
+                "operationId": {
+                  "maxLength": 160,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "retryAfterMs": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "operationId",
+                "inFlight",
+                "failedLaunches",
+                "exhausted"
+              ],
+              "type": "object"
+            },
             "freshAgentRuntimeVariant": {
               "type": "string"
             },
@@ -2909,6 +3042,39 @@
         "freshAgentCreateRequestId": {
           "type": "string"
         },
+        "freshAgentRecovery": {
+          "additionalProperties": false,
+          "properties": {
+            "exhausted": {
+              "type": "boolean"
+            },
+            "failedLaunches": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "inFlight": {
+              "type": "boolean"
+            },
+            "operationId": {
+              "maxLength": 160,
+              "minLength": 1,
+              "type": "string"
+            },
+            "retryAfterMs": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "operationId",
+            "inFlight",
+            "failedLaunches",
+            "exhausted"
+          ],
+          "type": "object"
+        },
         "freshAgentRuntimeVariant": {
           "type": "string"
         },
@@ -3276,6 +3442,39 @@
             },
             "freshAgentCreateRequestId": {
               "type": "string"
+            },
+            "freshAgentRecovery": {
+              "additionalProperties": false,
+              "properties": {
+                "exhausted": {
+                  "type": "boolean"
+                },
+                "failedLaunches": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "inFlight": {
+                  "type": "boolean"
+                },
+                "operationId": {
+                  "maxLength": 160,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "retryAfterMs": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "operationId",
+                "inFlight",
+                "failedLaunches",
+                "exhausted"
+              ],
+              "type": "object"
             },
             "freshAgentRuntimeVariant": {
               "type": "string"

@@ -1301,9 +1301,9 @@ pub enum ReconcileVerdict {
     DeadSession,
     Invalid,
     /// Terminal per-pane error state (replaces the deleted `retry`):
-    /// reason is one of "index_warming" | "provider_unavailable" |
-    /// "session_store_unreadable" (auto-restore-warming Task 4 adds the
-    /// session_store_unreadable value).
+    /// reason includes "index_warming", "provider_unavailable",
+    /// "session_store_unreadable", "recovery_in_progress", and
+    /// "recovery_retry_after".
     Error,
 }
 

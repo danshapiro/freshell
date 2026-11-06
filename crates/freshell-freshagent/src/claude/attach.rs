@@ -113,22 +113,36 @@ impl FreshClaudeState {
             Err(()) => return None,
             Ok(None) => {}
         }
-        // A competing attach may already be booting this conversation.
-        // Wait for it, then inspect the runtime again before launching.
-        let _flight = self.wait_resume_flight(&durable).await;
-        match self.reply_live_attach(&msg, &previous, fence, &reply).await {
-            Ok(Some(completion)) => return Some(completion),
-            Err(()) => return None,
-            Ok(None) => {}
+        let recovery = self
+            .resume_shared(
+                msg.clone(),
+                durable.clone(),
+                fence,
+                true,
+                "freshclaude/attach",
+            )
+            .await;
+        let is_owner_refusal = matches!(
+            recovery.result.as_ref(),
+            Err(crate::session_recovery::RecoveryFailure::Attempt(error)) if error.is_reserved()
+        );
+        if recovery.status.exhausted && !is_owner_refusal {
+            attach_error(
+                &reply,
+                &msg,
+                &previous,
+                "RECOVERY_EXHAUSTED",
+                "Claude could not restore this conversation after three failed launches.",
+            );
+            return None;
         }
-        match self.resume_untracked(&msg, &durable, fence, true).await {
+        match recovery.result.as_ref() {
             Ok(()) => {
                 // This operation advanced its own claim. The incoming
-                // pre-launch fence no longer names its committed owner.
+                // pre-launch fence no longer names its committed owner. Each
+                // joined view still receives its own owner-guarded snapshot.
                 match self.reply_live_attach(&msg, &previous, None, &reply).await {
-                    Ok(Some(completion)) => {
-                        return Some(completion);
-                    }
+                    Ok(Some(completion)) => return Some(completion),
                     Err(()) => return None,
                     Ok(None) => attach_error(
                         &reply,
@@ -139,11 +153,15 @@ impl FreshClaudeState {
                     ),
                 }
             }
-            Err(recovery::RuntimeResumeError::Lost) => {
+            Err(crate::session_recovery::RecoveryFailure::Attempt(
+                recovery::RuntimeResumeError::Lost,
+            )) => {
                 reply(lost_session_frame(&previous, msg.session_type));
                 return None;
             }
-            Err(recovery::RuntimeResumeError::Closed) => {
+            Err(crate::session_recovery::RecoveryFailure::Attempt(
+                recovery::RuntimeResumeError::Closed,
+            )) => {
                 attach_error(
                     &reply,
                     &msg,
@@ -153,8 +171,20 @@ impl FreshClaudeState {
                 );
                 return None;
             }
-            Err(recovery::RuntimeResumeError::Unavailable { code, message, .. }) => {
-                attach_error(&reply, &msg, &previous, code, &message);
+            Err(crate::session_recovery::RecoveryFailure::Attempt(
+                recovery::RuntimeResumeError::Unavailable { code, message, .. },
+            )) => {
+                attach_error(&reply, &msg, &previous, code, message);
+                return None;
+            }
+            Err(crate::session_recovery::RecoveryFailure::Panicked) => {
+                attach_error(
+                    &reply,
+                    &msg,
+                    &previous,
+                    "CLAUDE_ATTACH_RESUME_FAILED",
+                    "Claude recovery stopped unexpectedly. Try again.",
+                );
                 return None;
             }
         }

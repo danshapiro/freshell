@@ -3249,6 +3249,246 @@ fn resume_reuses_only_the_exact_running_soul_identity() {
     ));
 }
 
+async fn hosted_resume_joins_delayed_starting_recovery(fail_provider_start: bool) {
+    use freshell_runtime_protocol::{
+        FreshAgentProviderStartDiagnostic, HostBootId, IncarnationId, LaunchResult, RuntimeLimits,
+        SoulId,
+    };
+    use tokio::sync::Notify;
+
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("managed-resume-recovery.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let soul = SoulId::new();
+    let incarnation = IncarnationId::new();
+    let host_boot = HostBootId::new();
+    let session_id = "native-session-during-startup";
+    let operation_id = "shared-startup-operation";
+    let limits = RuntimeLimits {
+        cpu_milli: 500,
+        memory_bytes: 64 * 1024 * 1024,
+        swap_bytes: 0,
+        pids_max: 32,
+    };
+    let started_view = serde_json::json!({
+        "soulId": soul.to_string(),
+        "incarnationId": incarnation.to_string(),
+        "launchState": "running",
+        "cleanupState": "none",
+        "intentRevision": 1,
+        "executionGeneration": 1,
+        "desiredState": "running",
+        "recoveryState": "live",
+        "durabilityState": "unknown",
+        "allocationState": "allocated",
+        "evidenceRevision": 0,
+        "successfulRecoveriesInWindow": 0,
+        "provider": "opencode",
+        "nativeSessionId": session_id,
+        "freshAgentSessionId": session_id,
+        "freshAgentSessionType": "freshopencode"
+    });
+    let inventory_view = serde_json::json!({
+        "soulId": soul.to_string(),
+        "incarnationId": incarnation.to_string(),
+        "launchState": "starting",
+        "cleanupState": "none",
+        "intentRevision": 1,
+        "executionGeneration": 1,
+        "desiredState": "running",
+        "recoveryState": "recovering",
+        "durabilityState": "unknown",
+        "allocationState": "allocated",
+        "evidenceRevision": 0,
+        "successfulRecoveriesInWindow": 0,
+        "provider": "opencode",
+        "nativeSessionId": session_id,
+        "freshAgentSessionId": session_id,
+        "freshAgentSessionType": "freshopencode",
+        "freshAgentRecovery": {
+            "operationId": operation_id,
+            "inFlight": true,
+            "failedLaunches": 0,
+            "exhausted": false
+        }
+    });
+    let recovery_entered = Arc::new(Notify::new());
+    let recovery_entered_server = Arc::clone(&recovery_entered);
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let launch_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let launch_requests_server = Arc::clone(&launch_requests);
+    let server = tokio::spawn(async move {
+        let mut release_rx = Some(release_rx);
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: Envelope<serde_json::Value> = read_frame(&mut stream).await.unwrap();
+            let method = request.body["method"].as_str().unwrap_or_default();
+            let result: Result<AdminResult, freshell_runtime_protocol::RuntimeError> = match method
+            {
+                "health" => Ok(AdminResult::Health {
+                    control_epoch: 77,
+                    installation_id: InstallationId::new(),
+                }),
+                "inventory" => Ok(AdminResult::Inventory(vec![serde_json::from_value(
+                    inventory_view.clone(),
+                )
+                .unwrap()])),
+                "fresh_agent_recovery_wait" => {
+                    assert_eq!(request.body["params"]["soulId"], soul.to_string());
+                    assert_eq!(
+                        request.body["params"]["operationId"], operation_id,
+                        "the proxy joins the operation it observed in inventory"
+                    );
+                    recovery_entered_server.notify_one();
+                    let _ = release_rx.take().unwrap().await;
+                    if fail_provider_start {
+                        Err(freshell_runtime_protocol::RuntimeError::new(
+                            RuntimeErrorCode::BackendUnavailable,
+                            "private provider startup failure",
+                        )
+                        .with_diagnostic_code(RuntimeDiagnosticCode::FreshAgentProviderStartFailed)
+                        .with_fresh_agent_provider_start_diagnostic(
+                            FreshAgentProviderStartDiagnostic::Authentication,
+                        ))
+                    } else {
+                        let view = serde_json::from_value(started_view.clone()).unwrap();
+                        Ok(AdminResult::Launch(LaunchResult {
+                            view,
+                            worker_pid: 123,
+                            worker_launch_count: 1,
+                            host_boot_id: host_boot.clone(),
+                            effective_limits: limits,
+                            fixture_evidence: serde_json::Value::Null,
+                        }))
+                    }
+                }
+                "launch" => {
+                    launch_requests_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(freshell_runtime_protocol::RuntimeError::new(
+                        RuntimeErrorCode::FaultInjected,
+                        "a resume must not allocate a second launch",
+                    ))
+                }
+                "fresh_agent_read_events" | "fresh_agent_read_snapshot" => {
+                    Err(freshell_runtime_protocol::RuntimeError::new(
+                        RuntimeErrorCode::FaultInjected,
+                        "the test only exercises startup admission",
+                    ))
+                }
+                other => panic!("unexpected managed resume command: {other}"),
+            };
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: request.request_id,
+                    result,
+                },
+            )
+            .await
+            .unwrap();
+        }
+    });
+
+    let (broadcast, mut receiver) = broadcast::channel(32);
+    let proxy = Arc::new(HostedFreshAgentProxy {
+        client: RuntimeClient::new(&socket, "0123456789abcdef"),
+        broadcast: Arc::new(broadcast),
+        aliases: Mutex::new(HashMap::new()),
+        presentation_routes: Mutex::new(HashMap::new()),
+        pollers: Mutex::new(HashSet::new()),
+        attach_replay_states: Mutex::new(HashMap::new()),
+        #[cfg(test)]
+        attach_head_pause: OnceLock::new(),
+        fixture_modes: HashSet::new(),
+        naming: OnceLock::new(),
+        checkpoint_barrier: OnceLock::new(),
+        ownership: OnceLock::new(),
+    });
+    let request_id = if fail_provider_start {
+        "managed-resume-delayed-failure"
+    } else {
+        "managed-resume-delayed-success"
+    };
+    let message = serde_json::from_value(serde_json::json!({
+        "provider": "opencode",
+        "requestId": request_id,
+        "sessionType": "freshopencode",
+        "cwd": root.path(),
+        "sessionRef": { "provider": "opencode", "sessionId": session_id }
+    }))
+    .unwrap();
+    let proxy_for_task = Arc::clone(&proxy);
+    let create = tokio::spawn(async move {
+        proxy_for_task
+            .handle(HostedFreshAgentCommand::Create(message))
+            .await;
+    });
+
+    let mut premature_created = false;
+    if let Ok(raw) = tokio::time::timeout(Duration::from_millis(250), receiver.recv()).await {
+        let frame: serde_json::Value = serde_json::from_str(&raw.unwrap()).unwrap();
+        premature_created =
+            frame["type"] == "freshAgent.created" && frame["requestId"] == request_id;
+    }
+    let waited_for_recovery =
+        tokio::time::timeout(Duration::from_secs(2), recovery_entered.notified())
+            .await
+            .is_ok();
+    let _ = release_tx.send(());
+    tokio::time::timeout(Duration::from_secs(5), create)
+        .await
+        .expect("the managed resume settles after its shared outcome is released")
+        .unwrap();
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+
+    assert!(
+        waited_for_recovery,
+        "the request must join the observed supervisor operation"
+    );
+    assert!(
+        !premature_created,
+        "a Starting inventory row is not a successful create result"
+    );
+    assert_eq!(
+        launch_requests.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "joining a managed recovery must not launch another runtime"
+    );
+    let mut matching_frames = Vec::new();
+    while let Ok(raw) = receiver.try_recv() {
+        let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        if frame["requestId"] == request_id {
+            matching_frames.push(frame);
+        }
+    }
+    if fail_provider_start {
+        assert!(
+            matching_frames.iter().any(|frame| {
+                frame["type"] == "freshAgent.create.failed"
+                    && frame["code"] == "FRESH_AGENT_PROVIDER_START_FAILED"
+            }),
+            "the joined provider-start failure reaches this requester: {matching_frames:?}"
+        );
+        assert!(!matching_frames
+            .iter()
+            .any(|frame| frame["type"] == "freshAgent.created"));
+    } else {
+        assert!(
+            matching_frames.iter().any(|frame| {
+                frame["type"] == "freshAgent.created" && frame["sessionId"] == session_id
+            }),
+            "the requester is acknowledged only after startup succeeds: {matching_frames:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn hosted_resume_waits_for_delayed_managed_recovery_success_or_failure() {
+    hosted_resume_joins_delayed_starting_recovery(false).await;
+    hosted_resume_joins_delayed_starting_recovery(true).await;
+}
+
 #[test]
 fn provider_child_threads_remain_snapshot_topology_not_runtime_creation_intents() {
     let mut payload = serde_json::json!({

@@ -47,6 +47,15 @@ type NativeFixture = {
   holdNextTurn: (sessionId?: string) => Promise<void>
   releaseTurn: () => Promise<void>
   waitForHeldTurn: (prompt: string, sessionId?: string) => Promise<string>
+  holdNextRecovery: (sessionId?: string) => Promise<void>
+  failNextRecovery: () => Promise<void>
+  releaseRecovery: () => Promise<void>
+  waitForRecoveryAttempt: (sessionId?: string) => Promise<void>
+  recoveryAttemptCount: (sessionId?: string) => number
+  recoveryAttemptRows: (sessionId?: string) => JsonRow[]
+  codexResumeRows: () => JsonRow[]
+  recoveryAdmissions: (sessionId: string) => Promise<JsonRow[]>
+  waitForSharedRecoveryAdmissions: (sessionId: string, requestIds: string[]) => Promise<JsonRow[]>
 }
 
 export type FreshAgentMultipleDeviceSession = {
@@ -537,9 +546,13 @@ function countText(value: unknown, text: string): number {
 function nativeFixture(input: {
   mode: FreshAgentMultipleDeviceMode
   rowsPath: string
+  codexRequestLogPath?: string
+  codexOperationLogPath?: string
   notificationPath?: string
   additionalAuditPaths?: string[]
   gatePath: string
+  recoveryGatePath: string
+  failureMarkerPath: string
   info: E2eServerInfo
   sessionId: string
 }): NativeFixture {
@@ -557,7 +570,73 @@ function nativeFixture(input: {
     && Array.isArray(row.argv)
     && row.argv[0] === 'serve'
     && !row.argv.includes('--pure'))
+  const codexRequestRows = () => input.codexRequestLogPath
+    ? readJsonl(input.codexRequestLogPath)
+    : []
+  const codexOperationRows = () => input.codexOperationLogPath
+    ? readJsonl(input.codexOperationLogPath)
+    : []
+  const codexResumeRows = () => [
+    ...codexRequestRows()
+      .filter((row) => row.method === 'thread/resume')
+      .map((row) => ({ ...row, auditSource: 'request' })),
+    ...codexOperationRows()
+      .filter((row) => row.method === 'thread/resume')
+      .map((row) => ({ ...row, auditSource: 'operation' })),
+  ]
+  const codexRuntimeStartCount = (sessionId: string) => {
+    // `thread/start` gets its id from the response, so its operation receipt
+    // is the useful per-thread row. Resumes carry the requested id already
+    // and are counted at request receipt to avoid counting their completion
+    // receipt as a second start.
+    const starts = codexOperationRows().filter((row) => row.method === 'thread/start'
+      && row.threadId === sessionId)
+    const resumes = codexRequestRows().filter((row) => row.method === 'thread/resume'
+      && (row.params as Record<string, unknown> | undefined)?.threadId === sessionId)
+    return starts.length + resumes.length
+  }
   const promptText = (row: JsonRow) => typeof row.prompt === 'string' ? row.prompt : undefined
+  const recoveryAttemptRows = (sessionId = input.sessionId) => {
+    if (input.mode === 'freshclaude' || input.mode === 'kilroy') {
+      return rows().filter((row) => row.kind === 'resume_attempt' && row.sessionId === sessionId)
+    }
+    if (input.mode === 'freshcodex') {
+      // The fixture records each RPC at receipt and again after completion.
+      // Count the receipt log as the one authoritative native attempt so a
+      // successful call is not mistaken for two resumes.
+      return codexRequestRows().filter((row) => row.method === 'thread/resume'
+        && (row.params as Record<string, unknown> | undefined)?.threadId === sessionId)
+    }
+    return rows().filter((row) => row.event === 'session_get_started'
+      && row.sessionId === sessionId
+      && typeof row.recoveryRequestId === 'string')
+  }
+  const recoveryAttemptCount = (sessionId = input.sessionId) => {
+    return recoveryAttemptRows(sessionId).length
+  }
+  const recoveryAdmissionRows = async (sessionId?: string) => {
+    const files = (await fs.readdir(input.info.logsDir).catch(() => [] as string[]))
+      .filter((name) => name.endsWith('.log') || name.endsWith('.jsonl'))
+      .sort()
+    const admissions: JsonRow[] = []
+    for (const file of files) {
+      const text = await fs.readFile(path.join(input.info.logsDir, file), 'utf8').catch(() => '')
+      for (const line of text.split('\n')) {
+        if (!line.includes('freshagent.recovery_admitted')) continue
+        try {
+          const row = JSON.parse(line) as JsonRow
+          if (row.event === 'freshagent.recovery_admitted'
+            && (!sessionId
+              || row.canonical_key === `${input.mode === 'freshopencode' ? 'opencode' : 'codex'}:${sessionId}`)) {
+            admissions.push(row)
+          }
+        } catch {
+          // Skip the final line while the Rust server is still writing it.
+        }
+      }
+    }
+    return admissions
+  }
   const heldPromptCount = (sessionId = input.sessionId) => {
     switch (input.mode) {
       case 'freshclaude':
@@ -573,9 +652,12 @@ function nativeFixture(input: {
   let heldPromptCountBefore = 0
   let heldPromptSessionId = input.sessionId
   let heldRowsCountBefore = 0
+  let heldRecoveryAttemptCountBefore = 0
+  let heldRecoverySessionId = input.sessionId
   return {
     info: input.info,
     rows,
+    codexResumeRows,
     bootCount: (sessionId) => {
       if (sessionId) {
         if (input.mode === 'freshclaude' || input.mode === 'kilroy') {
@@ -597,8 +679,7 @@ function nativeFixture(input: {
         return rows().filter((row) => row.kind === 'boot' && row.sessionId === sessionId).length
       }
       if (input.mode === 'freshcodex') {
-        return rows().filter((row) => ['thread/start', 'thread/resume'].includes(String(row.method))
-          && row.threadId === sessionId).length
+        return codexRuntimeStartCount(sessionId)
       }
       return openCodeServeLaunches().length
     },
@@ -663,6 +744,47 @@ function nativeFixture(input: {
       }).toBe(true)
       return observedSessionId
     },
+    holdNextRecovery: async (sessionId = input.sessionId) => {
+      heldRecoverySessionId = sessionId
+      heldRecoveryAttemptCountBefore = recoveryAttemptCount(sessionId)
+      await fs.rm(input.recoveryGatePath, { force: true })
+    },
+    failNextRecovery: async () => fs.writeFile(input.failureMarkerPath, 'fail once\n'),
+    releaseRecovery: async () => fs.writeFile(input.recoveryGatePath, 'released\n'),
+    waitForRecoveryAttempt: async (sessionId = heldRecoverySessionId) => {
+      await expect.poll(() => recoveryAttemptCount(sessionId), {
+        timeout: 30_000,
+        message: `${input.mode} reached the held shared recovery operation`,
+      }).toBeGreaterThan(heldRecoveryAttemptCountBefore)
+    },
+    recoveryAttemptCount,
+    recoveryAttemptRows,
+    recoveryAdmissions: recoveryAdmissionRows,
+    waitForSharedRecoveryAdmissions: async (sessionId, requestIds) => {
+      let matching: JsonRow[] = []
+      let allAdmissions: JsonRow[] = []
+      const requestIdSet = new Set(requestIds)
+      await expect.poll(async () => {
+        allAdmissions = await recoveryAdmissionRows()
+        matching = allAdmissions
+          .filter((row) => row.canonical_key
+            === `${input.mode === 'freshopencode' ? 'opencode' : 'codex'}:${sessionId}`)
+          .filter((row) => typeof row.request_id === 'string' && requestIdSet.has(row.request_id))
+        const byRequest = new Map(matching.map((row) => [row.request_id as string, row]))
+        const [firstId, secondId] = requestIds
+        const first = byRequest.get(firstId)
+        const second = byRequest.get(secondId)
+        return Boolean(first && second
+          && first.operation_id === second.operation_id
+          && new Set([first.admission, second.admission]).has('started')
+          && new Set([first.admission, second.admission]).has('joined')
+          && Math.max(Number(first.waiter_count), Number(second.waiter_count)) >= 2)
+      }, {
+        timeout: 8_000,
+        message: `server admits request IDs ${requestIds.join(', ')} to one held ${input.mode} recovery operation; matching=${JSON.stringify(matching)} allAdmissions=${JSON.stringify(allAdmissions)}`,
+      }).toBe(true)
+      return matching
+    },
   }
 }
 
@@ -675,6 +797,8 @@ async function startTwoDeviceSession(
   const root = await fs.mkdtemp(path.join(os.tmpdir(), `freshell-multiple-devices-${mode}-`))
   const projectDir = path.join(root, 'project')
   const gatePath = path.join(root, 'release-turn')
+  const recoveryGatePath = path.join(root, 'release-recovery')
+  const failureMarkerPath = path.join(root, 'fail-next-recovery')
   const desktopFrames: JsonRow[] = []
   const mobileFrames: JsonRow[] = []
   const desktopContext = await newDeviceContext(browser, false)
@@ -685,6 +809,7 @@ async function startTwoDeviceSession(
   // The first warm turn is allowed through. Removing this file holds the next
   // native operation, and restoring it is the explicit release action.
   await fs.writeFile(gatePath, 'warm-turn-ready\n')
+  await fs.writeFile(recoveryGatePath, 'recovery-ready\n')
 
   const rowsPath = mode === 'freshclaude' || mode === 'kilroy'
     ? path.join(root, 'claude-sim-ledger.jsonl')
@@ -695,6 +820,8 @@ async function startTwoDeviceSession(
   const fakeOpencodePath = path.resolve(__dirname, '../fixtures/fake-opencode.cjs')
   let env: Record<string, string> = {}
   let additionalAuditPaths: string[] | undefined
+  let codexOperationLogPath: string | undefined
+  let codexRequestLogPath: string | undefined
   if (mode === 'freshclaude' || mode === 'kilroy') {
     const terminalBinDir = path.join(root, 'terminal-bin')
     const terminalClaudePath = path.join(terminalBinDir, 'claude')
@@ -717,12 +844,16 @@ async function startTwoDeviceSession(
         // a real Running PTY owner without depending on a host Claude install.
         CLAUDE_CMD: terminalClaudePath,
         FRESHELL_CLAUDE_SIM_HOLD_PROMPT_GATE_PATH: gatePath,
+        FRESHELL_CLAUDE_SIM_HOLD_RESUME_GATE_PATH: recoveryGatePath,
+        FRESHELL_CLAUDE_SIM_FAIL_RESUME_PATH: failureMarkerPath,
         FRESHELL_CLAUDE_SIM_RECORD_NATIVE_STOP: '1',
       },
     })
   } else if (mode === 'freshcodex') {
     const operationsPath = path.join(root, 'codex-operations.jsonl')
     const requestsPath = path.join(root, 'codex-requests.jsonl')
+    codexOperationLogPath = operationsPath
+    codexRequestLogPath = requestsPath
     additionalAuditPaths = [operationsPath, requestsPath]
     env = {
       CODEX_CMD: `${process.execPath} ${path.resolve(__dirname, '../../fixtures/coding-cli/codex-app-server/fake-app-server.mjs')}`,
@@ -737,6 +868,8 @@ async function startTwoDeviceSession(
         appendNativeNotificationLogPath: notificationsPath,
         appendNativeLifecycleLogPath: rowsPath,
         waitForTurnReleasePath: gatePath,
+        waitForThreadResumeReleasePath: recoveryGatePath,
+        failThreadResumePath: failureMarkerPath,
         liveTranscript: true,
         liveTranscriptPrompts: [
           'stage1 warm session for multiple devices',
@@ -758,6 +891,8 @@ async function startTwoDeviceSession(
       OPENCODE_CMD: fakeOpencode,
       FAKE_OPENCODE_AUDIT_LOG: rowsPath,
       FAKE_OPENCODE_HOLD_PROMPT_GATE_PATH: gatePath,
+      FAKE_OPENCODE_HOLD_SESSION_GET_GATE_PATH: recoveryGatePath,
+      FAKE_OPENCODE_FAIL_SESSION_GET_PATH: failureMarkerPath,
       FAKE_OPENCODE_DEFER_PROMPT_ROWS_TO_GATE: '1',
       FAKE_OPENCODE_RECORD_NATIVE_STOP: '1',
     }
@@ -842,9 +977,13 @@ async function startTwoDeviceSession(
     const native = nativeFixture({
       mode,
       rowsPath,
+      codexOperationLogPath,
+      codexRequestLogPath,
       notificationPath: mode === 'freshcodex' ? notificationsPath : undefined,
       additionalAuditPaths,
       gatePath,
+      recoveryGatePath,
+      failureMarkerPath,
       info,
       sessionId,
     })

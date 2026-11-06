@@ -15,8 +15,8 @@ use freshell_runtime_protocol::{
     host_proof, read_frame, write_frame, AdminCommand, AdminReply, AdminResult, CommandState,
     ControlRole, Envelope, FixtureKind, FreshAgentLaunchSpec, HostBootId, HostCommand, HostReply,
     HostResult, IncarnationId, IncidentId, LaunchResult, LaunchState, LimitApplication,
-    OpenCodeTransferAction, OpenCodeTransferReadinessReceipt, OpenCodeTransferResult,
-    RecoveryProbe, RequestId, ResumeSpec, RuntimeError, RuntimeErrorCode, RuntimeLimits,
+    OpenCodeTransferAction, OpenCodeTransferReadinessReceipt, OpenCodeTransferResult, RecoveryProbe,
+    RequestId, ResumeSpec, RuntimeDiagnosticCode, RuntimeError, RuntimeErrorCode, RuntimeLimits,
     RuntimeMetrics, RuntimeOutputBatch, RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec,
     UpdateLimitsResult, CONTROL_PROTOCOL_VERSION, HOST_CAPABILITY_NATIVE_READINESS_RECEIPT_V1,
 };
@@ -241,6 +241,81 @@ type ProviderPathInputBindings = HashMap<
 >;
 pub(crate) type LiveResumeEvidenceKey = (String, String, Option<String>);
 
+type SharedLaunchResult = Arc<Result<LaunchResult, RuntimeError>>;
+
+struct SoulLifecycleEntry {
+    lock: Arc<Mutex<()>>,
+    recovery: StdMutex<SoulRecoveryState>,
+}
+
+struct SoulRecoveryState {
+    operation_id: String,
+    in_flight: bool,
+    failed_launches: u32,
+    retry_until: Option<Instant>,
+    exhausted: bool,
+    waiters: usize,
+    result: Option<SharedLaunchResult>,
+    current: Option<Arc<SoulRecoveryOperation>>,
+}
+
+struct SoulRecoveryOperation {
+    operation_id: String,
+    result_tx: tokio::sync::watch::Sender<Option<SharedLaunchResult>>,
+}
+
+struct SoulRecoveryWaiter {
+    entry: Arc<SoulLifecycleEntry>,
+    operation_id: String,
+}
+
+impl Drop for SoulRecoveryWaiter {
+    fn drop(&mut self) {
+        let mut state = self
+            .entry
+            .recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.operation_id == self.operation_id {
+            state.waiters = state.waiters.saturating_sub(1);
+        }
+    }
+}
+
+async fn await_soul_recovery(
+    mut receiver: tokio::sync::watch::Receiver<Option<SharedLaunchResult>>,
+) -> SharedLaunchResult {
+    loop {
+        if let Some(result) = receiver.borrow().as_ref() {
+            return Arc::clone(result);
+        }
+        if receiver.changed().await.is_err() {
+            return Arc::new(Err(RuntimeError::new(
+                RuntimeErrorCode::BackendUnavailable,
+                "managed recovery stopped before it settled",
+            )));
+        }
+    }
+}
+
+fn soul_recovery_status(state: &SoulRecoveryState) -> freshell_runtime_protocol::RecoveryStatus {
+    let retry_after_ms = if state.exhausted {
+        None
+    } else {
+        state.retry_until.and_then(|until| {
+            let remaining = until.saturating_duration_since(Instant::now());
+            (remaining > Duration::ZERO).then(|| remaining.as_millis().min(u64::MAX as u128) as u64)
+        })
+    };
+    freshell_runtime_protocol::RecoveryStatus {
+        operation_id: state.operation_id.clone(),
+        in_flight: state.in_flight,
+        failed_launches: state.failed_launches,
+        retry_after_ms,
+        exhausted: state.exhausted,
+    }
+}
+
 #[derive(Clone)]
 pub struct Supervisor {
     pub(crate) registry: Registry,
@@ -253,7 +328,7 @@ pub struct Supervisor {
     /// Recovery and input dispatch serialize per soul, while unrelated souls
     /// remain independently recoverable. Stop commits its durable intent before
     /// waiting for this lock so it can invalidate an in-flight operation.
-    pub(crate) recovery_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    recovery_locks: Arc<Mutex<HashMap<String, Arc<SoulLifecycleEntry>>>>,
     /// Bounds repeated provider-store probes for an unchanged live identity.
     pub(crate) live_resume_evidence_attempts: Arc<Mutex<HashMap<LiveResumeEvidenceKey, Instant>>>,
     auth_lookup_authorities: Arc<StdMutex<HashMap<String, AuthLookupAuthority>>>,
@@ -330,12 +405,57 @@ impl Supervisor {
     }
 
     pub(crate) async fn lifecycle_lock(&self, soul_id: &SoulId) -> Arc<Mutex<()>> {
+        self.lifecycle_entry(soul_id).await.lock.clone()
+    }
+
+    async fn lifecycle_entry(&self, soul_id: &SoulId) -> Arc<SoulLifecycleEntry> {
         let mut locks = self.recovery_locks.lock().await;
         Arc::clone(
             locks
                 .entry(soul_id.as_str().to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(()))),
+                .or_insert_with(|| {
+                    Arc::new(SoulLifecycleEntry {
+                        lock: Arc::new(Mutex::new(())),
+                        recovery: StdMutex::new(SoulRecoveryState {
+                            operation_id: String::new(),
+                            in_flight: false,
+                            failed_launches: 0,
+                            retry_until: None,
+                            exhausted: false,
+                            waiters: 0,
+                            result: None,
+                            current: None,
+                        }),
+                    })
+                }),
         )
+    }
+
+    fn lifecycle_recovery_status(
+        entry: &SoulLifecycleEntry,
+    ) -> Option<freshell_runtime_protocol::RecoveryStatus> {
+        let state = entry
+            .recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.operation_id.is_empty()
+            || (!state.in_flight
+                && state.waiters == 0
+                && state.result.as_ref().is_some_and(|result| result.is_ok()))
+        {
+            return None;
+        }
+        Some(soul_recovery_status(&state))
+    }
+
+    async fn overlay_recovery_status(&self, views: &mut [RuntimeView]) {
+        let entries = self.recovery_locks.lock().await;
+        for view in views {
+            view.fresh_agent_recovery = entries
+                .get(view.soul_id.as_str())
+                .as_deref()
+                .and_then(|entry| Self::lifecycle_recovery_status(entry.as_ref()));
+        }
     }
 
     /// Retry cleanup for receipt-confirmed stages after startup or a prior
@@ -993,15 +1113,20 @@ impl Supervisor {
                 };
                 Ok(AdminResult::OpenCodeTransfer(result))
             }
-            AdminCommand::Inventory => Ok(AdminResult::Inventory(
-                self.registry.inventory().await.map_err(map_registry)?,
-            )),
-            AdminCommand::InventorySnapshot => Ok(AdminResult::InventorySnapshot(
-                self.registry
+            AdminCommand::Inventory => {
+                let mut inventory = self.registry.inventory().await.map_err(map_registry)?;
+                self.overlay_recovery_status(&mut inventory).await;
+                Ok(AdminResult::Inventory(inventory))
+            }
+            AdminCommand::InventorySnapshot => {
+                let mut snapshot = self
+                    .registry
                     .inventory_snapshot()
                     .await
-                    .map_err(map_registry)?,
-            )),
+                    .map_err(map_registry)?;
+                self.overlay_recovery_status(&mut snapshot.souls).await;
+                Ok(AdminResult::InventorySnapshot(snapshot))
+            }
             AdminCommand::QualificationWriterClaim(request) => {
                 Ok(AdminResult::QualificationWriterClaim(
                     crate::qualification_evidence::writer_claim_evidence(&self.registry, request)
@@ -1153,6 +1278,14 @@ impl Supervisor {
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
                 self.launch(request_id, *request)
+                    .await
+                    .map(AdminResult::Launch)
+            }
+            AdminCommand::FreshAgentRecoveryWait(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                self.wait_for_fresh_agent_recovery(&request.soul_id, &request.operation_id)
                     .await
                     .map(AdminResult::Launch)
             }
@@ -1435,8 +1568,258 @@ impl Supervisor {
         request_id: RequestId,
         request: freshell_runtime_protocol::LaunchRequest,
     ) -> Result<LaunchResult, RuntimeError> {
-        let lifecycle_lock = self.lifecycle_lock(&request.soul_id).await;
-        let _guard = lifecycle_lock.lock().await;
+        // Reject malformed or unsupported requests before they can become a
+        // shared in-flight result for this soul. A preflight refusal must not
+        // hide a later valid request behind the retry floor.
+        let limits = self.validate_launch_request(&request)?;
+        if request.fresh_agent.is_none() {
+            return self.launch_once(request_id, request, limits).await;
+        }
+        let entry = self.lifecycle_entry(&request.soul_id).await;
+        enum Admission {
+            Start {
+                operation: Arc<SoulRecoveryOperation>,
+                receiver: tokio::sync::watch::Receiver<Option<SharedLaunchResult>>,
+            },
+            Join {
+                operation_id: String,
+                receiver: tokio::sync::watch::Receiver<Option<SharedLaunchResult>>,
+            },
+            Cached(SharedLaunchResult),
+        }
+        let admission = {
+            let mut state = entry
+                .recovery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let now = Instant::now();
+            if state.in_flight {
+                let operation = state
+                    .current
+                    .as_ref()
+                    .expect("in-flight soul recovery has an operation");
+                let receiver = operation.result_tx.subscribe();
+                let operation_id = operation.operation_id.clone();
+                state.waiters += 1;
+                Admission::Join {
+                    operation_id,
+                    receiver,
+                }
+            } else if state.exhausted
+                || state
+                    .retry_until
+                    .is_some_and(|retry_until| now < retry_until)
+            {
+                Admission::Cached(
+                    state
+                        .result
+                        .as_ref()
+                        .expect("settled recovery retains its result")
+                        .clone(),
+                )
+            } else if state.result.as_ref().is_some_and(|result| result.is_ok())
+                && state.waiters > 0
+            {
+                let operation = state
+                    .current
+                    .as_ref()
+                    .expect("successful cohort has an operation");
+                let receiver = operation.result_tx.subscribe();
+                let operation_id = operation.operation_id.clone();
+                state.waiters += 1;
+                Admission::Join {
+                    operation_id,
+                    receiver,
+                }
+            } else {
+                let operation_id = uuid::Uuid::new_v4().to_string();
+                let (result_tx, receiver) = tokio::sync::watch::channel(None);
+                let operation = Arc::new(SoulRecoveryOperation {
+                    operation_id: operation_id.clone(),
+                    result_tx,
+                });
+                state.operation_id = operation_id;
+                state.in_flight = true;
+                state.retry_until = None;
+                state.exhausted = false;
+                state.waiters = 1;
+                state.result = None;
+                state.current = Some(Arc::clone(&operation));
+                Admission::Start {
+                    operation,
+                    receiver,
+                }
+            }
+        };
+
+        match admission {
+            Admission::Cached(result) => (*result).clone(),
+            Admission::Join {
+                operation_id,
+                receiver,
+            } => {
+                let _waiter = SoulRecoveryWaiter {
+                    entry: Arc::clone(&entry),
+                    operation_id,
+                };
+                (*await_soul_recovery(receiver).await).clone()
+            }
+            Admission::Start {
+                operation,
+                receiver,
+            } => {
+                let _waiter = SoulRecoveryWaiter {
+                    entry: Arc::clone(&entry),
+                    operation_id: operation.operation_id.clone(),
+                };
+                let supervisor = self.clone();
+                let operation_entry = Arc::clone(&entry);
+                let operation_id = operation.operation_id.clone();
+                let operation_tx = operation.result_tx.clone();
+                tokio::spawn(async move {
+                    let launched = tokio::spawn(async move {
+                        supervisor.launch_once(request_id, request, limits).await
+                    })
+                    .await;
+                    let result = match launched {
+                        Ok(result) => result,
+                        Err(error) => {
+                            tracing::error!(
+                                target: "freshell_supervisor::service",
+                                event = "supervisor.fresh_agent_launch_task_failed",
+                                operation_id = %operation_id,
+                                error = %error,
+                                "the detached managed launch task did not complete normally"
+                            );
+                            Err(RuntimeError::new(
+                                RuntimeErrorCode::BackendUnavailable,
+                                "managed launch did not settle normally",
+                            ))
+                        }
+                    };
+                    let shared_result = Arc::new(result);
+                    let mut state = operation_entry
+                        .recovery
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if state.operation_id == operation_id {
+                        state.in_flight = false;
+                        state.result = Some(Arc::clone(&shared_result));
+                        match shared_result.as_ref() {
+                            Ok(_) => {
+                                state.failed_launches = 0;
+                                state.retry_until = None;
+                                state.exhausted = false;
+                            }
+                            Err(error) => {
+                                if error.diagnostic_code
+                                    == Some(RuntimeDiagnosticCode::FreshAgentProviderStartFailed)
+                                {
+                                    state.failed_launches = state.failed_launches.saturating_add(1);
+                                }
+                                state.retry_until = Some(Instant::now() + Duration::from_secs(1));
+                                state.exhausted = state.failed_launches >= 3;
+                            }
+                        }
+                    }
+                    operation_tx.send_replace(Some(shared_result));
+                });
+                (*await_soul_recovery(receiver).await).clone()
+            }
+        }
+    }
+
+    /// Wait for an exact operation reported by managed inventory. This looks
+    /// up existing lifecycle state only and never creates an entry or admits a
+    /// launch, so stale inventory cannot turn a resume into another runtime.
+    async fn wait_for_fresh_agent_recovery(
+        &self,
+        soul_id: &SoulId,
+        operation_id: &str,
+    ) -> Result<LaunchResult, RuntimeError> {
+        enum Admission {
+            Wait {
+                entry: Arc<SoulLifecycleEntry>,
+                operation_id: String,
+                receiver: tokio::sync::watch::Receiver<Option<SharedLaunchResult>>,
+            },
+            Settled(SharedLaunchResult),
+        }
+
+        let entry = self
+            .recovery_locks
+            .lock()
+            .await
+            .get(soul_id.as_str())
+            .cloned()
+            .ok_or_else(|| {
+                RuntimeError::new(
+                    RuntimeErrorCode::RecoveryInProgress,
+                    "the observed managed Freshagent recovery operation is no longer available",
+                )
+            })?;
+
+        let admission = {
+            let mut state = entry
+                .recovery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if operation_id.is_empty() || state.operation_id != operation_id {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::RecoveryInProgress,
+                    "the observed managed Freshagent recovery operation has changed",
+                ));
+            }
+            if state.in_flight {
+                let operation = state
+                    .current
+                    .as_ref()
+                    .filter(|operation| operation.operation_id == operation_id)
+                    .ok_or_else(|| {
+                        RuntimeError::new(
+                            RuntimeErrorCode::RecoveryInProgress,
+                            "the observed managed Freshagent recovery operation is unavailable",
+                        )
+                    })?;
+                let receiver = operation.result_tx.subscribe();
+                state.waiters += 1;
+                Admission::Wait {
+                    entry: Arc::clone(&entry),
+                    operation_id: operation_id.to_string(),
+                    receiver,
+                }
+            } else {
+                let result = state.result.as_ref().cloned().ok_or_else(|| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::RecoveryInProgress,
+                        "the observed managed Freshagent recovery operation has no outcome",
+                    )
+                })?;
+                Admission::Settled(result)
+            }
+        };
+
+        let result = match admission {
+            Admission::Wait {
+                entry,
+                operation_id,
+                receiver,
+            } => {
+                let _waiter = SoulRecoveryWaiter {
+                    entry,
+                    operation_id,
+                };
+                await_soul_recovery(receiver).await
+            }
+            Admission::Settled(result) => result,
+        };
+        (*result).clone()
+    }
+
+    fn validate_launch_request(
+        &self,
+        request: &freshell_runtime_protocol::LaunchRequest,
+    ) -> Result<RuntimeLimits, RuntimeError> {
         let limits = request.limits.validate()?;
         request.validate_workload()?;
         if !release_qualified_workload(
@@ -1456,6 +1839,17 @@ impl Supervisor {
         crate::limits::verify_profile(request.profile, limits).map_err(|message| {
             RuntimeError::new(RuntimeErrorCode::InvalidRuntimeLimits, message)
         })?;
+        Ok(limits)
+    }
+
+    async fn launch_once(
+        &self,
+        request_id: RequestId,
+        request: freshell_runtime_protocol::LaunchRequest,
+        limits: RuntimeLimits,
+    ) -> Result<LaunchResult, RuntimeError> {
+        let lifecycle_lock = self.lifecycle_lock(&request.soul_id).await;
+        let _guard = lifecycle_lock.lock().await;
         let payload_digest = semantic_launch_digest(&request)?;
         let transfer_claim = request.terminal.as_ref().and_then(|terminal| {
             terminal.opencode_transfer.as_ref().map(|descriptor| {
@@ -11118,6 +11512,7 @@ mod codex_pre_worker_retry_tests {
 
     #[derive(Clone, Copy)]
     enum FirstGrantOutcome {
+        Success,
         CodexAppServerStartFailed,
         CodexProxyStartFailed,
         FreshAgentProviderStartFailed,
@@ -11151,9 +11546,41 @@ mod codex_pre_worker_retry_tests {
         empty_checks: AtomicUsize,
     }
 
+    #[derive(Default)]
+    struct LaunchGate {
+        entered_count: AtomicUsize,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl LaunchGate {
+        async fn enter_and_wait(&self) {
+            self.entered_count.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_waiters();
+            self.release.notified().await;
+        }
+
+        async fn wait_until_entered(&self) {
+            loop {
+                let notified = self.entered.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.entered_count.load(Ordering::SeqCst) > 0 {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        fn resume(&self) {
+            self.release.notify_one();
+        }
+    }
+
     struct FakeBackend {
         first_grant: FirstGrantOutcome,
         counts: Arc<Counts>,
+        launch_gate: Option<Arc<LaunchGate>>,
         runtimes: StdMutex<HashMap<String, RuntimeRecord>>,
         stop_targets: StdMutex<Vec<(IncarnationId, String)>>,
         empty_targets: StdMutex<Vec<(IncarnationId, String)>>,
@@ -11165,6 +11592,7 @@ mod codex_pre_worker_retry_tests {
             Self {
                 first_grant,
                 counts: Arc::new(Counts::default()),
+                launch_gate: None,
                 runtimes: StdMutex::new(HashMap::new()),
                 stop_targets: StdMutex::new(Vec::new()),
                 empty_targets: StdMutex::new(Vec::new()),
@@ -11172,11 +11600,17 @@ mod codex_pre_worker_retry_tests {
             }
         }
 
+        fn with_launch_gate(mut self, gate: Arc<LaunchGate>) -> Self {
+            self.launch_gate = Some(gate);
+            self
+        }
+
         fn outcome_for(&self, attempt: usize) -> HostOutcome {
             if attempt != 1 {
                 return HostOutcome::Running;
             }
             match self.first_grant {
+                FirstGrantOutcome::Success => HostOutcome::Running,
                 FirstGrantOutcome::CodexAppServerStartFailed => {
                     HostOutcome::CodexAppServerStartFailed
                 }
@@ -11293,8 +11727,18 @@ mod codex_pre_worker_retry_tests {
             let incarnation = handle.incarnation_id().clone();
             let outcome = self.outcome_for(attempt);
             let counts = Arc::clone(&self.counts);
+            let launch_gate = self.launch_gate.clone();
             let host = tokio::spawn(async move {
-                serve_fake_host(listener, secret, incarnation, limits, outcome, counts).await;
+                serve_fake_host(
+                    listener,
+                    secret,
+                    incarnation,
+                    limits,
+                    outcome,
+                    counts,
+                    launch_gate,
+                )
+                .await;
             });
             self.runtimes
                 .lock()
@@ -11398,6 +11842,7 @@ mod codex_pre_worker_retry_tests {
         limits: RuntimeLimits,
         outcome: HostOutcome,
         counts: Arc<Counts>,
+        launch_gate: Option<Arc<LaunchGate>>,
     ) {
         let boot = HostBootId::new();
         let mut grant_epoch = 0;
@@ -11429,9 +11874,13 @@ mod codex_pre_worker_retry_tests {
                     control_epoch,
                     execution_generation: generation,
                     native_identity_launch,
+                    fresh_agent,
                     ..
                 } => {
                     counts.grants.fetch_add(1, Ordering::SeqCst);
+                    if let Some(gate) = launch_gate.as_ref() {
+                        gate.enter_and_wait().await;
+                    }
                     match outcome {
                         HostOutcome::CodexAppServerStartFailed => Err(RuntimeError::new(
                             RuntimeErrorCode::HostUnreachable,
@@ -11462,14 +11911,22 @@ mod codex_pre_worker_retry_tests {
                             if launch.incarnation_id != incarnation {
                                 return;
                             }
+                            let native_session_id = fresh_agent
+                                .as_ref()
+                                .map(|agent| agent.session_id.clone())
+                                .unwrap_or_else(|| "synthetic-codex-session".into());
                             grant_epoch = control_epoch;
                             execution_generation = generation;
                             let current = NativeIdentityObservation {
-                                native_session_id: "synthetic-codex-session".into(),
+                                native_session_id,
                                 incarnation_id: incarnation.clone(),
                                 launch_nonce: launch.launch_nonce,
                                 evidence_revision: launch.evidence_revision,
-                                source: NativeIdentitySource::CodexAppServer,
+                                source: if fresh_agent.is_some() {
+                                    NativeIdentitySource::FreshProviderHandshake
+                                } else {
+                                    NativeIdentitySource::CodexAppServer
+                                },
                                 evidence_digest: "b".repeat(64),
                             };
                             observation = Some(current.clone());
@@ -11875,6 +12332,334 @@ mod codex_pre_worker_retry_tests {
         let views = supervisor.registry.inventory().await.unwrap();
         assert_eq!(views.len(), 1);
         assert_eq!(views[0].launch_state, LaunchState::Starting);
+    }
+
+    #[cfg(test)]
+    mod lifecycle_shared_recovery_tests {
+        use super::*;
+
+        async fn recovery_wait_returns_the_exact_shared_launch_outcome(fail_provider_start: bool) {
+            let dir = tempfile::tempdir().unwrap();
+            let gate = Arc::new(LaunchGate::default());
+            let backend = Arc::new(
+                FakeBackend::new(if fail_provider_start {
+                    FirstGrantOutcome::FreshAgentProviderStartFailed
+                } else {
+                    FirstGrantOutcome::Success
+                })
+                .with_launch_gate(Arc::clone(&gate)),
+            );
+            let supervisor = supervisor(dir.path(), Arc::clone(&backend));
+            let request = fresh_agent_launch_request(SoulId::new(), "claude");
+            let soul_id = request.soul_id.clone();
+            let first_supervisor = supervisor.clone();
+            let first =
+                tokio::spawn(
+                    async move { first_supervisor.launch(RequestId::new(), request).await },
+                );
+            gate.wait_until_entered().await;
+
+            let entry = supervisor.lifecycle_entry(&soul_id).await;
+            let operation_id = entry
+                .recovery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .operation_id
+                .clone();
+            assert!(!operation_id.is_empty());
+
+            let stale = supervisor
+                .dispatch_non_recovery(Envelope::new(
+                    RequestId::new(),
+                    ControlRole::Web,
+                    AdminCommand::FreshAgentRecoveryWait(
+                        freshell_runtime_protocol::FreshAgentRecoveryWaitRequest {
+                            soul_id: soul_id.clone(),
+                            operation_id: "stale-operation-id".into(),
+                            expected_control_epoch: None,
+                        },
+                    ),
+                ))
+                .await
+                .expect_err("a stale operation id cannot join a newer operation");
+            assert_eq!(stale.code, RuntimeErrorCode::RecoveryInProgress);
+
+            let wait_supervisor = supervisor.clone();
+            let wait_operation_id = operation_id.clone();
+            let waiter = tokio::spawn(async move {
+                wait_supervisor
+                    .dispatch_non_recovery(Envelope::new(
+                        RequestId::new(),
+                        ControlRole::Web,
+                        AdminCommand::FreshAgentRecoveryWait(
+                            freshell_runtime_protocol::FreshAgentRecoveryWaitRequest {
+                                soul_id,
+                                operation_id: wait_operation_id,
+                                expected_control_epoch: None,
+                            },
+                        ),
+                    ))
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if entry
+                        .recovery
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .waiters
+                        == 2
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the exact-operation wait joins the existing launch cohort");
+
+            gate.resume();
+            let launch_result = first.await.expect("the original launch requester settles");
+            let wait_result = waiter.await.expect("the exact-operation wait settles");
+            if fail_provider_start {
+                let launch_error = launch_result.expect_err("the shared provider start fails");
+                let wait_error = wait_result.expect_err("the waiter receives that failure");
+                assert_eq!(wait_error.code, launch_error.code);
+                assert_eq!(wait_error.diagnostic_code, launch_error.diagnostic_code);
+                assert_eq!(
+                    wait_error.diagnostic_code,
+                    Some(RuntimeDiagnosticCode::FreshAgentProviderStartFailed)
+                );
+            } else {
+                let launched = launch_result.expect("the shared provider start succeeds");
+                let waited = match wait_result.expect("the exact wait succeeds") {
+                    AdminResult::Launch(result) => result,
+                    other => panic!("unexpected exact recovery wait result: {other:?}"),
+                };
+                assert_eq!(waited.view.soul_id, launched.view.soul_id);
+                assert_eq!(waited.view.incarnation_id, launched.view.incarnation_id);
+                assert_eq!(waited.view.launch_state, LaunchState::Running);
+                assert_eq!(waited.worker_launch_count, launched.worker_launch_count);
+            }
+            assert_eq!(backend.counts.creates.load(Ordering::SeqCst), 1);
+            assert_eq!(backend.counts.grants.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn exact_managed_recovery_wait_shares_delayed_success_or_failure() {
+            recovery_wait_returns_the_exact_shared_launch_outcome(false).await;
+            recovery_wait_returns_the_exact_shared_launch_outcome(true).await;
+        }
+
+        #[tokio::test]
+        async fn concurrent_fresh_agent_launches_share_one_detached_outcome() {
+            let dir = tempfile::tempdir().unwrap();
+            let gate = Arc::new(LaunchGate::default());
+            let backend = Arc::new(
+                FakeBackend::new(FirstGrantOutcome::Success).with_launch_gate(Arc::clone(&gate)),
+            );
+            let supervisor = supervisor(dir.path(), Arc::clone(&backend));
+            let soul = SoulId::new();
+            let request = fresh_agent_launch_request(soul, "codex");
+
+            let first_supervisor = supervisor.clone();
+            let first_request = request.clone();
+            let first = tokio::spawn(async move {
+                first_supervisor
+                    .launch(RequestId::new(), first_request)
+                    .await
+            });
+            gate.wait_until_entered().await;
+
+            let second_supervisor = supervisor.clone();
+            let second_request = request.clone();
+            let second = tokio::spawn(async move {
+                second_supervisor
+                    .launch(RequestId::new(), second_request)
+                    .await
+            });
+            let entry = supervisor.lifecycle_entry(&request.soul_id).await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if entry
+                        .recovery
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .waiters
+                        == 2
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the second view joins the existing managed startup");
+
+            let during_startup = match supervisor
+                .dispatch_non_recovery(Envelope::new(
+                    RequestId::new(),
+                    ControlRole::Web,
+                    AdminCommand::Inventory,
+                ))
+                .await
+                .unwrap()
+            {
+                AdminResult::Inventory(inventory) => inventory,
+                other => panic!("unexpected inventory result: {other:?}"),
+            };
+            let status = during_startup
+                .iter()
+                .find(|view| view.soul_id == request.soul_id)
+                .and_then(|view| view.fresh_agent_recovery.as_ref())
+                .expect("inventory overlays the in-flight managed operation");
+            assert!(status.in_flight);
+            assert_eq!(status.failed_launches, 0);
+            first.abort();
+            let _ = first.await;
+            gate.resume();
+
+            let shared = second
+                .await
+                .expect("the surviving requester receives the operation result")
+                .expect("the shared startup succeeds");
+            assert_eq!(shared.view.launch_state, LaunchState::Running);
+            assert_eq!(backend.counts.creates.load(Ordering::SeqCst), 1);
+            assert_eq!(backend.counts.grants.load(Ordering::SeqCst), 1);
+
+            let inventory = match supervisor
+                .dispatch_non_recovery(Envelope::new(
+                    RequestId::new(),
+                    ControlRole::Web,
+                    AdminCommand::Inventory,
+                ))
+                .await
+                .unwrap()
+            {
+                AdminResult::Inventory(inventory) => inventory,
+                other => panic!("unexpected inventory result: {other:?}"),
+            };
+            let view = inventory
+                .iter()
+                .find(|view| view.soul_id == shared.view.soul_id)
+                .unwrap();
+            assert!(view.fresh_agent_recovery.is_none());
+        }
+
+        #[tokio::test]
+        async fn concurrent_fresh_agent_launch_failure_is_shared_and_counted_once() {
+            let dir = tempfile::tempdir().unwrap();
+            let gate = Arc::new(LaunchGate::default());
+            let backend = Arc::new(
+                FakeBackend::new(FirstGrantOutcome::FreshAgentProviderStartFailed)
+                    .with_launch_gate(Arc::clone(&gate)),
+            );
+            let supervisor = supervisor(dir.path(), Arc::clone(&backend));
+            let soul = SoulId::new();
+            let request = fresh_agent_launch_request(soul, "claude");
+            let first_supervisor = supervisor.clone();
+            let first_request = request.clone();
+            let first = tokio::spawn(async move {
+                first_supervisor
+                    .launch(RequestId::new(), first_request)
+                    .await
+            });
+            gate.wait_until_entered().await;
+
+            let second_supervisor = supervisor.clone();
+            let second_request = request.clone();
+            let second = tokio::spawn(async move {
+                second_supervisor
+                    .launch(RequestId::new(), second_request)
+                    .await
+            });
+            let entry = supervisor.lifecycle_entry(&request.soul_id).await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if entry
+                        .recovery
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .waiters
+                        == 2
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the second view joins the in-flight failed launch");
+
+            first.abort();
+            let _ = first.await;
+            gate.resume();
+            let error = second
+                .await
+                .expect("the surviving requester settles")
+                .expect_err("the shared provider startup fails");
+            assert_eq!(
+                error.diagnostic_code,
+                Some(RuntimeDiagnosticCode::FreshAgentProviderStartFailed)
+            );
+            assert_eq!(backend.counts.creates.load(Ordering::SeqCst), 1);
+            assert_eq!(backend.counts.grants.load(Ordering::SeqCst), 1);
+
+            let inventory = match supervisor
+                .dispatch_non_recovery(Envelope::new(
+                    RequestId::new(),
+                    ControlRole::Web,
+                    AdminCommand::Inventory,
+                ))
+                .await
+                .unwrap()
+            {
+                AdminResult::Inventory(inventory) => inventory,
+                other => panic!("unexpected inventory result: {other:?}"),
+            };
+            let status = inventory
+                .iter()
+                .find(|view| view.soul_id == request.soul_id)
+                .and_then(|view| view.fresh_agent_recovery.as_ref())
+                .expect("failed launch status remains visible during its retry floor");
+            assert!(!status.in_flight);
+            assert_eq!(status.failed_launches, 1);
+            assert!(status.retry_after_ms.is_some_and(|millis| millis > 0));
+            assert!(!status.exhausted);
+
+            let retry = supervisor
+                .launch(RequestId::new(), request.clone())
+                .await
+                .expect_err("a launch during the retry floor receives the shared error");
+            assert_eq!(retry.diagnostic_code, error.diagnostic_code);
+            assert_eq!(backend.counts.creates.load(Ordering::SeqCst), 1);
+            assert_eq!(backend.counts.grants.load(Ordering::SeqCst), 1);
+
+            for _ in 0..100 {
+                let inventory = match supervisor
+                    .dispatch_non_recovery(Envelope::new(
+                        RequestId::new(),
+                        ControlRole::Web,
+                        AdminCommand::InventorySnapshot,
+                    ))
+                    .await
+                    .unwrap()
+                {
+                    AdminResult::InventorySnapshot(snapshot) => snapshot,
+                    other => panic!("unexpected inventory snapshot result: {other:?}"),
+                };
+                let status = inventory
+                    .souls
+                    .iter()
+                    .find(|view| view.soul_id == request.soul_id)
+                    .and_then(|view| view.fresh_agent_recovery.as_ref())
+                    .expect("read-only inventory retains failed launch status");
+                assert_eq!(status.failed_launches, 1);
+                assert!(!status.exhausted);
+            }
+            assert_eq!(backend.counts.creates.load(Ordering::SeqCst), 1);
+            assert_eq!(backend.counts.grants.load(Ordering::SeqCst), 1);
+        }
     }
 }
 

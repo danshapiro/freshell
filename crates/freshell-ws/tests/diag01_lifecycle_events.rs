@@ -262,7 +262,6 @@ async fn spawn_server(ping_interval_ms: u64) -> String {
         activity: None,
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-        fresh_agent_respawn_counts: Default::default(),
         ownership: None,
     };
 

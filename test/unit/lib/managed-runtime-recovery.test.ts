@@ -791,6 +791,28 @@ describe('managed runtime recovery merge', () => {
     }
   })
 
+  it.each([
+    [{ operationId: 'operation-in-flight', inFlight: true, failedLaunches: 0, exhausted: false }, 'recovering'],
+    [{ operationId: 'operation-retry', inFlight: false, failedLaunches: 1, retryAfterMs: 500, exhausted: false }, 'recovering'],
+    [{ operationId: 'operation-exhausted', inFlight: false, failedLaunches: 3, exhausted: true }, 'error'],
+  ] as const)('projects managed Freshagent recovery status into its pane', (freshAgentRecovery, status) => {
+    const state = baseState()
+    state.panes.layouts['user-tab'].content = {
+      kind: 'terminal', createRequestId: 'create-one', terminalId: 'terminal-one',
+      streamId: 'transport-stream', mode: 'opencode', status: 'running', soulId: 'soul-one',
+      viewIntentId: 'view-one', sessionRef: { provider: 'opencode', sessionId: 'ses_one' },
+    }
+    const current = soul({ freshAgentRecovery })
+    const plan = buildManagedRuntimeMergePlan(snapshot([current]), state)
+    expect(plan.updates).toHaveLength(1)
+    expect(plan.updates[0].content).toMatchObject({ status, freshAgentRecovery })
+
+    const store = storeWithState(state)
+    applyManagedRuntimeMergePlan(store as any, plan)
+    expect((store.getState().panes.layouts['user-tab'] as any).content)
+      .toMatchObject({ status, freshAgentRecovery })
+  })
+
   it('updates an already represented stopped/lost Fresh Agent in place', () => {
     const state = baseState()
     state.tabs.tabs[0].mode = 'freshopencode'

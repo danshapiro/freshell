@@ -99,6 +99,7 @@ pub struct ServeHttpRequest {
     pub url: String,
     pub body: Option<Vec<u8>>,
     pub content_type: Option<String>,
+    pub headers: Vec<(String, String)>,
     pub timeout: Option<Duration>,
 }
 
@@ -109,6 +110,7 @@ impl ServeHttpRequest {
             url: url.into(),
             body: None,
             content_type: None,
+            headers: Vec::new(),
             timeout: None,
         }
     }
@@ -118,6 +120,7 @@ impl ServeHttpRequest {
             url: url.into(),
             body: None,
             content_type: None,
+            headers: Vec::new(),
             timeout: None,
         }
     }
@@ -127,6 +130,7 @@ impl ServeHttpRequest {
             url: url.into(),
             body: Some(body),
             content_type: Some("application/json".to_string()),
+            headers: Vec::new(),
             timeout: None,
         }
     }
@@ -137,11 +141,17 @@ impl ServeHttpRequest {
             url: url.into(),
             body: Some(body),
             content_type: Some("application/json".to_string()),
+            headers: Vec::new(),
             timeout: None,
         }
     }
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
         self
     }
 }
@@ -1258,6 +1268,7 @@ impl OpencodeServeManager {
             discard_on_timeout,
             dispatch_witnesses,
             timeout_override,
+            &[],
         )
         .await
         .map(|(value, _)| value)
@@ -1276,6 +1287,7 @@ impl OpencodeServeManager {
         discard_on_timeout: DiscardOnTimeout,
         dispatch_witnesses: &[std::sync::Arc<std::sync::atomic::AtomicBool>],
         timeout_override: Option<Duration>,
+        extra_headers: &[(&str, &str)],
     ) -> Result<(Value, u16), ServeError> {
         let url = format!("{base}{path}");
         let timeout = timeout_override.unwrap_or_else(|| self.config().request_timeout);
@@ -1298,6 +1310,9 @@ impl OpencodeServeManager {
                 })
             }
         };
+        for (name, value) in extra_headers {
+            req = req.with_header(*name, *value);
+        }
         req = req.with_timeout(timeout);
 
         let resp = match {
@@ -1390,6 +1405,33 @@ impl OpencodeServeManager {
     pub async fn get_session(&self, id: &str, route: &Route) -> Result<Value, ServeError> {
         let path = with_route(&format!("/session/{}", encode_path_segment(id)), route);
         self.json_request(HttpMethod::Get, &path, None, None).await
+    }
+
+    /// Recovery-specific session probe. The correlation header lets test
+    /// fixtures distinguish this lifecycle read from unrelated session reads
+    /// (for example native-name lookups) without changing the OpenCode path or
+    /// treating every GET as a recovery attempt.
+    pub async fn get_session_for_recovery(
+        &self,
+        id: &str,
+        route: &Route,
+        request_id: &str,
+    ) -> Result<Value, ServeError> {
+        let path = with_route(&format!("/session/{}", encode_path_segment(id)), route);
+        let base = self.require_base().await?;
+        self.json_request_over_base_with_status(
+            HttpMethod::Get,
+            &path,
+            None,
+            None,
+            base,
+            DiscardOnTimeout::Yes,
+            &[],
+            None,
+            &[("x-freshell-recovery-request-id", request_id)],
+        )
+        .await
+        .map(|(value, _)| value)
     }
 
     /// Unified agent names (Task 3): `PATCH /session/:id` — the supported
@@ -1546,6 +1588,7 @@ impl OpencodeServeManager {
             DiscardOnTimeout::No,
             &[],
             None,
+            &[],
         )
         .await
     }

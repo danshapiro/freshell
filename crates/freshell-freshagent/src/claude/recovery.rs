@@ -30,7 +30,7 @@ impl FreshClaudeState {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) enum RuntimeResumeError {
     Lost,
     Closed,
@@ -49,6 +49,26 @@ impl RuntimeResumeError {
             owner,
         }
     }
+
+    pub(super) fn is_reserved(&self) -> bool {
+        matches!(
+            self,
+            Self::Unavailable {
+                code: "SESSION_RESERVED",
+                ..
+            }
+        )
+    }
+
+    fn counts_as_failed_launch(&self) -> bool {
+        match self {
+            Self::Lost => false,
+            Self::Closed => false,
+            Self::Unavailable { code, .. } => {
+                *code != "SESSION_RESERVED" && *code != "SESSION_CLOSED"
+            }
+        }
+    }
 }
 
 impl From<ResumeClaudeError> for RuntimeResumeError {
@@ -65,8 +85,83 @@ impl From<ResumeClaudeError> for RuntimeResumeError {
 }
 
 impl FreshClaudeState {
+    fn recovery_admission_refusal(&self, durable: &str) -> Option<RuntimeResumeError> {
+        let snapshot = self.ownership_snapshot(PROVIDER, durable);
+        let coordinator_blocks_claim = match &snapshot.state {
+            freshell_ownership::OwnershipState::Live { owner, .. } => {
+                owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal
+            }
+            freshell_ownership::OwnershipState::Starting { .. }
+            | freshell_ownership::OwnershipState::Handoff { .. }
+            | freshell_ownership::OwnershipState::Stopping { .. }
+            | freshell_ownership::OwnershipState::Fenced { .. } => true,
+            freshell_ownership::OwnershipState::Vacant
+            | freshell_ownership::OwnershipState::Aliased { .. } => false,
+        };
+        if coordinator_blocks_claim || (self.terminal_liveness)(PROVIDER, durable) {
+            Some(RuntimeResumeError::reserved(
+                crate::ownership_lane::terminal_owner_fields_from_snapshot(&snapshot),
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Join or start the one provider recovery for this canonical Claude id.
+    /// The provider-specific launch still owns its ticket, lease, cleanup and
+    /// sidecar bounds; the holder only owns the cohort result and budget.
+    pub(super) async fn resume_shared(
+        &self,
+        msg: FreshAgentAttach,
+        durable: String,
+        fence: Option<freshell_ownership::ObservedFence>,
+        reopen_closed: bool,
+        initiator: &'static str,
+    ) -> crate::session_recovery::RecoveryAnswer<(), RuntimeResumeError> {
+        let state = self.clone();
+        let operation_durable = durable.clone();
+        let preflight_durable = durable.clone();
+        self.session_recovery
+            .run_with_requester_preflight(
+                durable,
+                msg.request_id.clone(),
+                {
+                    let state = self.clone();
+                    move || state.recovery_admission_refusal(&preflight_durable)
+                },
+                move || async move {
+                    if state.has_live_session(&operation_durable).await {
+                        return Ok(());
+                    }
+                    state
+                        .resume_untracked(&msg, &operation_durable, fence, reopen_closed, initiator)
+                        .await
+                        .map_err(|error| {
+                            if error.counts_as_failed_launch() {
+                                crate::session_recovery::RecoveryAttemptFailure::launch(error)
+                            } else {
+                                crate::session_recovery::RecoveryAttemptFailure::refusal(error)
+                            }
+                        })
+                },
+            )
+            .await
+    }
+
+    /// Read the shared provider recovery status for a durable id or alias.
+    /// Status reads never admit a launch or consume retry budget.
+    pub async fn recovery_status(
+        &self,
+        session_id: &str,
+    ) -> Option<freshell_agent_runtime::RecoveryStatus> {
+        let canonical = self
+            .recovery_durable_id(session_id)
+            .unwrap_or_else(|| session_id.to_string());
+        self.session_recovery.status(&canonical).await
+    }
+
     /// The cold attach path, also used by send/compact recovery. Its caller
-    /// owns the shared resume flight. All launches still go through
+    /// requests the shared operation. All launches still go through
     /// resume_for_attach -> establish_runtime, with the same lease and fence.
     pub(super) async fn resume_untracked(
         &self,
@@ -74,6 +169,7 @@ impl FreshClaudeState {
         durable: &str,
         fence: Option<freshell_ownership::ObservedFence>,
         reopen_closed: bool,
+        initiator: &str,
     ) -> Result<(), RuntimeResumeError> {
         let claim_dead_state = self.claim_dead_state_snapshot(durable);
         if !reopen_closed && claim_dead_state.is_some() {
@@ -90,7 +186,7 @@ impl FreshClaudeState {
             durable,
             &format!("attach-{}", uuid::Uuid::new_v4()),
             fence,
-            "freshclaude/attach",
+            initiator,
         ) {
             crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
             crate::ownership_lane::LaneClaim::Unwired => None,
@@ -159,10 +255,6 @@ impl FreshClaudeState {
         let durable = self
             .recovery_durable_id(wire_id)
             .ok_or(RuntimeResumeError::Lost)?;
-        let _flight = self.wait_resume_flight(&durable).await;
-        if let Some(key) = self.resolve_session_key(&durable).await {
-            return Ok(key);
-        }
         let dead = self.dead_sessions.find(&durable);
         tracing::info!(target: "freshell_freshagent::claude",
             event = "freshagent.claude.runtime_recovery_started", provider = PROVIDER,
@@ -187,7 +279,39 @@ impl FreshClaudeState {
             tab_id: None,
             pane_id: None,
         };
-        self.resume_untracked(&msg, &durable, fence, false).await?;
+        let recovery = self
+            .resume_shared(
+                msg.clone(),
+                durable.clone(),
+                fence,
+                false,
+                "freshclaude/attach",
+            )
+            .await;
+        let is_owner_refusal = matches!(
+            recovery.result.as_ref(),
+            Err(crate::session_recovery::RecoveryFailure::Attempt(error)) if error.is_reserved()
+        );
+        if recovery.status.exhausted && !is_owner_refusal {
+            return Err(RuntimeResumeError::Unavailable {
+                code: "RECOVERY_EXHAUSTED",
+                message: "Claude recovery exhausted three failed launches. Retry after reviewing the provider runtime.".into(),
+                owner: None,
+            });
+        }
+        match recovery.result.as_ref() {
+            Ok(()) => {}
+            Err(crate::session_recovery::RecoveryFailure::Attempt(error)) => {
+                return Err(error.clone());
+            }
+            Err(crate::session_recovery::RecoveryFailure::Panicked) => {
+                return Err(RuntimeResumeError::Unavailable {
+                    code: "CLAUDE_ATTACH_RESUME_FAILED",
+                    message: "Claude recovery stopped unexpectedly. Try again.".into(),
+                    owner: None,
+                });
+            }
+        }
         self.resolve_session_key(&msg.session_id)
             .await
             .ok_or_else(|| RuntimeResumeError::Unavailable {
@@ -276,7 +400,7 @@ pub(super) fn updated_settings(
 }
 
 impl FreshClaudeState {
-    fn recovery_durable_id(&self, wire_id: &str) -> Option<String> {
+    pub(super) fn recovery_durable_id(&self, wire_id: &str) -> Option<String> {
         let sink = self.identity_sink();
         let candidate = sink
             .as_ref()
@@ -332,7 +456,7 @@ impl FreshClaudeState {
                 tab_id: None,
                 pane_id: None,
             };
-            self.resume_untracked(&attach, &durable, None, false)
+            self.resume_untracked(&attach, &durable, None, false, "freshclaude/configure")
                 .await?;
             return self
                 .resolve_session_key(&durable)

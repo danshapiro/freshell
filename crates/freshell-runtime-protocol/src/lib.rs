@@ -4711,6 +4711,9 @@ pub enum AdminCommand {
     ObserveClaudeSources(Box<ObserveClaudeSourcesRequest>),
     BindProviderPathInputs(BindProviderPathInputsRequest),
     Launch(Box<LaunchRequest>),
+    /// Wait for the exact existing supervisor-owned Freshagent recovery
+    /// operation. This command never admits or starts a new launch.
+    FreshAgentRecoveryWait(FreshAgentRecoveryWaitRequest),
     /// Dedicated authenticated, bounded OpenCode-history transfer channel.
     /// These chunk commands are never embedded in launch or host-control
     /// frames; launch carries only the immutable descriptor.
@@ -5112,6 +5115,32 @@ impl fmt::Debug for NativeAuthValues {
     }
 }
 
+/// Read-only state for one shared Freshagent recovery episode. The supervisor
+/// and default provider lanes retain one operation result for its requester
+/// cohort; inventory and reconcile only observe this snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryStatus {
+    pub operation_id: String,
+    pub in_flight: bool,
+    pub failed_launches: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
+    pub exhausted: bool,
+}
+
+/// Identifies one already-admitted supervisor Freshagent launch operation.
+/// Waiting is fenced by both soul and operation id so a stale inventory
+/// observation cannot join a later retry or create another operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FreshAgentRecoveryWaitRequest {
+    pub soul_id: SoulId,
+    pub operation_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeView {
@@ -5154,6 +5183,10 @@ pub struct RuntimeView {
     pub fresh_agent_session_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fresh_agent_runtime_variant: Option<String>,
+    /// The current shared Freshagent recovery attempt, when one is retained.
+    /// This field is observational; serializing inventory never starts work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_agent_recovery: Option<RecoveryStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6240,6 +6273,31 @@ mod tests {
         let restored: Envelope<AdminCommand> = read_frame(&mut cursor).await.unwrap();
         assert_eq!(restored.protocol_version, CONTROL_PROTOCOL_VERSION);
         assert!(matches!(restored.body, AdminCommand::Health));
+    }
+
+    #[tokio::test]
+    async fn exact_fresh_agent_recovery_wait_round_trips_its_operation_id() {
+        let soul_id = SoulId::new();
+        let operation_id = "observed-managed-recovery-operation".to_string();
+        let envelope = Envelope::new(
+            RequestId::new(),
+            ControlRole::Web,
+            AdminCommand::FreshAgentRecoveryWait(FreshAgentRecoveryWaitRequest {
+                soul_id: soul_id.clone(),
+                operation_id: operation_id.clone(),
+                expected_control_epoch: Some(42),
+            }),
+        );
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &envelope).await.unwrap();
+        let mut cursor = std::io::Cursor::new(bytes);
+        let restored: Envelope<AdminCommand> = read_frame(&mut cursor).await.unwrap();
+        let AdminCommand::FreshAgentRecoveryWait(request) = restored.body else {
+            panic!("the exact recovery wait command must survive protocol framing")
+        };
+        assert_eq!(request.soul_id, soul_id);
+        assert_eq!(request.operation_id, operation_id);
+        assert_eq!(request.expected_control_epoch, Some(42));
     }
 
     #[test]

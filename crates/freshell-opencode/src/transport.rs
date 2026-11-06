@@ -71,6 +71,9 @@ impl ServeHttp for ReqwestServeHttp {
             if let Some(content_type) = &req.content_type {
                 builder = builder.header("content-type", content_type);
             }
+            for (name, value) in &req.headers {
+                builder = builder.header(name, value);
+            }
             if let Some(body) = req.body {
                 builder = builder.body(body);
             }

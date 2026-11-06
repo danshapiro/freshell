@@ -210,6 +210,11 @@ pub struct FreshOpencodeState {
     /// reader. Pinned by `handle_kill_never_holds_the_sessions_map_across_
     /// its_session_lock_wait` and its teardown/refusal-teardown twins.)
     sessions: Arc<TokioMutex<HashMap<String, Arc<OpencodeSessionCell>>>>,
+    /// Shared result and failed-start budget for cold resumes of each
+    /// canonical OpenCode session. The daemon remains shared globally and
+    /// its existing session bridge recovery stays provider-owned.
+    session_recovery:
+        crate::session_recovery::SessionRecoveryMap<OpencodeRecoveryReady, OpencodeRecoveryFailure>,
     /// `freshAgent.create` requestId dedup (parity gap fix -- see the module doc on
     /// [`crate::FreshAgentCreateDedup`]): single-flight + replay cache so a client
     /// resending the SAME `requestId` on every reconnect while a pane is
@@ -742,6 +747,16 @@ enum ResumeOpencodeError {
     Reserved,
 }
 
+enum OpencodeRecoveryFailure {
+    NotFound,
+    Manager(freshell_opencode::ServeError),
+    Reserved,
+}
+
+enum OpencodeRecoveryReady {
+    Resumed(Arc<OpencodeSessionCell>),
+}
+
 impl OpencodeSession {
     /// The session's turn-derived status -- the ONE derivation every surface
     /// reporting a freshopencode session's live status must use: the
@@ -1125,6 +1140,7 @@ impl FreshOpencodeState {
         Self {
             fresh_agent,
             sessions,
+            session_recovery: Default::default(),
             create_dedup: Arc::new(FreshAgentCreateDedup::new()),
             identity_sink: Arc::new(std::sync::OnceLock::new()),
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
@@ -2164,7 +2180,8 @@ impl FreshOpencodeState {
         // Vacant/Aliased, so a kill or same-kind turnover during the await
         // left stale durable metadata and still succeeded.
         let pre_await = self.fresh_agent.ownership_snapshot(PROVIDER, &durable_id);
-        let (pre_await_generation, pre_await_owner) = match &pre_await.state {
+        let mut pre_await_epoch = pre_await.epoch;
+        let (mut pre_await_generation, mut pre_await_owner) = match &pre_await.state {
             freshell_ownership::OwnershipState::Live {
                 owner, generation, ..
             } => (Some(*generation), Some(owner.clone())),
@@ -2181,7 +2198,7 @@ impl FreshOpencodeState {
                     PROVIDER,
                     &durable_id,
                     owner.ownership_id.as_deref()?,
-                    pre_await.epoch,
+                    pre_await_epoch,
                     pre_await_generation?,
                 ))
             });
@@ -2211,7 +2228,6 @@ impl FreshOpencodeState {
             let snap = self.fresh_agent.ownership_snapshot(PROVIDER, &durable_id);
             match snap.state {
                 freshell_ownership::OwnershipState::Handoff { .. }
-                | freshell_ownership::OwnershipState::Starting { .. }
                 | freshell_ownership::OwnershipState::Stopping { .. }
                 | freshell_ownership::OwnershipState::Fenced { .. } => {
                     tracing::warn!(target: "freshell_freshagent::opencode",
@@ -2225,6 +2241,101 @@ impl FreshOpencodeState {
                         "A lifecycle operation owns this session; retry after it settles",
                     );
                     return;
+                }
+                freshell_ownership::OwnershipState::Starting { .. } => {
+                    match self
+                        .join_existing_recovery(&durable_id, Some(&request_id))
+                        .await
+                    {
+                        Ok(recovered)
+                            if existing
+                                .as_ref()
+                                .is_some_and(|incumbent| Arc::ptr_eq(incumbent, &recovered)) =>
+                        {
+                            let settled =
+                                self.fresh_agent.ownership_snapshot(PROVIDER, &durable_id);
+                            match settled.state {
+                                freshell_ownership::OwnershipState::Live {
+                                    owner,
+                                    generation,
+                                    ..
+                                } if owner.kind
+                                    == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                                    && owner.live_session_key.as_deref()
+                                        == Some(durable_id.as_str()) =>
+                                {
+                                    let Some(ownership_id) = owner.ownership_id.as_deref() else {
+                                        self.fail_create(
+                                            &request_id,
+                                            view_id,
+                                            "SESSION_RESERVED",
+                                            "The OpenCode runtime has no current ownership identity; refresh before reopening it.",
+                                        );
+                                        return;
+                                    };
+                                    pre_await_epoch = settled.epoch;
+                                    pre_await_generation = Some(generation);
+                                    pre_await_owner = Some(owner.clone());
+                                    binding_claim_for_adopt =
+                                        Some(crate::identity_sink::BindingClaim::live_fresh_agent(
+                                            PROVIDER,
+                                            &durable_id,
+                                            ownership_id,
+                                            settled.epoch,
+                                            generation,
+                                        ));
+                                }
+                                state => {
+                                    tracing::warn!(target: "freshell_freshagent::opencode",
+                                        session_id = %durable_id, state = ?state,
+                                        "fresh_agent_create_recovery_settled_without_live_owner");
+                                    self.fail_create(
+                                        &request_id,
+                                        view_id,
+                                        "SESSION_RESERVED",
+                                        "A lifecycle operation owns this session; retry after it settles",
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                        Ok(_) => {
+                            self.fail_create(
+                                &request_id,
+                                view_id,
+                                "SESSION_RESERVED",
+                                "The OpenCode runtime changed while this create was waiting; refresh and retry",
+                            );
+                            return;
+                        }
+                        Err(ResumeOpencodeError::NotFound) => {
+                            self.fail_create(
+                                &request_id,
+                                view_id,
+                                "FRESH_AGENT_CREATE_FAILED",
+                                &format!("opencode session {durable_id} not found"),
+                            );
+                            return;
+                        }
+                        Err(ResumeOpencodeError::Manager(error)) => {
+                            self.fail_create(
+                                &request_id,
+                                view_id,
+                                "FRESH_AGENT_CREATE_FAILED",
+                                &error.to_string(),
+                            );
+                            return;
+                        }
+                        Err(ResumeOpencodeError::Reserved) => {
+                            self.fail_create(
+                                &request_id,
+                                view_id,
+                                "SESSION_RESERVED",
+                                "A lifecycle operation owns this session; retry after it settles",
+                            );
+                            return;
+                        }
+                    }
                 }
                 // b8ke e3r1 F3: a live session over a VACANT key is
                 // REGISTERED as the authoritative owner before the reuse
@@ -2323,13 +2434,14 @@ impl FreshOpencodeState {
         let session_arc = match existing {
             Some(session_arc) => session_arc,
             None => match self
-                .resume_durable_session(
+                .resume_durable_session_for_request(
                     &durable_id,
                     msg.cwd.as_deref(),
                     provenance.clone(),
                     // kata b8ke Task 3: the create's delayed-request fence.
                     create_fence,
                     None,
+                    Some(request_id.clone()),
                 )
                 .await
             {
@@ -2436,7 +2548,7 @@ impl FreshOpencodeState {
                     .ownership
                     .as_ref()
                     .map(|registry| registry.boot_epoch())
-                    .unwrap_or(pre_await.epoch),
+                    .unwrap_or(pre_await_epoch),
                 generation,
             )
         });
@@ -7937,7 +8049,6 @@ impl FreshOpencodeState {
                 .ownership_snapshot(PROVIDER, &ownership_session_id);
             match snap.state {
                 freshell_ownership::OwnershipState::Handoff { .. }
-                | freshell_ownership::OwnershipState::Starting { .. }
                 | freshell_ownership::OwnershipState::Stopping { .. }
                 | freshell_ownership::OwnershipState::Fenced { .. } => {
                     tracing::warn!(target: "freshell_freshagent::opencode",
@@ -7950,6 +8061,77 @@ impl FreshOpencodeState {
                         "A lifecycle operation owns this session; retry after it settles",
                     );
                     return;
+                }
+                freshell_ownership::OwnershipState::Starting { .. } => {
+                    match self
+                        .join_existing_recovery(&ownership_session_id, msg.request_id.as_deref())
+                        .await
+                    {
+                        Ok(recovered)
+                            if session_arc
+                                .as_ref()
+                                .is_some_and(|incumbent| Arc::ptr_eq(incumbent, &recovered)) =>
+                        {
+                            let settled = self
+                                .fresh_agent
+                                .ownership_snapshot(PROVIDER, &ownership_session_id);
+                            match settled.state {
+                                freshell_ownership::OwnershipState::Live {
+                                    owner,
+                                    generation,
+                                    ..
+                                } if owner.kind
+                                    == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                                    && owner.live_session_key.as_deref()
+                                        == Some(ownership_session_id.as_str()) =>
+                                {
+                                    attach_fence = Some(freshell_ownership::ObservedFence {
+                                        epoch: settled.epoch,
+                                        generation,
+                                    });
+                                }
+                                state => {
+                                    tracing::warn!(target: "freshell_freshagent::opencode",
+                                        session_id = %msg.session_id, state = ?state,
+                                        "fresh_agent_attach_recovery_settled_without_live_owner");
+                                    self.emit_fresh_agent_error(
+                                        &msg.session_id,
+                                        "SESSION_RESERVED",
+                                        "A lifecycle operation owns this session; retry after it settles",
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                        Ok(_) => {
+                            self.emit_fresh_agent_error(
+                                &msg.session_id,
+                                "SESSION_RESERVED",
+                                "The OpenCode runtime changed while this attach was waiting; refresh and retry",
+                            );
+                            return;
+                        }
+                        Err(ResumeOpencodeError::NotFound) => {
+                            self.broadcast(&lost_session_frame(&msg.session_id));
+                            return;
+                        }
+                        Err(ResumeOpencodeError::Manager(error)) => {
+                            self.send_error(
+                                &None,
+                                "OPENCODE_ATTACH_RESUME_FAILED",
+                                &error.to_string(),
+                            );
+                            return;
+                        }
+                        Err(ResumeOpencodeError::Reserved) => {
+                            self.emit_fresh_agent_error(
+                                &msg.session_id,
+                                "SESSION_RESERVED",
+                                "A lifecycle operation owns this session; retry after it settles",
+                            );
+                            return;
+                        }
+                    }
                 }
                 // b8ke e3r1 F3: a live session over a VACANT key is
                 // REGISTERED as the authoritative owner (claim + commit)
@@ -8190,7 +8372,7 @@ impl FreshOpencodeState {
             // Conn-less lane (D8): attach carries no tab identity — keep-when-None
             // merge preserves the create's provenance stamps.
             None => match self
-                .resume_durable_session(
+                .resume_durable_session_for_request(
                     &msg.session_id,
                     msg.cwd.as_deref(),
                     None,
@@ -8199,6 +8381,7 @@ impl FreshOpencodeState {
                     // untracked session, registering a runtime).
                     attach_fence,
                     None,
+                    msg.request_id.clone(),
                 )
                 .await
             {
@@ -8328,6 +8511,155 @@ impl FreshOpencodeState {
         session_id: &str,
         cwd: Option<&str>,
         provenance: Option<crate::BindProvenance>,
+        observed: Option<freshell_ownership::ObservedFence>,
+        handoff: Option<(&str, u64)>,
+    ) -> Result<Arc<OpencodeSessionCell>, ResumeOpencodeError> {
+        self.resume_durable_session_for_request(
+            session_id, cwd, provenance, observed, handoff, None,
+        )
+        .await
+    }
+
+    async fn resume_durable_session_for_request(
+        &self,
+        session_id: &str,
+        cwd: Option<&str>,
+        provenance: Option<crate::BindProvenance>,
+        observed: Option<freshell_ownership::ObservedFence>,
+        handoff: Option<(&str, u64)>,
+        request_id: Option<String>,
+    ) -> Result<Arc<OpencodeSessionCell>, ResumeOpencodeError> {
+        // Handoff continuation already carries the operation ticket and must
+        // return through its existing single-commit path.
+        if let Some(handoff) = handoff {
+            return self
+                .resume_durable_session_once(session_id, cwd, provenance, observed, Some(handoff))
+                .await;
+        }
+
+        let state = self.clone();
+        let operation_session_id = session_id.to_string();
+        let operation_cwd = cwd.map(str::to_string);
+        let recovery_request_id = request_id.clone();
+        let answer = self
+            .session_recovery
+            .run_with_requester(
+                format!("opencode:{session_id}"),
+                request_id,
+                move || async move {
+                    match state
+                        .resume_durable_session_once_for_request(
+                            &operation_session_id,
+                            operation_cwd.as_deref(),
+                            provenance,
+                            observed,
+                            None,
+                            recovery_request_id.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok(cell) => Ok(OpencodeRecoveryReady::Resumed(cell)),
+                        Err(ResumeOpencodeError::NotFound) => {
+                            Err(crate::session_recovery::RecoveryAttemptFailure::refusal(
+                                OpencodeRecoveryFailure::NotFound,
+                            ))
+                        }
+                        Err(ResumeOpencodeError::Reserved) => {
+                            Err(crate::session_recovery::RecoveryAttemptFailure::refusal(
+                                OpencodeRecoveryFailure::Reserved,
+                            ))
+                        }
+                        Err(ResumeOpencodeError::Manager(error)) => {
+                            Err(crate::session_recovery::RecoveryAttemptFailure::launch(
+                                OpencodeRecoveryFailure::Manager(error),
+                            ))
+                        }
+                    }
+                },
+            )
+            .await;
+
+        if answer.status.exhausted {
+            return Err(ResumeOpencodeError::Manager(
+                freshell_opencode::ServeError::StartupFailed(
+                    "RECOVERY_EXHAUSTED: three OpenCode recovery launches failed".into(),
+                ),
+            ));
+        }
+        match answer.result.as_ref() {
+            Ok(OpencodeRecoveryReady::Resumed(cell)) => Ok(Arc::clone(cell)),
+            Err(crate::session_recovery::RecoveryFailure::Attempt(
+                OpencodeRecoveryFailure::NotFound,
+            )) => Err(ResumeOpencodeError::NotFound),
+            Err(crate::session_recovery::RecoveryFailure::Attempt(
+                OpencodeRecoveryFailure::Manager(error),
+            )) => Err(ResumeOpencodeError::Manager(error.clone())),
+            Err(crate::session_recovery::RecoveryFailure::Attempt(
+                OpencodeRecoveryFailure::Reserved,
+            )) => Err(ResumeOpencodeError::Reserved),
+            Err(crate::session_recovery::RecoveryFailure::Panicked) => Err(
+                ResumeOpencodeError::Manager(freshell_opencode::ServeError::StartupFailed(
+                    "shared OpenCode recovery panicked".into(),
+                )),
+            ),
+        }
+    }
+
+    async fn join_existing_recovery(
+        &self,
+        session_id: &str,
+        request_id: Option<&str>,
+    ) -> Result<Arc<OpencodeSessionCell>, ResumeOpencodeError> {
+        let answer = self
+            .session_recovery
+            .join_existing(
+                &format!("opencode:{session_id}"),
+                request_id.map(str::to_string),
+            )
+            .await
+            .ok_or(ResumeOpencodeError::Reserved)?;
+
+        if answer.status.exhausted {
+            return Err(ResumeOpencodeError::Manager(
+                freshell_opencode::ServeError::StartupFailed(
+                    "RECOVERY_EXHAUSTED: three OpenCode recovery launches failed".into(),
+                ),
+            ));
+        }
+        match answer.result.as_ref() {
+            Ok(OpencodeRecoveryReady::Resumed(cell)) => Ok(Arc::clone(cell)),
+            Err(crate::session_recovery::RecoveryFailure::Attempt(
+                OpencodeRecoveryFailure::NotFound,
+            )) => Err(ResumeOpencodeError::NotFound),
+            Err(crate::session_recovery::RecoveryFailure::Attempt(
+                OpencodeRecoveryFailure::Manager(error),
+            )) => Err(ResumeOpencodeError::Manager(error.clone())),
+            Err(crate::session_recovery::RecoveryFailure::Attempt(
+                OpencodeRecoveryFailure::Reserved,
+            )) => Err(ResumeOpencodeError::Reserved),
+            Err(crate::session_recovery::RecoveryFailure::Panicked) => Err(
+                ResumeOpencodeError::Manager(freshell_opencode::ServeError::StartupFailed(
+                    "shared OpenCode recovery panicked".into(),
+                )),
+            ),
+        }
+    }
+
+    /// Read the server-owned shared recovery facts for a canonical OpenCode id.
+    pub async fn recovery_status(
+        &self,
+        session_id: &str,
+    ) -> Option<freshell_agent_runtime::RecoveryStatus> {
+        self.session_recovery
+            .status(&format!("opencode:{session_id}"))
+            .await
+    }
+
+    async fn resume_durable_session_once(
+        &self,
+        session_id: &str,
+        cwd: Option<&str>,
+        provenance: Option<crate::BindProvenance>,
         // kata b8ke Task 3: the calling lifecycle message's delayed-request
         // fence (`None` = legacy unfenced sender — still cross-kind-checked).
         observed: Option<freshell_ownership::ObservedFence>,
@@ -8336,6 +8668,21 @@ impl FreshOpencodeState {
         // performs the ONE `commit_live`, so this lane skips both its own
         // claim and its own commit (under-ticket mode).
         handoff: Option<(&str, u64)>,
+    ) -> Result<Arc<OpencodeSessionCell>, ResumeOpencodeError> {
+        self.resume_durable_session_once_for_request(
+            session_id, cwd, provenance, observed, handoff, None,
+        )
+        .await
+    }
+
+    async fn resume_durable_session_once_for_request(
+        &self,
+        session_id: &str,
+        cwd: Option<&str>,
+        provenance: Option<crate::BindProvenance>,
+        observed: Option<freshell_ownership::ObservedFence>,
+        handoff: Option<(&str, u64)>,
+        recovery_request_id: Option<&str>,
     ) -> Result<Arc<OpencodeSessionCell>, ResumeOpencodeError> {
         // A `freshopencode-*` placeholder is minted by Freshell for a pane
         // that has not materialized yet. Opencode has never seen it, so no
@@ -8479,11 +8826,22 @@ impl FreshOpencodeState {
                 .ok()
                 .as_deref(),
         );
-        let get = tokio::time::timeout(
-            std::time::Duration::from_millis(budget),
-            manager.get_session(session_id, &route),
-        )
-        .await;
+        let get = match recovery_request_id {
+            Some(request_id) => {
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(budget),
+                    manager.get_session_for_recovery(session_id, &route, request_id),
+                )
+                .await
+            }
+            None => {
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(budget),
+                    manager.get_session(session_id, &route),
+                )
+                .await
+            }
+        };
         let info = match get {
             Err(_elapsed) => {
                 lease_guard.fail();
@@ -17546,6 +17904,209 @@ mod tests {
         );
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum LateRecoveryJoinCall {
+        Attach,
+        Create,
+    }
+
+    async fn exercise_late_recovery_map_hit(call: LateRecoveryJoinCall, fail_startup: bool) {
+        let durable_id = match (call, fail_startup) {
+            (LateRecoveryJoinCall::Attach, false) => "ses_late_attach_success",
+            (LateRecoveryJoinCall::Attach, true) => "ses_late_attach_failure",
+            (LateRecoveryJoinCall::Create, false) => "ses_late_create_success",
+            (LateRecoveryJoinCall::Create, true) => "ses_late_create_failure",
+        };
+        let (state, mut rx, registry) = state_with_registry_and_receiver().await;
+        let identity = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(identity.clone());
+        let stall = identity.arm_binding_stall_result(PROVIDER, durable_id, fail_startup);
+
+        let recovery_state = state.clone();
+        let recovery_id = durable_id.to_string();
+        let recovery = tokio::spawn(async move {
+            recovery_state
+                .resume_durable_session(&recovery_id, None, None, None, None)
+                .await
+        });
+        stall
+            .entered
+            .recv_timeout(Duration::from_secs(15))
+            .expect("the recovery publishes its map row before its owner commit");
+        let incumbent = state
+            .sessions
+            .lock()
+            .await
+            .get(durable_id)
+            .cloned()
+            .expect("the late map-hit window has a published session row");
+        let starting = registry.observe(PROVIDER, durable_id);
+        assert!(matches!(
+            starting.state,
+            freshell_ownership::OwnershipState::Starting { .. }
+        ));
+        assert!(state
+            .session_recovery
+            .try_status(&format!("opencode:{durable_id}"))
+            .is_some_and(|status| status.in_flight));
+
+        let request_id = match call {
+            LateRecoveryJoinCall::Attach if fail_startup => "late-attach-failure-request",
+            LateRecoveryJoinCall::Attach => "late-attach-success-request",
+            LateRecoveryJoinCall::Create if fail_startup => "late-create-failure-request",
+            LateRecoveryJoinCall::Create => "late-create-success-request",
+        };
+        let (attach_task, attach_capture) = match call {
+            LateRecoveryJoinCall::Attach => {
+                let mut attach = attach_msg(durable_id);
+                attach.request_id = Some(request_id.to_string());
+                attach.view_id = Some("late-map-hit-view".to_string());
+                attach.observed_epoch = Some(starting.epoch);
+                attach.observed_generation = Some(starting.generation);
+                let (reply, captured) = capturing_sink();
+                let attach_state = state.clone();
+                (
+                    Some(tokio::spawn(async move {
+                        attach_state.handle_attach(attach, reply).await;
+                    })),
+                    Some(captured),
+                )
+            }
+            LateRecoveryJoinCall::Create => {
+                let mut create = create_msg(request_id);
+                create.resume_session_id = Some(durable_id.to_string());
+                create.session_ref = Some(SessionLocator {
+                    provider: PROVIDER.to_string(),
+                    session_id: durable_id.to_string(),
+                });
+                create.observed_epoch = Some(starting.epoch);
+                create.observed_generation = Some(starting.generation);
+                let create_state = state.clone();
+                (
+                    Some(tokio::spawn(async move {
+                        create_state.handle_create(create, None).await
+                    })),
+                    None,
+                )
+            }
+        };
+
+        let joined = tokio::time::timeout(Duration::from_secs(2), async {
+            while state
+                .session_recovery
+                .waiter_count_for_test(&format!("opencode:{durable_id}"))
+                .await
+                < 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        let _ = stall.release.send(());
+        let recovery_result = tokio::time::timeout(Duration::from_secs(10), recovery)
+            .await
+            .expect("the winning recovery settles after release")
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(10), attach_task.unwrap())
+            .await
+            .expect("the late requester settles with the shared recovery result")
+            .unwrap();
+
+        assert!(
+            joined,
+            "a late {call:?} map-hit must join the active canonical recovery before its owner commits"
+        );
+        if fail_startup {
+            assert!(recovery_result.is_err(), "the parked identity write fails");
+            assert!(state.sessions.lock().await.get(durable_id).is_none());
+            let status = state
+                .session_recovery
+                .status(&format!("opencode:{durable_id}"))
+                .await
+                .expect("the failed operation remains cached during its retry floor");
+            assert_eq!(status.failed_launches, 1);
+            match (call, attach_capture) {
+                (LateRecoveryJoinCall::Attach, Some(captured)) => {
+                    let replies = captured.lock().unwrap().clone();
+                    assert!(
+                        replies.iter().any(|message| matches!(message,
+                            ServerMessage::FreshAgentAttachFailed(failed)
+                                if failed.request_id == request_id
+                                    && failed.view_id.as_deref() == Some("late-map-hit-view")
+                                    && failed.code == "INTERNAL_ERROR"
+                                    && failed.message.starts_with("OPENCODE_ATTACH_RESUME_FAILED:")
+                        )),
+                        "the requester receives the shared attach failure: {replies:?}"
+                    );
+                }
+                (LateRecoveryJoinCall::Create, None) => {
+                    let frames = drain_frames(&mut rx);
+                    assert!(
+                        frames
+                            .iter()
+                            .any(|frame| frame["type"] == "freshAgent.create.failed"
+                                && frame["requestId"] == request_id
+                                && frame["code"] == "FRESH_AGENT_CREATE_FAILED"),
+                        "the requester receives the shared create failure: {frames:?}"
+                    );
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            assert!(
+                recovery_result.is_ok(),
+                "the parked identity write succeeds"
+            );
+            assert!(matches!(
+                registry.observe(PROVIDER, durable_id).state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ));
+            let current = state.sessions.lock().await.get(durable_id).cloned();
+            assert!(current.is_some_and(|current| Arc::ptr_eq(&current, &incumbent)));
+            assert!(session_serve_bridge_alive(&state, durable_id).await);
+            match (call, attach_capture) {
+                (LateRecoveryJoinCall::Attach, Some(captured)) => {
+                    let replies = captured.lock().unwrap().clone();
+                    assert!(
+                        replies.iter().any(|message| matches!(message,
+                            ServerMessage::FreshAgentAttached(attached)
+                                if attached.request_id == request_id
+                                    && attached.session_id == durable_id
+                        )),
+                        "the requester receives the shared attach success: {replies:?}"
+                    );
+                }
+                (LateRecoveryJoinCall::Create, None) => {
+                    let frames = drain_frames(&mut rx);
+                    assert!(
+                        frames
+                            .iter()
+                            .any(|frame| frame["type"] == "freshAgent.created"
+                                && frame["requestId"] == request_id
+                                && frame["sessionId"] == durable_id),
+                        "the requester receives its own create success: {frames:?}"
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_map_hit_attach_joins_recovery_before_owner_commit_on_success_or_failure() {
+        for fail_startup in [false, true] {
+            exercise_late_recovery_map_hit(LateRecoveryJoinCall::Attach, fail_startup).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_map_hit_create_joins_recovery_before_owner_commit_on_success_or_failure() {
+        for fail_startup in [false, true] {
+            exercise_late_recovery_map_hit(LateRecoveryJoinCall::Create, fail_startup).await;
+        }
+    }
+
     async fn cancel_parked_startup<T>(task: &mut tokio::task::JoinHandle<T>) {
         // abort() only requests cancellation. Keep the write parked until the
         // task has dropped its guard, or it can commit before its next yield.
@@ -17587,40 +18148,58 @@ mod tests {
             if cancel {
                 cancel_parked_startup(&mut task).await;
             }
-            let _ = stall.release.send(());
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let fenced = matches!(
+            assert!(matches!(
                 registry.observe(PROVIDER, id).state,
                 freshell_ownership::OwnershipState::Starting { .. }
-            );
-            let unrepaired = sink.repairs.lock().unwrap().is_empty();
-            drop(held);
-            assert!(
-                fenced && unrepaired,
-                "cancel={cancel}: ownership and binding must wait for registered-session cleanup"
-            );
-            if !cancel {
-                assert!(task.await.unwrap().is_err());
+            ));
+            assert!(sink.repairs.lock().unwrap().is_empty());
+            if cancel {
+                assert!(st
+                    .session_recovery
+                    .status(&format!("opencode:{id}"))
+                    .await
+                    .is_some_and(|status| status.in_flight));
             }
-            tokio::time::timeout(Duration::from_secs(10), async {
-                while !matches!(
-                    registry.observe(PROVIDER, id).state,
-                    freshell_ownership::OwnershipState::Vacant
-                ) {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-            assert!(!st.sessions.lock().await.contains_key(id));
-            let session = incumbent.lock().await;
-            assert!(session.killed.load(Ordering::SeqCst));
-            assert!(session.serve_bridge.is_none());
-            assert!(session.turn_task.is_none());
-            assert_eq!(sink.repairs.lock().unwrap().len(), 1);
+            let _ = stall.release.send(());
+            drop(held);
+
+            if cancel {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while !matches!(
+                        registry.observe(PROVIDER, id).state,
+                        freshell_ownership::OwnershipState::Live { .. }
+                    ) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("canceling one waiter must not cancel shared startup");
+                assert!(st.sessions.lock().await.contains_key(id));
+                let session = incumbent.lock().await;
+                assert!(!session.killed.load(Ordering::SeqCst));
+                assert!(session.serve_bridge.is_some());
+                assert!(sink.repairs.lock().unwrap().is_empty());
+                assert!(!exited.load(Ordering::SeqCst));
+            } else {
+                assert!(task.await.unwrap().is_err());
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while !matches!(
+                        registry.observe(PROVIDER, id).state,
+                        freshell_ownership::OwnershipState::Vacant
+                    ) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(!st.sessions.lock().await.contains_key(id));
+                let session = incumbent.lock().await;
+                assert!(session.killed.load(Ordering::SeqCst));
+                assert!(session.serve_bridge.is_none());
+                assert!(session.turn_task.is_none());
+                assert_eq!(sink.repairs.lock().unwrap().len(), 1);
+            }
             assert_eq!(spawns.load(Ordering::SeqCst), 1);
-            assert!(!exited.load(Ordering::SeqCst));
-            drop(session);
             manager.shutdown().await;
         }
     }

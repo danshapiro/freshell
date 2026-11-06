@@ -4,6 +4,10 @@ import type { TerminalStatus } from '../store/types.js'
 /** A retained process ending does not erase the supervisor's final verdict. */
 export function managedTerminalPaneStatus(terminal: ManagedRuntimeProjectionFields, fallback: TerminalStatus): TerminalStatus {
   if (terminal.runtimeStatus === 'blocked') return 'error'
+  if (terminal.freshAgentRecovery?.exhausted) return 'error'
+  if (terminal.freshAgentRecovery?.inFlight || (terminal.freshAgentRecovery?.retryAfterMs ?? 0) > 0) {
+    return 'recovering'
+  }
   if (!terminal.soulId || !terminal.recoverySummary) return fallback
   const { recoveryState, desiredState } = terminal.recoverySummary
   if (recoveryState === 'blocked' || recoveryState === 'lost') return 'error'
@@ -57,11 +61,21 @@ export function managedTerminalProjection(terminal?: ManagedRuntimeProjectionFie
     incarnationId: terminal.incarnationId,
     runtimeStatus: terminal.runtimeStatus,
     recoverySummary: terminal.recoverySummary,
+    freshAgentRecovery: terminal.freshAgentRecovery,
   }
 }
 
 export function sameManagedTerminalProjection(a: ManagedRuntimeProjectionFields, b: ManagedRuntimeProjectionFields): boolean {
   if (a.soulId !== b.soulId || a.incarnationId !== b.incarnationId || a.runtimeStatus !== b.runtimeStatus) return false
+  const firstFreshAgent = a.freshAgentRecovery, secondFreshAgent = b.freshAgentRecovery
+  if (firstFreshAgent !== secondFreshAgent) {
+    if (!firstFreshAgent || !secondFreshAgent) return false
+    if (firstFreshAgent.operationId !== secondFreshAgent.operationId
+      || firstFreshAgent.inFlight !== secondFreshAgent.inFlight
+      || firstFreshAgent.failedLaunches !== secondFreshAgent.failedLaunches
+      || firstFreshAgent.retryAfterMs !== secondFreshAgent.retryAfterMs
+      || firstFreshAgent.exhausted !== secondFreshAgent.exhausted) return false
+  }
   const first = a.recoverySummary, second = b.recoverySummary
   if (first === second) return true
   if (!first || !second) return false

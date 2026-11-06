@@ -145,6 +145,15 @@ function allowsDurableFixtureWrites() {
   return process.env.FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES === '1'
 }
 
+async function waitForFixtureGate(gatePath, description) {
+  if (!gatePath) return
+  const deadline = Date.now() + 120_000
+  while (!fs.existsSync(gatePath)) {
+    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${description} release`)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+}
+
 function rolloutFilename(threadId) {
   // Thread ids are data, never path segments. Percent encoding keeps the familiar
   // rollout-<id>.jsonl shape for ordinary Codex ids while escaping path separators
@@ -1053,7 +1062,7 @@ wss.on('connection', (socket, request) => {
     }
     diagnosticEvent('rpc.request', { connectionId: diagnosticConnectionId, id: message.id, method, params: message.params })
     if (behavior.appendRequestLogPath) {
-      fs.appendFileSync(behavior.appendRequestLogPath, JSON.stringify({ method, params: message.params, codexHome: getCodexHome(), cwd: process.cwd(), ...(behavior.requestLogContext ? { context: behavior.requestLogContext } : {}) }) + '\n')
+      fs.appendFileSync(behavior.appendRequestLogPath, JSON.stringify({ at: Date.now(), method, params: message.params, codexHome: getCodexHome(), cwd: process.cwd(), ...(behavior.requestLogContext ? { context: behavior.requestLogContext } : {}) }) + '\n')
     }
 
     if (
@@ -1170,11 +1179,25 @@ wss.on('connection', (socket, request) => {
     const threadResumeError = method === 'thread/resume'
       ? behavior.threadResumeErrorsById?.[message.params?.threadId]
       : undefined
-    const resumeError = threadResumeError ?? override?.error
+    const injectedResumeFailure = method === 'thread/resume'
+      && behavior.failThreadResumePath
+      && fs.existsSync(behavior.failThreadResumePath)
+    if (injectedResumeFailure) {
+      fs.rmSync(behavior.failThreadResumePath, { force: true })
+    }
+    const resumeError = injectedResumeFailure
+      ? { code: -32042, message: 'Synthetic Codex resume failure' }
+      : threadResumeError ?? override?.error
+    const resumeGatePath = method === 'thread/resume'
+      ? behavior.waitForThreadResumeReleasePath
+      : undefined
     const delayMs = Number(behavior.delayMethodsMs?.[method] || 0)
     const floodStdoutBytes = Number(behavior.floodStdoutBeforeMethodsBytes?.[method] || 0)
     const floodStderrBytes = Number(behavior.floodStderrBeforeMethodsBytes?.[method] || 0)
     if (resumeError) {
+      // Failed native calls are part of the operation log so recovery tests
+      // can distinguish one shared failure from duplicate retries.
+      appendThreadOperation(method, message.params, null)
       setTimeout(async () => {
         if (method === 'thread/resume' && behavior.waitForResumeReleasePath) {
           if (behavior.resumeWaitingPath) {
@@ -1186,6 +1209,7 @@ wss.on('connection', (socket, request) => {
             await new Promise((resolve) => setTimeout(resolve, 25))
           }
         }
+        await waitForFixtureGate(resumeGatePath, 'Codex thread/resume')
         socket.send(JSON.stringify({
           id: message.id,
           error: resumeError,
@@ -1195,6 +1219,7 @@ wss.on('connection', (socket, request) => {
     }
 
     setTimeout(async () => {
+      await waitForFixtureGate(resumeGatePath, 'Codex thread/resume')
       // Opt-in creation interleaving: the real browser may stage settings
       // after its native thread/start request but before its acknowledgement.
       if (method === 'thread/start' && behavior.waitForThreadStartReleasePath) {
