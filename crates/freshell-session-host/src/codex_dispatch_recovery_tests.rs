@@ -44,6 +44,7 @@ fn only_accepted_codex_sends_commit_native_root_transitions() {
         CommandState::Queued,
         CommandState::Dispatching,
         CommandState::Ambiguous,
+        CommandState::Cancelled,
     ] {
         assert!(
             !super::should_commit_fresh_native_transition(&FreshProvider::Codex, &state),
@@ -151,17 +152,27 @@ async fn fixture() -> (
     Arc<FreshAgentHostActor>,
     Arc<NativeRecoveryTransport>,
 ) {
+    fixture_for_provider("codex").await
+}
+
+async fn fixture_for_provider(
+    provider: &str,
+) -> (
+    Arc<HostState>,
+    Arc<FreshAgentHostActor>,
+    Arc<NativeRecoveryTransport>,
+) {
     let state = tests::test_host_state();
     let launch = NativeIdentityLaunch {
         incarnation_id: state.incarnation_id.clone(),
-        launch_nonce: "owned-codex-recovery-launch".into(),
+        launch_nonce: format!("owned-{provider}-recovery-launch"),
         evidence_revision: 7,
         execution_generation: 1,
         requested_native_session_id: Some(ORIGINAL.into()),
     };
     {
         let mut persisted = state.persisted.lock().await;
-        persisted.provider = Some("codex".into());
+        persisted.provider = Some(provider.into());
         persisted.host_boot_id = Some(state.host_boot_id.clone());
         persisted.max_execution_generation = launch.execution_generation;
         persisted.grant_id = Some(GrantId::new());
@@ -180,9 +191,11 @@ async fn fixture() -> (
         accepted_turns: AtomicUsize::new(0),
     });
     let profile: FreshAgentProfile = serde_json::from_value(serde_json::json!({
-        "provider":"codex", "runtimeVariant":"codex-app-server", "cwd":"/workspace",
+        "provider":provider,
+        "runtimeVariant":if provider == "codex" { "codex-app-server" } else { "claude-sdk" },
+        "cwd":"/workspace",
         "model":"fixture-model", "effort":"low", "permissionMode":"never", "sandbox":"read-only",
-        "providerStoreId":"owned-codex-recovery-store",
+        "providerStoreId":format!("owned-{provider}-recovery-store"),
     }))
     .unwrap();
     let actor = FreshAgentHostActor::open(
@@ -194,7 +207,9 @@ async fn fixture() -> (
     .unwrap();
     *state.fresh_agent.lock().await = Some(actor.clone());
     let before = state.persisted.lock().await.clone();
-    assert!(current_native_observation(&state, &before).await.is_some());
+    if provider == "codex" {
+        assert!(current_native_observation(&state, &before).await.is_some());
+    }
     (state, actor, transport)
 }
 
@@ -243,6 +258,46 @@ async fn ended_codex_send_commits_native_transition_before_reply() {
     assert_eq!(
         persisted.native_identity_launch.unwrap().evidence_revision,
         8
+    );
+    actor.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn accepted_claude_send_does_not_commit_codex_native_root_transition() {
+    let (state, actor, transport) = fixture_for_provider("claude").await;
+    let launch_before = state
+        .persisted
+        .lock()
+        .await
+        .native_identity_launch
+        .clone()
+        .unwrap();
+    let result = dispatch(
+        tests::authenticated_host_envelope(
+            &state,
+            HostCommand::FreshAgentSend {
+                incarnation_id: state.incarnation_id.clone(),
+                request_id: RequestId::new(),
+                text: "the original native recovery input".into(),
+                settings: None,
+                checkpoint_logical_attempt_id: None,
+                codex_dispatch_recovery_source: None,
+                receipt_only: false,
+            },
+        ),
+        &state,
+    )
+    .await;
+    assert!(
+        matches!(result, Ok(HostResult::FreshAgentCommand { .. })),
+        "the accepted Claude send should complete without Codex root-transition work: {result:?}"
+    );
+    assert_eq!(transport.accepted_turns.load(Ordering::SeqCst), 1);
+    let persisted = state.persisted.lock().await.clone();
+    assert_eq!(
+        persisted.native_identity_launch,
+        Some(launch_before),
+        "an accepted Claude send must not persist a Codex native-root transition"
     );
     actor.stop().await.unwrap();
 }

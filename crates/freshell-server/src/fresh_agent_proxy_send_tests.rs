@@ -134,7 +134,7 @@ async fn receipt_reconcile_bypasses_checkpoint_barrier_and_stale_admission() {
 }
 
 #[tokio::test]
-async fn receipt_reconcile_publishes_correlated_uncertainty_without_a_receipt() {
+async fn codex_receipt_reconcile_publishes_correlated_error_without_a_receipt() {
     use std::time::Duration;
 
     let root = tempfile::tempdir().unwrap();
@@ -215,11 +215,10 @@ async fn receipt_reconcile_publishes_correlated_uncertainty_without_a_receipt() 
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(frame["type"], "freshAgent.event");
-    assert_eq!(frame["event"]["type"], "freshAgent.send.uncertain");
-    assert_eq!(frame["event"]["requestId"], "reconcile-request-2");
-    assert_eq!(frame["event"]["sessionId"], "public-thread");
-    assert!(frame["event"]["message"]
+    assert_eq!(frame["type"], "error");
+    assert_eq!(frame["requestId"], "reconcile-request-2");
+    assert_eq!(frame["code"], "INTERNAL_ERROR");
+    assert!(frame["message"]
         .as_str()
         .unwrap()
         .starts_with("CODEX_DELIVERY_AMBIGUOUS:"));

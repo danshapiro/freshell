@@ -348,6 +348,20 @@ impl HostedFreshAgentProxy {
         request_id: Option<&str>,
         message: &str,
     ) {
+        if *provider == AgentProvider::Codex {
+            // Codex ambiguity is consumed from the correlated top-level error
+            // frame by the client. The additive nested event is for providers
+            // whose legacy send path has no typed error response.
+            self.send_error(
+                provider,
+                session_id,
+                session_type,
+                request_id,
+                "MANAGED_FRESH_AGENT_ERROR",
+                message,
+            );
+            return;
+        }
         tracing::warn!(
             provider = %provider_wire(provider),
             session_id,

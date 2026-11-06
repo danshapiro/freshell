@@ -640,6 +640,14 @@ pub struct HandshakeCapabilities {
     pub session_index_ready_v1: bool,
 }
 
+fn can_negotiate_fresh_agent_send_reconcile(
+    client_opted_in: bool,
+    managed_runtime_available: bool,
+    hosted_gateway_available: bool,
+) -> bool {
+    client_opted_in && managed_runtime_available && hosted_gateway_available
+}
+
 /// [`build_handshake`], parameterized on the connection's negotiated
 /// `hello.capabilities.paneReconcileV1` (reconciliation design §4.2): the
 /// `ready.capabilities` advertisement is emitted **only when the client's
@@ -670,8 +678,11 @@ pub async fn build_handshake_with_capabilities(
         fresh_agent_attention_replay_v1,
         session_index_ready_v1,
     } = capabilities;
-    let fresh_agent_send_reconcile_v1 =
-        requested_fresh_agent_send_reconcile_v1 && managed_runtime_v1;
+    let fresh_agent_send_reconcile_v1 = can_negotiate_fresh_agent_send_reconcile(
+        requested_fresh_agent_send_reconcile_v1,
+        managed_runtime_v1,
+        hosted_fresh_agent::installed_gateway().is_some(),
+    );
     let boot_id = state.boot_id.as_ref().clone();
     let fresh_agent_attention = if fresh_agent_attention_replay_v1 {
         let mut marks = state.fresh_claude.attention_marks();
@@ -1018,12 +1029,15 @@ async fn handle_socket(
     // Receipt-only send reconciliation depends on managed-runtime journal and
     // host receipt ownership. A client opt-in alone never acknowledges or
     // enables it.
-    let fresh_agent_send_reconcile_v1 = managed_runtime_v1
-        && value
+    let fresh_agent_send_reconcile_v1 = can_negotiate_fresh_agent_send_reconcile(
+        value
             .get("capabilities")
             .and_then(|caps| caps.get("freshAgentSendReconcileV1"))
             .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+            .unwrap_or(false),
+        managed_runtime_v1,
+        hosted_fresh_agent::installed_gateway().is_some(),
+    );
 
     let fresh_agent_attention_replay_v1 = value
         .get("capabilities")
@@ -1474,11 +1488,25 @@ mod tests {
         let ready = serde_json::to_value(&both[0]).unwrap();
         assert_eq!(
             ready["capabilities"],
-            serde_json::json!({
-                "managedRuntimeV1": true,
-                "freshAgentSendReconcileV1": true
-            })
+            serde_json::json!({ "managedRuntimeV1": true }),
+            "a managed controller without the hosted gateway must not advertise receipt reconciliation"
         );
+    }
+
+    #[test]
+    fn receipt_reconcile_negotiation_requires_client_runtime_and_gateway() {
+        for (client, managed, gateway, expected) in [
+            (false, true, true, false),
+            (true, false, true, false),
+            (true, true, false, false),
+            (true, true, true, true),
+        ] {
+            assert_eq!(
+                can_negotiate_fresh_agent_send_reconcile(client, managed, gateway),
+                expected,
+                "client={client}, managed={managed}, gateway={gateway}"
+            );
+        }
     }
 
     #[tokio::test]

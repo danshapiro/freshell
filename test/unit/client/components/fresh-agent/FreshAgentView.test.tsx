@@ -22105,10 +22105,21 @@ describe('task6 hosted recovery in the mounted view', () => {
         type: 'freshAgent.send.reconcile',
       })
 
+      if (!reportedAmbiguity) {
+        act(() => {
+          for (const handler of [...handlers]) handler({
+            type: 'error', code: 'INTERNAL_ERROR', requestId: originalFrame.requestId,
+            message: 'CODEX_DELIVERY_AMBIGUOUS: native response was lost',
+          })
+        })
+        await waitFor(() => expect(screen.getByRole('alert', { name: 'Agent warning' }))
+          .toHaveTextContent('Delivery is uncertain'))
+      }
+
       act(() => {
         const accepted = {
           type: 'freshAgent.send.accepted', ...locator,
-          requestId: originalFrame.requestId, submittedTurnId: 'receipt-replayed-turn',
+          requestId: originalFrame.requestId,
         }
         handleFreshAgentMessage(store.dispatch, accepted as never)
         for (const handler of [...handlers]) handler(accepted)
