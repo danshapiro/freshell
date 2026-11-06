@@ -455,7 +455,7 @@ impl Supervisor {
                     {
                         match host_observation {
                             Ok((host, status)) => {
-                                let retained_owner_valid = if host.is_retained_v1() {
+                                let retained_owner_valid = if host.is_retained_v1() && !status.exited {
                                     match supervisor
                                         .verify_retained_terminal_owner_status(
                                             &handle, &host, &status,
@@ -652,6 +652,10 @@ mod tests {
 
     impl ObserverFixture {
         async fn new(fresh: bool) -> Self {
+            Self::with_host(fresh, false, false).await
+        }
+
+        async fn with_host(fresh: bool, retained_v1_host: bool, host_exited: bool) -> Self {
             let root = Arc::new(tempfile::tempdir().unwrap());
             let registry = Registry::open(root.path().join("registry"), None).unwrap();
             let soul = SoulId::new();
@@ -759,16 +763,23 @@ mod tests {
                         let result = match request.body {
                             HostCommand::Hello { incarnation_id, challenge } => {
                                 assert_eq!(incarnation_id, launch.incarnation_id);
-                                Ok(HostResult::Hello {
-                                    proof: host_proof(b"synthetic-secret", &challenge, &boot, &incarnation_id),
-                                    host_boot_id: boot.clone(),
-                                    capabilities: vec![
-                                        "owned-provider-config-v1".into(),
-                                        "provider-store-probe-v1".into(),
-                                        "native-identity-observation-v1".into(),
-                                    ],
-                                    effective_limits: context.requested_limits,
-                                })
+                                if retained_v1_host && request.protocol_version != 1 {
+                                    Err(RuntimeError::new(
+                                        RuntimeErrorCode::ProtocolVersionMismatch,
+                                        "synthetic retained-v1 host",
+                                    ))
+                                } else {
+                                    Ok(HostResult::Hello {
+                                        proof: host_proof(b"synthetic-secret", &challenge, &boot, &incarnation_id),
+                                        host_boot_id: boot.clone(),
+                                        capabilities: vec![
+                                            "owned-provider-config-v1".into(),
+                                            "provider-store-probe-v1".into(),
+                                            "native-identity-observation-v1".into(),
+                                        ],
+                                        effective_limits: context.requested_limits,
+                                    })
+                                }
                             }
                             HostCommand::Status { incarnation_id } => {
                                 if hold_status.swap(false, Ordering::SeqCst) {
@@ -779,7 +790,7 @@ mod tests {
                                 Ok(HostResult::Status { fresh_agent_recovery_source: None,
                                     host_boot_id: boot.clone(), worker_pid: Some(42), worker_launch_count: 1,
                                     max_control_epoch: registry.control_epoch(), max_execution_generation: 1,
-                                    fixture_evidence: serde_json::json!({}), exited: false,
+                                    fixture_evidence: serde_json::json!({}), exited: host_exited,
                                     native_session_id: Some("observer-root".into()),
                                     native_identity_observation: Some(NativeIdentityObservation {
                                         native_session_id: "observer-root".into(),
@@ -911,6 +922,35 @@ mod tests {
                 Some(saved)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn observer_classifies_exited_retained_v1_terminal_as_provider_exit() {
+        let fixture = ObserverFixture::with_host(false, true, true).await;
+
+        fixture.observe().await;
+
+        let events: Vec<serde_json::Value> =
+            std::fs::read_to_string(fixture.root.path().join("lifecycle.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert!(
+            !events.iter().any(|event| {
+                event["event"] == "supervisor.runtime_observer.retained_owner_changed"
+                    && event["data"]["soulId"] == fixture.soul.as_str()
+            }),
+            "an exited worker is not an ownership mismatch: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| {
+                event["event"] == "supervisor.runtime_observer.recovery_scheduled"
+                    && event["data"]["soulId"] == fixture.soul.as_str()
+                    && event["data"]["trigger"] == "provider_exit"
+            }),
+            "the confirmed exit must follow the provider-exit recovery path: {events:?}"
+        );
     }
 
     #[tokio::test]

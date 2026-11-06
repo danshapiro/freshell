@@ -2471,6 +2471,9 @@ impl Supervisor {
                         || context.provider == "shell"
                         || current_fixture_native_session(context, &status).is_some()
                         || retained_status_observed(context, &host, &status);
+                    let retained_codex_actor_eligible = self
+                        .retained_codex_host_eligible(context, &host, &status)
+                        .await?;
                     if let Some(native_session_id) = status
                         .native_session_id
                         .as_ref()
@@ -2491,16 +2494,11 @@ impl Supervisor {
                             context.evidence_revision += 1;
                         }
                     }
-                    if self
-                        .retained_codex_host_eligible(context, &host, &status)
-                        .await?
-                    {
-                        return Ok(live_reattach_probe(
-                            context,
-                            &status,
-                            CONTROL_PROTOCOL_VERSION,
-                        ));
-                    }
+                    // A retained actor proves who owned the native session,
+                    // but it does not prove that the exact native history is
+                    // still present. Keep the host attached while classifying
+                    // the actor, then require the exact store probe below
+                    // before reporting the session as reattachable.
                     if !status.exited {
                         if !native_observation_qualified
                             && context.provider != "shell"
@@ -2565,6 +2563,17 @@ impl Supervisor {
                             "probe": store_probe,
                         }),
                     );
+                    if retained_codex_actor_eligible
+                        && matches!(&store_probe, RecoveryProbe::ResumeReady { .. })
+                    {
+                        // The retained actor is safe to reattach only after
+                        // its exact native root has passed a fresh store read.
+                        return Ok(live_reattach_probe(
+                            context,
+                            &status,
+                            CONTROL_PROTOCOL_VERSION,
+                        ));
+                    }
                     // A loader may emit its native root before later restoration
                     // fails. Re-read the current child after the independent store
                     // read, then persist only that still-live current observation.

@@ -89,7 +89,9 @@ struct ControlledCodex {
     inputs: Arc<AtomicUsize>,
     native_prepares: Arc<AtomicUsize>,
     recovery_probes: Arc<AtomicUsize>,
+    recovery_probe_blocked: Arc<AtomicBool>,
     prepares: Arc<AtomicUsize>,
+    same_root_prepares: Arc<AtomicUsize>,
     compacts: Arc<AtomicUsize>,
     resolves: Arc<AtomicUsize>,
     statuses: Arc<AtomicUsize>,
@@ -100,6 +102,7 @@ struct ControlledCodex {
     worker: Arc<AtomicBool>,
     capability: Arc<AtomicBool>,
     same_root_capability: Arc<AtomicBool>,
+    native_observation_missing: Arc<AtomicBool>,
     readiness_root_change: Arc<AtomicBool>,
     readiness_receipt: Arc<std::sync::Mutex<Option<NativeReadinessReceipt>>>,
     bad_ack: Arc<AtomicBool>,
@@ -196,7 +199,9 @@ impl ControlledCodex {
         let inputs = Arc::new(AtomicUsize::new(0));
         let native_prepares = Arc::new(AtomicUsize::new(0));
         let recovery_probes = Arc::new(AtomicUsize::new(0));
+        let recovery_probe_blocked = Arc::new(AtomicBool::new(false));
         let prepares = Arc::new(AtomicUsize::new(0));
+        let same_root_prepares = Arc::new(AtomicUsize::new(0));
         let compacts = Arc::new(AtomicUsize::new(0));
         let resolves = Arc::new(AtomicUsize::new(0));
         let statuses = Arc::new(AtomicUsize::new(0));
@@ -207,6 +212,7 @@ impl ControlledCodex {
         let worker = Arc::new(AtomicBool::new(true));
         let capability = Arc::new(AtomicBool::new(true));
         let same_root_capability = Arc::new(AtomicBool::new(true));
+        let native_observation_missing = Arc::new(AtomicBool::new(false));
         let readiness_root_change = Arc::new(AtomicBool::new(false));
         let readiness_receipt = Arc::new(std::sync::Mutex::new(None));
         let bad_ack = Arc::new(AtomicBool::new(false));
@@ -220,7 +226,9 @@ impl ControlledCodex {
             let inputs = inputs.clone();
             let native_prepares = native_prepares.clone();
             let recovery_probes = recovery_probes.clone();
+            let recovery_probe_blocked = recovery_probe_blocked.clone();
             let prepares = prepares.clone();
+            let same_root_prepares = same_root_prepares.clone();
             let compacts = compacts.clone();
             let resolves = resolves.clone();
             let statuses = statuses.clone();
@@ -231,6 +239,7 @@ impl ControlledCodex {
             let worker = worker.clone();
             let capability = capability.clone();
             let same_root_capability = same_root_capability.clone();
+            let native_observation_missing = native_observation_missing.clone();
             let readiness_root_change = readiness_root_change.clone();
             let readiness_receipt = readiness_receipt.clone();
             let bad_ack = bad_ack.clone();
@@ -245,7 +254,9 @@ impl ControlledCodex {
                     let inputs = inputs.clone();
                     let native_prepares = native_prepares.clone();
                     let recovery_probes = recovery_probes.clone();
+                    let recovery_probe_blocked = recovery_probe_blocked.clone();
                     let prepares = prepares.clone();
+                    let same_root_prepares = same_root_prepares.clone();
                     let compacts = compacts.clone();
                     let resolves = resolves.clone();
                     let statuses = statuses.clone();
@@ -258,6 +269,7 @@ impl ControlledCodex {
                     let worker = worker.clone();
                     let capability = capability.clone();
                     let same_root_capability = same_root_capability.clone();
+                    let native_observation_missing = native_observation_missing.clone();
                     let readiness_root_change = readiness_root_change.clone();
                     let readiness_receipt = readiness_receipt.clone();
                     let bad_ack = bad_ack.clone();
@@ -330,7 +342,9 @@ impl ControlledCodex {
                                     exited: ended,
                                     native_session_id: (!ended)
                                         .then(|| observation.native_session_id.clone()),
-                                    native_identity_observation: (!ended).then_some(observation),
+                                    native_identity_observation: (!ended
+                                        && !native_observation_missing.load(Ordering::SeqCst))
+                                    .then_some(observation),
                                     native_readiness_receipt: readiness_receipt
                                         .lock()
                                         .unwrap()
@@ -431,7 +445,9 @@ impl ControlledCodex {
                                 }
                             }
                             HostCommand::FreshAgentPrepareSameRootNative { .. } => {
+                                same_root_prepares.fetch_add(1, Ordering::SeqCst);
                                 prepares.fetch_add(1, Ordering::SeqCst);
+                                native_observation_missing.store(false, Ordering::SeqCst);
                                 if prepare_refuse.load(Ordering::SeqCst) {
                                     write_frame(
                                         &mut socket,
@@ -493,12 +509,24 @@ impl ControlledCodex {
                                 ..
                             } => {
                                 recovery_probes.fetch_add(1, Ordering::SeqCst);
-                                HostResult::RecoveryProbe(
+                                let probe = if recovery_probe_blocked.load(Ordering::SeqCst) {
+                                    freshell_runtime_protocol::RecoveryProbe::Blocked {
+                                        path: freshell_runtime_protocol::RecoveryPath::NativeResume,
+                                        reason: freshell_runtime_protocol::RecoveryBlockReason::ImplementationUnavailable,
+                                        retry_hint: freshell_runtime_protocol::RetryHint {
+                                            automatic_after_ms: None,
+                                            manual_retry: true,
+                                            repair: None,
+                                        },
+                                        evidence: vec!["exact native history is unavailable".into()],
+                                    }
+                                } else {
                                     freshell_runtime_protocol::RecoveryProbe::ResumeReady {
                                         evidence_revision: resume_spec.evidence_revision,
                                         resume_spec,
-                                    },
-                                )
+                                    }
+                                };
+                                HostResult::RecoveryProbe(probe)
                             }
                             HostCommand::Stop { .. } => HostResult::Stopped,
                             other => panic!("unexpected controlled Codex command {other:?}"),
@@ -550,7 +578,9 @@ impl ControlledCodex {
             inputs,
             native_prepares,
             recovery_probes,
+            recovery_probe_blocked,
             prepares,
+            same_root_prepares,
             compacts,
             resolves,
             statuses,
@@ -561,6 +591,7 @@ impl ControlledCodex {
             worker,
             capability,
             same_root_capability,
+            native_observation_missing,
             readiness_root_change,
             readiness_receipt,
             bad_ack,
@@ -831,6 +862,68 @@ async fn public_compact_prepares_retained_codex_same_root_without_input_or_repla
 }
 
 #[tokio::test]
+async fn retained_codex_native_exit_requires_a_fresh_store_probe_before_reattaching() {
+    let fixture = ControlledCodex::new().await;
+    fixture.recovery_probe_blocked.store(true, Ordering::SeqCst);
+
+    let probe = fixture
+        .supervisor
+        .probe_recovery_locked(fixture.soul.clone())
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            probe,
+            freshell_runtime_protocol::RecoveryProbe::Blocked {
+                reason: freshell_runtime_protocol::RecoveryBlockReason::ImplementationUnavailable,
+                ..
+            }
+        ),
+        "an in-memory retained actor cannot prove its archived native history still exists: {probe:?}"
+    );
+    assert_eq!(
+        fixture.recovery_probes.load(Ordering::SeqCst),
+        1,
+        "reattachment must be gated on a fresh exact native-store probe"
+    );
+    fixture.assert_retained().await;
+}
+
+#[tokio::test]
+async fn public_compact_prepares_live_codex_same_root_when_current_proof_is_missing() {
+    let fixture = ControlledCodex::new().await;
+    fixture.exited.store(false, Ordering::SeqCst);
+    fixture
+        .native_observation_missing
+        .store(true, Ordering::SeqCst);
+
+    assert!(matches!(
+        fixture.compact().await.unwrap(),
+        AdminResult::FreshAgentCommand {
+            state: CommandState::ProviderAcked
+        }
+    ));
+
+    assert_eq!(fixture.same_root_prepares.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.native_prepares.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.inputs.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.compacts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture
+            .supervisor
+            .registry
+            .recovery_context(fixture.soul.clone())
+            .await
+            .unwrap()
+            .native_session_id
+            .as_deref(),
+        Some("native-parent"),
+        "live same-root readiness must preserve the current Codex identity"
+    );
+}
+
+#[tokio::test]
 async fn public_compact_uses_exact_store_readiness_without_same_root_support() {
     let fixture = ControlledCodex::new().await;
     fixture.same_root_capability.store(false, Ordering::SeqCst);
@@ -1091,6 +1184,7 @@ async fn manual_retry_classifies_blocked_codex_when_readiness_fails_without_a_pe
         )
         .await
         .unwrap();
+    let native_prepares_before = fixture.native_prepares.load(Ordering::SeqCst);
     fixture.native_prepare_refuse.store(true, Ordering::SeqCst);
 
     let result = fixture
@@ -1111,10 +1205,17 @@ async fn manual_retry_classifies_blocked_codex_when_readiness_fails_without_a_pe
         .await
         .unwrap();
     assert_eq!(after.intent_revision, before.intent_revision + 1);
-    assert_eq!(fixture.native_prepares.load(Ordering::SeqCst), 1);
+    assert!(
+        fixture.native_prepares.load(Ordering::SeqCst) > native_prepares_before,
+        "manual retry must perform a readiness attempt beyond fixture setup"
+    );
     assert_eq!(after.recovery_state, RecoveryState::Live, "{result:?}");
     assert_eq!(result.outcome, RecoveryOutcome::Reattached, "{result:?}");
-    assert_eq!(fixture.recovery_probes.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture.recovery_probes.load(Ordering::SeqCst),
+        2,
+        "manual readiness preflight and normal recovery each require an exact store read"
+    );
 }
 
 #[tokio::test]

@@ -1873,7 +1873,7 @@ tool_timeout_sec = 120
           return undefined
         }, 150_000)
       } catch (error) {
-        const diagnostic = { ...coldRecoveryDiagnostics(), wait: coldRecoveryWaitDiagnostics() }
+        const diagnostic = coldRecoveryDiagnostics()
         try { rig.runtime.writeIncident('freshcodex-managed-native-cold-recovery-failed', diagnostic) } catch { /* Preserve the recovery failure. */ }
         throw new Error(`cold Codex host recovery did not settle: ${error instanceof Error ? error.message : String(error)}; ${JSON.stringify(diagnostic)}`)
       }

@@ -3015,7 +3015,7 @@ impl Supervisor {
         };
         let codex_same_root_prepare = admission == FreshNativeAdmission::CodexCompactReadiness
             && supports_codex_same_root_readiness
-            && retained_codex;
+            && (!status.exited || retained_codex);
         if readiness_needed && can_prepare_claude {
             let before = current.write_fence();
             let expected_launch = current
