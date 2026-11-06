@@ -136,7 +136,7 @@ import { asyncQuestionKey, asyncQuestionDraftPrefix, asyncQuestionKeysInText, fo
 import FreshAgentElicitationBanner from './FreshAgentElicitationBanner.js'
 import { FreshAgentTranscript, type FreshAgentTranscriptHandle, type FreshAgentTranscriptProps } from './FreshAgentTranscript'
 import { mergeFreshAgentTranscriptProjection, readTranscriptProjection } from '@/lib/fresh-agent-transcript-projection'
-import { acceptsTranscriptProjectionSnapshot, codexSnapshotSourceRevision, transcriptProjectionSnapshotReceived } from '@/store/freshAgentLiveSlice'
+import { acceptsTranscriptProjectionSnapshot, codexSnapshotRouteRevision, codexSnapshotSourceRevision, transcriptProjectionSnapshotReceived } from '@/store/freshAgentLiveSlice'
 import { FreshAgentLiveTail, liveTailShowsContent } from './FreshAgentLiveTail'
 import { useTranscriptLandings } from './useTranscriptLandings'
 import { landedTranscriptOf } from '@/lib/fresh-agent-landed-transcript'
@@ -1886,8 +1886,10 @@ export function FreshAgentView({
     : undefined
   const codexSnapshotRevision = useAppSelector((state) => codexSnapshotKey
     ? codexSnapshotSourceRevision(state.freshAgentLive, codexSnapshotKey) : undefined)
+  const previousCodexReadRevisionRef = useRef({ key: codexSnapshotKey, revision: codexSnapshotRevision })
+  const deferredCodexReadKeyRef = useRef<string | undefined>()
   const codexSourceRevision = useAppSelector((state) => codexSnapshotKey
-    ? state.freshAgentLive?.snapshotSourceRevisionBySession?.[codexSnapshotKey] ?? 0 : undefined)
+    ? codexSnapshotRouteRevision(state.freshAgentLive, codexSnapshotKey) : undefined)
   const codexExpectedNative = useAppSelector((state) => codexSnapshotKey
     ? state.freshAgentLive?.bySession[codexSnapshotKey]?.awaitingNativeSessionId
       ?? state.freshAgentLive?.announcedNativeBySession?.[codexSnapshotKey] : undefined)
@@ -3643,6 +3645,19 @@ export function FreshAgentView({
   }, [agentSession?.cwd, appStore, captureFreshAgentAttachmentAttempt, clearReserveRedrive, commitSnapshot, descriptor?.label, dispatch, markSnapshotDirty, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, redriveAfterSessionReserved, releasePendingRebind, requestRevealRefresh, requestSnapshotRefresh, resendPendingMessage, sendFencedFreshAgentAttach, sendFreshAgentMessage, setLocalEcho, tabId, ws])
 
   useEffect(() => {
+    const previousCodexRead = previousCodexReadRevisionRef.current
+    previousCodexReadRevisionRef.current = { key: codexSnapshotKey, revision: codexSnapshotRevision }
+    const changedCodexSource = Boolean(codexSnapshotKey && previousCodexRead.key === codexSnapshotKey
+      && previousCodexRead.revision !== codexSnapshotRevision)
+    if (hiddenRef.current && codexSnapshotKey
+      && (changedCodexSource || deferredCodexReadKeyRef.current === codexSnapshotKey)) {
+      if (deferredCodexReadKeyRef.current !== codexSnapshotKey) markSnapshotDirty('reconnect')
+      deferredCodexReadKeyRef.current = codexSnapshotKey
+      pendingRevealRefreshRef.current = true
+      recordSnapshotAudit('effect_skipped', () => ({ reason: 'hidden_source_change' }))
+      return
+    }
+    deferredCodexReadKeyRef.current = undefined
     if (!snapshotThreadId) {
       recordSnapshotAudit('effect_skipped', () => ({ reason: 'no_thread' }))
       return
@@ -4293,12 +4308,14 @@ export function FreshAgentView({
     agentSession?.lost,
     managedLostStatusVersion,
     managedCodexNativeId,
+    codexSnapshotKey,
     codexSnapshotRevision,
     appStore,
     captureFreshAgentAttachmentAttempt,
     claudeSession,
     isRestoring,
     isPaneBusyNow,
+    markSnapshotDirty,
     dispatch,
     paneContent.provider,
     paneContent.soulId,

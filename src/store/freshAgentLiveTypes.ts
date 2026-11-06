@@ -119,6 +119,8 @@ export type FreshAgentLiveState = {
   announcedNativeBySession: Record<string, string>
   /** In-flight snapshot reads cannot cross an observed source or connection change. */
   snapshotSourceRevisionBySession: Record<string, number>
+  /** Partial session removals invalidate all matching route types. */
+  snapshotRemovalRevisionBySessionId: Record<string, number>
   snapshotConnectionRevision: number
   noticeSeq: number
   /**

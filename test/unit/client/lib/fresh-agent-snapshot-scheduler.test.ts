@@ -122,6 +122,75 @@ describe('FreshAgentSnapshotScheduler', () => {
     expect(scheduler.getBackoffUntil(KEY)).toBeNull()
   })
 
+  it('retires settled successful generations while retaining active and trailing work', async () => {
+    const scheduler = getSnapshotScheduler()
+    // Inspect the existing runtime state to verify the resource lifecycle;
+    // its public outcomes alone cannot distinguish an idle entry from none.
+    const cohorts = (scheduler as unknown as { keys: Map<string, unknown> }).keys
+    for (let generation = 0; generation < 20; generation += 1) {
+      const key = `${KEY}:generation:${generation}`
+      await expect(scheduler.schedule(key, 'manual', async () => generation)).resolves.toEqual({ status: 'ok', value: generation })
+    }
+    expect(cohorts.size).toBe(0)
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const run = vi.fn(async () => { await gate; return 'current' })
+    const first = scheduler.schedule(KEY, 'manual', run)
+    const trailing = scheduler.schedule(KEY, 'event', run)
+    expect(cohorts.size).toBe(1)
+    release()
+    await first
+    expect(cohorts.size).toBe(1)
+    await vi.advanceTimersByTimeAsync(250)
+    await expect(trailing).resolves.toEqual({ status: 'ok', value: 'current' })
+    expect(run).toHaveBeenCalledTimes(2)
+    expect(cohorts.size).toBe(0)
+  })
+
+  it('retains 429 history through an ordinary failure until a successful retry', async () => {
+    const scheduler = getSnapshotScheduler()
+    const cohorts = (scheduler as unknown as { keys: Map<string, unknown> }).keys
+    const rateLimit = async () => { throw new ApiError(429, 'Too many requests') }
+    const first = await scheduler.schedule(KEY, 'manual', rateLimit)
+    if (first.status !== 'rate-limited') throw new Error('expected rate limit')
+    const firstDelay = first.retryAtMs - Date.now()
+    const suppressed = vi.fn(async () => 'unexpected')
+    expect((await scheduler.schedule(KEY, 'manual', suppressed)).status).toBe('backoff')
+    expect(suppressed).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(firstDelay + 1)
+    expect((await scheduler.schedule(KEY, 'manual', async () => { throw new Error('offline') })).status).toBe('error')
+    expect(cohorts.size).toBe(1)
+    const second = await scheduler.schedule(KEY, 'manual', rateLimit)
+    if (second.status !== 'rate-limited') throw new Error('expected second rate limit')
+    expect(second.retryAtMs - Date.now()).toBeGreaterThan(firstDelay)
+    await vi.advanceTimersByTimeAsync(second.retryAtMs - Date.now() + 1)
+    expect((await scheduler.schedule(KEY, 'manual', async () => 'recovered')).status).toBe('ok')
+    expect(cohorts.size).toBe(0)
+    const afterSuccess = await scheduler.schedule(KEY, 'manual', rateLimit)
+    if (afterSuccess.status !== 'rate-limited') throw new Error('expected rate limit after success')
+    expect(afterSuccess.retryAtMs - Date.now()).toBe(firstDelay)
+  })
+
+  it('does not let an old completion retire a replacement in-flight cohort', async () => {
+    const scheduler = getSnapshotScheduler()
+    let releaseOld!: () => void
+    let releaseCurrent!: () => void
+    const oldGate = new Promise<void>((resolve) => { releaseOld = resolve })
+    const currentGate = new Promise<void>((resolve) => { releaseCurrent = resolve })
+    const old = scheduler.schedule(KEY, 'manual', async () => { await oldGate; return 'old' })
+    scheduler.disposeForTests()
+    const run = vi.fn(async () => { await currentGate; return 'current' })
+    const current = scheduler.schedule(KEY, 'manual', run)
+    releaseOld()
+    await expect(old).resolves.toEqual({ status: 'ok', value: 'old' })
+    const trailing = scheduler.schedule(KEY, 'event', run)
+    releaseCurrent()
+    await expect(current).resolves.toEqual({ status: 'ok', value: 'current' })
+    await vi.advanceTimersByTimeAsync(250)
+    await expect(trailing).resolves.toEqual({ status: 'ok', value: 'current' })
+    expect(run).toHaveBeenCalledTimes(2)
+  })
+
   it('reset cancels pending debounced runs so a stale run cannot fire into the next test', async () => {
     const scheduler = getSnapshotScheduler()
     const run = vi.fn(async () => 'snap')

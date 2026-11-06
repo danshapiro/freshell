@@ -28,6 +28,7 @@ const initialState: FreshAgentLiveState = {
   bySession: {},
   announcedNativeBySession: {},
   snapshotSourceRevisionBySession: {},
+  snapshotRemovalRevisionBySessionId: {},
   snapshotConnectionRevision: 0,
   noticeSeq: 0,
   viewers: {},
@@ -59,8 +60,12 @@ function advanceSnapshotSourceRevision(state: FreshAgentLiveState, key: string):
   state.snapshotSourceRevisionBySession[key] = (state.snapshotSourceRevisionBySession[key] ?? 0) + 1
 }
 
+export function codexSnapshotRouteRevision(state: FreshAgentLiveState | undefined, key: string): string {
+  return `${state?.snapshotSourceRevisionBySession?.[key] ?? 0}:${state?.snapshotRemovalRevisionBySessionId?.[sessionIdOfKey(key)] ?? 0}`
+}
+
 export function codexSnapshotSourceRevision(state: FreshAgentLiveState | undefined, key: string): string {
-  return `${state?.snapshotConnectionRevision ?? 0}:${state?.snapshotSourceRevisionBySession?.[key] ?? 0}`
+  return `${state?.snapshotConnectionRevision ?? 0}:${codexSnapshotRouteRevision(state, key)}`
 }
 
 function retireRetainedSource(session: FreshAgentLiveSession, uncertain = false): void {
@@ -73,8 +78,10 @@ function retireRetainedSource(session: FreshAgentLiveSession, uncertain = false)
   delete session.retainedSnapshot
 }
 
-function retireLiveProjection(session: FreshAgentLiveSession, nextNativeSessionId?: string): void {
-  const uncertain = !session.projectionNativeSessionId
+function retireLiveProjection(session: FreshAgentLiveSession, nextNativeSessionId?: string, observedSourceChange = false): void {
+  // A proven incarnation boundary retires even an unidentified projection:
+  // a same-native announcement cannot identify which incarnation produced it.
+  const uncertain = !observedSourceChange && !session.projectionNativeSessionId
   const sameSource = Boolean(nextNativeSessionId && session.projectionNativeSessionId === nextNativeSessionId)
   if (session.projection) {
     if (!sameSource) {
@@ -278,7 +285,10 @@ const freshAgentLiveSlice = createSlice({
   initialState,
   reducers: {
     snapshotSourceChanged(state, action: PayloadAction<FreshAgentSessionLocator>) {
-      advanceSnapshotSourceRevision(state, makeFreshAgentSessionKey(action.payload))
+      const key = makeFreshAgentSessionKey(action.payload)
+      advanceSnapshotSourceRevision(state, key)
+      const session = state.bySession[key]
+      if (session) retireLiveProjection(session, undefined, true)
     },
     nativeProjectionRetired(state, action: PayloadAction<FreshAgentSessionLocator & { awaitingNativeSessionId: string }>) {
       const { awaitingNativeSessionId, ...locator } = action.payload
@@ -583,6 +593,11 @@ const freshAgentLiveSlice = createSlice({
       .addCase(removeSession, (state, action) => {
         for (const key of tailKeysFor(state, action.payload)) delete state.bySession[key]
         const { sessionId, sessionType, provider } = action.payload
+        if (sessionType && provider) {
+          if (provider === 'codex') advanceSnapshotSourceRevision(state, makeFreshAgentSessionKey({ sessionId, sessionType, provider }))
+        } else {
+          state.snapshotRemovalRevisionBySessionId[sessionId] = (state.snapshotRemovalRevisionBySessionId[sessionId] ?? 0) + 1
+        }
         for (const key of Object.keys(state.announcedNativeBySession)) {
           if (sessionType && provider
             ? key === makeFreshAgentSessionKey({ sessionId, sessionType, provider })

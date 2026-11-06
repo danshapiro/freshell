@@ -4,6 +4,7 @@ import type { AppStore, RootState } from '@/store/store'
 import { addTab, updateTab } from '@/store/tabsSlice'
 import { initLayout, updatePaneContent } from '@/store/panesSlice'
 import { nativeProjectionRetired, snapshotSourceChanged } from '@/store/freshAgentLiveSlice'
+import type { FreshAgentSessionLocator } from '@/store/freshAgentTypes'
 import { memoryWarningSourceChanged } from '@/store/freshAgentSlice'
 import { findPaneContent } from '@/lib/pane-utils'
 import { streamBatcherFor } from '@/lib/fresh-agent-stream-batcher'
@@ -69,9 +70,9 @@ function collectPaneLocations(layouts: RootState['panes']['layouts']): PaneLocat
   return out
 }
 
-function latestSoulViews(snapshot: ManagedRuntimeInventorySnapshot): Map<string, ManagedRuntimeSoul> {
+function latestSoulViews(souls: ManagedRuntimeSoul[]): Map<string, ManagedRuntimeSoul> {
   const latest = new Map<string, ManagedRuntimeSoul>()
-  for (const soul of snapshot.souls) latest.set(soul.soulId, soul)
+  for (const soul of souls) latest.set(soul.soulId, soul)
   return latest
 }
 
@@ -377,7 +378,7 @@ export function buildManagedRuntimeMergePlan(
   snapshot: ManagedRuntimeInventorySnapshot,
   state: LayoutState,
 ): ManagedRuntimeMergePlan {
-  const souls = latestSoulViews(snapshot)
+  const souls = latestSoulViews(snapshot.souls)
   const codexPresentationOwners = new Map<string, string | null>()
   for (const soul of souls.values()) {
     if (soul.provider !== 'codex') continue
@@ -467,9 +468,22 @@ export function buildManagedRuntimeMergePlan(
   return { creates, updates, representedViewCount }
 }
 
+function invalidateCodexSource(
+  store: Pick<AppStore, 'dispatch'>,
+  locator: FreshAgentSessionLocator,
+  invalidated: Set<string>,
+): void {
+  const key = makeFreshAgentSessionKey(locator)
+  if (invalidated.has(key)) return
+  streamBatcherFor(store.dispatch).flush(locator)
+  store.dispatch(snapshotSourceChanged(locator))
+  invalidated.add(key)
+}
+
 export function applyManagedRuntimeMergePlan(
   store: Pick<AppStore, 'dispatch' | 'getState'>,
   plan: ManagedRuntimeMergePlan,
+  invalidatedSources = new Set<string>(),
 ): void {
   for (const update of plan.updates) {
     const layout = store.getState().panes.layouts[update.tabId]
@@ -483,7 +497,7 @@ export function applyManagedRuntimeMergePlan(
       // native ID. Fence reads in every pane, including panes with no soul.
       if (previous.soulId && next.soulId && (previous.soulId !== next.soulId
         || (previous.incarnationId && next.incarnationId && previous.incarnationId !== next.incarnationId))) {
-        store.dispatch(snapshotSourceChanged(locator))
+        invalidateCodexSource(store, locator, invalidatedSources)
       }
       store.dispatch(memoryWarningSourceChanged({ ...locator, nativeSessionId: next.sessionRef.sessionId, soulId: next.soulId }))
       // A public route without a native ref does not identify its source.
@@ -520,6 +534,43 @@ export function applyManagedRuntimeMergePlan(
   }
 }
 
+/** An inventory route is evidence only when exactly one typed soul owns it. */
+function inventoryCodexSource(souls: ManagedRuntimeSoul[], sessionType: string, sessionId: string): ManagedRuntimeSoul | undefined {
+  const matches = souls.filter((soul) =>
+    soul.provider === 'codex'
+    && (!soul.freshAgentSessionType || soul.freshAgentSessionType === sessionType)
+    && (soul.freshAgentSessionId === sessionId || soul.freshAgentPresentationIds?.includes(sessionId)))
+  return matches.length === 1 && matches[0].freshAgentSessionType === sessionType ? matches[0] : undefined
+}
+
+function invalidateChangedInventorySources(
+  store: Pick<AppStore, 'dispatch' | 'getState'>,
+  snapshot: ManagedRuntimeInventorySnapshot,
+): Set<string> {
+  const state = store.getState()
+  const invalidated = new Set<string>()
+  const checked = new Set<string>()
+  const previousSouls = [...latestSoulViews(state.managedRuntime.souls).values()]
+  const nextSouls = [...latestSoulViews(snapshot.souls).values()]
+  for (const { content } of collectPaneLocations(state.panes.layouts)) {
+    if (content.kind !== 'fresh-agent' || content.provider !== 'codex' || !content.sessionId) continue
+    const locator = { sessionId: content.sessionId, sessionType: content.sessionType, provider: content.provider }
+    const key = makeFreshAgentSessionKey(locator)
+    if (checked.has(key)) continue
+    checked.add(key)
+    const previous = inventoryCodexSource(previousSouls, locator.sessionType, locator.sessionId)
+    const next = inventoryCodexSource(nextSouls, locator.sessionType, locator.sessionId)
+    if (!previous || !next) continue
+    const changed = previous.soulId !== next.soulId
+      || Boolean(previous.incarnationId && next.incarnationId && previous.incarnationId !== next.incarnationId)
+      || Boolean(previous.nativeSessionId && next.nativeSessionId && previous.nativeSessionId !== next.nativeSessionId)
+      || Boolean(previous.hostBootId && next.hostBootId && previous.hostBootId !== next.hostBootId)
+    if (!changed) continue
+    invalidateCodexSource(store, locator, invalidated)
+  }
+  return invalidated
+}
+
 let activeRefresh: Promise<void> | null = null
 let queuedReason: string | null = null
 
@@ -535,7 +586,8 @@ async function runManagedRuntimeRefresh(
       const snapshot = await getManagedRuntimeInventory()
       if (snapshot.revision >= store.getState().managedRuntime.revision) {
         const plan = buildManagedRuntimeMergePlan(snapshot, store.getState())
-        applyManagedRuntimeMergePlan(store, plan)
+        const invalidatedSources = invalidateChangedInventorySources(store, snapshot)
+        applyManagedRuntimeMergePlan(store, plan, invalidatedSources)
         store.dispatch(managedRuntimeSnapshotReceived({
           snapshot,
           reconstructedViewCount: plan.representedViewCount,

@@ -152,6 +152,11 @@ export class FreshAgentSnapshotScheduler {
     } else {
       s.trailingRequested = false
     }
+    // Keep 429 history until a successful retry resets it. Ordinary settled
+    // cohorts have no future work and need not survive source generations.
+    if (this.keys.get(key) === s && !s.inFlight && s.debounceTimer === null
+      && !s.pendingRun && s.pendingResolvers.length === 0 && !s.trailingRequested
+      && s.backoffUntil === null && s.consecutive429 === 0) this.keys.delete(key)
   }
 
   /**
