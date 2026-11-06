@@ -289,17 +289,17 @@ impl HostedFreshAgentProxy {
             );
             return;
         };
-        let outcome = match self
+        let resolved_soul = self
             .resolve_soul(&provider, session_type, &session_id)
-            .await
-        {
+            .await;
+        let outcome = match resolved_soul.as_ref() {
             Some(soul) => {
                 let settings = turn_settings(message.settings, message.cwd);
                 let result = self
                     .client
                     .fresh_agent_send_reconcile(
                         request_id,
-                        soul,
+                        soul.clone(),
                         message.text,
                         settings,
                         checkpoint_logical_attempt_id,
@@ -311,11 +311,21 @@ impl HostedFreshAgentProxy {
         };
         match outcome {
             HostedSendOutcome::Accepted => {
+                let receipt_session_id = if let Some(soul) = resolved_soul.as_ref() {
+                    self.presentation_routes
+                        .lock()
+                        .await
+                        .get(soul)
+                        .map(|route| route.session_id.clone())
+                        .unwrap_or_else(|| session_id.clone())
+                } else {
+                    session_id.clone()
+                };
                 self.send(ServerMessage::FreshAgentSendAccepted(
                     FreshAgentSendAccepted {
                         provider: provider_wire(&provider),
                         request_id: public_request_id.to_string(),
-                        session_id,
+                        session_id: receipt_session_id,
                         session_type: session_type_wire(session_type),
                         cwd,
                         submitted_turn_id: None,

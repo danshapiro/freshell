@@ -91,13 +91,18 @@ async fn receipt_reconcile_bypasses_checkpoint_barrier_and_stale_admission() {
         .await
         .unwrap();
     });
+    let soul = SoulId::parse("reconcile-soul").unwrap();
     let (proxy, mut frames) = configure_proxy(
         &socket,
-        HashMap::from([(
-            ("codex".into(), "public-thread".into()),
-            SoulId::parse("reconcile-soul").unwrap(),
-        )]),
+        HashMap::from([(("codex".into(), "public-thread".into()), soul.clone())]),
     );
+    // The original send used the parent ID, but the pane materialized to the
+    // current child route before this receipt-only reconciliation completed.
+    proxy
+        .presentation_routes
+        .lock()
+        .await
+        .insert(soul, PresentationRoute::materialized("materialized-child"));
     let barrier = Arc::new(CheckpointBarrierSpy::default());
     proxy.set_checkpoint_barrier(barrier.clone());
     proxy.set_ownership(Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new()));
@@ -129,7 +134,7 @@ async fn receipt_reconcile_bypasses_checkpoint_barrier_and_stale_admission() {
     .unwrap();
     assert_eq!(frame["type"], "freshAgent.send.accepted");
     assert_eq!(frame["requestId"], "reconcile-request-1");
-    assert_eq!(frame["sessionId"], "public-thread");
+    assert_eq!(frame["sessionId"], "materialized-child");
     assert_eq!(frame["sessionType"], "freshcodex");
 }
 

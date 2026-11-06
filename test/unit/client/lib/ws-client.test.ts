@@ -96,6 +96,7 @@ describe('WsClient.connect', () => {
       paneReconcileV1: true,
       paneReconcileFreshAgentV1: true,
       freshAgentAttentionReplayV1: true,
+      freshAgentSendReconcileV1: true,
       pacedTerminalReplayV1: true,
       terminalLifetimeClaimV1: true,
       managedRuntimeV1: true,
