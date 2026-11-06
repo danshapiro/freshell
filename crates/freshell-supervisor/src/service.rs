@@ -2705,12 +2705,13 @@ impl Supervisor {
         {
             Ok(host) => host,
             Err(error) => {
-                tracing::warn!(
-                    event = "fresh_agent.codex_send_receipt_authentication_failed",
-                    soul_id = %soul_id,
-                    incarnation_id = %recorded_incarnation,
-                    error_code = ?error.code,
-                    "cannot safely reconcile the ambiguous send receipt"
+                self.log_codex_send_receipt_outcome(
+                    soul_id,
+                    request_id,
+                    &recorded_incarnation,
+                    "ambiguous",
+                    "host_authentication_failed",
+                    Some(error.code),
                 );
                 return Ok(false);
             }
@@ -2720,6 +2721,14 @@ impl Supervisor {
             .iter()
             .any(|capability| capability == HOST_CAPABILITY_CODEX_SEND_RECEIPT_V1)
         {
+            self.log_codex_send_receipt_outcome(
+                soul_id,
+                request_id,
+                &recorded_incarnation,
+                "ambiguous",
+                "receipt_capability_unavailable",
+                None,
+            );
             return Ok(false);
         }
         let status = match self
@@ -2728,12 +2737,13 @@ impl Supervisor {
         {
             Ok(status) => status,
             Err(error) => {
-                tracing::warn!(
-                    event = "fresh_agent.codex_send_receipt_status_failed",
-                    soul_id = %soul_id,
-                    incarnation_id = %recorded_incarnation,
-                    error_code = ?error.code,
-                    "cannot safely reconcile the ambiguous send receipt"
+                self.log_codex_send_receipt_outcome(
+                    soul_id,
+                    request_id,
+                    &recorded_incarnation,
+                    "ambiguous",
+                    "host_status_failed",
+                    Some(error.code),
                 );
                 return Ok(false);
             }
@@ -2742,6 +2752,14 @@ impl Supervisor {
             || !source.matches_host(&status.host_boot_id, status.max_execution_generation)
             || status.worker_pid.is_none()
         {
+            self.log_codex_send_receipt_outcome(
+                soul_id,
+                request_id,
+                &recorded_incarnation,
+                "ambiguous",
+                "host_status_not_current_or_worker_unavailable",
+                None,
+            );
             return Ok(false);
         }
 
@@ -2768,39 +2786,121 @@ impl Supervisor {
                 native_session_id: Some(native_session_id),
                 native_identity: Some(identity),
                 ..
-            }) if context.native_session_id.as_deref()
-                == Some(identity.previous_native_session_id.as_str())
-                && native_session_id == identity.native_session_id =>
-            {
-                identity
+            }) => {
+                if context.native_session_id.as_deref()
+                    == Some(identity.previous_native_session_id.as_str())
+                    && native_session_id == identity.native_session_id
+                {
+                    identity
+                } else {
+                    self.log_codex_send_receipt_outcome(
+                        soul_id,
+                        request_id,
+                        &recorded_incarnation,
+                        "ambiguous",
+                        "native_identity_mismatch",
+                        None,
+                    );
+                    return Ok(false);
+                }
             }
-            Ok(HostResult::FreshAgentCommand { .. }) => return Ok(false),
-            Ok(_) => return Ok(false),
-            Err(error) if error.code == RuntimeErrorCode::CommandAmbiguous => return Ok(false),
+            Ok(HostResult::FreshAgentCommand { .. }) => {
+                self.log_codex_send_receipt_outcome(
+                    soul_id,
+                    request_id,
+                    &recorded_incarnation,
+                    "ambiguous",
+                    "receipt_not_accepted_or_missing_identity",
+                    None,
+                );
+                return Ok(false);
+            }
+            Ok(_) => {
+                self.log_codex_send_receipt_outcome(
+                    soul_id,
+                    request_id,
+                    &recorded_incarnation,
+                    "ambiguous",
+                    "unexpected_host_reply",
+                    None,
+                );
+                return Ok(false);
+            }
+            Err(error) if error.code == RuntimeErrorCode::CommandAmbiguous => {
+                self.log_codex_send_receipt_outcome(
+                    soul_id,
+                    request_id,
+                    &recorded_incarnation,
+                    "ambiguous",
+                    "receipt_query_remains_ambiguous",
+                    Some(error.code),
+                );
+                return Ok(false);
+            }
             Err(error) => {
-                tracing::warn!(
-                    event = "fresh_agent.codex_send_receipt_lookup_failed",
-                    soul_id = %soul_id,
-                    incarnation_id = %recorded_incarnation,
-                    error_code = ?error.code,
-                    "host did not return a durable accepted-send receipt"
+                self.log_codex_send_receipt_outcome(
+                    soul_id,
+                    request_id,
+                    &recorded_incarnation,
+                    "ambiguous",
+                    "receipt_lookup_failed",
+                    Some(error.code),
                 );
                 return Ok(false);
             }
         };
 
-        self.registry
+        if let Err(error) = self
+            .registry
             .record_codex_dispatch_recovery_identity(source, identity, request_id.clone())
             .await
-            .map_err(map_registry)?;
-        tracing::info!(
-            event = "fresh_agent.codex_send_receipt_reconciled",
-            soul_id = %soul_id,
-            incarnation_id = %recorded_incarnation,
-            request_id = %request_id,
-            "committed the host's existing Codex send receipt without dispatching again"
+        {
+            self.log_codex_send_receipt_outcome(
+                soul_id,
+                request_id,
+                &recorded_incarnation,
+                "ambiguous",
+                "registry_identity_commit_failed",
+                None,
+            );
+            return Err(map_registry(error));
+        }
+        self.log_codex_send_receipt_outcome(
+            soul_id,
+            request_id,
+            &recorded_incarnation,
+            "reconciled",
+            "accepted_receipt_committed",
+            None,
         );
         Ok(true)
+    }
+
+    fn log_codex_send_receipt_outcome(
+        &self,
+        soul_id: &SoulId,
+        request_id: &RequestId,
+        incarnation_id: &IncarnationId,
+        outcome: &str,
+        reason: &str,
+        error_code: Option<RuntimeErrorCode>,
+    ) {
+        let mut data = serde_json::json!({
+            "severity": if outcome == "reconciled" { "info" } else { "warning" },
+            "soulId": soul_id.as_str(),
+            "requestId": request_id.as_str(),
+            "incarnationId": incarnation_id.as_str(),
+            "outcome": outcome,
+            "reason": reason,
+        });
+        if let Some(error_code) = error_code {
+            data["errorCode"] = serde_json::json!(error_code);
+        }
+        append_event(
+            &self.config.lifecycle_log,
+            "fresh_agent.codex_send_receipt_reconcile",
+            data,
+        );
     }
 
     fn fresh_agent_send<'a>(

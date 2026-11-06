@@ -88,6 +88,7 @@ struct ControlledCodex {
     exited: Arc<AtomicBool>,
     inputs: Arc<AtomicUsize>,
     receipt_queries: Arc<AtomicUsize>,
+    receipt_identity_mismatch: Arc<AtomicBool>,
     lose_send_reply_once: Arc<AtomicBool>,
     native_prepares: Arc<AtomicUsize>,
     recovery_probes: Arc<AtomicUsize>,
@@ -201,6 +202,7 @@ impl ControlledCodex {
         let exited = Arc::new(AtomicBool::new(true));
         let inputs = Arc::new(AtomicUsize::new(0));
         let receipt_queries = Arc::new(AtomicUsize::new(0));
+        let receipt_identity_mismatch = Arc::new(AtomicBool::new(false));
         let lose_send_reply_once = Arc::new(AtomicBool::new(false));
         let send_receipt = Arc::new(std::sync::Mutex::new(
             None::<(RequestId, NativeDispatchIdentity)>,
@@ -234,6 +236,7 @@ impl ControlledCodex {
             let exited = exited.clone();
             let inputs = inputs.clone();
             let receipt_queries = receipt_queries.clone();
+            let receipt_identity_mismatch = receipt_identity_mismatch.clone();
             let lose_send_reply_once = lose_send_reply_once.clone();
             let send_receipt = send_receipt.clone();
             let native_prepares = native_prepares.clone();
@@ -266,6 +269,7 @@ impl ControlledCodex {
                     let exited = exited.clone();
                     let inputs = inputs.clone();
                     let receipt_queries = receipt_queries.clone();
+                    let receipt_identity_mismatch = receipt_identity_mismatch.clone();
                     let lose_send_reply_once = lose_send_reply_once.clone();
                     let send_receipt = send_receipt.clone();
                     let native_prepares = native_prepares.clone();
@@ -410,9 +414,13 @@ impl ControlledCodex {
                                 if receipt_only {
                                     receipt_queries.fetch_add(1, Ordering::SeqCst);
                                     match send_receipt.lock().unwrap().clone() {
-                                        Some((recorded_request, identity))
+                                        Some((recorded_request, mut identity))
                                             if recorded_request == request_id =>
                                         {
+                                            if receipt_identity_mismatch.load(Ordering::SeqCst) {
+                                                identity.previous_native_session_id =
+                                                    "foreign-receipt-source".into();
+                                            }
                                             HostResult::FreshAgentCommand {
                                                 state: CommandState::ProviderAcked,
                                                 claude_fork: None,
@@ -667,6 +675,7 @@ impl ControlledCodex {
             exited,
             inputs,
             receipt_queries,
+            receipt_identity_mismatch,
             lose_send_reply_once,
             native_prepares,
             recovery_probes,
@@ -1391,6 +1400,55 @@ async fn explicit_receipt_reconcile_settles_ambiguous_send_without_dispatching_a
     ));
     assert_eq!(fixture.inputs.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.receipt_queries.load(Ordering::SeqCst), 1);
+    fixture.peer.abort();
+}
+
+#[tokio::test]
+async fn mismatched_receipt_stays_ambiguous_and_records_safe_lifecycle_event() {
+    let fixture = ControlledCodex::new().await;
+    fixture.receipt_capability.store(false, Ordering::SeqCst);
+    fixture.lose_send_reply_once.store(true, Ordering::SeqCst);
+    let request_id = RequestId::parse("receipt-identity-mismatch").unwrap();
+    let checkpoint_logical_attempt_id = Some("logical-attempt-identity-mismatch".to_string());
+    let settings = Some(freshell_runtime_protocol::FreshAgentTurnSettings {
+        cwd: Some(fixture._root.path().to_string_lossy().into_owned()),
+        model: Some("gpt-5-codex".into()),
+        ..Default::default()
+    });
+
+    let original_send_error = fixture
+        .send_with_checkpoint(
+            request_id.clone(),
+            checkpoint_logical_attempt_id.clone(),
+            settings.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(original_send_error.code, RuntimeErrorCode::HostUnreachable);
+    assert_eq!(fixture.inputs.load(Ordering::SeqCst), 1);
+
+    fixture.receipt_capability.store(true, Ordering::SeqCst);
+    fixture
+        .receipt_identity_mismatch
+        .store(true, Ordering::SeqCst);
+    assert!(matches!(
+        fixture
+            .reconcile_send(request_id.clone(), checkpoint_logical_attempt_id, settings)
+            .await
+            .unwrap(),
+        AdminResult::FreshAgentCommand {
+            state: CommandState::Ambiguous
+        }
+    ));
+
+    assert_eq!(fixture.inputs.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.receipt_queries.load(Ordering::SeqCst), 1);
+    let lifecycle = std::fs::read_to_string(&fixture.supervisor.config.lifecycle_log).unwrap();
+    assert!(lifecycle.contains("fresh_agent.codex_send_receipt_reconcile"));
+    assert!(lifecycle.contains("native_identity_mismatch"));
+    assert!(lifecycle.contains(request_id.as_str()));
+    assert!(!lifecycle.contains("original public reference input"));
+    assert!(!lifecycle.contains("gpt-5-codex"));
     fixture.peer.abort();
 }
 
