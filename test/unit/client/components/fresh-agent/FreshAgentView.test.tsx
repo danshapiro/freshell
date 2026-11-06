@@ -1927,11 +1927,11 @@ describe('FreshAgentView', () => {
     })
   }
 
-  async function mountProjectionReviewRoute(name: string, withSoul = true, withNativeRef = false) {
+  async function mountProjectionReviewRoute(name: string, withSoul = true, withNativeRef = false, noSoulPublicId = 'native-b') {
     const { WsClient } = await vi.importActual<typeof import('@/lib/ws-client')>('@/lib/ws-client')
     const client = new WsClient(`ws://${name}.test/ws`)
     const store = createStore()
-    const locator = { sessionId: withSoul ? 'managed-public' : 'native-b', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    const locator = { sessionId: withSoul ? 'managed-public' : noSoulPublicId, sessionType: 'freshcodex' as const, provider: 'codex' as const }
     const initial = createDeferred<unknown>()
     client.onMessage((message) => { handleFreshAgentMessage(store.dispatch, message, client) })
     wsMock.onMessage.mockImplementation((handler) => client.onMessage(handler))
@@ -2499,6 +2499,31 @@ describe('FreshAgentView', () => {
     },
   )
 
+  it('rejects a delayed no-soul A snapshot after B is announced on its public route', async () => {
+    const publicId = 'managed-public'
+    const route = await mountProjectionReviewRoute('stale-no-soul-http', false, false, publicId)
+    const current = createDeferred<unknown>()
+    try {
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[0]).toEqual([
+        'freshcodex', 'codex', publicId, expect.not.objectContaining({ soulId: expect.anything() }),
+      ])
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(current.promise)
+      // A was current when the server answered; delivery was delayed until
+      // the connection had announced the replacement source B.
+      act(() => route.announce('native-b'))
+      await act(async () => route.initial.resolve(hostedCodexProjectionSnapshot('native-a', 'stale-http-a', 'Stale A HTTP answer', 1)))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
+      expect(screen.queryByText('Stale A HTTP answer')).not.toBeInTheDocument()
+      expect(route.store.getState().freshAgentLive.bySession[`freshcodex:codex:${publicId}`]?.projection?.id).not.toBe('stale-http-a')
+      await act(async () => current.resolve(hostedCodexProjectionSnapshot('native-b', 'current-http-b', 'Current B HTTP answer', 1)))
+      await expectRenderedText('Current B HTTP answer')
+    } finally {
+      cleanup()
+      route.initial.resolve(hostedCodexSnapshot('native-a', 'Old snapshot'))
+      current.resolve(hostedCodexSnapshot('native-b', 'Current snapshot'))
+    }
+  })
+
   it('retires the old shared output when a new pane already references the replacement source', async () => {
     const { WsClient } = await vi.importActual<typeof import('@/lib/ws-client')>('@/lib/ws-client')
     const client = new WsClient('ws://codex-shared-replacement.test/ws')
@@ -2660,6 +2685,59 @@ describe('FreshAgentView', () => {
       later.resolve(hostedCodexSnapshot('native-b', 'Later snapshot'))
     }
   })
+
+  it.each([
+    ['managed-public', false], ['managed-public', true], ['native-b', false], ['native-b', true],
+  ] as const)(
+    'keeps the first no-soul HTTP projection live on %s (repeat B: %s)', async (publicId, repeatAnnouncement) => {
+      const route = await mountProjectionReviewRoute('first-no-soul-snapshot', false, false, publicId)
+      const { store } = route
+      const key = `freshcodex:codex:${publicId}`
+      const later = createDeferred<unknown>()
+      try {
+        expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+        expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[0]).toEqual([
+          'freshcodex', 'codex', publicId, expect.not.objectContaining({ soulId: expect.anything() }),
+        ])
+        apiMock.getFreshAgentThreadSnapshot.mockReturnValue(later.promise)
+        const current = hostedCodexProjectionSnapshot('native-b', 'first-http-q', 'B first HTTP answer', 1)
+        act(() => route.announce('native-b'))
+        expect(store.getState().freshAgentLive.announcedNativeBySession[key]).toBe('native-b')
+        expect(getFreshAgentPaneContent(store).soulId).toBeUndefined()
+        await act(async () => route.initial.resolve(current))
+        await expectRenderedText('B first HTTP answer')
+        expect(store.getState().freshAgentLive.bySession[key]?.projection?.id).toBe('first-http-q')
+        await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
+        expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[1]).toEqual([
+          'freshcodex', 'codex', publicId, expect.not.objectContaining({ soulId: expect.anything() }),
+        ])
+
+        const stale = hostedCodexProjectionSnapshot('native-a', 'stale-a-q', 'Stale A retained answer', 1)
+        act(() => {
+          // The second announcement models another pane attaching to B. The
+          // paired control omits it; the next HTTP read stays unresolved in both.
+          if (repeatAnnouncement) route.announce('native-b')
+          route.event({ type: 'freshAgent.host.backpressure', retainedState: {
+            source: { soulId: 'old-soul', incarnationId: 'old-incarnation', hostBootId: 'old-boot',
+              nativeSessionId: 'native-a', projectionId: 'stale-a-q', ownerEpoch: 0, ownerGeneration: 0 },
+            snapshot: stale, pendingControls: [], attentionMarks: [],
+          } })
+        })
+        expect(screen.queryByText('Stale A retained answer')).not.toBeInTheDocument()
+        expect(store.getState().freshAgentLive.bySession[key]?.projection?.id).not.toBe('stale-a-q')
+        act(() => route.event({ type: 'freshAgent.transcript.patch', projectionId: 'first-http-q', historyGeneration: 0,
+          ops: [{ op: 'resetTurn', nativeTurnId: 'turn', revision: 2,
+            turns: [{ id: 'turn', turnId: 'turn', role: 'assistant', summary: '',
+              items: [{ id: 'answer', kind: 'text', text: 'B later current answer' }] }] }] }))
+        await expectRenderedText('B later current answer')
+        expect(screen.queryByText('Stale A retained answer')).not.toBeInTheDocument()
+      } finally {
+        cleanup()
+        route.initial.resolve(hostedCodexSnapshot('native-b', 'First snapshot'))
+        later.resolve(hostedCodexSnapshot('native-b', 'Later snapshot'))
+      }
+    },
+  )
 
   it('review does not assign a known source to a different no-soul HTTP projection', async () => {
     const route = await mountProjectionReviewRoute('projection-no-soul-different', false)
