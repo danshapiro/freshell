@@ -3542,8 +3542,12 @@ async fn commit_fresh_native_transition_from_codex_receipt(
     if !source.matches_launch(&source_launch) {
         return Err(refuse());
     }
+    // A first launch has no requested root; its matching observation establishes one.
+    let mut first_launch_source = source_launch.clone();
+    first_launch_source.requested_native_session_id = None;
+    let is_source_launch = current_launch == source_launch || current_launch == first_launch_source;
     if identity.native_session_id == identity.previous_native_session_id {
-        return if current_launch == source_launch {
+        return if is_source_launch {
             Ok(())
         } else {
             Err(refuse())
@@ -3559,7 +3563,7 @@ async fn commit_fresh_native_transition_from_codex_receipt(
     if current_launch == target_launch {
         return Ok(());
     }
-    if current_launch != source_launch {
+    if !is_source_launch {
         return Err(refuse());
     }
 
@@ -12722,6 +12726,17 @@ mod tests {
 
     #[tokio::test]
     async fn codex_send_receipt_commits_exact_transition_after_provider_exit() {
+        assert_codex_send_receipt_commits_transition(Some("codex-receipt-parent".into())).await;
+    }
+
+    #[tokio::test]
+    async fn codex_send_receipt_commits_first_launch_transition_after_provider_exit() {
+        assert_codex_send_receipt_commits_transition(None).await;
+    }
+
+    async fn assert_codex_send_receipt_commits_transition(
+        requested_native_session_id: Option<String>,
+    ) {
         let root = tempfile::tempdir().unwrap();
         let mut state = test_host_state();
         let old_state_dir = state.state_dir.clone();
@@ -12733,7 +12748,7 @@ mod tests {
             launch_nonce: "codex-send-receipt-test".into(),
             evidence_revision: 7,
             execution_generation: 1,
-            requested_native_session_id: Some("codex-receipt-parent".into()),
+            requested_native_session_id,
         };
         let source = freshell_runtime_protocol::NativeIdentityObservation {
             native_session_id: "codex-receipt-parent".into(),
