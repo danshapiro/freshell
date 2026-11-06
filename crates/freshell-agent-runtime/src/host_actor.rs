@@ -290,6 +290,11 @@ pub struct DispatchResult {
     /// The provider's exact correlated identity receipt. Persisted with the
     /// command so a retry after a lost host reply returns the same transition.
     pub native_identity: Option<NativeDispatchIdentity>,
+    /// The exact retained Codex source used to accept the command. Returning
+    /// this beside the durable identity lets the host finish its launch-state
+    /// write after the provider process has exited, without inventing live
+    /// evidence or replaying the provider input.
+    pub codex_dispatch_recovery_source: Option<NativeIdentityObservation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2672,6 +2677,7 @@ impl FreshAgentHostActor {
         Ok(DispatchResult {
             state: existing.state,
             native_identity: Some(native_identity),
+            codex_dispatch_recovery_source: Some(source.clone()),
         })
     }
 
@@ -2716,6 +2722,9 @@ impl FreshAgentHostActor {
                     other => Ok(DispatchResult {
                         state: other,
                         native_identity: existing.native_identity.clone(),
+                        codex_dispatch_recovery_source: existing
+                            .codex_dispatch_recovery_source
+                            .clone(),
                     }),
                 };
             }
@@ -2833,6 +2842,7 @@ impl FreshAgentHostActor {
                 Ok(DispatchResult {
                     state: CommandState::ProviderAcked,
                     native_identity: ack.native_identity,
+                    codex_dispatch_recovery_source,
                 })
             }
             Err(failure) => {

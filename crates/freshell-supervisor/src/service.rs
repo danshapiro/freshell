@@ -2841,7 +2841,11 @@ impl Supervisor {
                     ))
                     .await?
                     {
-                        return Ok(CommandState::ProviderAcked);
+                        // The registry transaction that accepted the receipt
+                        // also settles this input journal. Report the same
+                        // replay state used for any previously accepted input
+                        // so REST callers read the already-written outcome.
+                        return Ok(CommandState::Completed);
                     }
                     return Ok(CommandState::Ambiguous);
                 }
@@ -2943,9 +2947,9 @@ impl Supervisor {
                     HostCommand::FreshAgentSend {
                         incarnation_id: handle.incarnation_id().clone(),
                         request_id: request_id.clone(),
-                        text,
-                        settings,
-                        checkpoint_logical_attempt_id,
+                        text: text.clone(),
+                        settings: settings.clone(),
+                        checkpoint_logical_attempt_id: checkpoint_logical_attempt_id.clone(),
                         codex_dispatch_recovery_source,
                         receipt_only: false,
                     },
@@ -2977,24 +2981,32 @@ impl Supervisor {
                             prior_native,
                             native_session_id.as_deref(),
                         )?;
-                        if let Some(source) = recovery_source.as_ref() {
-                            self.registry
-                                .record_codex_dispatch_recovery_identity(
-                                    source.clone(),
-                                    identity,
-                                    request_id.clone(),
-                                )
-                                .await
-                                .map_err(map_registry)?;
-                        } else {
-                            self.registry
-                                .record_fresh_agent_dispatch_identity(
-                                    soul_id.clone(),
-                                    handle.incarnation_id().clone(),
-                                    identity,
-                                )
-                                .await
-                                .map_err(map_registry)?;
+                        let naming_handle_changed = handle.fresh_agent().is_some_and(|spec| {
+                            spec.naming_handle != identity.pending_naming_handle
+                        });
+                        if update != FreshAgentNativeIdentityUpdate::Unchanged
+                            || naming_handle_changed
+                            || recovery_source.is_some()
+                        {
+                            if let Some(source) = recovery_source.as_ref() {
+                                self.registry
+                                    .record_codex_dispatch_recovery_identity(
+                                        source.clone(),
+                                        identity,
+                                        request_id.clone(),
+                                    )
+                                    .await
+                                    .map_err(map_registry)?;
+                            } else {
+                                self.registry
+                                    .record_fresh_agent_dispatch_identity(
+                                        soul_id.clone(),
+                                        handle.incarnation_id().clone(),
+                                        identity,
+                                    )
+                                    .await
+                                    .map_err(map_registry)?;
+                            }
                         }
                         tracing::info!(soul_id=%soul_id,incarnation_id=%handle.incarnation_id(),previous_native_session_id=prior_native,native_session_id=native_session_id.as_deref(),native_identity_update=?update,"freshagent.native_dispatch_identity_committed");
                     } else if recovery_source.is_some() {
@@ -3067,14 +3079,31 @@ impl Supervisor {
                 });
                     if let Some(diagnostic) = refusal {
                         self.registry
-                            .mark_fresh_input_refused(soul_id, request_id, diagnostic.clone())
+                            .mark_fresh_input_refused(
+                                soul_id.clone(),
+                                request_id.clone(),
+                                diagnostic.clone(),
+                            )
                             .await
                             .map_err(map_registry)?;
                     } else {
                         self.registry
-                            .mark_input_ambiguous(soul_id, request_id)
+                            .mark_input_ambiguous(soul_id.clone(), request_id.clone())
                             .await
                             .map_err(map_registry)?;
+                        if recovery_source.is_some()
+                            && Box::pin(self.reconcile_ambiguous_codex_send_receipt(
+                                &soul_id,
+                                &request_id,
+                                &text,
+                                settings.as_ref(),
+                                checkpoint_logical_attempt_id.as_deref(),
+                                &settings_correlation,
+                            ))
+                            .await?
+                        {
+                            return Ok(CommandState::Completed);
+                        }
                     }
                     Err(error)
                 }

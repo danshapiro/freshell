@@ -4380,8 +4380,14 @@ describe('FreshAgentView', () => {
         queue.store.dispatch({ type: 'connection/setStatus', payload: 'ready' })
         reconnect()
       })
-      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
-      expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Second message' })
+      if (provider === 'codex') {
+        await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(3))
+        expect(sentFreshAgentMessages('freshAgent.send')[1]).toEqual(first)
+        expect(sentFreshAgentMessages('freshAgent.send')[2]).toMatchObject({ text: 'Second message' })
+      } else {
+        await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+        expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Second message' })
+      }
     })
 
     it('does not advance Claude from disk-only idle history after accepting a prompt', async () => {
@@ -4412,9 +4418,11 @@ describe('FreshAgentView', () => {
       queue.send('Later follow-up')
       const beforeRefresh = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
       const reconnect = wsMock.onReconnect.mock.calls.at(-1)?.[0] as unknown as () => void
+      const first = sentFreshAgentMessages('freshAgent.send')[0]
       act(() => reconnect())
       await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeGreaterThan(beforeRefresh))
-      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
+      expect(sentFreshAgentMessages('freshAgent.send')[1]).toEqual(first)
       expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
     })
 
@@ -22033,6 +22041,76 @@ describe('task6 hosted recovery in the mounted view', () => {
       await act(async () => heldSnapshot.resolve({ status: 'running', capabilities: { send: true, interrupt: true }, turns: [] }))
     }
   })
+
+  it.each([false, true] as const)(
+    'replays a pending Codex send with the exact same request frame after reconnect (prior ambiguity: %s)',
+    async (reportedAmbiguity) => {
+      const store = createStore()
+      const handlers = new Set<(message: unknown) => void>()
+      let reconnectHandler: (() => void) | undefined
+      wsMock.onMessage.mockImplementation((handler) => { handlers.add(handler); return () => { handlers.delete(handler) } })
+      wsMock.onReconnect.mockImplementation((handler: () => void) => {
+        reconnectHandler = handler
+        return () => { reconnectHandler = undefined }
+      })
+      const locator = { sessionId: 'codex-reconnect-receipt', sessionType: 'freshcodex', provider: 'codex' }
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+        ...locator, threadId: locator.sessionId, status: 'idle',
+        capabilities: { send: true, interrupt: true }, turns: [],
+        extensions: { codex: { ownerKind: 'fresh-agent', statusFromLiveState: true } },
+      })
+      store.dispatch(sessionInit(locator))
+      store.dispatch(setSessionStatus({ ...locator, status: 'idle' }))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+        kind: 'fresh-agent', ...locator, sessionRef: { provider: 'codex', sessionId: locator.sessionId },
+        createRequestId: 'codex-reconnect-receipt-create', status: 'idle', soulId: 'codex-reconnect-receipt-soul',
+        soulIntentRevision: 1,
+        recoverySummary: { desiredState: 'running', recoveryState: 'live',
+          durabilityState: 'resume_captured', allocationState: 'verified_durable' },
+      } }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).toBeEnabled())
+
+      fireEvent.change(composer, { target: { value: 'Recover this accepted send' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1))
+      const originalFrame = sentFreshAgentMessages('freshAgent.send')[0]
+      expect(originalFrame.settings).toMatchObject({ collaborationMode: 'default' })
+
+      if (reportedAmbiguity) {
+        act(() => {
+          for (const handler of [...handlers]) handler({
+            type: 'error', code: 'INTERNAL_ERROR', requestId: originalFrame.requestId,
+            message: 'CODEX_DELIVERY_AMBIGUOUS: native response was lost',
+          })
+        })
+        await waitFor(() => expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain'))
+      }
+
+      // A settings change while disconnected must not alter the exact retry
+      // payload. The accepted receipt is tied to the original settings too.
+      act(() => store.dispatch(mergePaneContent({
+        tabId: 'tab-1', paneId: 'pane-1', updates: { collaborationMode: 'plan' },
+      })))
+      act(() => reconnectHandler?.())
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+      expect(sentFreshAgentMessages('freshAgent.send')[1]).toEqual(originalFrame)
+
+      act(() => {
+        const accepted = {
+          type: 'freshAgent.send.accepted', ...locator,
+          requestId: originalFrame.requestId, submittedTurnId: 'receipt-replayed-turn',
+        }
+        handleFreshAgentMessage(store.dispatch, accepted as never)
+        for (const handler of [...handlers]) handler(accepted)
+      })
+      await waitFor(() => expect(screen.queryByText(/Delivery is uncertain/)).not.toBeInTheDocument())
+      act(() => reconnectHandler?.())
+      await act(async () => { await Promise.resolve() })
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
+    },
+  )
 
   it.each(([
     ['freshcodex', 'codex', 'CODEX_DELIVERY_AMBIGUOUS'],

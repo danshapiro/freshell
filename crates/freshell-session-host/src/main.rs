@@ -1307,12 +1307,22 @@ async fn dispatch_with_effects(
                             .await
                             .map_err(map_actor_error)?;
                         let after = actor.profile().await;
-                        let identity = receipt.native_identity.as_ref().ok_or_else(|| {
+                        let identity = receipt.native_identity.clone().ok_or_else(|| {
                             RuntimeError::new(
                                 RuntimeErrorCode::CommandAmbiguous,
                                 "Codex send has no durable accepted identity receipt",
                             )
                         })?;
+                        let source =
+                            receipt
+                                .codex_dispatch_recovery_source
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    RuntimeError::new(
+                                        RuntimeErrorCode::CommandAmbiguous,
+                                        "Codex send receipt has no retained source binding",
+                                    )
+                                })?;
                         if after.native_session_id.as_deref()
                             != Some(identity.native_session_id.as_str())
                         {
@@ -1321,17 +1331,15 @@ async fn dispatch_with_effects(
                                 "Codex send receipt does not match the host's current native root",
                             ));
                         }
-                        commit_fresh_native_transition(
-                            state,
-                            &actor,
-                            Some(&identity.previous_native_session_id),
+                        commit_fresh_native_transition_from_codex_receipt(
+                            state, &actor, source, &identity,
                         )
                         .await?;
                         return Ok(HostResult::FreshAgentCommand {
                             state: receipt.state,
                             claude_fork: actor.claude_fork_recipe().await,
                             native_session_id: after.native_session_id,
-                            native_identity: receipt.native_identity,
+                            native_identity: Some(identity),
                         });
                     }
                     ensure_fresh_native_send_authority(state).await?;
@@ -3470,6 +3478,108 @@ async fn commit_fresh_native_transition(
         serde_json::json!({"severity":"info","incarnationId":state.incarnation_id,
         "executionGeneration":persisted.max_execution_generation,
         "evidenceRevision":persisted.native_identity_launch.as_ref().map(|launch|launch.evidence_revision)})).ok();
+    Ok(())
+}
+
+/// Finish the host launch write from an exact persisted Codex SEND receipt.
+/// The actor receipt proves that the provider accepted this request and its
+/// typed root transition. That proof remains valid after the provider child
+/// exits; it is historical evidence, not a claim that the child is still live.
+async fn commit_fresh_native_transition_from_codex_receipt(
+    state: &HostState,
+    actor: &Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>,
+    source: &freshell_runtime_protocol::NativeIdentityObservation,
+    identity: &freshell_runtime_protocol::NativeDispatchIdentity,
+) -> Result<(), RuntimeError> {
+    let refuse = || {
+        RuntimeError::new(
+            RuntimeErrorCode::RecoveryWrongIdentity,
+            "durable Codex send receipt lost its current host binding",
+        )
+    };
+    let profile = actor.profile().await;
+    if profile.provider != freshell_runtime_protocol::FreshProvider::Codex
+        || profile.native_session_id.as_deref() != Some(identity.native_session_id.as_str())
+        || profile.naming_handle != identity.pending_naming_handle
+        || source.native_session_id != identity.previous_native_session_id
+        || !source.matches_provider("codex", true)
+        || !state
+            .fresh_agent
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, actor))
+    {
+        return Err(refuse());
+    }
+
+    let mut persisted = state.persisted.lock().await;
+    let Some(current_launch) = persisted.native_identity_launch.clone() else {
+        return Err(refuse());
+    };
+    if persisted.provider.as_deref() != Some("codex")
+        || persisted.host_boot_id.as_ref() != Some(&state.host_boot_id)
+        || current_launch.incarnation_id != state.incarnation_id
+        || current_launch.execution_generation != persisted.max_execution_generation
+        || source.incarnation_id != state.incarnation_id
+        || current_launch.launch_nonce != source.launch_nonce
+    {
+        return Err(refuse());
+    }
+    ensure_grant_running(
+        state,
+        persisted.max_control_epoch,
+        persisted.max_execution_generation,
+    )?;
+
+    // Reconstruct the exact launch that authorized the retained source. The
+    // only valid current states are that source launch or its single receipt
+    // derived successor. Any other owner, generation, or intervening root
+    // transition makes this receipt stale.
+    let mut source_launch = current_launch.clone();
+    source_launch.evidence_revision = source.evidence_revision;
+    source_launch.requested_native_session_id = Some(source.native_session_id.clone());
+    if !source.matches_launch(&source_launch) {
+        return Err(refuse());
+    }
+    if identity.native_session_id == identity.previous_native_session_id {
+        return if current_launch == source_launch {
+            Ok(())
+        } else {
+            Err(refuse())
+        };
+    }
+
+    let mut target_launch = source_launch.clone();
+    target_launch.evidence_revision = target_launch
+        .evidence_revision
+        .checked_add(1)
+        .ok_or_else(refuse)?;
+    target_launch.requested_native_session_id = Some(identity.native_session_id.clone());
+    if current_launch == target_launch {
+        return Ok(());
+    }
+    if current_launch != source_launch {
+        return Err(refuse());
+    }
+
+    let mut updated = persisted.clone();
+    updated.native_identity_launch = Some(target_launch);
+    updated.native_readiness_receipt = None;
+    write_state(&state.state_dir, &updated).map_err(registry_like_error)?;
+    *persisted = updated;
+    append_event_with_secret(
+        &state.state_dir,
+        &state.secret,
+        "host.native_identity.transition_committed_from_send_receipt",
+        serde_json::json!({
+            "severity":"info",
+            "incarnationId":state.incarnation_id,
+            "executionGeneration":persisted.max_execution_generation,
+            "evidenceRevision":persisted.native_identity_launch.as_ref().map(|launch| launch.evidence_revision),
+        }),
+    )
+    .ok();
     Ok(())
 }
 
@@ -12320,6 +12430,104 @@ mod tests {
         readiness_calls: AtomicUsize,
     }
 
+    struct CodexReceiptFixtureTransport {
+        launch: std::sync::Mutex<freshell_runtime_protocol::NativeIdentityLaunch>,
+        native_session_id: std::sync::Mutex<String>,
+        live: std::sync::atomic::AtomicBool,
+        exit_after_accept: std::sync::atomic::AtomicBool,
+        dispatches: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl FreshAgentTransport for CodexReceiptFixtureTransport {
+        async fn native_identity_evidence(&self) -> Option<serde_json::Value> {
+            Some(serde_json::json!({
+                "launch": self.launch.lock().unwrap().clone(),
+                "nativeSessionId": self.native_session_id.lock().unwrap().clone(),
+            }))
+        }
+
+        async fn start(&self, profile: &FreshAgentProfile) -> Result<TransportStart, String> {
+            Ok(TransportStart {
+                native_session_id: profile.native_session_id.clone(),
+            })
+        }
+
+        async fn is_live(&self) -> bool {
+            self.live.load(Ordering::SeqCst)
+        }
+
+        async fn dispatch(
+            &self,
+            request_id: &RequestId,
+            _text: &str,
+            _profile: &FreshAgentProfile,
+        ) -> Result<DispatchAck, DispatchFailure> {
+            self.dispatches.fetch_add(1, Ordering::SeqCst);
+            Ok(DispatchAck {
+                native_identity: None,
+                provider_ack_id: Some(request_id.to_string()),
+            })
+        }
+
+        async fn dispatch_with_codex_recovery_source(
+            &self,
+            request_id: &RequestId,
+            _text: &str,
+            profile: &FreshAgentProfile,
+            _settings: Option<&freshell_runtime_protocol::FreshAgentTurnSettings>,
+            _logical_attempt_id: Option<&str>,
+            source: Option<&freshell_runtime_protocol::NativeIdentityObservation>,
+        ) -> Result<DispatchAck, DispatchFailure> {
+            self.dispatches.fetch_add(1, Ordering::SeqCst);
+            let source = source.expect("test sends must carry the retained Codex source");
+            assert_eq!(profile.provider, FreshProvider::Codex);
+            assert_eq!(
+                profile.native_session_id.as_deref(),
+                Some(source.native_session_id.as_str())
+            );
+            let child = "codex-receipt-child".to_string();
+            {
+                let mut launch = self.launch.lock().unwrap();
+                launch.evidence_revision += 1;
+                launch.requested_native_session_id = Some(child.clone());
+                *self.native_session_id.lock().unwrap() = child.clone();
+            }
+            if self.exit_after_accept.swap(false, Ordering::SeqCst) {
+                self.live.store(false, Ordering::SeqCst);
+            }
+            Ok(DispatchAck {
+                native_identity: Some(freshell_runtime_protocol::NativeDispatchIdentity {
+                    previous_native_session_id: source.native_session_id.clone(),
+                    native_session_id: child,
+                    pending_naming_handle: None,
+                }),
+                provider_ack_id: Some(request_id.to_string()),
+            })
+        }
+
+        async fn resolve_permission(
+            &self,
+            _decision_id: &str,
+            _decision: serde_json::Value,
+        ) -> Result<(), DispatchFailure> {
+            Ok(())
+        }
+
+        async fn interrupt(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn stop(self: Arc<Self>) -> Result<(), String> {
+            self.live.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn take_event_stream(&self) -> Option<tokio::sync::mpsc::Receiver<AgentEvent>> {
+            None
+        }
+    }
+
     #[async_trait]
     impl FreshAgentTransport for CodexReadinessFixtureTransport {
         async fn native_identity_evidence(&self) -> Option<serde_json::Value> {
@@ -12509,6 +12717,171 @@ mod tests {
                 ..
             }
         ));
+        actor.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_send_receipt_commits_exact_transition_after_provider_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = test_host_state();
+        let old_state_dir = state.state_dir.clone();
+        std::fs::remove_dir_all(old_state_dir).unwrap();
+        Arc::get_mut(&mut state).unwrap().state_dir = root.path().to_path_buf();
+
+        let launch = freshell_runtime_protocol::NativeIdentityLaunch {
+            incarnation_id: state.incarnation_id.clone(),
+            launch_nonce: "codex-send-receipt-test".into(),
+            evidence_revision: 7,
+            execution_generation: 1,
+            requested_native_session_id: Some("codex-receipt-parent".into()),
+        };
+        let source = freshell_runtime_protocol::NativeIdentityObservation {
+            native_session_id: "codex-receipt-parent".into(),
+            incarnation_id: state.incarnation_id.clone(),
+            launch_nonce: launch.launch_nonce.clone(),
+            evidence_revision: launch.evidence_revision,
+            source: freshell_runtime_protocol::NativeIdentitySource::FreshProviderHandshake,
+            evidence_digest: "a".repeat(64),
+        };
+        {
+            let mut persisted = state.persisted.lock().await;
+            persisted.native_identity_launch = Some(launch.clone());
+            persisted.host_boot_id = Some(state.host_boot_id.clone());
+            persisted.provider = Some("codex".into());
+            persisted.grant_id = Some(freshell_runtime_protocol::GrantId::new());
+            persisted.worker_pid = Some(std::process::id());
+            persisted.worker_launch_count = 1;
+            persisted.max_control_epoch = 1;
+            persisted.max_execution_generation = launch.execution_generation;
+            *state.control_fence.lock().unwrap() = HostControlFence::from(&*persisted);
+            write_state(&state.state_dir, &persisted).unwrap();
+        }
+
+        let transport = Arc::new(CodexReceiptFixtureTransport {
+            launch: std::sync::Mutex::new(launch.clone()),
+            native_session_id: std::sync::Mutex::new("codex-receipt-parent".into()),
+            live: std::sync::atomic::AtomicBool::new(true),
+            exit_after_accept: std::sync::atomic::AtomicBool::new(true),
+            dispatches: AtomicUsize::new(0),
+        });
+        let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+            state.state_dir.join("receipt-agent"),
+            FreshAgentProfile {
+                naming_handle: None,
+                collaboration_mode: None,
+                provider: FreshProvider::Codex,
+                runtime_variant: "codex-app-server".into(),
+                cwd: "/workspace".into(),
+                model: None,
+                effort: None,
+                permission_mode: None,
+                sandbox: None,
+                provider_store_id: "receipt-store".into(),
+                native_session_id: Some("codex-receipt-parent".into()),
+                plugins: None,
+                model_selection: None,
+                session_ref: None,
+                provider_launch_context: None,
+                provider_secret_references: Vec::new(),
+            },
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+        *state.fresh_agent.lock().await = Some(actor.clone());
+
+        let request_id = RequestId::new();
+        let send = || HostCommand::FreshAgentSend {
+            incarnation_id: state.incarnation_id.clone(),
+            request_id: request_id.clone(),
+            text: "accepted before provider exit".into(),
+            settings: None,
+            checkpoint_logical_attempt_id: None,
+            codex_dispatch_recovery_source: Some(source.clone()),
+            receipt_only: false,
+        };
+        let first = dispatch(authenticated_host_envelope(&state, send()), &state).await;
+        assert_eq!(
+            first.unwrap_err().code,
+            RuntimeErrorCode::RecoveryWrongIdentity,
+            "the provider exited after its durable actor receipt but before the normal live-evidence commit"
+        );
+        assert_eq!(transport.dispatches.load(Ordering::SeqCst), 1);
+
+        let receipt = dispatch(
+            authenticated_host_envelope(
+                &state,
+                HostCommand::FreshAgentSend {
+                    incarnation_id: state.incarnation_id.clone(),
+                    request_id: request_id.clone(),
+                    text: "accepted before provider exit".into(),
+                    settings: None,
+                    checkpoint_logical_attempt_id: None,
+                    codex_dispatch_recovery_source: None,
+                    receipt_only: true,
+                },
+            ),
+            &state,
+        )
+        .await
+        .expect("receipt-only lookup must settle the exact durable transition after exit");
+        let HostResult::FreshAgentCommand {
+            state: command_state,
+            native_session_id,
+            ..
+        } = receipt
+        else {
+            panic!("receipt lookup returned an unexpected host result");
+        };
+        assert_eq!(
+            command_state,
+            freshell_runtime_protocol::CommandState::ProviderAcked
+        );
+        assert_eq!(native_session_id.as_deref(), Some("codex-receipt-child"));
+        assert_eq!(transport.dispatches.load(Ordering::SeqCst), 1);
+        let committed = state.persisted.lock().await;
+        let committed_launch = committed.native_identity_launch.as_ref().unwrap();
+        assert_eq!(
+            committed_launch.evidence_revision,
+            launch.evidence_revision + 1
+        );
+        assert_eq!(
+            committed_launch.requested_native_session_id.as_deref(),
+            Some("codex-receipt-child")
+        );
+        let committed_revision = committed_launch.evidence_revision;
+        drop(committed);
+
+        dispatch(
+            authenticated_host_envelope(
+                &state,
+                HostCommand::FreshAgentSend {
+                    incarnation_id: state.incarnation_id.clone(),
+                    request_id,
+                    text: "accepted before provider exit".into(),
+                    settings: None,
+                    checkpoint_logical_attempt_id: None,
+                    codex_dispatch_recovery_source: None,
+                    receipt_only: true,
+                },
+            ),
+            &state,
+        )
+        .await
+        .expect("a duplicate receipt lookup must be idempotent");
+        assert_eq!(transport.dispatches.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .persisted
+                .lock()
+                .await
+                .native_identity_launch
+                .as_ref()
+                .unwrap()
+                .evidence_revision,
+            committed_revision,
+            "replaying the same receipt must not advance the launch twice"
+        );
         actor.stop().await.unwrap();
     }
 

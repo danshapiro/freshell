@@ -430,6 +430,11 @@ impl ControlledCodex {
                                     *send_receipt.lock().unwrap() =
                                         Some((request_id.clone(), identity.clone()));
                                     if lose_send_reply_once.swap(false, Ordering::SeqCst) {
+                                        // The provider accepted the request and then exited before
+                                        // the supervisor could receive the host reply. The host
+                                        // worker itself remains available to answer a receipt-only
+                                        // query.
+                                        exited.store(true, Ordering::SeqCst);
                                         drop_reply = true;
                                     }
                                     HostResult::FreshAgentCommand {
@@ -1202,17 +1207,22 @@ async fn lost_retained_codex_send_reply_is_reconciled_from_host_receipt_without_
     fixture.lose_send_reply_once.store(true, Ordering::SeqCst);
     let request_id = RequestId::new();
 
-    let first_error = fixture
+    assert!(matches!(
+        fixture
         .send(request_id.clone())
         .await
-        .expect_err("the first response is deliberately lost after the host accepts the input");
+        .unwrap(),
+        AdminResult::FreshAgentCommand {
+            state: CommandState::Completed
+        }
+    ), "receipt recovery should finish the original public SEND request, even when the provider exits before its reply is queried");
     assert_eq!(
         fixture.inputs.load(Ordering::SeqCst),
         1,
-        "the request must reach the host before response loss: {first_error:?}; lifecycle: {}",
+        "the request must reach the host exactly once; lifecycle: {}",
         std::fs::read_to_string(fixture._root.path().join("lifecycle.jsonl")).unwrap_or_default()
     );
-    assert_eq!(fixture.receipt_queries.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.receipt_queries.load(Ordering::SeqCst), 1);
     assert_eq!(
         fixture
             .supervisor
@@ -1222,14 +1232,14 @@ async fn lost_retained_codex_send_reply_is_reconciled_from_host_receipt_without_
             .unwrap()
             .native_session_id
             .as_deref(),
-        Some("native-parent"),
-        "the registry must remain on the old root until the durable receipt is checked"
+        Some("native-child"),
+        "the original SEND should commit the receipt-backed root before returning"
     );
 
     assert!(matches!(
         fixture.send(request_id.clone()).await.unwrap(),
         AdminResult::FreshAgentCommand {
-            state: CommandState::ProviderAcked
+            state: CommandState::Completed
         }
     ));
     assert_eq!(fixture.inputs.load(Ordering::SeqCst), 1);
@@ -1253,6 +1263,35 @@ async fn lost_retained_codex_send_reply_is_reconciled_from_host_receipt_without_
     ));
     assert_eq!(fixture.inputs.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.receipt_queries.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn ordinary_same_root_codex_send_skips_identity_rewrite_after_intent_change() {
+    let fixture = ControlledCodex::new().await;
+    fixture.exited.store(false, Ordering::SeqCst);
+    fixture.readiness_root_change.store(true, Ordering::SeqCst);
+
+    let context = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    let mut limits = context.requested_limits;
+    limits.cpu_milli += 100;
+    fixture
+        .supervisor
+        .registry
+        .update_configured_limits(fixture.soul.clone(), limits, context.intent_revision)
+        .await
+        .unwrap();
+
+    let sent = fixture.send(RequestId::new()).await;
+    assert!(
+        matches!(sent, Ok(AdminResult::FreshAgentCommand { state: CommandState::ProviderAcked })),
+        "unchanged Codex root should not try to rewrite its writer claim after a harmless intent revision: {sent:?}"
+    );
+    assert_eq!(fixture.inputs.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

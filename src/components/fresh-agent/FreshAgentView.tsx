@@ -302,6 +302,10 @@ type PendingSendMetadata = {
   submittedTurnId?: string
   legacyAccepted?: boolean
   deliveryAmbiguous?: boolean
+  /** The exact original send frame is retained in memory so a reconnect can
+   * safely re-submit the same request id and settings to the supervisor's
+   * idempotency journal. */
+  sendFrame?: Record<string, unknown>
   /** The exact text of the freshAgent.send frame -- retained as the resend
    * payload for the lost-session retry (Task 10). Never read back from the
    * local echo. */
@@ -2336,7 +2340,7 @@ export function FreshAgentView({
     // crash + generation advance is typed-refused server-side, never an
     // unfenced recreation.
     const fence = selectPaneOwnerFence(appStore.getState(), current)
-    sendFreshAgentMessage({
+    const frame = {
       type: 'freshAgent.send',
       requestId,
       sessionId: current.sessionId,
@@ -2357,8 +2361,27 @@ export function FreshAgentView({
         ...(current.provider === 'codex' ? { collaborationMode: current.collaborationMode ?? 'default' } : {}),
         ...(getFreshAgentRequestEffort(current, providerDefaults) !== undefined ? { effort: getFreshAgentRequestEffort(current, providerDefaults) } : {}),
       },
-    })
-  }, [appStore, providerDefaults, sendFreshAgentMessage])
+    }
+    recordPendingSendMetadata(requestId, { sendFrame: frame })
+    sendFreshAgentMessage(frame)
+  }, [appStore, providerDefaults, recordPendingSendMetadata, sendFreshAgentMessage])
+
+  const replayPendingCodexSendFrames = useCallback((current: FreshAgentPaneContent) => {
+    if (current.provider !== 'codex') return
+    const currentScope = paneSessionScope(current)
+    for (const [requestId, pending] of pendingSendMetadataRef.current) {
+      if (pending.submittedTurnId || pending.legacyAccepted || !pending.sendFrame) continue
+      if (pending.sendFrame.type !== 'freshAgent.send'
+        || pending.sendFrame.provider !== 'codex'
+        || pending.sendFrame.requestId !== requestId
+        || !scopeToPaneSession(pending, currentScope.sourceSessionKey, currentScope.sourceCanonicalSessionKey)) {
+        continue
+      }
+      // Same ID and exact payload: the supervisor returns the durable result
+      // or checks the host receipt. It never dispatches this input a second time.
+      sendFreshAgentMessage(pending.sendFrame)
+    }
+  }, [sendFreshAgentMessage])
 
   /** Task 10: re-issue a failed send under a fresh requestId with the
    * retained text + route cwd. The retry gets its own pending-metadata entry
@@ -3289,12 +3312,14 @@ export function FreshAgentView({
         }
         if (hiddenRef.current) {
           enqueueFreshAgentAttach(attempt)
+          replayPendingCodexSendFrames(current)
           // Surface hydration (HTTP transcript snapshot fetch) is EXPENSIVE --
           // defer it until reveal instead of fetching for every hidden pane.
           pendingRevealRefreshRef.current = true
           markSnapshotDirty('reconnect')
         } else {
           sendAttach()
+          replayPendingCodexSendFrames(current)
           requestSnapshotRefresh('reconnect')
         }
       })
@@ -3309,6 +3334,7 @@ export function FreshAgentView({
     lifecycleBlocked,
     markSnapshotDirty,
     requestSnapshotRefresh,
+    replayPendingCodexSendFrames,
     sendFencedFreshAgentAttach,
     ws,
   ])
