@@ -310,6 +310,17 @@ fn pre_native_terminal(context: &RecoveryContext) -> bool {
         && context.fixture.is_none()
         && context.native_identity_launch.is_none()
 }
+
+fn has_unresolved_retained_codex_input(context: &RecoveryContext) -> bool {
+    context.provider == "codex"
+        && context.fixture.is_none()
+        && context.fresh_agent.as_ref().is_some_and(|agent| {
+            agent.provider == freshell_runtime_protocol::FreshProvider::Codex
+                && agent.fixture_transport.is_none()
+        })
+        && context.dispatched_command_count > context.completed_command_count
+}
+
 fn retained_status_observed(
     context: &RecoveryContext,
     host: &crate::service::AuthenticatedHost,
@@ -3126,11 +3137,6 @@ impl Supervisor {
         {
             Ok(host) => host,
             Err(error) => {
-                // The normal recovery classifier already handles an
-                // unavailable retained host by using the exact persisted
-                // resume candidate, then requiring verified-empty cleanup
-                // before replacement. A failed manual-retry preflight must
-                // not strand a Blocked soul before that path can run.
                 crate::service::append_event(
                     &self.config.lifecycle_log,
                     "supervisor.manual_retry_readiness_deferred",
@@ -3142,7 +3148,11 @@ impl Supervisor {
                         "errorCode": error.code,
                     }),
                 );
-                return Ok(());
+                // This helper is reached only after the backend reports the
+                // old runtime as Running. A silent host is not proof that the
+                // runtime is gone, so preserve the current intent and receipt
+                // fence instead of letting ManualRetry classify it offline.
+                return Err(readiness_error);
             }
         };
         let status = match self
@@ -3166,7 +3176,7 @@ impl Supervisor {
                         "errorCode": error.code,
                     }),
                 );
-                return Ok(());
+                return Err(readiness_error);
             }
         };
         let current = self
@@ -3227,6 +3237,70 @@ impl Supervisor {
         // stranded Blocked souls because rearming alone does not schedule a
         // retry for the new intent.
         Ok(())
+    }
+
+    async fn manual_retry_unresolved_codex_input_block(
+        &self,
+        context: &RecoveryContext,
+    ) -> Result<Option<Box<RecoveryResult>>, RuntimeError> {
+        if !has_unresolved_retained_codex_input(context) {
+            return Ok(None);
+        }
+        Ok(Some(Box::new(RecoveryResult {
+            outcome: RecoveryOutcome::Blocked,
+            view: self.view_for(context.prior_handle.incarnation_id()).await?,
+            probe: Some(blocked(
+                RecoveryPath::NativeResume,
+                RecoveryBlockReason::CommandAmbiguous,
+                "a previous Codex send still needs its original host receipt; recovery intent was left unchanged",
+                None,
+            )),
+            prior_incarnation_id: Some(context.prior_handle.incarnation_id().clone()),
+            attempt_id: None,
+            expected_native_session_id: context.native_session_id.clone(),
+            observed_native_session_id: None,
+            incident_id: None,
+        })))
+    }
+
+    async fn replacement_unresolved_codex_input_block(
+        &self,
+        soul_id: &SoulId,
+        context: &RecoveryContext,
+        path: RecoveryPath,
+        resume_spec: Option<&freshell_runtime_protocol::ResumeSpec>,
+    ) -> Result<Option<Box<RecoveryResult>>, RuntimeError> {
+        if !has_unresolved_retained_codex_input(context) {
+            return Ok(None);
+        }
+        let reason = RecoveryBlockReason::CommandAmbiguous;
+        let message = "a previous Codex send still needs its original host receipt; preserving the saved conversation before replacement";
+        self.registry
+            .mark_recovery_blocked(
+                soul_id.clone(),
+                None,
+                reason,
+                vec![format!(
+                    "unresolvedCodexInputCount={}",
+                    context
+                        .dispatched_command_count
+                        .saturating_sub(context.completed_command_count)
+                )],
+                context.write_fence(),
+            )
+            .await
+            .map_err(map_registry)?;
+        Ok(Some(Box::new(RecoveryResult {
+            outcome: RecoveryOutcome::Blocked,
+            view: self.view_for(context.prior_handle.incarnation_id()).await?,
+            probe: Some(blocked(path, reason, message, None)),
+            prior_incarnation_id: Some(context.prior_handle.incarnation_id().clone()),
+            attempt_id: None,
+            expected_native_session_id: resume_spec
+                .map(|spec| spec.provider_session.native_session_id.clone()),
+            observed_native_session_id: None,
+            incident_id: None,
+        })))
     }
 
     pub(crate) async fn recover(
@@ -3419,6 +3493,16 @@ impl Supervisor {
                 "supervisor.stopped_data_repair_resume_requested",
                 serde_json::json!({"soulId":request.soul_id,"intentRevision":next_revision}),
             );
+        }
+        if request.trigger == RecoveryTrigger::ManualRetry
+            && before_retry.desired_state == DesiredState::Running
+            && before_retry.recovery_state != freshell_runtime_protocol::RecoveryState::Lost
+        {
+            if let Some(result) =
+                Box::pin(self.manual_retry_unresolved_codex_input_block(&before_retry)).await?
+            {
+                finish!(*result);
+            }
         }
         if request.trigger == RecoveryTrigger::ManualRetry
             && before_retry.desired_state == DesiredState::Running
@@ -4136,6 +4220,21 @@ impl Supervisor {
             ($result:expr) => {
                 return Ok(RecoveryReplacementPreparation::Finished(Box::new($result)));
             };
+        }
+        let current = self
+            .registry
+            .recovery_context(soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        if let Some(result) = Box::pin(self.replacement_unresolved_codex_input_block(
+            &soul_id,
+            &current,
+            path,
+            resume_spec.as_ref(),
+        ))
+        .await?
+        {
+            finish!(*result);
         }
         let recovery_started = Instant::now();
         let start = match self
@@ -9026,6 +9125,7 @@ pub(crate) mod tests {
     struct ObservedRuntime {
         state: BackendRuntimeState,
         repaired: Option<Arc<RepairedPreflightEvidence>>,
+        inspect_failure_once: Option<Arc<std::sync::atomic::AtomicBool>>,
     }
 
     #[derive(Default)]
@@ -9066,6 +9166,15 @@ pub(crate) mod tests {
             &self,
             handle: &OwnedRuntimeHandle,
         ) -> Result<crate::backend::BackendInspection, BackendError> {
+            if self
+                .inspect_failure_once
+                .as_ref()
+                .is_some_and(|failure| failure.swap(false, std::sync::atomic::Ordering::SeqCst))
+            {
+                return Err(BackendError::Unavailable(
+                    "controlled initial inspection failure".into(),
+                ));
+            }
             if self
                 .repaired
                 .as_ref()
@@ -9175,11 +9284,21 @@ pub(crate) mod tests {
         registry: crate::registry::Registry,
         state: BackendRuntimeState,
     ) -> Supervisor {
+        supervisor_with_runtime_state_and_inspect_failure(dir, registry, state, None)
+    }
+
+    pub(crate) fn supervisor_with_runtime_state_and_inspect_failure(
+        dir: &tempfile::TempDir,
+        registry: crate::registry::Registry,
+        state: BackendRuntimeState,
+        inspect_failure_once: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Supervisor {
         Supervisor::new(
             registry,
             std::sync::Arc::new(ObservedRuntime {
                 state,
                 repaired: None,
+                inspect_failure_once,
             }),
             crate::service::SupervisorConfig {
                 runtime_root: dir.path().join("runtime"),
@@ -9228,6 +9347,7 @@ pub(crate) mod tests {
                     Arc::new(ObservedRuntime {
                         state,
                         repaired: Some(evidence.clone()),
+                        inspect_failure_once: None,
                     }),
                     config,
                 )

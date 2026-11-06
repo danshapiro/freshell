@@ -2397,6 +2397,7 @@ export function FreshAgentView({
 
   const scheduleCodexSendReconcileRetry = useCallback((requestId: string) => {
     if (codexSendReconcileTimersRef.current.has(requestId)
+      || typeof ws.getServerCapabilities !== 'function'
       || ws.getServerCapabilities().freshAgentSendReconcileV1 !== true
       || (codexSendReconcileAttemptsRef.current.get(requestId) ?? 0) >= FRESH_AGENT_CODEX_RECEIPT_MAX_RETRIES) return
 
@@ -2421,17 +2422,19 @@ export function FreshAgentView({
           codexSendReconcileAttemptsRef.current.delete(requestId)
           return
         }
+        if (isManagedFreshAgentStopped(current)) {
+          codexSendReconcileAttemptsRef.current.delete(requestId)
+          return
+        }
         // A disconnect is handled by the existing reconnect listener. Do not
         // put receipt frames into WsClient's offline queue, where they could
         // displace user messages while the socket is down.
         if (ws.state !== 'ready') return
-        if (isFreshAgentLifecycleBlocked(current)) {
-          scheduleNext()
-          return
-        }
         // Receipt reconciliation only reads the durable result; it never
         // replays the provider input. Poll a bounded number of times while
-        // this pane still owns the send.
+        // this pane still owns the send. The supervisor accepts exact receipt
+        // reads while recovery is blocked, so they can be what clears that
+        // block.
         if (sendCodexSendReceiptReconcile(requestId, pending)) scheduleNext()
       }, FRESH_AGENT_CODEX_RECEIPT_RETRY_DELAY_MS)
       codexSendReconcileTimersRef.current.set(requestId, timer)
@@ -2445,8 +2448,10 @@ export function FreshAgentView({
     codexSendReconcileAttemptsRef.current.clear()
   }, [])
 
-  const replayPendingCodexSendFrames = useCallback((current: FreshAgentPaneContent) => {
-    if (current.provider !== 'codex' || ws.getServerCapabilities().freshAgentSendReconcileV1 !== true) return
+  const replayPendingCodexSendFrames = useCallback((current: FreshAgentPaneContent, newConnection = false) => {
+    if (current.provider !== 'codex'
+      || typeof ws.getServerCapabilities !== 'function'
+      || ws.getServerCapabilities().freshAgentSendReconcileV1 !== true) return
     const currentScope = paneSessionScope(current)
     for (const [requestId, pending] of pendingSendMetadataRef.current) {
       if (pending.submittedTurnId || pending.legacyAccepted || !pending.sendFrame) continue
@@ -2456,6 +2461,11 @@ export function FreshAgentView({
         || !scopeToPaneSession(pending, currentScope.sourceSessionKey, currentScope.sourceCanonicalSessionKey)) {
         continue
       }
+      if (isManagedFreshAgentStopped(current)) {
+        retireCodexSendReconcileRetry(requestId)
+        continue
+      }
+      if (!newConnection && codexSendReconcileTimersRef.current.has(requestId)) continue
       // A new ready WebSocket connection is a new opportunity for the
       // supervisor to have recovered. Keep each connection's receipt-read
       // burst bounded, but do not let an earlier exhausted burst disable a
@@ -2465,12 +2475,10 @@ export function FreshAgentView({
       // Preserve the request ID and full original payload so the supervisor
       // can check its journal and durable host receipt. This route never
       // dispatches the provider input a second time.
-      if (!isFreshAgentLifecycleBlocked(current)) {
-        sendCodexSendReceiptReconcile(requestId, pending)
-      }
+      sendCodexSendReceiptReconcile(requestId, pending)
       if (pending.deliveryAmbiguous) scheduleCodexSendReconcileRetry(requestId)
     }
-  }, [clearCodexSendReconcileRetry, scheduleCodexSendReconcileRetry, sendCodexSendReceiptReconcile, ws])
+  }, [clearCodexSendReconcileRetry, retireCodexSendReconcileRetry, scheduleCodexSendReconcileRetry, sendCodexSendReceiptReconcile, ws])
 
   /** Task 10: re-issue a failed send under a fresh requestId with the
    * retained text + route cwd. The retry gets its own pending-metadata entry
@@ -3353,6 +3361,7 @@ export function FreshAgentView({
     previousLifecycleBlockedRef.current = lifecycleBlocked
     if (lifecycleBlocked) return
     if (!paneContent.sessionId) return
+    if (wasLifecycleBlocked) replayPendingCodexSendFrames(paneContentRef.current)
     // Supervisor recovery is a new attachment decision for the same conversation.
     // Capture its current owner fence; old queued attempts retain their old decision.
     if (wasLifecycleBlocked) attachDecisionSerialRef.current += 1
@@ -3381,11 +3390,12 @@ export function FreshAgentView({
     paneContent.sessionRef?.provider,
     paneContent.sessionRef?.sessionId,
     paneContent.sessionType,
+    replayPendingCodexSendFrames,
     sendFencedFreshAgentAttach,
   ])
 
   useEffect(() => {
-    if (isFreshAgentLifecycleBlocked(paneContentRef.current) || !paneContent.sessionId) return
+    if (!paneContent.sessionId) return
     if (typeof ws.onReconnect !== 'function') return
     return ws.onReconnect(() => {
       // The ready handler folds the new boot and runtime-owner state in the
@@ -3394,21 +3404,25 @@ export function FreshAgentView({
       queueMicrotask(() => {
         if (!isMountedRef.current) return
         const current = paneContentRef.current
-        if (isFreshAgentLifecycleBlocked(current) || !current.sessionId) return
+        if (!current.sessionId) return
+        if (isFreshAgentLifecycleBlocked(current)) {
+          replayPendingCodexSendFrames(current, true)
+          return
+        }
         const attempt = captureFreshAgentAttachmentAttempt(current)
         const sendAttach = () => {
           sendFencedFreshAgentAttach(attempt)
         }
         if (hiddenRef.current) {
           enqueueFreshAgentAttach(attempt)
-          replayPendingCodexSendFrames(current)
+          replayPendingCodexSendFrames(current, true)
           // Surface hydration (HTTP transcript snapshot fetch) is EXPENSIVE --
           // defer it until reveal instead of fetching for every hidden pane.
           pendingRevealRefreshRef.current = true
           markSnapshotDirty('reconnect')
         } else {
           sendAttach()
-          replayPendingCodexSendFrames(current)
+          replayPendingCodexSendFrames(current, true)
           requestSnapshotRefresh('reconnect')
         }
       })

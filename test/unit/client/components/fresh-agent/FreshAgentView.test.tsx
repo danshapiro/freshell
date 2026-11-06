@@ -22191,6 +22191,75 @@ describe('task6 hosted recovery in the mounted view', () => {
     expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(0)
   })
 
+  it('reconciles an ambiguous Codex send when recovery returns after a reconnect while blocked', async () => {
+    const store = createStore()
+    const handlers = new Set<(message: unknown) => void>()
+    let reconnectHandler: (() => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => { handlers.add(handler); return () => { handlers.delete(handler) } })
+    wsMock.onReconnect.mockImplementation((handler: () => void) => {
+      reconnectHandler = handler
+      return () => { reconnectHandler = undefined }
+    })
+    wsMock.getServerCapabilities.mockReturnValue({ freshAgentSendReconcileV1: true })
+    const locator = { sessionId: 'codex-blocked-reconnect-receipt', sessionType: 'freshcodex', provider: 'codex' }
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      ...locator, threadId: locator.sessionId, status: 'idle',
+      capabilities: { send: true, interrupt: true }, turns: [],
+      extensions: { codex: { ownerKind: 'fresh-agent', statusFromLiveState: true } },
+    })
+    store.dispatch(sessionInit(locator))
+    store.dispatch(setSessionStatus({ ...locator, status: 'idle' }))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      kind: 'fresh-agent', ...locator, sessionRef: { provider: 'codex', sessionId: locator.sessionId },
+      createRequestId: 'codex-blocked-reconnect-receipt-create', status: 'idle',
+      soulId: 'codex-blocked-reconnect-receipt-soul', soulIntentRevision: 1,
+      recoverySummary: { desiredState: 'running', recoveryState: 'live',
+        durabilityState: 'resume_captured', allocationState: 'verified_durable' },
+    } }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+    await waitFor(() => expect(composer).toBeEnabled())
+    fireEvent.change(composer, { target: { value: 'Keep this accepted send attached to its receipt' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1))
+    const originalFrame = sentFreshAgentMessages('freshAgent.send')[0]
+    act(() => {
+      for (const handler of [...handlers]) handler({
+        type: 'error', code: 'INTERNAL_ERROR', requestId: originalFrame.requestId,
+        message: 'CODEX_DELIVERY_AMBIGUOUS: native response was lost',
+      })
+    })
+    await waitFor(() => expect(screen.getByRole('alert', { name: 'Agent warning' }))
+      .toHaveTextContent('Delivery is uncertain'))
+
+    const liveRecovery = getFreshAgentPaneContent(store).recoverySummary!
+    act(() => store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: {
+      recoverySummary: { ...liveRecovery, recoveryState: 'blocked' },
+    } })))
+    expect(reconnectHandler).toBeTypeOf('function')
+
+    // The socket reconnects while recovery is blocked. The listener performs
+    // only the exact receipt read; it does not attach or resend provider input.
+    wsMock.state = 'disconnected'
+    wsMock.state = 'ready'
+    act(() => reconnectHandler?.())
+    await act(async () => { await Promise.resolve() })
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(1))
+
+    // When recovery returns to live, an active receipt timer is retained and
+    // does not start a duplicate burst on the same connection.
+    const blockedRecovery = getFreshAgentPaneContent(store).recoverySummary!
+    act(() => store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: {
+      recoverySummary: { ...blockedRecovery, recoveryState: 'live' },
+    } })))
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(1))
+    expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+    expect(sentFreshAgentMessages('freshAgent.send.reconcile')[0]).toEqual({
+      ...originalFrame,
+      type: 'freshAgent.send.reconcile',
+    })
+  })
+
   it('reconciles an ambiguous Codex send when connected, waits through recovery blocks, and bounds receipt reads', async () => {
     const store = createStore()
     const handlers = new Set<(message: unknown) => void>()
@@ -22236,6 +22305,7 @@ describe('task6 hosted recovery in the mounted view', () => {
       expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(0)
       wsMock.state = 'ready'
       act(() => reconnectHandler?.())
+      await act(async () => { await Promise.resolve() })
       expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toEqual([{
         ...originalFrame,
         type: 'freshAgent.send.reconcile',
@@ -22247,13 +22317,13 @@ describe('task6 hosted recovery in the mounted view', () => {
         recoverySummary: { ...liveRecovery, recoveryState: 'blocked' },
       } })))
       await act(async () => { await vi.advanceTimersByTimeAsync(FRESH_AGENT_CODEX_RECEIPT_RETRY_DELAY_MS) })
-      expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(1)
+      expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(2)
       const blockedRecovery = getFreshAgentPaneContent(store).recoverySummary!
       act(() => store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: {
         recoverySummary: { ...blockedRecovery, recoveryState: 'live' },
       } })))
       await act(async () => { await vi.advanceTimersByTimeAsync(FRESH_AGENT_CODEX_RECEIPT_RETRY_DELAY_MS) })
-      expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(2)
+      expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(3)
 
       act(() => {
         for (const handler of [...handlers]) handler({
@@ -22262,12 +22332,12 @@ describe('task6 hosted recovery in the mounted view', () => {
         })
       })
       await act(async () => { await vi.advanceTimersByTimeAsync(FRESH_AGENT_CODEX_RECEIPT_RETRY_DELAY_MS) })
-      expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(3)
+      expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(4)
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
 
       await act(async () => {
         await vi.advanceTimersByTimeAsync(
-          FRESH_AGENT_CODEX_RECEIPT_RETRY_DELAY_MS * (FRESH_AGENT_CODEX_RECEIPT_MAX_RETRIES - 3),
+          FRESH_AGENT_CODEX_RECEIPT_RETRY_DELAY_MS * (FRESH_AGENT_CODEX_RECEIPT_MAX_RETRIES - 4),
         )
       })
       expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(FRESH_AGENT_CODEX_RECEIPT_MAX_RETRIES)
@@ -22275,6 +22345,7 @@ describe('task6 hosted recovery in the mounted view', () => {
       expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(FRESH_AGENT_CODEX_RECEIPT_MAX_RETRIES)
 
       act(() => reconnectHandler?.())
+      await act(async () => { await Promise.resolve() })
       expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(FRESH_AGENT_CODEX_RECEIPT_MAX_RETRIES + 1)
       await act(async () => {
         await vi.advanceTimersByTimeAsync(

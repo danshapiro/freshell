@@ -24,6 +24,72 @@ use std::{
 };
 use tokio::{sync::Semaphore, task::JoinSet};
 
+type ObserverHostObservation = Option<
+    Result<
+        (
+            crate::service::AuthenticatedHost,
+            crate::service::HostStatus,
+        ),
+        RecoveryTrigger,
+    >,
+>;
+
+async fn observer_host_status(
+    supervisor: &Supervisor,
+    handle: &crate::registry::OwnedRuntimeHandle,
+    soul_id: &SoulId,
+    recheck: bool,
+) -> ObserverHostObservation {
+    let host = match supervisor
+        .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+        .await
+    {
+        Ok(host) => host,
+        Err(error) => {
+            append_event(
+                &supervisor.config.lifecycle_log,
+                if recheck {
+                    "supervisor.runtime_observer.authenticate_recheck_failed"
+                } else {
+                    "supervisor.runtime_observer.authenticate_failed"
+                },
+                serde_json::json!({"soulId":soul_id,"errorCode":error.code,"message":error.message}),
+            );
+            return Some(Err(RecoveryTrigger::HostUnreachable));
+        }
+    };
+    match supervisor
+        .host_status(handle.incarnation_id().clone(), handle.runtime_dir(), &host)
+        .await
+    {
+        Ok(status) => Some(Ok((host, status))),
+        Err(error) => {
+            append_event(
+                &supervisor.config.lifecycle_log,
+                if recheck {
+                    "supervisor.runtime_observer.host_status_recheck_failed"
+                } else {
+                    "supervisor.runtime_observer.host_status_failed"
+                },
+                serde_json::json!({"soulId":soul_id,"errorCode":error.code,"message":error.message}),
+            );
+            Some(Err(RecoveryTrigger::HostUnreachable))
+        }
+    }
+}
+
+fn observer_status_needs_refresh(
+    inspection: &Result<crate::backend::BackendInspection, crate::backend::BackendError>,
+    host_observation: &ObserverHostObservation,
+) -> bool {
+    inspection.is_err()
+        || match host_observation {
+            Some(Err(_)) => true,
+            Some(Ok((_, status))) => status.exited,
+            None => false,
+        }
+}
+
 pub const DEFAULT_STARTUP_RECOVERY_CONCURRENCY: usize = 4;
 const MAX_STARTUP_RECOVERY_CONCURRENCY: usize = 16;
 const DEFAULT_STARTUP_SOUL_TIMEOUT: Duration = Duration::from_secs(180);
@@ -355,7 +421,7 @@ impl Supervisor {
                     .active_handle_for_soul(view.soul_id.clone())
                     .await
                     .map_err(map_registry)?;
-                let inspection = supervisor.backend.inspect(&handle).await;
+                let mut inspection = supervisor.backend.inspect(&handle).await;
                 // Backend inspection can outlive the ownership snapshot from
                 // inventory. Re-read it before contacting the host so an
                 // observation of a revoked incarnation cannot authenticate
@@ -378,48 +444,50 @@ impl Supervisor {
                 // lock. A stalled host must not block SEND or Compact. The
                 // snapshot is revalidated under the lock before it can drive
                 // any registry mutation or recovery decision.
-                let host_observation = match &inspection {
-                    Ok(inspection) if inspection.state == BackendRuntimeState::Running => {
-                        Some(match supervisor
-                            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
-                            .await
-                        {
-                            Ok(host) => match supervisor
-                                .host_status(
-                                    handle.incarnation_id().clone(),
-                                    handle.runtime_dir(),
-                                    &host,
-                                )
-                                .await
-                            {
-                                Ok(status) => Ok((host, status)),
-                                Err(error) => {
-                                    append_event(
-                                        &supervisor.config.lifecycle_log,
-                                        "supervisor.runtime_observer.host_status_failed",
-                                        serde_json::json!({"soulId":view.soul_id,"errorCode":error.code,"message":error.message}),
-                                    );
-                                    Err(RecoveryTrigger::HostUnreachable)
-                                }
-                            },
-                            Err(error) => {
-                                append_event(
-                                    &supervisor.config.lifecycle_log,
-                                    "supervisor.runtime_observer.authenticate_failed",
-                                    serde_json::json!({"soulId":view.soul_id,"errorCode":error.code,"message":error.message}),
-                                );
-                                Err(RecoveryTrigger::HostUnreachable)
-                            }
-                        })
-                    }
-                    _ => None,
+                let mut host_observation = if matches!(
+                    &inspection,
+                    Ok(inspection) if inspection.state == BackendRuntimeState::Running
+                ) {
+                    observer_host_status(&supervisor, &handle, &view.soul_id, false).await
+                } else {
+                    None
                 };
                 let lifecycle = supervisor.lifecycle_lock(&view.soul_id).await;
                 // Preserve this observation's recovery trigger when another
-                // lifecycle operation (such as an event read) owns the lock.
-                // Host authentication and Status remain outside the lock; the
-                // snapshot is revalidated immediately after acquiring it.
-                let lifecycle_guard = lifecycle.lock().await;
+                // lifecycle operation owns the lock. If it took time to wait,
+                // refresh any observation that could have triggered recovery
+                // before acquiring the lock again. Host I/O stays outside the
+                // lock so a stalled host cannot block SEND or Compact.
+                let lifecycle_guard = match lifecycle.try_lock() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        append_event(
+                            &supervisor.config.lifecycle_log,
+                            "supervisor.runtime_observer.lifecycle_lock_wait",
+                            serde_json::json!({"severity":"debug","soulId":view.soul_id}),
+                        );
+                        let waited_guard = lifecycle.lock().await;
+                        drop(waited_guard);
+                        if observer_status_needs_refresh(&inspection, &host_observation) {
+                            inspection = supervisor.backend.inspect(&handle).await;
+                            host_observation = if matches!(
+                                &inspection,
+                                Ok(inspection) if inspection.state == BackendRuntimeState::Running
+                            ) {
+                                observer_host_status(
+                                    &supervisor,
+                                    &handle,
+                                    &view.soul_id,
+                                    true,
+                                )
+                                .await
+                            } else {
+                                None
+                            };
+                        }
+                        lifecycle.lock().await
+                    }
+                };
                 let current = supervisor.registry.recovery_context(view.soul_id.clone())
                     .await.map_err(map_registry)?;
                 if current.desired_state != DesiredState::Running
@@ -440,52 +508,6 @@ impl Supervisor {
                 {
                     return Ok(());
                 }
-                // Status can describe an in-flight host-side transition that
-                // completed while this observer waited for the lifecycle
-                // lock (for example, Codex same-root readiness during
-                // Compact). Refresh only observations that could trigger
-                // recovery; otherwise a stale pre-lock `exited`/error result
-                // can spend a recovery attempt against a now-healthy actor.
-                let recheck_host_observation = match &host_observation {
-                    Some(Err(_)) => true,
-                    Some(Ok((_, status))) => status.exited,
-                    None => false,
-                };
-                let host_observation = if recheck_host_observation {
-                    Some(match supervisor
-                            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
-                            .await
-                        {
-                            Ok(host) => match supervisor
-                                .host_status(
-                                    handle.incarnation_id().clone(),
-                                    handle.runtime_dir(),
-                                    &host,
-                                )
-                                .await
-                            {
-                                Ok(status) => Ok((host, status)),
-                                Err(error) => {
-                                    append_event(
-                                        &supervisor.config.lifecycle_log,
-                                        "supervisor.runtime_observer.host_status_recheck_failed",
-                                        serde_json::json!({"soulId":view.soul_id,"errorCode":error.code,"message":error.message}),
-                                    );
-                                    Err(RecoveryTrigger::HostUnreachable)
-                                }
-                            },
-                            Err(error) => {
-                                append_event(
-                                    &supervisor.config.lifecycle_log,
-                                    "supervisor.runtime_observer.authenticate_recheck_failed",
-                                    serde_json::json!({"soulId":view.soul_id,"errorCode":error.code,"message":error.message}),
-                                );
-                                Err(RecoveryTrigger::HostUnreachable)
-                            }
-                        })
-                } else {
-                    host_observation
-                };
                 let mut retained_source = None;
                 let trigger = match (inspection, host_observation) {
                     (Ok(inspection), _)
@@ -692,6 +714,7 @@ mod tests {
         stale_observation: Arc<AtomicBool>,
         probe_unavailable: Arc<AtomicBool>,
         stop_during_probe: Arc<AtomicBool>,
+        inspect_failure_once: Arc<AtomicBool>,
         hold_status: Arc<AtomicBool>,
         fail_status_once: Arc<AtomicBool>,
         status_started: Arc<Notify>,
@@ -771,11 +794,14 @@ mod tests {
                 .bind_native_identity_launch(launch.clone())
                 .await
                 .unwrap();
-            let supervisor = crate::recovery::tests::supervisor_with_runtime_state(
-                &root,
-                registry.clone(),
-                BackendRuntimeState::Running,
-            );
+            let inspect_failure_once = Arc::new(AtomicBool::new(false));
+            let supervisor =
+                crate::recovery::tests::supervisor_with_runtime_state_and_inspect_failure(
+                    &root,
+                    registry.clone(),
+                    BackendRuntimeState::Running,
+                    Some(Arc::clone(&inspect_failure_once)),
+                );
             let probes = Arc::new(AtomicUsize::new(0));
             let stale_observation = Arc::new(AtomicBool::new(false));
             let probe_unavailable = Arc::new(AtomicBool::new(false));
@@ -909,6 +935,7 @@ mod tests {
                 stale_observation,
                 probe_unavailable,
                 stop_during_probe,
+                inspect_failure_once,
                 hold_status,
                 fail_status_once,
                 status_started,
@@ -1093,6 +1120,122 @@ mod tests {
             lifecycle_lock_available,
             "a slow host Status request must not block SEND/Compact's lifecycle lock"
         );
+    }
+
+    #[tokio::test]
+    async fn observer_rechecks_host_status_after_lock_wait_without_holding_lifecycle_lock() {
+        let fixture = ObserverFixture::new(false).await;
+        fixture.fail_status_once.store(true, Ordering::SeqCst);
+        let lifecycle = fixture.supervisor.lifecycle_lock(&fixture.soul).await;
+        let lifecycle_guard = lifecycle.lock().await;
+        let supervisor = fixture.supervisor.clone();
+        let observer = tokio::spawn(async move { supervisor.observe_once().await });
+
+        tokio::time::timeout(Duration::from_secs(5), fixture.status_started.notified())
+            .await
+            .expect("observer should complete its initial failed Status call");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let initial_failure_recorded =
+                    std::fs::read_to_string(fixture.root.path().join("lifecycle.jsonl"))
+                        .unwrap_or_default()
+                        .lines()
+                        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                        .any(|event| {
+                            event["event"] == "supervisor.runtime_observer.host_status_failed"
+                                && event["data"]["soulId"] == fixture.soul.as_str()
+                        });
+                if initial_failure_recorded {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("observer should log the initial Status failure before waiting for the lock");
+
+        fixture.hold_status.store(true, Ordering::SeqCst);
+        drop(lifecycle_guard);
+        tokio::time::timeout(Duration::from_secs(5), fixture.status_started.notified())
+            .await
+            .expect("observer should retry Status after the lifecycle lock becomes available");
+        let lifecycle_lock_available = lifecycle.try_lock().is_ok();
+        fixture.release_status.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), observer)
+            .await
+            .expect("observer should settle after the retried Status call is released")
+            .expect("observer task should not panic")
+            .expect("observer pass should succeed");
+
+        assert!(
+            lifecycle_lock_available,
+            "the post-contention host Status retry must not hold SEND/Compact's lifecycle lock"
+        );
+        let events: Vec<serde_json::Value> =
+            std::fs::read_to_string(fixture.root.path().join("lifecycle.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert!(
+            !events.iter().any(|event| {
+                event["event"] == "supervisor.runtime_observer.recovery_scheduled"
+                    && event["data"]["soulId"] == fixture.soul.as_str()
+            }),
+            "a recovered host Status result must suppress the stale failure trigger: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn observer_refreshes_a_failed_backend_inspection_after_lock_wait() {
+        let fixture = ObserverFixture::new(false).await;
+        fixture.inspect_failure_once.store(true, Ordering::SeqCst);
+        let lifecycle = fixture.supervisor.lifecycle_lock(&fixture.soul).await;
+        let lifecycle_guard = lifecycle.lock().await;
+        let supervisor = fixture.supervisor.clone();
+        let observer = tokio::spawn(async move { supervisor.observe_once().await });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting_for_lifecycle =
+                    std::fs::read_to_string(fixture.root.path().join("lifecycle.jsonl"))
+                        .unwrap_or_default()
+                        .lines()
+                        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                        .any(|event| {
+                            event["event"] == "supervisor.runtime_observer.lifecycle_lock_wait"
+                                && event["data"]["soulId"] == fixture.soul.as_str()
+                        });
+                if waiting_for_lifecycle {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("observer should wait after its initial backend inspection fails");
+
+        drop(lifecycle_guard);
+        tokio::time::timeout(Duration::from_secs(10), observer)
+            .await
+            .expect("observer should finish after it refreshes the backend inspection")
+            .expect("observer task should not panic")
+            .expect("observer pass should succeed");
+
+        let events: Vec<serde_json::Value> =
+            std::fs::read_to_string(fixture.root.path().join("lifecycle.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert!(
+            !events.iter().any(|event| {
+                event["event"] == "supervisor.runtime_observer.recovery_scheduled"
+                    && event["data"]["soulId"] == fixture.soul.as_str()
+            }),
+            "a healthy refreshed backend must not spend a recovery attempt: {events:?}"
+        );
+        assert_eq!(fixture.context().await.recovery_state, RecoveryState::Live);
     }
 
     #[tokio::test]
