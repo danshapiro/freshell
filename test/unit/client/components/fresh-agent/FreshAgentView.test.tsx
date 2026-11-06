@@ -1971,6 +1971,20 @@ describe('FreshAgentView', () => {
     })
   }
 
+  // A different client can already have put its user item and an assistant
+  // item in the still-running turn before this pane's input is steered into it.
+  function claimSnapshotWithRunningNativePreview(nativeTurnId: string, text: string, revision: number) {
+    const snapshot = claimSnapshotWithCompletedNativeTurn(nativeTurnId, text, revision)
+    const projection = snapshot.extensions!.codex!.projection!
+    return FreshAgentSnapshotSchema.parse({ ...snapshot, status: 'running',
+      turns: snapshot.turns.map((turn) => turn.turnId === `${nativeTurnId}:row-1` ? { ...turn, ordinal: 1 } : turn),
+      extensions: { codex: { ...snapshot.extensions!.codex!, projection: {
+        ...projection, nativeFinalTurnIds: [], nativePreviewTurnIds: [nativeTurnId],
+        turnOutputStates: { ...projection.turnOutputStates, [nativeTurnId]: { provenance: 'preview', refreshPending: false } },
+      } } },
+    })
+  }
+
   async function mountProjectionReviewRoute(name: string, withSoul = true, withNativeRef = false, noSoulPublicId = 'native-b', hidden = false, overrides: Partial<FreshAgentPaneContent> = {}, optional = false) {
     const { WsClient } = await vi.importActual<typeof import('@/lib/ws-client')>('@/lib/ws-client')
     const client = new WsClient(`ws://${name}.test/ws`)
@@ -4952,6 +4966,88 @@ describe('FreshAgentView', () => {
       vi.useRealTimers()
     }
   })
+
+  it.each([
+    ['different', 'shared'],
+    ['identical', 'shared'],
+    ['different', 'earlier'],
+    ['identical', 'earlier'],
+  ] as const)(
+    'keeps an accepted Codex input when an earlier %s input has a %s turn', async (textRelationship, turnRelationship) => {
+      const route = await mountProjectionReviewRoute(`claim-running-input-${textRelationship}-${turnRelationship}`, false)
+      const acceptedRead = createDeferred<unknown>()
+      let claimRead: ReturnType<typeof createDeferred<unknown>> | undefined
+      const key = 'freshcodex:codex:native-b'
+      const sentText = 'My input awaiting its own native item'
+      const earlierText = textRelationship === 'identical' ? sentText : 'Earlier input from another client'
+      try {
+        ;({ current: claimRead } = await prepareNativeClaim(route))
+        const ready = hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Ready before concurrent input', 2)
+        await act(async () => claimRead!.resolve(ready))
+        await expectRenderedText('Ready before concurrent input')
+        expect(route.store.getState().freshAgentLive.bySession[key]?.routeOnlyProjectionId).toBe('claim-q')
+        vi.useFakeTimers()
+        const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+        const send = (text: string) => {
+          fireEvent.change(composer, { target: { value: text } })
+          fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+        }
+        send(sentText)
+        send('Follow-up waiting behind my input')
+        const first = sentFreshAgentMessages('freshAgent.send')[0]
+        expect(first).toMatchObject({ text: sentText, sessionId: 'native-b' })
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+        expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+        expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({ requestId: first.requestId, text: sentText })
+        expect(screen.getByText(sentText)).toBeInTheDocument()
+
+        // A concurrent client begins T after this pane sent B. The running
+        // status arrives before B's accepted receipt, and this read contains
+        // A but no item for B. Both native submissions can share T; the
+        // control has A in a separate previously completed turn instead.
+        apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(FreshAgentSnapshotSchema.parse({ ...ready, status: 'running' }))
+        act(() => route.event({ type: 'freshAgent.status', status: 'running' }))
+        expect(route.store.getState().freshAgent.sessions[key]?.status).toBe('running')
+        await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+        apiMock.getFreshAgentThreadSnapshot.mockReturnValue(acceptedRead.promise)
+        act(() => route.receive({ type: 'freshAgent.send.accepted', ...route.locator,
+          requestId: first.requestId, submittedTurnId: 'shared-running-turn' }))
+        await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+        const read = apiMock.getFreshAgentThreadSnapshot.mock.results.findIndex((result) => result.value === acceptedRead.promise)
+        expect(read).toBeGreaterThanOrEqual(0)
+        expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[read]).toMatchObject(['freshcodex', 'codex', 'native-b', { trigger: 'send-accepted' }])
+        expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({
+          requestId: first.requestId, text: sentText, submittedTurnId: 'shared-running-turn',
+        })
+        const response = turnRelationship === 'shared'
+          ? claimSnapshotWithRunningNativePreview('shared-running-turn', earlierText, 3)
+          : FreshAgentSnapshotSchema.parse({
+              ...claimSnapshotWithCompletedNativeTurn('earlier-completed-turn', earlierText, 3), status: 'running',
+            })
+        apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(response)
+        await act(async () => acceptedRead.resolve(response))
+        expect(route.store.getState().freshAgentLive.bySession[key]?.projection).toMatchObject({ id: 'claim-q', eventRevision: 3 })
+        expect(route.store.getState().freshAgent.sessions[key]?.status).toBe('running')
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+        expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+        expect.soft(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({
+          requestId: first.requestId, text: sentText, submittedTurnId: 'shared-running-turn',
+        })
+        const userTurns = within(route.view.container).queryAllByRole('article', { name: 'You transcript turn' })
+        expect.soft(userTurns).toHaveLength(2)
+        expect.soft(userTurns.map((turn) => turn.textContent)).toEqual([
+          expect.stringContaining(earlierText), expect.stringContaining(sentText),
+        ])
+      } finally {
+        cleanup()
+        resetSnapshotSchedulerForTests()
+        route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+        claimRead?.resolve(hostedCodexSnapshot('native-b', 'Claim'))
+        acceptedRead.resolve(hostedCodexSnapshot('native-b', 'Accepted'))
+        vi.useRealTimers()
+      }
+    },
+  )
 
   it('does not reconcile an unbound send from a read started before that send', async () => {
     const route = await mountProjectionReviewRoute('claim-unbound-pre-send-read', false)
