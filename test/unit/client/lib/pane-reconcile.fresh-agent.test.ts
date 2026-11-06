@@ -332,6 +332,37 @@ describe('buildReconcileRequestForPanes is kind-agnostic', () => {
 })
 
 describe('foldVerdicts fresh-agent routing', () => {
+  it('folds one shared session fact into an attach for each independent view', () => {
+    let panes = emptyPanesState()
+    const sessionRef = { provider: 'claude', sessionId: DURABLE }
+    panes = addFreshAgentPane(panes, 'desktop-tab', 'desktop-pane', { sessionRef, resumeSessionId: DURABLE })
+    panes = addFreshAgentPane(panes, 'mobile-tab', 'mobile-pane', { sessionRef, resumeSessionId: DURABLE })
+    const req = buildReconcileRequest(asRootState(panes), { includeFreshAgent: true })!
+    const { dispatch, dispatched } = recordingDispatch()
+    const verdicts: PaneVerdict[] = req.panes.map((pane) => ({
+      paneKey: pane.paneKey,
+      verdict: 'attach',
+      sessionRef,
+    }))
+
+    const outcome = foldVerdicts(dispatch, req, resultFor(req, verdicts))
+
+    expect(outcome.attached).toBe(2)
+    expect(dispatched.countOf(applyFreshAgentReconcileAttach.type)).toBe(2)
+    expect(dispatched.actions
+      .filter((action) => action.type === applyFreshAgentReconcileAttach.type)
+      .map((action) => (action as { payload: { tabId: string; paneId: string } }).payload))
+      .toEqual([
+        expect.objectContaining({ tabId: 'desktop-tab', paneId: 'desktop-pane' }),
+        expect.objectContaining({ tabId: 'mobile-tab', paneId: 'mobile-pane' }),
+      ])
+    expect(dispatched.actions
+      .filter((action) => action.type === applyFreshAgentReconcileAttach.type)
+      .every((action) =>
+      (action as { payload: { sessionRef: typeof sessionRef } }).payload.sessionRef.sessionId === DURABLE,
+    )).toBe(true)
+  })
+
   it('attach dispatches applyFreshAgentReconcileAttach with the verdict sessionRef', () => {
     const { req, dispatch, dispatched } = freshAgentFoldHarness([
       ['attach', { sessionRef: { provider: 'claude', sessionId: DURABLE }, corrected: true }],
@@ -346,6 +377,48 @@ describe('foldVerdicts fresh-agent routing', () => {
       serverInstanceId: 'srv-1',
       corrected: true,
     })
+  })
+
+  it('joins an explicit recovery_in_progress verdict only with its current owner fence', () => {
+    let panes = addFreshAgentPane(emptyPanesState(), 'tab1', 'p1', {
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+      resumeSessionId: DURABLE,
+    })
+    const req = buildReconcileRequest(asRootState(panes), { includeFreshAgent: true })!
+    const { dispatch, dispatched } = recordingDispatch()
+    const fence = { epoch: 7, generation: 3 }
+    const outcome = foldVerdicts(dispatch, req, resultFor(req, [{
+      paneKey: req.panes[0].paneKey,
+      verdict: 'error',
+      reason: 'recovery_in_progress',
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+    }]), {
+      getRecoveryJoinFence: () => fence,
+    })
+
+    expect(outcome.recoveryJoining).toBe(1)
+    expect(dispatched.lastPayloadOf(applyFreshAgentReconcileAttach.type)).toMatchObject({
+      tabId: 'tab1',
+      paneId: 'p1',
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+      recoveryJoinFence: fence,
+    })
+    expect(dispatched.countOf(setPaneRestoreError.type)).toBe(0)
+  })
+
+  it('does not silently consume recovery_in_progress without a matching owner fence', () => {
+    const { req, dispatch, dispatched } = freshAgentFoldHarness([['error', {
+      reason: 'recovery_in_progress',
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+    }]])
+
+    const outcome = foldVerdicts(dispatch, req, resultFor(req, dispatched.verdicts), {
+      getRecoveryJoinFence: () => undefined,
+    })
+
+    expect(outcome.recoveryJoining).toBe(0)
+    expect(dispatched.countOf(applyFreshAgentReconcileAttach.type)).toBe(0)
+    expect(dispatched.countOf(setPaneRestoreError.type)).toBe(1)
   })
 
   it('attach without a sessionRef is skipped entirely (malformed verdict)', () => {

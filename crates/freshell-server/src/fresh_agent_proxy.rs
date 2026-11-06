@@ -20,8 +20,8 @@ use freshell_runtime_client::RuntimeClient;
 use freshell_runtime_protocol::{
     AgentEvent, DesiredState, FreshAgentFixtureTransport, FreshAgentLaunchSpec,
     FreshAgentProviderStartDiagnostic, FreshAgentRollbackDirection, FreshAgentRollbackMode,
-    FreshProvider, LaunchRequest, ProviderBootstrapFile, RequestId, RuntimeDiagnosticCode,
-    RuntimeErrorCode, RuntimeLimits, RuntimeProfile, SoulId, StopOutcome,
+    FreshProvider, LaunchRequest, LaunchState, ProviderBootstrapFile, RequestId,
+    RuntimeDiagnosticCode, RuntimeErrorCode, RuntimeLimits, RuntimeProfile, SoulId, StopOutcome,
 };
 use freshell_terminal::FrameSink;
 use freshell_ws::hosted_fresh_agent::{HostedFreshAgentCommand, HostedFreshAgentGateway};
@@ -908,7 +908,79 @@ impl HostedFreshAgentProxy {
                 .into_iter()
                 .rev()
                 .find(|view| resume_view_matches(view, provider.as_str(), &session_ref.session_id));
-            if let Some(view) = view {
+            if let Some(mut view) = view {
+                if view
+                    .fresh_agent_recovery
+                    .as_ref()
+                    .is_some_and(|status| status.exhausted)
+                {
+                    let mut error = RestLaneError::new(
+                        RestLaneErrorKind::Unavailable,
+                        "RECOVERY_EXHAUSTED",
+                        "managed Freshagent could not restore this conversation after three failed launches",
+                    );
+                    error.retryable = Some(false);
+                    return Err(error);
+                }
+                let recovery_operation = view
+                    .fresh_agent_recovery
+                    .as_ref()
+                    .filter(|status| status.in_flight)
+                    .map(|status| status.operation_id.clone());
+                if let Some(operation_id) = recovery_operation {
+                    tracing::debug!(
+                        event = "fresh_agent.create.resume_joining_managed_recovery",
+                        request_id = message.request_id.as_str(),
+                        provider = provider.as_str(),
+                        soul_id = %view.soul_id,
+                        operation_id = %operation_id,
+                        "joining the supervisor-owned managed Freshagent recovery"
+                    );
+                    let result = self
+                        .client
+                        .wait_fresh_agent_recovery(view.soul_id.clone(), operation_id.clone())
+                        .await
+                        .map_err(|error| {
+                            tracing::warn!(
+                                event = "fresh_agent.create.resume_recovery_failed",
+                                reason = create_client_error_reason(&error),
+                                operation_id = %operation_id,
+                                request_id = message.request_id.as_str(),
+                                provider = provider.as_str(),
+                                soul_id = %view.soul_id,
+                                "the shared managed Freshagent recovery did not succeed"
+                            );
+                            create_launch_failure(&error)
+                        })?;
+                    if !resume_view_matches(
+                        &result.view,
+                        provider.as_str(),
+                        &session_ref.session_id,
+                    ) || result.view.launch_state != LaunchState::Running
+                    {
+                        tracing::warn!(
+                            event = "fresh_agent.create.resume_recovery_identity_mismatch",
+                            operation_id = %operation_id,
+                            request_id = message.request_id.as_str(),
+                            provider = provider.as_str(),
+                            soul_id = %view.soul_id,
+                            launch_state = ?result.view.launch_state,
+                            "the shared recovery result did not confirm the requested running session"
+                        );
+                        return Err(RestLaneError::from(()));
+                    }
+                    view = result.view;
+                } else if view.launch_state != LaunchState::Running {
+                    tracing::warn!(
+                        event = "fresh_agent.create.resume_not_running",
+                        request_id = message.request_id.as_str(),
+                        provider = provider.as_str(),
+                        soul_id = %view.soul_id,
+                        launch_state = ?view.launch_state,
+                        "a managed Freshagent resume row is not ready and has no active recovery operation"
+                    );
+                    return Err(RestLaneError::from(()));
+                }
                 if matches!(provider, FreshProvider::Claude | FreshProvider::Kilroy) {
                     self.client.fresh_agent_prepare_native(view.soul_id.clone()).await.map_err(|error| {
                         tracing::warn!(event="fresh_agent.create.resume_preparation_failed",
@@ -1274,16 +1346,7 @@ impl HostedFreshAgentProxy {
                     stage="controller", operation="launch", reason=create_client_error_reason(&error),
                     "Retain provider inputs until dispatch outcome is confirmed");
             }
-            match (error.diagnostic_code(), provider_start_diagnostic) {
-                (Some(RuntimeDiagnosticCode::FreshAgentProviderStartFailed), Some(diagnostic)) => {
-                    RestLaneError::new(
-                        RestLaneErrorKind::Unavailable,
-                        "FRESH_AGENT_PROVIDER_START_FAILED",
-                        format!("hosted fresh-agent provider failed to start (startup diagnostic: {})", diagnostic.as_str()),
-                    )
-                }
-                _ => RestLaneError::from(()),
-            }
+            create_launch_failure(&error)
         })?;
         let cleanup_receipt = (soul.clone(), launched.view.intent_revision);
         let naming_projection = match message.naming_handle.as_deref() {
@@ -2655,6 +2718,25 @@ fn create_client_error_reason(error: &freshell_runtime_client::ClientError) -> &
         ClientError::Protocol(_) => "supervisor_protocol",
         ClientError::Runtime { .. } => "runtime_rejection",
         ClientError::UnexpectedResult => "unexpected_supervisor_result",
+    }
+}
+
+fn create_launch_failure(error: &freshell_runtime_client::ClientError) -> RestLaneError {
+    match (
+        error.diagnostic_code(),
+        error.fresh_agent_provider_start_diagnostic(),
+    ) {
+        (Some(RuntimeDiagnosticCode::FreshAgentProviderStartFailed), Some(diagnostic)) => {
+            RestLaneError::new(
+                RestLaneErrorKind::Unavailable,
+                "FRESH_AGENT_PROVIDER_START_FAILED",
+                format!(
+                    "hosted fresh-agent provider failed to start (startup diagnostic: {})",
+                    diagnostic.as_str()
+                ),
+            )
+        }
+        _ => RestLaneError::from(()),
     }
 }
 

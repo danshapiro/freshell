@@ -368,15 +368,6 @@ pub struct WsState {
     /// tests shrink it so the warming paths are observable without a real
     /// 2s wait (mirrors `ping_interval_ms` / `hello_timeout_ms`).
     pub reconcile_deferral_budget_ms: u64,
-    /// Per-boot fresh-agent respawn-answer counter, keyed `(provider,
-    /// sessionId)` (campaign §4.3, V2/A7). Counts RESPAWN ANSWERS only —
-    /// incremented by [`crate::reconcile_freshagent::build_snapshot`] when an
-    /// answer goes out as `respawn`, and CLEARED when the session's presence
-    /// resolves Live (a successful respawn is OBSERVED as the session going
-    /// live), so healthy sessions are never exhausted by reconnect/reload
-    /// storms. In-memory only: a server restart intentionally resets it.
-    pub fresh_agent_respawn_counts:
-        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(String, String), u32>>>,
     /// kata b8ke Task 4: the ONE server-wide runtime-ownership coordinator
     /// (the same instance `freshell-server::main` injects into every
     /// fresh-agent state and the terminal registry). `None` (every hand-built
@@ -1196,7 +1187,6 @@ pub(crate) fn test_ws_state() -> WsState {
         activity: None,
         session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-        fresh_agent_respawn_counts: Default::default(),
         ownership: None,
     }
 }

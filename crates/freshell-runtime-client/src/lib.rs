@@ -9,18 +9,19 @@ use freshell_runtime_protocol::{
     CanonicalOwnerChoice, ControlRole, Envelope, FreshAgentCapture, FreshAgentCaptureRequest,
     FreshAgentCompactRequest, FreshAgentConfigureRequest, FreshAgentForkRequest,
     FreshAgentInterruptRequest, FreshAgentProviderStartDiagnostic, FreshAgentReadEventsRequest,
-    FreshAgentResolveRequest, FreshAgentRollbackDirection, FreshAgentRollbackMode,
-    FreshAgentRollbackRequest, FreshAgentSendRequest, IncidentId, IncidentSummaryRequest,
-    LaunchRequest, LossIncidentSummary, LostSoulRepairTarget, ManagedRolloutMode, MigrationPlan,
-    MigrationPlanRequest, NoticeDeliveryState, NoticeId, NoticeReceiptRequest,
-    OpenCodeTransferAction, OpenCodeTransferDescriptor, OpenCodeTransferResult,
-    PendingNoticesRequest, PendingViewProjectionsRequest, RecoverRequest, RecoveryProbeRequest,
-    RecoveryTrigger, RepairAudit, RepairRequest, RequestId, RestoreLostSoulsRequest,
-    RestoreLostSoulsResult, RuntimeDiagnosticCode, RuntimeError, RuntimeErrorCode,
-    RuntimeInventorySnapshot, RuntimeMetricsRequest, RuntimeMetricsSnapshot, RuntimeNotice,
-    RuntimeView, SoulId, StopOutcome, StopRequest, TerminalInputRequest, TerminalReadOutputRequest,
-    TerminalResizeRequest, UpdateLimitsRequest, UpdateLimitsResult, UpdateViewVisibilityRequest,
-    UpsertViewIntentRequest, ViewIntent, ViewProjectionEvent, CONTROL_PROTOCOL_VERSION,
+    FreshAgentRecoveryWaitRequest, FreshAgentResolveRequest, FreshAgentRollbackDirection,
+    FreshAgentRollbackMode, FreshAgentRollbackRequest, FreshAgentSendRequest, IncidentId,
+    IncidentSummaryRequest, LaunchRequest, LossIncidentSummary, LostSoulRepairTarget,
+    ManagedRolloutMode, MigrationPlan, MigrationPlanRequest, NoticeDeliveryState, NoticeId,
+    NoticeReceiptRequest, OpenCodeTransferAction, OpenCodeTransferDescriptor,
+    OpenCodeTransferResult, PendingNoticesRequest, PendingViewProjectionsRequest, RecoverRequest,
+    RecoveryProbeRequest, RecoveryTrigger, RepairAudit, RepairRequest, RequestId,
+    RestoreLostSoulsRequest, RestoreLostSoulsResult, RuntimeDiagnosticCode, RuntimeError,
+    RuntimeErrorCode, RuntimeInventorySnapshot, RuntimeMetricsRequest, RuntimeMetricsSnapshot,
+    RuntimeNotice, RuntimeView, SoulId, StopOutcome, StopRequest, TerminalInputRequest,
+    TerminalReadOutputRequest, TerminalResizeRequest, UpdateLimitsRequest, UpdateLimitsResult,
+    UpdateViewVisibilityRequest, UpsertViewIntentRequest, ViewIntent, ViewProjectionEvent,
+    CONTROL_PROTOCOL_VERSION,
 };
 use std::{path::PathBuf, sync::Arc};
 use tokio::{net::UnixStream, sync::RwLock};
@@ -866,6 +867,45 @@ impl RuntimeClient {
                 retry.expected_control_epoch = Some(epoch);
                 match self
                     .request(request_id, AdminCommand::Launch(Box::new(retry)))
+                    .await?
+                {
+                    AdminResult::Launch(result) => Ok(result),
+                    _ => Err(ClientError::UnexpectedResult),
+                }
+            }
+            Ok(_) => Err(ClientError::UnexpectedResult),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Await a specific already-admitted managed Freshagent recovery. This
+    /// exact-operation command cannot create a new launch if the observed
+    /// operation has already changed or disappeared.
+    pub async fn wait_fresh_agent_recovery(
+        &self,
+        soul_id: SoulId,
+        operation_id: String,
+    ) -> Result<freshell_runtime_protocol::LaunchResult, ClientError> {
+        let mut request = FreshAgentRecoveryWaitRequest {
+            soul_id,
+            operation_id,
+            expected_control_epoch: Some(self.current_epoch().await?),
+        };
+        let original = request.clone();
+        let request_id = RequestId::new();
+        match self
+            .request(
+                request_id.clone(),
+                AdminCommand::FreshAgentRecoveryWait(request),
+            )
+            .await
+        {
+            Ok(AdminResult::Launch(result)) => Ok(result),
+            Err(error) if error.runtime_code() == Some(RuntimeErrorCode::StaleControlEpoch) => {
+                request = original;
+                request.expected_control_epoch = Some(self.health().await?.0);
+                match self
+                    .request(request_id, AdminCommand::FreshAgentRecoveryWait(request))
                     .await?
                 {
                     AdminResult::Launch(result) => Ok(result),

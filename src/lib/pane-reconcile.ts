@@ -37,7 +37,7 @@ import {
 } from '@/store/panesSlice'
 import { retainedManagedPreparationFailure } from '@/store/paneTypes'
 import { clearSessionLost } from '@/store/freshAgentSlice'
-import type { PaneOwnerDivergence } from '@/store/selectors/runtimeOwner'
+import type { ObservedOwnerFence, PaneOwnerDivergence } from '@/store/selectors/runtimeOwner'
 import {
   DEAD_SESSION_RECONCILE_NOTICES,
   deadSessionReconcileNoticeFor,
@@ -281,6 +281,7 @@ export function buildReconcileRequestForPanes(
 
 export interface FoldOutcome {
   attached: number
+  recoveryJoining: number
   respawned: number
   fresh: number
   warming: number
@@ -327,6 +328,10 @@ function foldFreshAgentVerdict(
   warmingRefs: Array<{ tabId: string; paneId: string }>,
   outcome: FoldOutcome,
   getOwnerDivergence?: (pane: ReconcilePane) => PaneOwnerDivergence | null,
+  getRecoveryJoinFence?: (
+    pane: ReconcilePane,
+    sessionRef: NonNullable<ReconcilePane['sessionRef']>,
+  ) => ObservedOwnerFence | undefined,
 ): boolean {
   const { tabId, paneId } = paneRefFromOwnKey(pane.paneKey)
 
@@ -408,8 +413,32 @@ function foldFreshAgentVerdict(
       return true
     }
     case 'error': {
-      // Fresh-agent verdicts never emit 'error' today, but the fold must
-      // not crash if one arrives — identical handling to the terminal arm.
+      if (verdict.reason === 'recovery_in_progress') {
+        // This answer is not a failed restore. When the ready owner replay
+        // proves the same fresh-agent recovery is still in flight, retain
+        // its exact fence as a one-shot attach authorization. The view's
+        // sender rechecks that pair at send time; a newer owner transition
+        // makes the authorization inert.
+        if (verdict.sessionRef) {
+          const recoveryJoinFence = getRecoveryJoinFence?.(pane, verdict.sessionRef)
+          if (recoveryJoinFence) {
+            dispatch(applyFreshAgentReconcileAttach({
+              tabId,
+              paneId,
+              sessionRef: verdict.sessionRef,
+              serverInstanceId: result.serverInstanceId,
+              recoveryJoinFence,
+            }))
+            outcome.recoveryJoining++
+            return true
+          }
+        }
+        // Without the matching current owner fence, keep the existing visible
+        // failure path. The pane must not cancel its held create and then
+        // disappear into an unobservable wait state.
+      }
+      // The server reports ordinary errors through this arm as typed pane
+      // restore failures. Keep warming as its separate bounded retry path.
       if (verdict.reason === 'index_warming') {
         warmingRefs.push({ tabId, paneId })
         outcome.warming++
@@ -464,10 +493,16 @@ export function foldVerdicts(
   opts?: {
     onVerdictFolded?: (createRequestId: string) => void
     getOwnerDivergence?: (pane: ReconcilePane) => PaneOwnerDivergence | null
+    /** Current same-kind owner fence, only used for an explicit in-flight recovery verdict. */
+    getRecoveryJoinFence?: (
+      pane: ReconcilePane,
+      sessionRef: NonNullable<ReconcilePane['sessionRef']>,
+    ) => ObservedOwnerFence | undefined
   },
 ): FoldOutcome {
   const outcome: FoldOutcome = {
     attached: 0,
+    recoveryJoining: 0,
     respawned: 0,
     fresh: 0,
     warming: 0,
@@ -494,7 +529,16 @@ export function foldVerdicts(
     const verdict = result.verdicts[i]
 
     if (pane.kind === 'fresh-agent') {
-      const folded = foldFreshAgentVerdict(dispatch, pane, verdict, result, warmingRefs, outcome, opts?.getOwnerDivergence)
+      const folded = foldFreshAgentVerdict(
+        dispatch,
+        pane,
+        verdict,
+        result,
+        warmingRefs,
+        outcome,
+        opts?.getOwnerDivergence,
+        opts?.getRecoveryJoinFence,
+      )
       if (folded) opts?.onVerdictFolded?.(pane.createRequestId)
       continue
     }

@@ -2832,6 +2832,7 @@ mod tests {
             fresh_agent_create_request_id: None,
             fresh_agent_session_type: None,
             fresh_agent_runtime_variant: None,
+            fresh_agent_recovery: None,
             project_key: Some("project-test".into()),
             profile: Some(RuntimeProfile::DefaultAgent),
             desired_state: freshell_runtime_protocol::DesiredState::Running,

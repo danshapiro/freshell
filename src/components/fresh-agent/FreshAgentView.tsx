@@ -17,7 +17,7 @@ import {
   type FreshAgentCheckpointOutcome,
   type FreshAgentPaneContent,
 } from '@/store/paneTypes'
-import type { PaneReconcileRequest } from '@shared/ws-protocol'
+import type { PaneReconcileRequest, ReconcilePane } from '@shared/ws-protocol'
 import { isUnifiedAgentMode } from '@shared/session-names'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import type { AppStore } from '@/store/store'
@@ -38,7 +38,7 @@ import {
   getFreshAgentThreadSnapshot,
   setSessionMetadata,
 } from '@/lib/api'
-import { clearPaneCloseError, clearReconcilePendingPane, consumePaneRefreshRequest, isPaneClosePending, mergePaneContent, startNewManagedRuntimeConversation, updatePaneContent } from '@/store/panesSlice'
+import { clearFreshAgentRecoveryJoinFence, clearPaneCloseError, clearReconcilePendingPane, consumePaneRefreshRequest, isPaneClosePending, mergePaneContent, startNewManagedRuntimeConversation, updatePaneContent } from '@/store/panesSlice'
 import { retryManagedConversation } from '@/lib/managed-runtime-retry'
 import { isManagedRuntimeRecoveryDecision, ManagedRuntimeRecoveryCard } from '@/components/ManagedRuntimeRecoveryCard'
 import { isManagedRuntimeRecoveryPending } from '@/lib/managed-runtime-recovery-message'
@@ -2121,9 +2121,21 @@ export function FreshAgentView({
     if (isPaneClosePending(state.panes, tabId, paneId)) return false
     if (attachmentAttemptRef.current !== attempt) return false
     if (attachmentAttemptKey(state, content, attachDecisionSerialRef.current) !== attempt.key) return false
-    if (isLifecycleStartSuperseded(state, 'fresh-agent', content, attempt.fence)) {
-      const canonical = resolveCanonicalPaneSession(state, content)
-      const owner = canonical && selectSessionRuntimeOwner(state, canonical.provider, canonical.sessionId)
+    const canonical = resolveCanonicalPaneSession(state, content)
+    const owner = canonical && selectSessionRuntimeOwner(state, canonical.provider, canonical.sessionId)
+    const joinFence = content.recoveryJoinFence
+    const joinFenceMatchesAttempt = joinFence !== undefined
+      && joinFence.epoch === attempt.fence?.epoch
+      && joinFence.generation === attempt.fence?.generation
+    const joinFenceMatchesOwner = joinFenceMatchesAttempt
+      && owner?.ownerKind === 'fresh-agent'
+      && owner.fenced !== true
+      && owner.epoch === joinFence.epoch
+      && owner.generation === joinFence.generation
+    const authorizedRecoveryJoin = joinFenceMatchesOwner
+      && owner.transition === 'handoff-started'
+
+    if (isLifecycleStartSuperseded(state, 'fresh-agent', content, attempt.fence) && !authorizedRecoveryJoin) {
       if (owner?.transition === 'handoff-started') {
         // The sender can observe Starting even if React batches it with Live
         // before the next render. Retain the exact blocked decision so that
@@ -2131,6 +2143,13 @@ export function FreshAgentView({
         blockedAttachmentAttemptRef.current = { attempt, owner }
       }
       return false
+    }
+    if (joinFenceMatchesOwner) {
+      dispatch(clearFreshAgentRecoveryJoinFence({
+        tabId,
+        paneId,
+        expectedFence: joinFence,
+      }))
     }
     const cwd = getFreshOpenCodeRouteCwd(attempt.content, { sessionCwd: freshOpenCodeRouteCwdRef.current })
     sendFreshAgentMessage(buildFreshAgentAttachMessage(
@@ -3376,7 +3395,21 @@ export function FreshAgentView({
             })
             return
           }
-          foldVerdicts(dispatch, lostRequest, message)
+          foldVerdicts(dispatch, lostRequest, message, {
+            getRecoveryJoinFence: (pane: ReconcilePane, sessionRef: NonNullable<ReconcilePane['sessionRef']>) => {
+              const state = appStore.getState()
+              const canonical = resolveCanonicalPaneSession(state, {
+                provider: pane.mode,
+                sessionRef,
+              })
+              if (!canonical) return undefined
+              const owner = selectSessionRuntimeOwner(state, canonical.provider, canonical.sessionId)
+              if (owner?.ownerKind !== 'fresh-agent'
+                || owner.transition !== 'handoff-started'
+                || owner.fenced) return undefined
+              return { epoch: owner.epoch, generation: owner.generation }
+            },
+          })
           // markSessionLost's counterpart: an attach fold where the durable id
           // equals the old sessionId leaves the SAME freshAgent session entry
           // flagged lost=true (the attach-path reducers never clear it), which

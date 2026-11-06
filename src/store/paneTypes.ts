@@ -558,6 +558,8 @@ export type FreshAgentPaneContent = {
   pendingReconcile?: 'respawn' | 'fresh'
   /** VOLATILE fold counter — re-fires FreshAgentView's create effect on same-createRequestId folds. */
   reconcileEpoch?: number
+  /** One-shot authorization to join the exact recovery reported by reconcile. VOLATILE. */
+  recoveryJoinFence?: { epoch: number; generation: number }
   /**
    * Unified agent names (Task 1): canonical naming identity for this pane's
    * conversation (pending handle until durable materialization binds it).

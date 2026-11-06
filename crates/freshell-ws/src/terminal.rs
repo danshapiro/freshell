@@ -8856,11 +8856,9 @@ pub fn broadcast_sessions_changed(state: &WsState) {
 /// `pane.reconcile.request` (reconciliation design §5): the terminal sources
 /// remain a PURE READ over the terminal registry × identity registry × disk
 /// index — one verdict per presented pane, safe to receive N times on N
-/// sockets (§7). The capability-gated fresh-agent snapshot is the ONE
-/// exception: it mutates the per-boot respawn counter
-/// (`WsState.fresh_agent_respawn_counts`, bounded per `(provider,
-/// sessionId)`; reset when the session resolves Live — V2/A7). The only
-/// error paths are the explicit `RECONCILE_TOO_LARGE` cap and the
+/// sockets (§7). The fresh-agent snapshot reads provider recovery status
+/// without starting work or changing failure budgets. The only error paths
+/// are the explicit `RECONCILE_TOO_LARGE` cap and the
 /// `RECONCILE_UNAVAILABLE` derivation-failure frame, both carrying the
 /// `reconcileId` for correlation.
 async fn handle_pane_reconcile(
@@ -12157,7 +12155,6 @@ mod terminals_changed_tests {
             activity: None,
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-            fresh_agent_respawn_counts: Default::default(),
             ownership: None,
         };
         (state, rx)
@@ -12357,7 +12354,6 @@ mod terminal_kill_stop_wedge_tests {
             activity: None,
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-            fresh_agent_respawn_counts: Default::default(),
             ownership: Some(Arc::clone(&ownership)),
         };
         (state, ownership, "t-kill-wedge".to_string())
@@ -12791,7 +12787,6 @@ mod terminal_meta_created_tests {
             activity: None,
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-            fresh_agent_respawn_counts: Default::default(),
             ownership: None,
         };
         (state, rx)
@@ -13440,7 +13435,6 @@ mod pane_reconcile_gate_tests {
             activity: None,
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-            fresh_agent_respawn_counts: Default::default(),
             ownership: None,
         }
     }
@@ -15448,7 +15442,6 @@ mod host_stats_dispatch_tests {
             activity: None,
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-            fresh_agent_respawn_counts: Default::default(),
             ownership: None,
         }
     }

@@ -78,6 +78,8 @@
 //   FRESHELL_CLAUDE_SIM_HOLD_PROMPT_GATE_PATH  when set, a streamed text turn
 //                                       pauses after its first chunk until this
 //                                       file exists (opt-in browser fixture seam)
+//   FRESHELL_CLAUDE_SIM_HOLD_RESUME_GATE_PATH when set, a resumed session waits
+//                                       for this file before reporting ready
 //   FRESHELL_CLAUDE_SIM_FAIL_RESUME_PATH  opt-in test seam: fail resumed sessions with a
 //                                        transient provider error after this path exists
 //   FRESHELL_CLAUDE_SIM_RECORD_NATIVE_STOP  '1' records an interrupted live
@@ -294,8 +296,10 @@ class SimulatedCli {
     this.ledger('query', { options: describeOptions(options) })
 
     this.sessionId = options.forkSession ? (options.sessionId ?? randomUUID()) : (options.resume ?? options.sessionId ?? randomUUID())
+    if (options.resume) this.ledger('resume_attempt', { sessionId: options.resume })
     const failResumePath = this.env.FRESHELL_CLAUDE_SIM_FAIL_RESUME_PATH
-    if (options.resume && failResumePath && fs.existsSync(failResumePath)) {
+    if (options.resume && failResumePath && fs.existsSync(failResumePath)
+      && !this.env.FRESHELL_CLAUDE_SIM_HOLD_RESUME_GATE_PATH) {
       this.ledger('resume_failure', { sessionId: options.resume })
       throw new Error('simulated transient provider resume failure')
     }
@@ -451,6 +455,24 @@ class SimulatedCli {
   // ── boot ──────────────────────────────────────────────────────────────────
 
   async boot() {
+    const resumeGatePath = this.env.FRESHELL_CLAUDE_SIM_HOLD_RESUME_GATE_PATH
+    if (this.options.resume && resumeGatePath) {
+      this.ledger('resume_gate_wait', { sessionId: this.options.resume })
+      const deadline = Date.now() + 120_000
+      while (!fs.existsSync(resumeGatePath)) {
+        if (Date.now() > deadline) throw new Error('Timed out waiting for Claude resume release gate')
+        await new Promise((resolve) => setTimeout(resolve, 25))
+        if (this.dead) return
+      }
+      const failResumePath = this.env.FRESHELL_CLAUDE_SIM_FAIL_RESUME_PATH
+      if (failResumePath && fs.existsSync(failResumePath)) {
+        fs.rmSync(failResumePath, { force: true })
+        this.ledger('resume_failure', { sessionId: this.options.resume })
+        this.bootError = 'simulated transient provider resume failure'
+        this.terminate(new Error(this.bootError))
+        return
+      }
+    }
     await this.sleep(T.boot)
     if (this.dead) return
     const refusal = this.bootRefusal()

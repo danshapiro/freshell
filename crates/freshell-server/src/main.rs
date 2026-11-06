@@ -2277,9 +2277,6 @@ async fn main() -> ExitCode {
         // §5.3 row 5: the ONE bounded index-warming deferral's budget
         // (council-pinned single deferral, default 2000ms).
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-        // Per-boot fresh-agent respawn-answer counter (campaign §4.3, V2/A7):
-        // in-memory by design — a restart intentionally resets it.
-        fresh_agent_respawn_counts: Default::default(),
         // kata b8ke Task 4: the terminal lane's coordinator handle — the
         // SAME ONE registry the fresh states and the terminal registry hold
         // (the create/kill claims and the ready-frame owner replay consult
@@ -4755,7 +4752,6 @@ mod sessions_sweep_tests {
             session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
             reconcile_deferral_budget_ms:
                 freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-            fresh_agent_respawn_counts: Default::default(),
             ownership: None,
         };
 

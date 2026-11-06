@@ -668,6 +668,11 @@ pub struct FreshCodexState {
     /// worse than `sessions` itself never shrinking for thread ids this process has ever
     /// touched).
     resuming: Arc<TokioMutex<HashMap<String, Arc<TokioMutex<()>>>>>,
+    /// Shared result and actual failed-launch budget for recovery of each
+    /// canonical thread id. Provider-specific tickets, leases and cleanup
+    /// remain inside the recovery methods below.
+    session_recovery:
+        crate::session_recovery::SessionRecoveryMap<CodexRecoveryReady, CodexRecoveryFailure>,
     /// FIX (CODEX-FIRST triage Finding 2, sidecar spawn storm): a negative cache of thread
     /// ids this process has recently confirmed genuinely gone (`is_codex_thread_not_found`
     /// on a `thread/resume` attempt), mapped to the `Instant` the entry expires. Consulted
@@ -1078,7 +1083,7 @@ enum CodexTeardownSettlement {
 pub(crate) use crate::quiet_deadman::QuietDeadman;
 
 /// The result of [`FreshCodexState::ensure_session_alive`].
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 enum EnsureAliveOutcome {
     /// The session's sidecar was already alive; no respawn was needed.
     AlreadyRunning,
@@ -1099,8 +1104,25 @@ enum EnsureAliveOutcome {
     Respawned { new_session_id: String },
 }
 
-/// Why [`FreshCodexState::ensure_session_alive`] could not guarantee a live session.
 #[derive(Debug)]
+enum CodexRecoveryReady {
+    Alive(EnsureAliveOutcome),
+    Resumed,
+    CreateResumed(CodexCreateOutcome),
+}
+
+#[derive(Debug)]
+enum CodexRecoveryFailure {
+    NotFound,
+    Reserved,
+    CrashRecovery(String),
+    HistoricalResume(String),
+    CreateRefused(CodexCreateOutcome),
+    CreateLaunch(CodexCreateOutcome),
+}
+
+/// Why [`FreshCodexState::ensure_session_alive`] could not guarantee a live session.
+#[derive(Debug, Clone)]
 enum EnsureAliveError {
     /// No session is tracked under the given id at all.
     NotFound,
@@ -1169,6 +1191,7 @@ impl FreshCodexState {
             settings: Arc::new(TokioMutex::new(settings)),
             auth_token,
             resuming: Arc::new(TokioMutex::new(HashMap::new())),
+            session_recovery: Default::default(),
             dead_threads: Arc::new(TokioMutex::new(HashMap::new())),
             dead_thread_ttl: DEAD_THREAD_CACHE_TTL,
             create_dedup: Arc::new(FreshAgentCreateDedup::new()),
@@ -2772,6 +2795,14 @@ impl FreshCodexState {
         msg: FreshAgentCreate,
         provenance: Option<crate::BindProvenance>,
     ) -> CodexCreateOutcome {
+        self.handle_create_inner(msg, provenance).await
+    }
+
+    async fn handle_create_inner(
+        &self,
+        msg: FreshAgentCreate,
+        provenance: Option<crate::BindProvenance>,
+    ) -> CodexCreateOutcome {
         let request_id = msg.request_id.clone();
         let view_id = msg.view_id.clone();
         // Unified agent names (Task 2): the pane's pre-durable naming handle
@@ -2924,203 +2955,137 @@ impl FreshCodexState {
         // an EMPTY new conversation under a brand-new id -- connected, no error, just quiet
         // data loss.
         if let Some(resume_session_id) = requested_resume_session_id.clone() {
-            // Task 13b (cross-kind liveness): a live terminal PTY owning
-            // `(codex, thread)` is the one writer on that rollout -- refuse the resume
-            // with the retryable loser answer; NO lease claim, NO spawn.
-            if (self.terminal_liveness)(PROVIDER, &resume_session_id) {
-                tracing::warn!(target: "freshell_freshagent::codex",
-                    session_id = %resume_session_id, request_id = %request_id,
-                    "fresh_agent_create_refused: a live terminal PTY owns this session (Task 13b cross-kind live-guard)");
-                return self.fail_create_session_reserved(&request_id, view_id.as_deref());
-            }
-            // Task 12 (D8 for fresh agents): claim the per-sessionRef lease BEFORE any
-            // spawn -- exactly one in-flight resume (and one live rollout writer) per
-            // thread. ALWAYS ON (never capability-gated).
-            // b8ke ext r10 F1: the map-hit fast path moved BEHIND the fence +
-            // coordinator claim (the Claude path's round-3 F2 shape). Pre-r10
-            // the already-live fast path ran BEFORE wire_fence and
-            // begin_lane_claim_at: during a handoff the OLD codex session
-            // stays live in the map until teardown, so a delayed
-            // freshAgent.create entered the branch, ignored its
-            // stale/malformed observed generation, rewrote the durable
-            // binding/provenance, and broadcast freshAgent.created for the
-            // runtime being handed off. The Adopt/Unwired/Granted arms below
-            // resolve the map hit COORDINATED (adopt proceeds idempotently;
-            // refusals answer typed) before any durable write or broadcast.
-            // kata b8ke Task 3: the coordinator claim comes FIRST — before
-            // the provider lease — so the cross-kind authority decides
-            // atomically (no check-then-act window the terminal-lane probe
-            // regime left). The wire pair on `freshAgent.create` is the
-            // delayed-request fence (`None` = legacy unfenced sender, still
-            // cross-kind-checked). b8ke delta review F7: a half-sent pair is
-            // the typed invalid-fence refusal, never a legacy downgrade.
-            let claim_op_id = format!("create-resume-{request_id}");
-            let claim_fence =
-                crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation);
-            let claim_fence = match claim_fence {
-                Ok(fence) => fence,
-                Err(err) => {
-                    tracing::warn!(target: "freshell_freshagent::codex",
-                        session_id = %resume_session_id, request_id = %request_id,
-                        code = err.code(),
-                        "fresh_agent_create_refused: the observed fence is half-sent (invalid)");
-                    return self.fail_create(
-                        &request_id,
-                        view_id.as_deref(),
-                        err.code(),
-                        err.message(),
-                    );
-                }
-            };
-            let own_ticket = match self.begin_lane_claim_at(
-                &resume_session_id,
-                &claim_op_id,
-                claim_fence,
-                &Self::initiator_for(provenance.as_ref(), "freshcodex/create-resume"),
-            ) {
-                crate::ownership_lane::LaneClaim::Granted(ticket) => {
-                    // b8ke ext r10 F1 (the Claude path's delta round-3 F2 +
-                    // e3r1 F3 shape): Granted-from-Vacant with a LIVE in-map
-                    // runtime is the unowned-runtime shape — adopt it, spawn
-                    // nothing, and COMMIT the adopted runtime as the
-                    // authoritative Live owner (the ticket's drop would
-                    // otherwise restore Vacant while the runtime keeps
-                    // running, licensing a SECOND writer).
-                    let mut guard =
-                        self.map_hit_binding_guard(ticket, &resume_session_id, provenance.clone());
-                    if guard.map_hit_runtime_present().await {
-                        return self
-                            .adopt_live_create_with_starting_ticket(
-                                &request_id,
-                                view_id.as_deref(),
-                                &resume_session_id,
-                                provenance.clone(),
-                                Some(guard),
-                            )
-                            .await;
-                    }
-                    guard.finish()
-                }
-                crate::ownership_lane::LaneClaim::Unwired => {
-                    // The unwired lane's map fast path (V1 behavior): a live
-                    // session adopts, spawn nothing. With no coordinator
-                    // there is no fence to consult.
-                    if self.has_live_session(&resume_session_id).await {
-                        return self
-                            .adopt_live_create(
-                                &request_id,
-                                view_id.as_deref(),
-                                &resume_session_id,
-                                provenance.clone(),
-                            )
-                            .await;
-                    }
-                    None
-                }
-                crate::ownership_lane::LaneClaim::Adopt => {
-                    // A same-kind live runtime the coordinator names —
-                    // adopt it, spawn nothing (the COORDINATED map-hit:
-                    // the claim already verified the key's state).
-                    return self
-                        .adopt_live_create(
-                            &request_id,
-                            view_id.as_deref(),
-                            &resume_session_id,
-                            provenance.clone(),
-                        )
-                        .await;
-                }
-                crate::ownership_lane::LaneClaim::Refused(outcome) => {
-                    tracing::warn!(target: "freshell_freshagent::codex",
-                        session_id = %resume_session_id, request_id = %request_id,
-                        outcome = ?outcome,
-                        "fresh_agent_create_refused: the ownership coordinator refused the \
-                         claim (kata b8ke cross-kind authority)"
-                    );
-                    return self.fail_create_with_owner(
-                        &request_id,
-                        view_id.as_deref(),
-                        "SESSION_RESERVED",
-                        "Another resume for this session is in flight",
-                        crate::ownership_lane::fresh_agent_owner_fields_from_outcome(
-                            &self.ownership,
-                            &outcome,
-                        ),
-                    );
-                }
-            };
-            let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
-            for round in 0..2u8 {
-                match self.leases.claim(
-                    PROVIDER,
-                    &resume_session_id,
-                    &request_id,
-                    crate::session_lease::now_epoch_ms(),
-                ) {
-                    crate::session_lease::FreshSessionClaim::Acquired => {
-                        lease_guard = Some(crate::FreshSessionLeaseGuard::armed(
-                            Arc::clone(&self.leases),
-                            PROVIDER,
-                            &resume_session_id,
-                            &request_id,
-                        ));
-                        break;
-                    }
-                    crate::session_lease::FreshSessionClaim::BoundLive { .. } => {
-                        // Under-lock ADOPT (the V5 TOCTOU window). D8
-                        // (focused-ep1-r4 Finding 1): re-parks/re-stamps the
-                        // CURRENT connection's provenance on the incumbent.
-                        return self
-                            .adopt_live_create(
-                                &request_id,
-                                view_id.as_deref(),
-                                &resume_session_id,
-                                provenance.clone(),
-                            )
-                            .await;
-                    }
-                    crate::session_lease::FreshSessionClaim::Held { .. } => {
-                        return self.fail_create_session_reserved(&request_id, view_id.as_deref());
-                    }
-                    crate::session_lease::FreshSessionClaim::ExpiredNeedsKill {
-                        pid,
-                        ownership_id,
-                    } => {
-                        if round == 0
-                            && crate::session_lease::kill_and_confirm_tree_dead(
-                                pid,
-                                CODEX_SIDECAR_OWNERSHIP_ENV,
-                                &ownership_id,
-                            )
-                            .await
-                        {
-                            self.leases
-                                .force_release_after_confirmed_kill(PROVIDER, &resume_session_id);
-                            continue;
+            let state = self.clone();
+            let operation_request_id = request_id.clone();
+            let operation_view_id = view_id.clone();
+            let operation_session_id = resume_session_id.clone();
+            let operation_cwd = cwd.clone();
+            let operation_model = model.clone();
+            let operation_effort = effort.clone();
+            let operation_sandbox = sandbox.clone();
+            let operation_permission_mode = permission_mode.clone();
+            let operation_collaboration_mode = collaboration_mode;
+            let operation_provenance = provenance.clone();
+            let operation_naming_handle = naming_handle.clone();
+            let observed_epoch = msg.observed_epoch;
+            let observed_generation = msg.observed_generation;
+            let answer = self
+                .session_recovery
+                .run_with_requester(
+                    format!("codex:{resume_session_id}"),
+                    Some(request_id.clone()),
+                    move || async move {
+                        if state.is_known_dead_thread(&operation_session_id).await {
+                            let outcome = state.fail_create(
+                                &operation_request_id,
+                                operation_view_id.as_deref(),
+                                "FRESH_AGENT_CREATE_FAILED",
+                                &format!("codex thread {operation_session_id} not found"),
+                            );
+                            return Err(crate::session_recovery::RecoveryAttemptFailure::refusal(
+                                CodexRecoveryFailure::CreateRefused(outcome),
+                            ));
                         }
-                        tracing::error!(target: "invariant", pid, session_id = %resume_session_id,
-                            "fresh_agent_lease_expired_kill_unconfirmed: holding closed");
-                        return self.fail_create_session_reserved(&request_id, view_id.as_deref());
-                    }
-                }
-            }
-            return self
-                .handle_create_resume(
-                    request_id,
-                    view_id,
-                    resume_session_id,
-                    cwd,
-                    model,
-                    effort,
-                    sandbox,
-                    permission_mode,
-                    collaboration_mode,
-                    lease_guard,
-                    own_ticket,
-                    provenance,
-                    naming_handle,
+                        let outcome = state
+                            .handle_create_resume_operation(
+                                operation_request_id,
+                                operation_view_id,
+                                operation_session_id,
+                                operation_cwd,
+                                operation_model,
+                                operation_effort,
+                                operation_sandbox,
+                                operation_permission_mode,
+                                operation_collaboration_mode,
+                                operation_provenance,
+                                operation_naming_handle,
+                                observed_epoch,
+                                observed_generation,
+                            )
+                            .await;
+                        match &outcome {
+                            CodexCreateOutcome::Created { .. } => {
+                                Ok(CodexRecoveryReady::CreateResumed(outcome))
+                            }
+                            CodexCreateOutcome::Failed { code, .. }
+                                if code == "SESSION_RESERVED" =>
+                            {
+                                Err(crate::session_recovery::RecoveryAttemptFailure::refusal(
+                                    CodexRecoveryFailure::CreateRefused(outcome),
+                                ))
+                            }
+                            CodexCreateOutcome::Failed { .. } => {
+                                Err(crate::session_recovery::RecoveryAttemptFailure::launch(
+                                    CodexRecoveryFailure::CreateLaunch(outcome),
+                                ))
+                            }
+                        }
+                    },
                 )
                 .await;
+
+            let (outcome, operation_already_acknowledged) = match answer.result.as_ref() {
+                Ok(CodexRecoveryReady::CreateResumed(outcome)) => (outcome.clone(), true),
+                Ok(CodexRecoveryReady::Resumed) => (
+                    Self::successful_create_outcome(resume_session_id.clone()),
+                    false,
+                ),
+                Ok(CodexRecoveryReady::Alive(EnsureAliveOutcome::Respawned { new_session_id })) => {
+                    (
+                        Self::successful_create_outcome(new_session_id.clone()),
+                        false,
+                    )
+                }
+                Ok(CodexRecoveryReady::Alive(_)) => (
+                    Self::successful_create_outcome(resume_session_id.clone()),
+                    false,
+                ),
+                Err(crate::session_recovery::RecoveryFailure::Attempt(
+                    CodexRecoveryFailure::CreateRefused(outcome)
+                    | CodexRecoveryFailure::CreateLaunch(outcome),
+                )) => (outcome.clone(), true),
+                Err(crate::session_recovery::RecoveryFailure::Attempt(
+                    CodexRecoveryFailure::Reserved,
+                )) => (
+                    Self::failed_create_outcome(
+                        "SESSION_RESERVED",
+                        "Another resume for this session is in flight",
+                        None,
+                    ),
+                    false,
+                ),
+                Err(crate::session_recovery::RecoveryFailure::Attempt(
+                    CodexRecoveryFailure::NotFound,
+                )) => (
+                    Self::failed_create_outcome(
+                        "FRESH_AGENT_CREATE_FAILED",
+                        &format!("codex thread {resume_session_id} not found"),
+                        None,
+                    ),
+                    false,
+                ),
+                Err(crate::session_recovery::RecoveryFailure::Attempt(
+                    CodexRecoveryFailure::CrashRecovery(error)
+                    | CodexRecoveryFailure::HistoricalResume(error),
+                )) => (
+                    Self::failed_create_outcome("FRESH_AGENT_CREATE_FAILED", error, None),
+                    false,
+                ),
+                Err(crate::session_recovery::RecoveryFailure::Panicked) => (
+                    Self::failed_create_outcome(
+                        "FRESH_AGENT_CREATE_FAILED",
+                        "shared Codex recovery panicked",
+                        None,
+                    ),
+                    false,
+                ),
+            };
+            if answer.joined_existing || !operation_already_acknowledged {
+                return self
+                    .reply_to_shared_create(&request_id, view_id.as_deref(), &outcome)
+                    .await;
+            }
+            return outcome;
         }
 
         // b8ke ext r22 F1: the fresh create is coordinator-owned from BEFORE
@@ -3353,6 +3318,218 @@ impl FreshCodexState {
             naming_handle,
         )
         .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_create_resume_operation(
+        &self,
+        request_id: String,
+        view_id: Option<String>,
+        resume_session_id: String,
+        cwd: Option<String>,
+        model: String,
+        effort: Option<String>,
+        sandbox: Option<String>,
+        permission_mode: Option<String>,
+        collaboration_mode: Option<CodexWorkMode>,
+        provenance: Option<crate::BindProvenance>,
+        naming_handle: Option<String>,
+        observed_epoch: Option<u64>,
+        observed_generation: Option<u64>,
+    ) -> CodexCreateOutcome {
+        // Task 13b (cross-kind liveness): a live terminal PTY owning
+        // `(codex, thread)` is the one writer on that rollout -- refuse the resume
+        // with the retryable loser answer; NO lease claim, NO spawn.
+        if (self.terminal_liveness)(PROVIDER, &resume_session_id) {
+            tracing::warn!(target: "freshell_freshagent::codex",
+                session_id = %resume_session_id, request_id = %request_id,
+                "fresh_agent_create_refused: a live terminal PTY owns this session (Task 13b cross-kind live-guard)");
+            return self.fail_create_session_reserved(&request_id, view_id.as_deref());
+        }
+        // Task 12 (D8 for fresh agents): claim the per-sessionRef lease BEFORE any
+        // spawn -- exactly one in-flight resume (and one live rollout writer) per
+        // thread. ALWAYS ON (never capability-gated).
+        // b8ke ext r10 F1: the map-hit fast path moved BEHIND the fence +
+        // coordinator claim (the Claude path's round-3 F2 shape). Pre-r10
+        // the already-live fast path ran BEFORE wire_fence and
+        // begin_lane_claim_at: during a handoff the OLD codex session
+        // stays live in the map until teardown, so a delayed
+        // freshAgent.create entered the branch, ignored its
+        // stale/malformed observed generation, rewrote the durable
+        // binding/provenance, and broadcast freshAgent.created for the
+        // runtime being handed off. The Adopt/Unwired/Granted arms below
+        // resolve the map hit COORDINATED (adopt proceeds idempotently;
+        // refusals answer typed) before any durable write or broadcast.
+        // kata b8ke Task 3: the coordinator claim comes FIRST — before
+        // the provider lease — so the cross-kind authority decides
+        // atomically (no check-then-act window the terminal-lane probe
+        // regime left). The wire pair on `freshAgent.create` is the
+        // delayed-request fence (`None` = legacy unfenced sender, still
+        // cross-kind-checked). b8ke delta review F7: a half-sent pair is
+        // the typed invalid-fence refusal, never a legacy downgrade.
+        let claim_op_id = format!("create-resume-{request_id}");
+        let claim_fence = crate::ownership_lane::wire_fence(observed_epoch, observed_generation);
+        let claim_fence = match claim_fence {
+            Ok(fence) => fence,
+            Err(err) => {
+                tracing::warn!(target: "freshell_freshagent::codex",
+                    session_id = %resume_session_id, request_id = %request_id,
+                    code = err.code(),
+                    "fresh_agent_create_refused: the observed fence is half-sent (invalid)");
+                return self.fail_create(
+                    &request_id,
+                    view_id.as_deref(),
+                    err.code(),
+                    err.message(),
+                );
+            }
+        };
+        let own_ticket = match self.begin_lane_claim_at(
+            &resume_session_id,
+            &claim_op_id,
+            claim_fence,
+            &Self::initiator_for(provenance.as_ref(), "freshcodex/create-resume"),
+        ) {
+            crate::ownership_lane::LaneClaim::Granted(ticket) => {
+                // b8ke ext r10 F1 (the Claude path's delta round-3 F2 +
+                // e3r1 F3 shape): Granted-from-Vacant with a LIVE in-map
+                // runtime is the unowned-runtime shape — adopt it, spawn
+                // nothing, and COMMIT the adopted runtime as the
+                // authoritative Live owner (the ticket's drop would
+                // otherwise restore Vacant while the runtime keeps
+                // running, licensing a SECOND writer).
+                let mut guard =
+                    self.map_hit_binding_guard(ticket, &resume_session_id, provenance.clone());
+                if guard.map_hit_runtime_present().await {
+                    return self
+                        .adopt_live_create_with_starting_ticket(
+                            &request_id,
+                            view_id.as_deref(),
+                            &resume_session_id,
+                            provenance.clone(),
+                            Some(guard),
+                        )
+                        .await;
+                }
+                guard.finish()
+            }
+            crate::ownership_lane::LaneClaim::Unwired => {
+                // The unwired lane's map fast path (V1 behavior): a live
+                // session adopts, spawn nothing. With no coordinator
+                // there is no fence to consult.
+                if self.has_live_session(&resume_session_id).await {
+                    return self
+                        .adopt_live_create(
+                            &request_id,
+                            view_id.as_deref(),
+                            &resume_session_id,
+                            provenance.clone(),
+                        )
+                        .await;
+                }
+                None
+            }
+            crate::ownership_lane::LaneClaim::Adopt => {
+                // A same-kind live runtime the coordinator names —
+                // adopt it, spawn nothing (the COORDINATED map-hit:
+                // the claim already verified the key's state).
+                return self
+                    .adopt_live_create(
+                        &request_id,
+                        view_id.as_deref(),
+                        &resume_session_id,
+                        provenance.clone(),
+                    )
+                    .await;
+            }
+            crate::ownership_lane::LaneClaim::Refused(outcome) => {
+                tracing::warn!(target: "freshell_freshagent::codex",
+                    session_id = %resume_session_id, request_id = %request_id,
+                    outcome = ?outcome,
+                    "fresh_agent_create_refused: the ownership coordinator refused the \
+                     claim (kata b8ke cross-kind authority)"
+                );
+                return self.fail_create_with_owner(
+                    &request_id,
+                    view_id.as_deref(),
+                    "SESSION_RESERVED",
+                    "Another resume for this session is in flight",
+                    crate::ownership_lane::fresh_agent_owner_fields_from_outcome(
+                        &self.ownership,
+                        &outcome,
+                    ),
+                );
+            }
+        };
+        let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
+        for round in 0..2u8 {
+            match self.leases.claim(
+                PROVIDER,
+                &resume_session_id,
+                &request_id,
+                crate::session_lease::now_epoch_ms(),
+            ) {
+                crate::session_lease::FreshSessionClaim::Acquired => {
+                    lease_guard = Some(crate::FreshSessionLeaseGuard::armed(
+                        Arc::clone(&self.leases),
+                        PROVIDER,
+                        &resume_session_id,
+                        &request_id,
+                    ));
+                    break;
+                }
+                crate::session_lease::FreshSessionClaim::BoundLive { .. } => {
+                    // Under-lock ADOPT (the V5 TOCTOU window). D8
+                    // (focused-ep1-r4 Finding 1): re-parks/re-stamps the
+                    // CURRENT connection's provenance on the incumbent.
+                    return self
+                        .adopt_live_create(
+                            &request_id,
+                            view_id.as_deref(),
+                            &resume_session_id,
+                            provenance.clone(),
+                        )
+                        .await;
+                }
+                crate::session_lease::FreshSessionClaim::Held { .. } => {
+                    return self.fail_create_session_reserved(&request_id, view_id.as_deref());
+                }
+                crate::session_lease::FreshSessionClaim::ExpiredNeedsKill { pid, ownership_id } => {
+                    if round == 0
+                        && crate::session_lease::kill_and_confirm_tree_dead(
+                            pid,
+                            CODEX_SIDECAR_OWNERSHIP_ENV,
+                            &ownership_id,
+                        )
+                        .await
+                    {
+                        self.leases
+                            .force_release_after_confirmed_kill(PROVIDER, &resume_session_id);
+                        continue;
+                    }
+                    tracing::error!(target: "invariant", pid, session_id = %resume_session_id,
+                        "fresh_agent_lease_expired_kill_unconfirmed: holding closed");
+                    return self.fail_create_session_reserved(&request_id, view_id.as_deref());
+                }
+            }
+        }
+        return self
+            .handle_create_resume(
+                request_id,
+                view_id,
+                resume_session_id,
+                cwd,
+                model,
+                effort,
+                sandbox,
+                permission_mode,
+                collaboration_mode,
+                lease_guard,
+                own_ticket,
+                provenance,
+                naming_handle,
+            )
+            .await;
     }
 
     /// The resume branch of `handle_create` (FINDING 1 -- CODEX-FIRST triage): spawn a
@@ -4228,6 +4405,83 @@ impl FreshCodexState {
     /// so this was a real, user-visible gap: every Rust `fail_create` call previously sent
     /// no `retryable` field at all (serde omits `None`), silently hiding the retry button
     /// legacy always offers.
+    fn successful_create_outcome(session_id: String) -> CodexCreateOutcome {
+        CodexCreateOutcome::Created {
+            session_ref: Some(SessionLocator {
+                provider: PROVIDER.into(),
+                session_id: session_id.clone(),
+            }),
+            session_id,
+            cleanup_ownership_id: None,
+            name_ref: None,
+        }
+    }
+
+    fn failed_create_outcome(
+        code: &str,
+        message: &str,
+        owner: Option<crate::ownership_lane::TerminalOwnerFields>,
+    ) -> CodexCreateOutcome {
+        CodexCreateOutcome::Failed {
+            code: code.into(),
+            message: message.into(),
+            retryable: Some(true),
+            owner,
+        }
+    }
+
+    async fn reply_to_shared_create(
+        &self,
+        request_id: &str,
+        view_id: Option<&str>,
+        outcome: &CodexCreateOutcome,
+    ) -> CodexCreateOutcome {
+        match outcome {
+            CodexCreateOutcome::Created { session_id, .. } => {
+                let projection = self.created_projection_for(session_id).await;
+                let name_ref = projection.as_ref().map(|(reference, _)| reference.clone());
+                let session_name = projection.map(|(_, record)| record);
+                self.create_dedup
+                    .record_success(
+                        request_id,
+                        CodexCreateRecord {
+                            session_id: session_id.clone(),
+                        },
+                    )
+                    .await;
+                self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
+                    provider: PROVIDER.to_string(),
+                    request_id: request_id.to_string(),
+                    view_id: view_id.map(str::to_string),
+                    runtime_provider: PROVIDER.to_string(),
+                    session_id: session_id.clone(),
+                    session_type: SESSION_TYPE.to_string(),
+                    session_ref: Some(SessionLocator {
+                        provider: PROVIDER.to_string(),
+                        session_id: session_id.clone(),
+                    }),
+                    name_ref: name_ref.clone(),
+                    session_name,
+                }));
+                CodexCreateOutcome::Created {
+                    session_id: session_id.clone(),
+                    session_ref: Some(SessionLocator {
+                        provider: PROVIDER.into(),
+                        session_id: session_id.clone(),
+                    }),
+                    cleanup_ownership_id: None,
+                    name_ref,
+                }
+            }
+            CodexCreateOutcome::Failed {
+                code,
+                message,
+                owner,
+                ..
+            } => self.fail_create_with_owner(request_id, view_id, code, message, owner.clone()),
+        }
+    }
+
     fn fail_create(
         &self,
         request_id: &str,
@@ -7922,7 +8176,20 @@ impl FreshCodexState {
         let mut tracked_attach_guard = None;
         if tracked {
             let snap = self.ownership_snapshot(PROVIDER, &msg.session_id);
+            let shared_recovery_in_flight = self
+                .session_recovery
+                .status(&format!("codex:{}", msg.session_id))
+                .await
+                .is_some_and(|status| status.in_flight);
             match snap.state {
+                freshell_ownership::OwnershipState::Starting {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    ..
+                } if shared_recovery_in_flight => {
+                    // The Starting owner is the one shared provider operation
+                    // this handler is about to join below. Keep the ordinary
+                    // refusal for unrelated starts and lifecycle transitions.
+                }
                 freshell_ownership::OwnershipState::Handoff { .. }
                 | freshell_ownership::OwnershipState::Starting { .. }
                 | freshell_ownership::OwnershipState::Stopping { .. }
@@ -8027,7 +8294,11 @@ impl FreshCodexState {
         let (session_id, active_turn_present, should_emit_snapshot, recovered_runtime) = if tracked
         {
             let (resolved_id, should_emit_snapshot) = match self
-                .ensure_session_alive(&msg.session_id, attach_fence)
+                .ensure_session_alive_for_request(
+                    &msg.session_id,
+                    attach_fence,
+                    msg.request_id.clone(),
+                )
                 .await
             {
                 Ok(EnsureAliveOutcome::AlreadyRunning) => (msg.session_id.clone(), false),
@@ -8076,7 +8347,7 @@ impl FreshCodexState {
             )
         } else {
             match self
-                .ensure_session_resumable(
+                .ensure_session_resumable_for_request(
                     &msg.session_id,
                     msg.cwd.as_deref(),
                     // kata b8ke Task 3: the attach's delayed-request fence
@@ -8084,6 +8355,7 @@ impl FreshCodexState {
                     // untracked session, registering a runtime).
                     attach_fence,
                     None,
+                    msg.request_id.clone(),
                 )
                 .await
             {
@@ -8203,6 +8475,147 @@ impl FreshCodexState {
     /// afterward when the outcome is [`EnsureAliveOutcome::Respawned`] -- for
     /// [`EnsureAliveOutcome::Recovered`], `session_id` is unchanged.
     async fn ensure_session_alive(
+        &self,
+        session_id: &str,
+        observed: Option<freshell_ownership::ObservedFence>,
+    ) -> Result<EnsureAliveOutcome, EnsureAliveError> {
+        self.ensure_session_alive_for_request(session_id, observed, None)
+            .await
+    }
+
+    async fn ensure_session_alive_for_request(
+        &self,
+        session_id: &str,
+        observed: Option<freshell_ownership::ObservedFence>,
+        request_id: Option<String>,
+    ) -> Result<EnsureAliveOutcome, EnsureAliveError> {
+        let shared_recovery_in_flight = self
+            .session_recovery
+            .try_status(&format!("codex:{session_id}"))
+            .is_some_and(|status| status.in_flight);
+        if !shared_recovery_in_flight && self.has_live_session(session_id).await {
+            // Preserve the provider's existing live-session command ordering.
+            // The shared flight is needed for a cold recovery, while an
+            // already-live sidecar needs no spawned operation or extra turn
+            // scheduling point.
+            return Ok(EnsureAliveOutcome::AlreadyRunning);
+        }
+
+        let state = self.clone();
+        let operation_session_id = session_id.to_string();
+        let answer = self
+            .session_recovery
+            .run_with_requester(
+                format!("codex:{session_id}"),
+                request_id,
+                move || async move {
+                    match state
+                        .ensure_session_alive_once(&operation_session_id, observed)
+                        .await
+                    {
+                        Ok(outcome) => Ok(CodexRecoveryReady::Alive(outcome)),
+                        Err(EnsureAliveError::NotFound) => {
+                            Err(crate::session_recovery::RecoveryAttemptFailure::refusal(
+                                CodexRecoveryFailure::NotFound,
+                            ))
+                        }
+                        Err(EnsureAliveError::Reserved) => {
+                            Err(crate::session_recovery::RecoveryAttemptFailure::refusal(
+                                CodexRecoveryFailure::Reserved,
+                            ))
+                        }
+                        Err(EnsureAliveError::RespawnFailed(error)) => {
+                            Err(crate::session_recovery::RecoveryAttemptFailure::launch(
+                                CodexRecoveryFailure::CrashRecovery(error),
+                            ))
+                        }
+                    }
+                },
+            )
+            .await;
+
+        if answer.status.exhausted {
+            return Err(EnsureAliveError::RespawnFailed(
+                "RECOVERY_EXHAUSTED: three Codex recovery launches failed".into(),
+            ));
+        }
+        match answer.result.as_ref() {
+            Ok(CodexRecoveryReady::Alive(outcome)) => Ok(outcome.clone()),
+            Ok(CodexRecoveryReady::Resumed) => self
+                .has_live_session(session_id)
+                .await
+                .then_some(EnsureAliveOutcome::Recovered)
+                .ok_or(EnsureAliveError::Reserved),
+            Ok(CodexRecoveryReady::CreateResumed(CodexCreateOutcome::Created {
+                session_id: resumed_id,
+                ..
+            })) if resumed_id == session_id => self
+                .has_live_session(session_id)
+                .await
+                .then_some(EnsureAliveOutcome::Recovered)
+                .ok_or(EnsureAliveError::Reserved),
+            Ok(CodexRecoveryReady::CreateResumed(CodexCreateOutcome::Created {
+                session_id: resumed_id,
+                ..
+            })) => Ok(EnsureAliveOutcome::Respawned {
+                new_session_id: resumed_id.clone(),
+            }),
+            Ok(CodexRecoveryReady::CreateResumed(CodexCreateOutcome::Failed {
+                code,
+                message,
+                ..
+            })) => {
+                if code == "SESSION_RESERVED" {
+                    Err(EnsureAliveError::Reserved)
+                } else {
+                    Err(EnsureAliveError::RespawnFailed(message.clone()))
+                }
+            }
+            Err(crate::session_recovery::RecoveryFailure::Attempt(
+                CodexRecoveryFailure::NotFound,
+            )) => Err(EnsureAliveError::NotFound),
+            Err(crate::session_recovery::RecoveryFailure::Attempt(
+                CodexRecoveryFailure::Reserved,
+            )) => Err(EnsureAliveError::Reserved),
+            Err(crate::session_recovery::RecoveryFailure::Attempt(
+                CodexRecoveryFailure::CrashRecovery(error)
+                | CodexRecoveryFailure::HistoricalResume(error),
+            )) => Err(EnsureAliveError::RespawnFailed(error.clone())),
+            Err(crate::session_recovery::RecoveryFailure::Attempt(
+                CodexRecoveryFailure::CreateRefused(outcome),
+            )) => match outcome {
+                CodexCreateOutcome::Failed { code, message, .. } if code == "SESSION_RESERVED" => {
+                    Err(EnsureAliveError::Reserved)
+                }
+                CodexCreateOutcome::Failed { message, .. } => {
+                    Err(EnsureAliveError::RespawnFailed(message.clone()))
+                }
+                CodexCreateOutcome::Created { .. } => Err(EnsureAliveError::Reserved),
+            },
+            Err(crate::session_recovery::RecoveryFailure::Attempt(
+                CodexRecoveryFailure::CreateLaunch(outcome),
+            )) => match outcome {
+                CodexCreateOutcome::Failed { message, .. } => {
+                    Err(EnsureAliveError::RespawnFailed(message.clone()))
+                }
+                CodexCreateOutcome::Created { .. } => Err(EnsureAliveError::Reserved),
+            },
+            Err(crate::session_recovery::RecoveryFailure::Panicked) => Err(
+                EnsureAliveError::RespawnFailed("shared Codex recovery panicked".into()),
+            ),
+        }
+    }
+
+    pub async fn recovery_status(
+        &self,
+        thread_id: &str,
+    ) -> Option<freshell_agent_runtime::RecoveryStatus> {
+        self.session_recovery
+            .status(&format!("codex:{thread_id}"))
+            .await
+    }
+
+    async fn ensure_session_alive_once(
         &self,
         session_id: &str,
         // b8ke ext r8 F5: the caller's observed (epoch, generation) fence.
@@ -10619,6 +11032,154 @@ impl FreshCodexState {
     /// fresh not-found produces, without spawning a sidecar to re-prove it. This is what
     /// bounds the spawn storm from a client retrying `freshAgent.attach` with no backoff.
     async fn ensure_session_resumable(
+        &self,
+        thread_id: &str,
+        cwd: Option<&str>,
+        observed: Option<freshell_ownership::ObservedFence>,
+        handoff: Option<(&str, u64)>,
+    ) -> Result<ResumedCodexSession, ResumeSessionError> {
+        self.ensure_session_resumable_for_request(thread_id, cwd, observed, handoff, None)
+            .await
+    }
+
+    async fn ensure_session_resumable_for_request(
+        &self,
+        thread_id: &str,
+        cwd: Option<&str>,
+        observed: Option<freshell_ownership::ObservedFence>,
+        handoff: Option<(&str, u64)>,
+        request_id: Option<String>,
+    ) -> Result<ResumedCodexSession, ResumeSessionError> {
+        // Handoff continuation already owns the operation ticket and must
+        // return its constructed owner identity to the single commit owner.
+        if let Some(handoff) = handoff {
+            return self
+                .ensure_session_resumable_once(thread_id, cwd, observed, Some(handoff))
+                .await;
+        }
+
+        let state = self.clone();
+        let operation_thread_id = thread_id.to_string();
+        let operation_cwd = cwd.map(str::to_string);
+        let answer = self
+            .session_recovery
+            .run_with_requester(
+                format!("codex:{thread_id}"),
+                request_id,
+                move || async move {
+                    match state
+                        .ensure_session_resumable_once(
+                            &operation_thread_id,
+                            operation_cwd.as_deref(),
+                            observed,
+                            None,
+                        )
+                        .await
+                    {
+                        Ok(_) => Ok(CodexRecoveryReady::Resumed),
+                        Err(ResumeSessionError::NotFound) => {
+                            Err(crate::session_recovery::RecoveryAttemptFailure::refusal(
+                                CodexRecoveryFailure::NotFound,
+                            ))
+                        }
+                        Err(ResumeSessionError::Reserved) => {
+                            Err(crate::session_recovery::RecoveryAttemptFailure::refusal(
+                                CodexRecoveryFailure::Reserved,
+                            ))
+                        }
+                        Err(ResumeSessionError::Transient(error)) => {
+                            Err(crate::session_recovery::RecoveryAttemptFailure::launch(
+                                CodexRecoveryFailure::HistoricalResume(error),
+                            ))
+                        }
+                    }
+                },
+            )
+            .await;
+
+        if answer.status.exhausted {
+            return Err(ResumeSessionError::Transient(
+                "RECOVERY_EXHAUSTED: three Codex recovery launches failed".into(),
+            ));
+        }
+        match answer.result.as_ref() {
+            Ok(CodexRecoveryReady::Resumed) => {
+                self.live_resumed_session(thread_id).await.ok_or_else(|| {
+                    ResumeSessionError::Transient(
+                        "the shared Codex recovery settled without a live runtime".into(),
+                    )
+                })
+            }
+            Ok(CodexRecoveryReady::Alive(EnsureAliveOutcome::Respawned { new_session_id })) => self
+                .live_resumed_session(new_session_id)
+                .await
+                .ok_or_else(|| {
+                    ResumeSessionError::Transient(
+                        "the shared Codex recovery settled without a live runtime".into(),
+                    )
+                }),
+            Ok(CodexRecoveryReady::Alive(_)) => {
+                self.live_resumed_session(thread_id).await.ok_or_else(|| {
+                    ResumeSessionError::Transient(
+                        "the shared Codex recovery settled without a live runtime".into(),
+                    )
+                })
+            }
+            Ok(CodexRecoveryReady::CreateResumed(CodexCreateOutcome::Created {
+                session_id,
+                ..
+            })) => self.live_resumed_session(session_id).await.ok_or_else(|| {
+                ResumeSessionError::Transient(
+                    "the shared Codex recovery settled without a live runtime".into(),
+                )
+            }),
+            Ok(CodexRecoveryReady::CreateResumed(CodexCreateOutcome::Failed {
+                code,
+                message,
+                ..
+            })) => {
+                if code == "SESSION_RESERVED" {
+                    Err(ResumeSessionError::Reserved)
+                } else {
+                    Err(ResumeSessionError::Transient(message.clone()))
+                }
+            }
+            Err(crate::session_recovery::RecoveryFailure::Attempt(
+                CodexRecoveryFailure::NotFound,
+            )) => Err(ResumeSessionError::NotFound),
+            Err(crate::session_recovery::RecoveryFailure::Attempt(
+                CodexRecoveryFailure::Reserved,
+            )) => Err(ResumeSessionError::Reserved),
+            Err(crate::session_recovery::RecoveryFailure::Attempt(
+                CodexRecoveryFailure::CrashRecovery(error)
+                | CodexRecoveryFailure::HistoricalResume(error),
+            )) => Err(ResumeSessionError::Transient(error.clone())),
+            Err(crate::session_recovery::RecoveryFailure::Attempt(
+                CodexRecoveryFailure::CreateRefused(outcome),
+            )) => match outcome {
+                CodexCreateOutcome::Failed { code, message, .. } if code == "SESSION_RESERVED" => {
+                    Err(ResumeSessionError::Reserved)
+                }
+                CodexCreateOutcome::Failed { message, .. } => {
+                    Err(ResumeSessionError::Transient(message.clone()))
+                }
+                CodexCreateOutcome::Created { .. } => Err(ResumeSessionError::Reserved),
+            },
+            Err(crate::session_recovery::RecoveryFailure::Attempt(
+                CodexRecoveryFailure::CreateLaunch(outcome),
+            )) => match outcome {
+                CodexCreateOutcome::Failed { message, .. } => {
+                    Err(ResumeSessionError::Transient(message.clone()))
+                }
+                CodexCreateOutcome::Created { .. } => Err(ResumeSessionError::Reserved),
+            },
+            Err(crate::session_recovery::RecoveryFailure::Panicked) => Err(
+                ResumeSessionError::Transient("shared Codex recovery panicked".into()),
+            ),
+        }
+    }
+
+    async fn ensure_session_resumable_once(
         &self,
         thread_id: &str,
         cwd: Option<&str>,
@@ -15030,6 +15591,125 @@ pub(crate) mod tests {
         .await
         .expect("confirmed cleanup and durable repair release the startup claim");
         check.state.shutdown().await;
+        (owner_retained, terminal_refused)
+    }
+
+    struct SharedRecoveryCancellationCheck<'a> {
+        state: &'a FreshCodexState,
+        registry: &'a freshell_ownership::RuntimeOwnershipRegistry,
+        attach_id: &'a str,
+        owner_id: &'a str,
+        operation_id: &'a str,
+        generation: u64,
+        pid: u32,
+        runtime_id: &'a str,
+    }
+
+    async fn cancel_recovery_waiter_and_confirm_shared_launch<T: Send + 'static>(
+        task: tokio::task::JoinHandle<T>,
+        sessions: tokio::sync::MutexGuard<'_, HashMap<String, CodexSession>>,
+        check: SharedRecoveryCancellationCheck<'_>,
+    ) -> (bool, bool) {
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+
+        let owner_retained = matches!(
+            check.registry.observe(PROVIDER, check.owner_id).state,
+            freshell_ownership::OwnershipState::Starting {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                operation_id: current_operation,
+                generation: current_generation,
+                ..
+            } if current_operation == check.operation_id && current_generation == check.generation
+        );
+        let competitor = check.registry.begin_start(
+            PROVIDER,
+            check.owner_id,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "terminal-during-shared-codex-recovery",
+            None,
+            "codex-shared-recovery-cancellation-test",
+            crate::session_lease::now_epoch_ms(),
+        );
+        let terminal_refused = matches!(
+            &competitor,
+            freshell_ownership::BeginOutcome::Blocked {
+                state: freshell_ownership::OwnershipState::Starting {
+                    operation_id: current_operation,
+                    generation: current_generation,
+                    ..
+                },
+                ..
+            } if current_operation == check.operation_id && *current_generation == check.generation
+        );
+        if let freshell_ownership::BeginOutcome::Granted {
+            generation: competing_generation,
+        } = competitor
+        {
+            let _ = check.registry.fail(
+                PROVIDER,
+                check.owner_id,
+                "terminal-during-shared-codex-recovery",
+                competing_generation,
+                false,
+            );
+        }
+
+        // The first request only owned a waiter. Its shared provider operation
+        // remains parked at session registration and keeps the Starting fence.
+        // A second view may join while that same operation owns the fence.
+        let second_state = check.state.clone();
+        let attach_id = check.attach_id.to_string();
+        let second_view = tokio::spawn(async move {
+            second_state
+                .handle_attach_events(attach_msg(&attach_id))
+                .await;
+        });
+        drop(sessions);
+        tokio::time::timeout(Duration::from_secs(20), second_view)
+            .await
+            .expect("the surviving view joins and receives the shared recovery")
+            .expect("the joined attach handler settles");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !check.state.has_live_session(check.owner_id).await {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the detached provider operation commits its runtime");
+        let sessions = check.state.sessions.lock().await;
+        let live_session = sessions
+            .get(check.owner_id)
+            .expect("the shared provider operation registers its canonical session");
+        assert_eq!(live_session.sidecar_pid, Some(check.pid));
+        assert_eq!(live_session.sidecar_ownership_id, check.runtime_id);
+        let owner_committed = matches!(
+            check.registry.observe(PROVIDER, check.owner_id).state,
+            freshell_ownership::OwnershipState::Live {
+                owner: freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    live_session_key: Some(owner_session_key),
+                    pid: Some(owner_pid),
+                    ownership_id: Some(owner_operation),
+                    ..
+                },
+                ..
+            } if owner_session_key == check.owner_id
+                && owner_pid == check.pid
+                && owner_operation == check.operation_id
+        );
+        assert!(
+            owner_committed,
+            "the shared operation keeps its exact native writer"
+        );
+        assert_eq!(
+            check
+                .state
+                .session_recovery
+                .status(&format!("codex:{}", check.owner_id))
+                .await,
+            None
+        );
         (owner_retained, terminal_refused)
     }
 
@@ -22247,8 +22927,6 @@ pub(crate) mod tests {
         ));
 
         let (registration_rx, registration_release_tx) = arm_session_registration_pause(&state);
-        let (mut cleanup_entered_rx, mut cleanup_completed_rx, cleanup_release_tx) =
-            arm_delayed_exact_cleanup(&state);
         let st = state.clone();
         let attach = attach_msg(&id);
         let task = tokio::spawn(async move { st.handle_attach_events(attach).await });
@@ -22277,20 +22955,18 @@ pub(crate) mod tests {
             "attach is blocked at session-map registration"
         );
 
-        let (owner_retained, terminal_refused) = cancel_registration_and_confirm_cleanup(
+        let (owner_retained, terminal_refused) = cancel_recovery_waiter_and_confirm_shared_launch(
             task,
             sessions,
-            RegistrationCleanupCheck {
+            SharedRecoveryCancellationCheck {
                 state: &state,
                 registry: &registry,
-                id: &resumed_id,
+                attach_id: &resumed_id,
+                owner_id: &resumed_id,
                 operation_id: &operation_id,
                 generation,
                 pid,
                 runtime_id: &sidecar_ownership_id,
-                cleanup_entered_rx: &mut cleanup_entered_rx,
-                cleanup_completed_rx: &mut cleanup_completed_rx,
-                cleanup_release_tx: &cleanup_release_tx,
             },
         )
         .await;
@@ -22302,7 +22978,7 @@ pub(crate) mod tests {
             terminal_refused,
             "an active terminal takeover must be refused until attach cleanup settles"
         );
-        assert_eq!(sink.repairs.lock().unwrap().len(), 1);
+        assert!(sink.repairs.lock().unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -22347,8 +23023,6 @@ pub(crate) mod tests {
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         state.set_ownership(registry.clone());
         let (registration_rx, registration_release_tx) = arm_session_registration_pause(&state);
-        let (mut cleanup_entered_rx, mut cleanup_completed_rx, cleanup_release_tx) =
-            arm_delayed_exact_cleanup(&state);
         let st = state.clone();
         let attach = attach_msg(&id);
         let task = tokio::spawn(async move { st.handle_attach_events(attach).await });
@@ -22377,20 +23051,18 @@ pub(crate) mod tests {
             "recovery is blocked at session-map registration"
         );
 
-        let (owner_retained, terminal_refused) = cancel_registration_and_confirm_cleanup(
+        let (owner_retained, terminal_refused) = cancel_recovery_waiter_and_confirm_shared_launch(
             task,
             sessions,
-            RegistrationCleanupCheck {
+            SharedRecoveryCancellationCheck {
                 state: &state,
                 registry: &registry,
-                id: &id,
+                attach_id: &id,
+                owner_id: &id,
                 operation_id: &operation_id,
                 generation,
                 pid,
                 runtime_id: &sidecar_ownership_id,
-                cleanup_entered_rx: &mut cleanup_entered_rx,
-                cleanup_completed_rx: &mut cleanup_completed_rx,
-                cleanup_release_tx: &cleanup_release_tx,
             },
         )
         .await;
@@ -22402,7 +23074,7 @@ pub(crate) mod tests {
             terminal_refused,
             "an active terminal takeover must be refused until recovery cleanup settles"
         );
-        assert_eq!(sink.repairs.lock().unwrap().len(), 1);
+        assert!(sink.repairs.lock().unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -22449,8 +23121,6 @@ pub(crate) mod tests {
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         state.set_ownership(registry.clone());
         let (registration_rx, registration_release_tx) = arm_session_registration_pause(&state);
-        let (mut cleanup_entered_rx, mut cleanup_completed_rx, cleanup_release_tx) =
-            arm_delayed_exact_cleanup(&state);
         let st = state.clone();
         let attach = attach_msg(&old_id);
         let task = tokio::spawn(async move { st.handle_attach_events(attach).await });
@@ -22479,20 +23149,18 @@ pub(crate) mod tests {
             "respawn is blocked at session-map registration"
         );
 
-        let (owner_retained, terminal_refused) = cancel_registration_and_confirm_cleanup(
+        let (owner_retained, terminal_refused) = cancel_recovery_waiter_and_confirm_shared_launch(
             task,
             sessions,
-            RegistrationCleanupCheck {
+            SharedRecoveryCancellationCheck {
                 state: &state,
                 registry: &registry,
-                id: &new_id,
+                attach_id: &old_id,
+                owner_id: &new_id,
                 operation_id: &operation_id,
                 generation,
                 pid,
                 runtime_id: &sidecar_ownership_id,
-                cleanup_entered_rx: &mut cleanup_entered_rx,
-                cleanup_completed_rx: &mut cleanup_completed_rx,
-                cleanup_release_tx: &cleanup_release_tx,
             },
         )
         .await;
@@ -22504,7 +23172,7 @@ pub(crate) mod tests {
             terminal_refused,
             "an active terminal takeover must be refused until respawn cleanup settles"
         );
-        assert_eq!(sink.repairs.lock().unwrap().len(), 1);
+        assert!(sink.repairs.lock().unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -29192,6 +29860,156 @@ pub(crate) mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn concurrent_create_resume_requests_share_one_resumed_thread_and_ack() {
+        let _guard = ENV_LOCK.lock().await;
+        let log_path = std::env::temp_dir().join(format!(
+            "codex-create-resume-shared-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_file(&log_path);
+        configure_fake_codex_cmd(
+            &json!({
+                "delayMethodsMs": { "thread/resume": 800 },
+                "appendThreadOperationLogPath": log_path.to_str().unwrap(),
+            })
+            .to_string(),
+        );
+        let (mut state, mut rx) = state_with_bus();
+        state.set_ownership(Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new()));
+        let session_id = "thread-create-resume-shared";
+        let mut first_message = create_msg("create-resume-device-a");
+        first_message.resume_session_id = Some(session_id.to_string());
+        let mut second_message = create_msg("create-resume-device-b");
+        second_message.resume_session_id = Some(session_id.to_string());
+
+        let first_state = state.clone();
+        let first =
+            tokio::spawn(async move { first_state.handle_create(first_message, None).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !matches!(
+                state.ownership_snapshot(PROVIDER, session_id).state,
+                freshell_ownership::OwnershipState::Starting { .. }
+            ) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first request owns the thread's Starting fence before the second joins");
+        let second_state = state.clone();
+        let second =
+            tokio::spawn(async move { second_state.handle_create(second_message, None).await });
+
+        let first_outcome = first.await.unwrap();
+        let second_outcome = second.await.unwrap();
+        assert!(
+            matches!(first_outcome, CodexCreateOutcome::Created { session_id: ref id, .. } if id == session_id)
+        );
+        assert!(
+            matches!(second_outcome, CodexCreateOutcome::Created { session_id: ref id, .. } if id == session_id)
+        );
+        for request_id in ["create-resume-device-a", "create-resume-device-b"] {
+            let frame = await_created(&mut rx, request_id).await;
+            assert_eq!(
+                frame["type"], "freshAgent.created",
+                "request {request_id}: {frame}"
+            );
+            assert_eq!(frame["sessionId"], session_id);
+        }
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.contains("\"thread/resume\""))
+                .count(),
+            1,
+            "one shared native resume: {log}"
+        );
+        let _ = std::fs::remove_file(&log_path);
+    }
+
+    #[tokio::test]
+    async fn concurrent_create_resume_failure_is_shared_and_counted_once() {
+        let _guard = ENV_LOCK.lock().await;
+        let log_path = std::env::temp_dir().join(format!(
+            "codex-create-resume-failed-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_file(&log_path);
+        configure_fake_codex_cmd(
+            &json!({
+                "delayMethodsMs": { "thread/resume": 800 },
+                "appendThreadOperationLogPath": log_path.to_str().unwrap(),
+                "overrides": {
+                    "thread/resume": {
+                        "error": { "code": -32000, "message": "temporary resume failure" }
+                    }
+                }
+            })
+            .to_string(),
+        );
+        let (mut state, mut rx) = state_with_bus();
+        state.set_ownership(Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new()));
+        let session_id = "thread-create-resume-failure-shared";
+        let mut first_message = create_msg("create-resume-failure-device-a");
+        first_message.resume_session_id = Some(session_id.to_string());
+        let mut second_message = create_msg("create-resume-failure-device-b");
+        second_message.resume_session_id = Some(session_id.to_string());
+
+        let first_state = state.clone();
+        let first =
+            tokio::spawn(async move { first_state.handle_create(first_message, None).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !matches!(
+                state.ownership_snapshot(PROVIDER, session_id).state,
+                freshell_ownership::OwnershipState::Starting { .. }
+            ) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first request owns the thread's Starting fence before the second joins");
+        let second_state = state.clone();
+        let second =
+            tokio::spawn(async move { second_state.handle_create(second_message, None).await });
+
+        let first_outcome = first.await.unwrap();
+        let second_outcome = second.await.unwrap();
+        for outcome in [&first_outcome, &second_outcome] {
+            assert!(
+                matches!(outcome, CodexCreateOutcome::Failed { code, .. } if code == "FRESH_AGENT_CREATE_FAILED")
+            );
+        }
+        for request_id in [
+            "create-resume-failure-device-a",
+            "create-resume-failure-device-b",
+        ] {
+            let frame = await_created(&mut rx, request_id).await;
+            assert_eq!(
+                frame["type"], "freshAgent.create.failed",
+                "request {request_id}: {frame}"
+            );
+            assert_eq!(frame["code"], "FRESH_AGENT_CREATE_FAILED");
+        }
+        let status = state
+            .session_recovery
+            .status(&format!("codex:{session_id}"))
+            .await
+            .expect("failed native create-resume remains visible during the retry floor");
+        assert_eq!(status.failed_launches, 1);
+        assert!(!status.in_flight);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.contains("\"thread/resume\""))
+                .count(),
+            1,
+            "one shared failed native resume: {log}"
+        );
+        let _ = std::fs::remove_file(&log_path);
+    }
+
     // -- TERM-25: wrong-thread resume rejection --
 
     /// TERM-25 (restore-matrix SCENARIO 7): when `thread/resume` answers with a DIFFERENT
@@ -29604,7 +30422,11 @@ pub(crate) mod tests {
             "the dead-thread result is requester-only"
         );
 
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        // The session negative-cache expires after 50ms, while the shared
+        // recovery holder deliberately retains a failed launch for its
+        // one-second retry floor. Wait beyond both before admitting a new
+        // provider attempt.
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
 
         // Now the thread is genuinely resumable.
         configure_fake_codex_cmd("{}");

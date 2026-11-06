@@ -91,6 +91,7 @@ mod scoped_name_rename;
 pub mod session_handoff;
 pub mod session_lease;
 pub mod session_metadata;
+pub mod session_recovery;
 pub mod snapshot;
 pub mod spawn_gate;
 pub(crate) mod summary;

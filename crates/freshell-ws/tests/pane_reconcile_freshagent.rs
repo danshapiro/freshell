@@ -10,13 +10,12 @@
 //!   pre-existing verdict for `kind: "fresh-agent"`: `invalid` /
 //!   `unsupported_kind` (the permanent regression guard).
 //! * Task 13 — fresh-agent verdict derivation: the four states, live→attach,
-//!   in-request dedupe, the respawn cap + reset-on-live, and the G3
+//!   independent same-session views, read-only recovery status, and the G3
 //!   supersession-chain reader rule end-to-end through the real ledger.
 
 mod common;
 
 use common::claude_sim_environment::ClaudeSimEnvironment;
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -93,8 +92,6 @@ struct Server {
     identity: freshell_ws::identity::TerminalIdentityRegistry,
     /// The REAL temp-root ledger shared with the server (G3 tests seed it).
     pane_ledger: Arc<PaneLedger>,
-    /// Clone of `WsState.fresh_agent_respawn_counts` for direct assertions.
-    respawn_counts: Arc<Mutex<HashMap<(String, String), u32>>>,
     /// Keeps the ledger's temp root alive for the server's lifetime.
     #[allow(dead_code)]
     ledger_root: tempfile::TempDir,
@@ -123,7 +120,6 @@ async fn spawn_server_with_claude_environment(
     let pane_ledger = Arc::new(PaneLedger::new_locked(Some(
         ledger_root.path().to_path_buf(),
     )));
-    let respawn_counts: Arc<Mutex<HashMap<(String, String), u32>>> = Arc::default();
 
     let mut fresh_claude = freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx));
     if let Some(environment) = environment {
@@ -182,7 +178,6 @@ async fn spawn_server_with_claude_environment(
         activity: None,
         session_existence: probe,
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-        fresh_agent_respawn_counts: Arc::clone(&respawn_counts),
         ownership: None,
     };
 
@@ -200,7 +195,6 @@ async fn spawn_server_with_claude_environment(
         registry,
         identity,
         pane_ledger,
-        respawn_counts,
         ledger_root,
     }
 }
@@ -494,12 +488,10 @@ async fn live_fresh_agent_session_gets_attach() {
 }
 
 /// WAVE-B B1xB4 seam pin (V9 3.6): a mixed request whose TERMINAL pane
-/// triggers B1's bounded index-warming deferral re-derives the verdicts ONCE
-/// -- and that re-derivation must REUSE the fresh-agent snapshot built at
-/// request start, so the fresh-agent respawn counter burns exactly once per
-/// request (never once per derivation).
+/// triggers B1's bounded index-warming deferral still returns the fresh-agent
+/// verdict from the same request snapshot.
 #[tokio::test]
-async fn warming_deferral_rederivation_burns_the_respawn_counter_once() {
+async fn warming_deferral_rederivation_keeps_the_fresh_agent_verdict() {
     let probe = std::sync::Arc::new(StubProbe::default());
     probe.answers.lock().unwrap().insert(
         ("codex".into(), "fa-once".into()),
@@ -522,21 +514,15 @@ async fn warming_deferral_rederivation_burns_the_respawn_counter_once() {
     assert_eq!(verdicts[0]["verdict"], "error");
     assert_eq!(verdicts[0]["reason"], "index_warming");
     assert_eq!(verdicts[1]["verdict"], "respawn");
-    let counts = server.respawn_counts.lock().expect("counts lock");
-    assert_eq!(
-        counts.get(&("codex".into(), "fa-once".into())).copied(),
-        Some(1),
-        "the deferral's re-derivation must not double-burn the respawn counter"
-    );
 }
 
 /// WAVE-B B1xB4 seam pin: B1's `ProviderUnavailable` existence answer maps to
 /// the B4 pre-decision (V9/A12): presence Unknown => conservative
-/// respawn-with-cap -- never dead_session, and never the terminal arm's
+/// respawn -- never dead_session, and never the terminal arm's
 /// error{provider_unavailable} shape (fresh-agent liveness does not depend on
 /// the disk index being able to warm).
 #[tokio::test]
-async fn provider_unavailable_existence_maps_to_respawn_with_cap() {
+async fn provider_unavailable_existence_maps_to_respawn() {
     let probe = std::sync::Arc::new(StubProbe::default());
     probe.answers.lock().unwrap().insert(
         ("codex".into(), "pu-1".into()),
@@ -554,16 +540,10 @@ async fn provider_unavailable_existence_maps_to_respawn_with_cap() {
     .await;
     assert_eq!(verdicts[0]["verdict"], "respawn");
     assert_eq!(verdicts[0]["sessionRef"]["sessionId"], "pu-1");
-    let counts = server.respawn_counts.lock().expect("counts lock");
-    assert_eq!(
-        counts.get(&("codex".into(), "pu-1".into())).copied(),
-        Some(1),
-        "the answer counted against the respawn cap"
-    );
 }
 
 #[tokio::test]
-async fn duplicate_session_claims_dedupe_within_one_request() {
+async fn same_session_views_each_receive_their_own_recovery_verdict() {
     let probe = std::sync::Arc::new(StubProbe::default());
     probe
         .answers
@@ -581,15 +561,16 @@ async fn duplicate_session_claims_dedupe_within_one_request() {
     )
     .await;
     assert_eq!(verdicts[0]["verdict"], "respawn");
-    assert_eq!(verdicts[1]["verdict"], "fresh");
-    assert_eq!(verdicts[1]["reason"], "duplicate_session_claim");
-    assert_eq!(verdicts[1]["duplicate"], "first");
+    assert_eq!(verdicts[1]["verdict"], "respawn");
+    assert_eq!(verdicts[0]["sessionRef"], verdicts[1]["sessionRef"]);
+    assert!(verdicts[0].get("duplicate").is_none());
+    assert!(verdicts[1].get("duplicate").is_none());
 }
 
 #[tokio::test]
-async fn respawn_cap_turns_the_fourth_answer_into_dead_session() {
-    // The session stays Present-but-never-live, so every answer maps to
-    // respawn; only RESPAWN ANSWERS burn the cap (V2/A7).
+async fn repeated_reconcile_answers_do_not_exhaust_recovery_budget() {
+    // The session stays Present-but-never-live. Reconcile only reads recovery
+    // status; no launch failure occurred, so repeated answers remain respawn.
     let probe = std::sync::Arc::new(StubProbe::default());
     probe
         .answers
@@ -598,7 +579,7 @@ async fn respawn_cap_turns_the_fourth_answer_into_dead_session() {
         .insert(("codex".into(), "cap".into()), SessionExistence::Present);
     let server = spawn_server_with_probe(probe).await;
     let (mut ws, _ready) = connect(&server.url, true, true).await;
-    for i in 0..4 {
+    for i in 0..100 {
         let verdicts = reconcile_request(
             &mut ws,
             serde_json::json!([
@@ -606,20 +587,13 @@ async fn respawn_cap_turns_the_fourth_answer_into_dead_session() {
             ]),
         )
         .await;
-        if i < 3 {
-            assert_eq!(verdicts[0]["verdict"], "respawn", "answer {i}");
-        } else {
-            assert_eq!(verdicts[0]["verdict"], "dead_session");
-            assert_eq!(verdicts[0]["reason"], "respawn_exhausted");
-        }
+        assert_eq!(verdicts[0]["verdict"], "respawn", "answer {i}");
+        assert_eq!(verdicts[0]["sessionRef"]["sessionId"], "cap");
     }
 }
 
 #[tokio::test]
-async fn a_session_resolving_live_clears_the_respawn_counter() {
-    // Reset-on-live (V2/A7): a successful respawn is OBSERVED as the session
-    // going live; the counter must clear so healthy sessions are never
-    // exhausted by reconnect/reload storms.
+async fn a_session_resolving_live_changes_reconcile_to_attach() {
     let environment = ClaudeSimEnvironment::new();
     let probe = Arc::new(StubProbe::default());
     let server =
@@ -644,7 +618,7 @@ async fn a_session_resolving_live_clears_the_respawn_counter() {
         SessionExistence::Present,
     );
 
-    // TWO reconcile requests while the session is NOT yet live → both respawn.
+    // Reconcile while the session is NOT yet live → each view may recover.
     for i in 0..2 {
         let verdicts = reconcile_request(
             &mut ws,
@@ -656,17 +630,6 @@ async fn a_session_resolving_live_clears_the_respawn_counter() {
         .await;
         assert_eq!(verdicts[0]["verdict"], "respawn", "pre-live answer {i}");
     }
-    assert_eq!(
-        server
-            .respawn_counts
-            .lock()
-            .unwrap()
-            .get(&("claude".to_string(), cli_session_id.clone()))
-            .copied(),
-        Some(2),
-        "two respawn answers burned two"
-    );
-
     // Resume the same saved conversation through the real SDK boundary.
     let resumed = create_live_claude_session(
         &mut ws,
@@ -686,14 +649,6 @@ async fn a_session_resolving_live_clears_the_respawn_counter() {
     )
     .await;
     assert_eq!(verdicts[0]["verdict"], "attach");
-    assert!(
-        !server
-            .respawn_counts
-            .lock()
-            .unwrap()
-            .contains_key(&("claude".to_string(), cli_session_id.clone())),
-        "counter cleared (not merely un-incremented) when presence resolved Live"
-    );
     kill_live_claude_session(&mut ws, &environment, &cli_session_id).await;
 }
 
@@ -856,11 +811,10 @@ async fn a_bound_claude_session_with_a_genesis_and_no_transcript_yet_answers_res
     assert_eq!(verdicts[3]["reason"], "session_not_on_disk");
 }
 
-/// The genesis-backed respawn is subject to the existing respawn cap: a
-/// pending session that never comes back live converges to
-/// `dead_session{respawn_exhausted}` instead of looping.
+/// Reconcile does not consume a launch-failure budget. A pending session only
+/// reaches exhaustion after three actual provider launch failures.
 #[tokio::test]
-async fn a_pending_claude_session_that_never_comes_back_exhausts_the_respawn_cap() {
+async fn a_pending_claude_session_does_not_exhaust_from_reconcile_answers() {
     let probe = std::sync::Arc::new(StubProbe::default());
     probe.answers.lock().unwrap().insert(
         ("claude".into(), "never-back".into()),
@@ -876,13 +830,11 @@ async fn a_pending_claude_session_that_never_comes_back_exhausts_the_respawn_cap
     let pane = serde_json::json!([
         { "paneKey": "p", "kind": "fresh-agent", "sessionRef": {"provider": "claude", "sessionId": "never-back"} }
     ]);
-    for attempt in 0..freshell_ws::reconcile_freshagent::FRESH_AGENT_RESPAWN_CAP {
+    for attempt in 0..100 {
         let verdicts = reconcile_request(&mut ws, pane.clone()).await;
         assert_eq!(verdicts[0]["verdict"], "respawn", "attempt {attempt}");
+        assert_eq!(verdicts[0]["sessionRef"]["sessionId"], "never-back");
     }
-    let verdicts = reconcile_request(&mut ws, pane).await;
-    assert_eq!(verdicts[0]["verdict"], "dead_session");
-    assert_eq!(verdicts[0]["reason"], "respawn_exhausted");
 }
 
 // ── dead_session verdict observability (WARN log at the result choke point) ──

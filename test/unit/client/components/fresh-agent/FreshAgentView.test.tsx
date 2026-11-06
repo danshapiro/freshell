@@ -18077,6 +18077,107 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
     })
   })
 
+  it('joins only the recovery_in_progress owner pair authorized by pane reconcile', async () => {
+    const store = createStore()
+    const sid = 'thread-explicit-recovery-join'
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: divergencePaneContent({
+        sessionId: sid,
+        sessionRef: { provider: 'codex', sessionId: sid },
+      }),
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1))
+    wsMock.send.mockClear()
+
+    act(() => {
+      store.dispatch(applyRuntimeOwner({
+        type: 'session.runtimeOwner',
+        provider: 'codex',
+        sessionId: sid,
+        epoch: 2,
+        generation: 1,
+        ownerKind: 'fresh-agent',
+        operationId: 'recovery-op',
+        transition: 'handoff-started',
+      }))
+      store.dispatch(applyFreshAgentReconcileAttach({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        sessionRef: { provider: 'codex', sessionId: sid },
+        serverInstanceId: 'same-server',
+        recoveryJoinFence: { epoch: 2, generation: 1 },
+      }))
+    })
+
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1))
+    expect(sentFreshAgentMessages('freshAgent.attach')[0]).toMatchObject({
+      sessionId: sid,
+      observedEpoch: 2,
+      observedGeneration: 1,
+    })
+    expect(getFreshAgentPaneContent(store).recoveryJoinFence).toBeUndefined()
+  })
+
+  it('does not use an in-flight recovery join after the owner fence changes', async () => {
+    const store = createStore()
+    const sid = 'thread-stale-recovery-join'
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: divergencePaneContent({
+        sessionId: sid,
+        sessionRef: { provider: 'codex', sessionId: sid },
+      }),
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1))
+    wsMock.send.mockClear()
+
+    act(() => {
+      store.dispatch(applyRuntimeOwner({
+        type: 'session.runtimeOwner',
+        provider: 'codex',
+        sessionId: sid,
+        epoch: 2,
+        generation: 1,
+        ownerKind: 'fresh-agent',
+        operationId: 'recovery-op-one',
+        transition: 'handoff-started',
+      }))
+      store.dispatch(applyFreshAgentReconcileAttach({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        sessionRef: { provider: 'codex', sessionId: sid },
+        serverInstanceId: 'same-server',
+        recoveryJoinFence: { epoch: 2, generation: 1 },
+      }))
+      store.dispatch(applyRuntimeOwner({
+        type: 'session.runtimeOwner',
+        provider: 'codex',
+        sessionId: sid,
+        epoch: 2,
+        generation: 2,
+        ownerKind: 'fresh-agent',
+        operationId: 'recovery-op-two',
+        transition: 'handoff-started',
+      }))
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
+  })
+
   it('coalesces duplicate no-fence ready producers but preserves transport and reconcile rounds', async () => {
     const reconnectHandlers: Array<() => void> = []
     wsMock.onReconnect.mockImplementation((handler: () => void) => {

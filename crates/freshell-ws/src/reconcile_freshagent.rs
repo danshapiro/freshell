@@ -47,31 +47,6 @@
 
 use freshell_protocol::{PaneVerdict, ReconcilePane, ReconcileVerdict, SessionLocator};
 
-pub const FRESH_AGENT_RESPAWN_CAP: u32 = 3;
-
-/// kata b8ke: skip the respawn-counter burn when the coordinator shows the
-/// key owned by the OTHER kind or transitioning — the freshAgent.create the
-/// respawn verdict arms would be typed-refused anyway, and burning would let
-/// reconnect loops march a divergent pane toward a false
-/// `dead_session{respawn_exhausted}`.
-fn respawn_burn_skipped(state: &freshell_ownership::OwnershipState) -> bool {
-    use freshell_ownership::OwnershipState;
-    matches!(
-        state,
-        OwnershipState::Live { owner, .. }
-            if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal
-    ) || matches!(
-        state,
-        OwnershipState::Starting { .. }
-            | OwnershipState::Handoff { .. }
-            | OwnershipState::Stopping { .. }
-            // b8ke focused round-2 review: a fenced key (an unconfirmed
-            // prior death) blocks every create the respawn verdict would
-            // arm — never burn the counter toward a false respawn_exhausted.
-            | OwnershipState::Fenced { .. }
-    )
-}
-
 /// Claude core design §4.4 (the restart fix; the fresh-agent twin of the
 /// terminal claude carve-out in `reconcile.rs`): a claude session whose
 /// transcript does not exist yet but whose binding row records a genesis (a
@@ -120,8 +95,9 @@ pub enum FreshAgentPresence {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FreshAgentPaneFacts {
     pub presence: FreshAgentPresence,
-    pub duplicate_of: Option<String>, // paneKey of the earlier pane claiming the same session
     pub respawn_exhausted: bool,
+    pub recovery_in_flight: bool,
+    pub recovery_retry_after_ms: Option<u64>,
     /// G3 supersession terminus (V8/A14): when the claimed sessionRef resolved
     /// through the ledger's supersededBy chain to a DIFFERENT id, this is the
     /// terminus id — the verdict answers with it + `corrected: true`.
@@ -133,27 +109,21 @@ pub struct FreshAgentReconcileSnapshot {
     pub facts: std::collections::HashMap<String /* paneKey */, FreshAgentPaneFacts>,
 }
 
-/// The ONE async gathering pass per reconcile request (Task 13): session-map
-/// liveness, disk existence, ledger supersession resolution, in-request
-/// dedupe, and the respawn cap all condense into per-pane facts here, so
+/// The ONE async gathering pass per reconcile request: session-map liveness,
+/// disk existence, ledger supersession resolution, and shared recovery status
+/// condense into per-pane facts here, so
 /// [`verdict_for_pane`] stays pure + sync inside derive_verdicts'
-/// catch_unwind. Built ONCE per request and REUSED if deps are re-derived —
-/// rebuilding would double-burn the respawn counter.
-///
-/// Respawn-cap rationale (V2/A7): the terminal donor counts actual process
-/// exits within a liveness window and RESETS on survival
-/// (`registry.rs:1271-1283`) — per-answer burning without decay would let 3
-/// reloads kill a healthy session. Counting respawn ANSWERS with
-/// reset-on-live means only a genuinely non-recovering loop trips the cap.
-/// Residual A19 (accepted): the next-wave client's reconcile cadence is
-/// unpinned — REVISIT the cap value/semantics when that client lands.
+/// catch_unwind. Multiple panes with one canonical locator share gathered
+/// facts while each receives its own pane verdict.
 pub async fn build_snapshot(
     state: &crate::WsState,
     panes: &[ReconcilePane],
 ) -> FreshAgentReconcileSnapshot {
     let mut facts = std::collections::HashMap::new();
-    let mut claimed: std::collections::HashMap<(String, String), String> =
-        std::collections::HashMap::new();
+    let mut shared: std::collections::HashMap<
+        (String, String),
+        (FreshAgentPresence, bool, bool, Option<u64>),
+    > = std::collections::HashMap::new();
     for pane in panes
         .iter()
         .filter(|p| p.kind.as_deref() == Some("fresh-agent"))
@@ -162,9 +132,8 @@ pub async fn build_snapshot(
             continue; // verdict fn answers no_recoverable_identity
         };
         // G3 reader rule (V8/A14): resolve the CLAIM through the ledger's
-        // supersession chain FIRST — dedupe, liveness, existence, and the
-        // respawn counter all key on the TERMINUS id (lookup_by_session is
-        // public + memory-only).
+        // supersession chain FIRST — liveness, existence, and recovery status
+        // all key on the TERMINUS id (lookup_by_session is public + memory-only).
         let resolved = state
             .pane_ledger
             .lookup_by_session(&sref.provider, &sref.session_id)
@@ -172,129 +141,66 @@ pub async fn build_snapshot(
             .map(|r| r.row.session_id);
         let session_id = resolved.clone().unwrap_or_else(|| sref.session_id.clone());
         let key = (sref.provider.clone(), session_id.clone());
-        if let Some(winner) = claimed.get(&key) {
-            facts.insert(
-                pane.pane_key.clone(),
-                FreshAgentPaneFacts {
-                    presence: FreshAgentPresence::Unknown,
-                    duplicate_of: Some(winner.clone()),
-                    respawn_exhausted: false,
-                    resolved_session_id: resolved,
-                },
-            );
-            continue;
-        }
-        claimed.insert(key.clone(), pane.pane_key.clone());
-        let live = match sref.provider.as_str() {
-            "codex" => state.fresh_codex.has_live_session(&session_id).await,
-            "claude" => state.fresh_claude.has_live_session(&session_id).await,
-            "opencode" => state.fresh_opencode.has_live_session(&session_id).await,
-            _ => false,
-        };
-        // kata b8ke Task 3: the coordinator's view of the key (via each
-        // fresh state's side-effect-free `ownership_snapshot`) — the
-        // respawn-counter guard consults it below.
-        let ownership_state = match sref.provider.as_str() {
-            "codex" => {
-                state
-                    .fresh_codex
-                    .ownership_snapshot("codex", &session_id)
-                    .state
-            }
-            "claude" => {
-                state
-                    .fresh_claude
-                    .ownership_snapshot("claude", &session_id)
-                    .state
-            }
-            "opencode" => {
-                state
-                    .fresh_opencode
-                    .ownership_snapshot("opencode", &session_id)
-                    .state
-            }
-            _ => freshell_ownership::OwnershipState::Vacant,
-        };
-        use crate::existence::SessionExistence as E;
-        let presence = if live {
-            FreshAgentPresence::Live
-        } else {
-            // Exhaustive match, NO catch-all (B1 hardening). ProviderUnavailable
-            // arm is the B4 pre-decision (V9/A12, module doc above): conservative
-            // respawn-with-cap via Unknown, never dead_session.
-            match state.session_existence.exists(&sref.provider, &session_id) {
-                E::Present => FreshAgentPresence::OnDisk,
-                E::ProviderUnavailable => FreshAgentPresence::Unknown,
-                E::Absent => {
-                    if claude_pending_genesis(state, &sref.provider, &session_id) {
-                        FreshAgentPresence::OnDisk
-                    } else if state
-                        .session_existence
-                        .ever_observed(&sref.provider, &session_id)
-                    {
-                        FreshAgentPresence::GoneObserved
-                    } else {
-                        FreshAgentPresence::NeverObserved
-                    }
-                }
-                E::Unknown => {
-                    // The ledger is positive evidence the session existed.
-                    if state.pane_ledger.ever_bound(&sref.provider, &session_id) {
-                        FreshAgentPresence::OnDisk
-                    } else {
-                        FreshAgentPresence::Unknown
-                    }
-                }
-            }
-        };
-        // Respawn cap (V2/A7 — reworked): count only answers that actually
-        // come back `respawn`, and CLEAR the counter when presence resolves
-        // Live (a successful respawn is OBSERVED as the session going live).
-        // The counting lives HERE because for non-duplicate panes the verdict
-        // is fully determined by presence: OnDisk/Unknown + !exhausted ⇒
-        // respawn (see verdict_for_pane) — so "this answer will be respawn"
-        // is known at increment time. Mutation stays in this async builder,
-        // OUTSIDE derive_verdicts' catch_unwind.
-        //
-        // kata b8ke Task 3: when the coordinator owns the key elsewhere
-        // (Live{Terminal}) or a lifecycle transition is in flight, the armed
-        // create is typed-refused anyway — NO burn (a reconnect loop must
-        // never march a divergent pane toward a false
-        // `dead_session{respawn_exhausted}`).
-        let respawn_exhausted = match presence {
-            FreshAgentPresence::Live => {
-                state
-                    .fresh_agent_respawn_counts
-                    .lock()
-                    .expect("respawn counts poisoned")
-                    .remove(&key); // reset-on-live
-                false
-            }
-            FreshAgentPresence::OnDisk | FreshAgentPresence::Unknown => {
-                if respawn_burn_skipped(&ownership_state) {
-                    false // the coordinator owns elsewhere — no burn
+        let (presence, respawn_exhausted, recovery_in_flight, recovery_retry_after_ms) =
+            if let Some(cached) = shared.get(&key) {
+                *cached
+            } else {
+                let live = match sref.provider.as_str() {
+                    "codex" => state.fresh_codex.has_live_session(&session_id).await,
+                    "claude" => state.fresh_claude.has_live_session(&session_id).await,
+                    "opencode" => state.fresh_opencode.has_live_session(&session_id).await,
+                    _ => false,
+                };
+                let recovery = match sref.provider.as_str() {
+                    "codex" => state.fresh_codex.recovery_status(&session_id).await,
+                    "claude" => state.fresh_claude.recovery_status(&session_id).await,
+                    "opencode" => state.fresh_opencode.recovery_status(&session_id).await,
+                    _ => None,
+                };
+                use crate::existence::SessionExistence as E;
+                let presence = if live {
+                    FreshAgentPresence::Live
                 } else {
-                    let mut counts = state
-                        .fresh_agent_respawn_counts
-                        .lock()
-                        .expect("respawn counts poisoned");
-                    let c = counts.entry(key).or_insert(0);
-                    if *c >= FRESH_AGENT_RESPAWN_CAP {
-                        true // this answer becomes dead_session{respawn_exhausted}; no burn
-                    } else {
-                        *c += 1; // this answer goes out as `respawn` — burn one
-                        false
+                    match state.session_existence.exists(&sref.provider, &session_id) {
+                        E::Present => FreshAgentPresence::OnDisk,
+                        E::ProviderUnavailable => FreshAgentPresence::Unknown,
+                        E::Absent => {
+                            if claude_pending_genesis(state, &sref.provider, &session_id) {
+                                FreshAgentPresence::OnDisk
+                            } else if state
+                                .session_existence
+                                .ever_observed(&sref.provider, &session_id)
+                            {
+                                FreshAgentPresence::GoneObserved
+                            } else {
+                                FreshAgentPresence::NeverObserved
+                            }
+                        }
+                        E::Unknown => {
+                            if state.pane_ledger.ever_bound(&sref.provider, &session_id) {
+                                FreshAgentPresence::OnDisk
+                            } else {
+                                FreshAgentPresence::Unknown
+                            }
+                        }
                     }
-                }
-            }
-            FreshAgentPresence::GoneObserved | FreshAgentPresence::NeverObserved => false,
-        };
+                };
+                let gathered = (
+                    presence,
+                    recovery.as_ref().is_some_and(|status| status.exhausted),
+                    recovery.as_ref().is_some_and(|status| status.in_flight),
+                    recovery.and_then(|status| status.retry_after_ms),
+                );
+                shared.insert(key.clone(), gathered);
+                gathered
+            };
         facts.insert(
             pane.pane_key.clone(),
             FreshAgentPaneFacts {
                 presence,
-                duplicate_of: None,
                 respawn_exhausted,
+                recovery_in_flight,
+                recovery_retry_after_ms,
                 resolved_session_id: resolved,
             },
         );
@@ -336,12 +242,6 @@ pub fn verdict_for_pane(
         v.reason = Some("no_recoverable_identity".into());
         return v;
     };
-    if let Some(winner) = &facts.duplicate_of {
-        let mut v = base(pane, ReconcileVerdict::Fresh);
-        v.reason = Some("duplicate_session_claim".into());
-        v.duplicate = Some(winner.clone());
-        return v;
-    }
     // G3 reader rule (V8/A14): when the claim resolved through the ledger's
     // supersession chain, every echoed session_ref carries the TERMINUS id
     // and the verdict is marked corrected (never answer the retired ref).
@@ -366,6 +266,18 @@ pub fn verdict_for_pane(
             if facts.respawn_exhausted {
                 let mut v = base(pane, ReconcileVerdict::DeadSession);
                 v.reason = Some("respawn_exhausted".into());
+                v.session_ref = Some(sref);
+                v.corrected = corrected;
+                v
+            } else if facts.recovery_in_flight {
+                let mut v = base(pane, ReconcileVerdict::Error);
+                v.reason = Some("recovery_in_progress".into());
+                v.session_ref = Some(sref);
+                v.corrected = corrected;
+                v
+            } else if facts.recovery_retry_after_ms.is_some() {
+                let mut v = base(pane, ReconcileVerdict::Error);
+                v.reason = Some("recovery_retry_after".into());
                 v.session_ref = Some(sref);
                 v.corrected = corrected;
                 v
@@ -417,13 +329,14 @@ mod tests {
         entries: &[(&str, FreshAgentPresence, Option<&str>, bool)],
     ) -> FreshAgentReconcileSnapshot {
         let mut snapshot = FreshAgentReconcileSnapshot::default();
-        for (pane_key, presence, duplicate_of, respawn_exhausted) in entries {
+        for (pane_key, presence, _duplicate_of, respawn_exhausted) in entries {
             snapshot.facts.insert(
                 pane_key.to_string(),
                 FreshAgentPaneFacts {
                     presence: *presence,
-                    duplicate_of: duplicate_of.map(|s| s.to_string()),
                     respawn_exhausted: *respawn_exhausted,
+                    recovery_in_flight: false,
+                    recovery_retry_after_ms: None,
                     resolved_session_id: None,
                 },
             );
@@ -495,12 +408,17 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_claim_yields_fresh_with_duplicate_marker() {
-        let s = snap(&[("p2", FreshAgentPresence::OnDisk, Some("p1"), false)]);
-        let v = verdict_for_pane(Some(&s), &pane("p2", Some(("codex", "t1"))));
-        assert_eq!(v.verdict, ReconcileVerdict::Fresh);
-        assert_eq!(v.reason.as_deref(), Some("duplicate_session_claim"));
-        assert_eq!(v.duplicate.as_deref(), Some("p1"));
+    fn concurrent_views_keep_their_own_attach_fact_and_locator() {
+        let s = snap(&[
+            ("p1", FreshAgentPresence::Live, None, false),
+            ("p2", FreshAgentPresence::Live, Some("p1"), false),
+        ]);
+        for key in ["p1", "p2"] {
+            let v = verdict_for_pane(Some(&s), &pane(key, Some(("codex", "t1"))));
+            assert_eq!(v.verdict, ReconcileVerdict::Attach);
+            assert_eq!(v.session_ref.unwrap().session_id, "t1");
+            assert_eq!(v.duplicate, None);
+        }
     }
 
     #[test]
@@ -529,39 +447,38 @@ mod tests {
     }
 
     #[test]
-    fn respawn_counter_does_not_burn_when_the_coordinator_owns_elsewhere() {
-        use freshell_ownership::{OwnershipState, RuntimeOwnerKind};
-        fn owner_of(kind: RuntimeOwnerKind) -> freshell_ownership::OwnerIdentity {
-            freshell_ownership::OwnerIdentity {
-                kind,
-                terminal_id: Some("t-1".into()),
-                live_session_key: None,
-                pid: None,
-                ownership_id: None,
-            }
-        }
-        // Live same-kind (fresh-agent): respawn still burns (a same-kind rebind).
-        assert!(!respawn_burn_skipped(&OwnershipState::Live {
-            owner: owner_of(RuntimeOwnerKind::FreshAgent),
-            generation: 1,
-            since_ms: 0,
-        }));
-        // Live cross-kind (terminal): the armed create is typed-refused — no burn.
-        assert!(respawn_burn_skipped(&OwnershipState::Live {
-            owner: owner_of(RuntimeOwnerKind::Terminal),
-            generation: 2,
-            since_ms: 0,
-        }));
-        // A lifecycle transition in flight: no burn.
-        assert!(respawn_burn_skipped(&OwnershipState::Handoff {
-            prior: None,
-            to_kind: RuntimeOwnerKind::Terminal,
-            operation_id: "ho-1".into(),
-            generation: 3,
-            initiator: "test".into(),
-            since_ms: 0,
-        }));
-        // Vacant: normal respawn accounting.
-        assert!(!respawn_burn_skipped(&OwnershipState::Vacant));
+    fn shared_recovery_facts_park_views_without_reminting_the_locator() {
+        let mut snapshot = snap(&[("p", FreshAgentPresence::OnDisk, None, false)]);
+        let facts = snapshot.facts.get_mut("p").unwrap();
+        facts.recovery_in_flight = true;
+        let verdict = verdict_for_pane(
+            Some(&snapshot),
+            &pane("p", Some(("claude", "canonical-id"))),
+        );
+        assert_eq!(verdict.verdict, ReconcileVerdict::Error);
+        assert_eq!(verdict.reason.as_deref(), Some("recovery_in_progress"));
+        assert_eq!(verdict.session_ref.unwrap().session_id, "canonical-id");
+    }
+
+    #[test]
+    fn retry_floor_and_exhaustion_come_from_recovery_facts() {
+        let mut retry = snap(&[("p", FreshAgentPresence::OnDisk, None, false)]);
+        retry.facts.get_mut("p").unwrap().recovery_retry_after_ms = Some(500);
+        let retry_verdict =
+            verdict_for_pane(Some(&retry), &pane("p", Some(("codex", "thread-id"))));
+        assert_eq!(retry_verdict.verdict, ReconcileVerdict::Error);
+        assert_eq!(
+            retry_verdict.reason.as_deref(),
+            Some("recovery_retry_after")
+        );
+
+        let exhausted = snap(&[("p", FreshAgentPresence::OnDisk, None, true)]);
+        let exhausted_verdict =
+            verdict_for_pane(Some(&exhausted), &pane("p", Some(("codex", "thread-id"))));
+        assert_eq!(exhausted_verdict.verdict, ReconcileVerdict::DeadSession);
+        assert_eq!(
+            exhausted_verdict.reason.as_deref(),
+            Some("respawn_exhausted")
+        );
     }
 }

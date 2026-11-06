@@ -71,6 +71,7 @@ function normalizeManagedRuntimeProjection(
     placementGroup: input.placementGroup,
     resourceSummary: input.resourceSummary,
     recoverySummary: input.recoverySummary,
+    freshAgentRecovery: input.freshAgentRecovery,
   })
   if (!parsed.success) return {}
   return Object.fromEntries(
@@ -1088,6 +1089,7 @@ function stripStaleIds(content: PaneContent, preserveCreateRequestIds = false): 
       serverInstanceId: _serverInstanceId,
       createError: _createError,
       reconcileEpoch: _reconcileEpoch,
+      recoveryJoinFence: _recoveryJoinFence,
       pendingReconcile: _pendingReconcile,
       reconcileNotice: _reconcileNotice,
       ...rest
@@ -2826,9 +2828,10 @@ export const panesSlice = createSlice({
         serverInstanceId?: string
         corrected?: boolean
         duplicate?: boolean
+        recoveryJoinFence?: { epoch: number; generation: number }
       }>
     ) => {
-      const { tabId, paneId, sessionRef, serverInstanceId, corrected, duplicate } = action.payload
+      const { tabId, paneId, sessionRef, serverInstanceId, corrected, duplicate, recoveryJoinFence } = action.payload
       const content = findReconcilePaneContent(state, tabId, paneId)
       if (!content || content.kind !== 'fresh-agent') return
       if (!sessionRef?.sessionId || sessionRef.provider !== content.provider) return // malformed verdict — no-op
@@ -2839,11 +2842,29 @@ export const panesSlice = createSlice({
       content.serverInstanceId = serverInstanceId
       content.restoreError = undefined
       content.createError = undefined
+      content.recoveryJoinFence = recoveryJoinFence
       content.pendingReconcile = undefined
       content.reconcileEpoch = (content.reconcileEpoch ?? 0) + 1
       if (corrected) content.reconcileNotice = RECONCILE_NOTICE_CORRECTED
       else if (duplicate) content.reconcileNotice = RECONCILE_NOTICE_DUPLICATE
       clearReconcilePendingForPane(state, tabId, paneId)
+    },
+
+    /** Consume only the one-shot authorization captured for this exact owner pair. */
+    clearFreshAgentRecoveryJoinFence: (
+      state,
+      action: PayloadAction<{
+        tabId: string
+        paneId: string
+        expectedFence: { epoch: number; generation: number }
+      }>,
+    ) => {
+      const { tabId, paneId, expectedFence } = action.payload
+      const content = findReconcilePaneContent(state, tabId, paneId)
+      if (content?.kind !== 'fresh-agent') return
+      if (content.recoveryJoinFence?.epoch !== expectedFence.epoch
+        || content.recoveryJoinFence?.generation !== expectedFence.generation) return
+      content.recoveryJoinFence = undefined
     },
 
     /**
@@ -2890,6 +2911,7 @@ export const panesSlice = createSlice({
       content.status = 'creating'
       content.restoreError = undefined
       content.createError = undefined
+      content.recoveryJoinFence = undefined
       if (intent === 'respawn' && sessionRef) {
         content.sessionRef = { provider: sessionRef.provider, sessionId: sessionRef.sessionId }
         content.resumeSessionId = sessionRef.sessionId
@@ -3149,6 +3171,7 @@ export const {
   clearPaneLaunchFailure,
   resetPaneForReconcileCreate,
   applyFreshAgentReconcileAttach,
+  clearFreshAgentRecoveryJoinFence,
   resetFreshAgentPaneForReconcileCreate,
   startNewManagedRuntimeConversation,
   setPaneReconcileNotice,

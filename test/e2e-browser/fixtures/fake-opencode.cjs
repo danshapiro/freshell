@@ -25,6 +25,15 @@ function appendAudit(payload) {
   })}\n`)
 }
 
+async function waitForFixtureGate(gatePath, description) {
+  if (!gatePath) return
+  const deadline = Date.now() + 120_000
+  while (!fs.existsSync(gatePath)) {
+    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${description} release`)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+}
+
 if (process.argv.includes('--version') || process.argv.includes('version')) {
   process.stdout.write('opencode fake 1.0.0\n')
   process.exit(0)
@@ -666,6 +675,8 @@ const sessionArg = argValue('--session')
 const sessionEventGatePath = process.env.FAKE_OPENCODE_SESSION_EVENT_GATE_PATH
 const holdSummarizeGatePath = process.env.FAKE_OPENCODE_HOLD_SUMMARIZE_GATE_PATH
 const holdPromptGatePath = process.env.FAKE_OPENCODE_HOLD_PROMPT_GATE_PATH
+const holdSessionGetGatePath = process.env.FAKE_OPENCODE_HOLD_SESSION_GET_GATE_PATH
+const failSessionGetPath = process.env.FAKE_OPENCODE_FAIL_SESSION_GET_PATH
 // Second-message reload lane: with FAKE_OPENCODE_DEFER_PROMPT_ROWS_TO_GATE=1
 // (and the hold-prompt gate active), a gated turn's rows append at GATE
 // RELEASE instead of request receipt — the parked window's snapshots hold
@@ -1309,9 +1320,27 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (action === '' && req.method === 'GET') {
+      const recoveryRequestId = req.headers['x-freshell-recovery-request-id']
+      appendAudit({
+        event: 'session_get_started',
+        sessionId,
+        ...(recoveryRequestId ? { recoveryRequestId } : {}),
+        routeDirectory: directory,
+        directory: session.directory,
+      })
+      if (recoveryRequestId) {
+        await waitForFixtureGate(holdSessionGetGatePath, 'OpenCode session recovery read')
+      }
+      if (recoveryRequestId && failSessionGetPath && fs.existsSync(failSessionGetPath)) {
+        fs.rmSync(failSessionGetPath, { force: true })
+        appendAudit({ event: 'session_get_failed', sessionId, recoveryRequestId, routeDirectory: directory })
+        sendJson(res, 503, { error: 'synthetic OpenCode session recovery failure', sessionId })
+        return
+      }
       appendAudit({
         event: 'session_get',
         sessionId,
+        ...(recoveryRequestId ? { recoveryRequestId } : {}),
         routeDirectory: directory,
         directory: session.directory,
       })

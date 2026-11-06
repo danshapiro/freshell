@@ -221,7 +221,6 @@ pub async fn spawn_server_with_specs_and_shared_settings(
         activity: None,
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-        fresh_agent_respawn_counts: Default::default(),
         ownership: None,
     };
 
@@ -303,7 +302,6 @@ pub async fn spawn_server_with_specs(
         activity: None,
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-        fresh_agent_respawn_counts: Default::default(),
         ownership: None,
     };
 
@@ -653,7 +651,6 @@ pub async fn spawn_server_with_specs_and_naming(
         activity: None,
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-        fresh_agent_respawn_counts: Default::default(),
     };
 
     let router = freshell_ws::router(state);
@@ -734,7 +731,6 @@ pub async fn spawn_server_with_specs_and_auto_resume_rx(
         activity: None,
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-        fresh_agent_respawn_counts: Default::default(),
         ownership: None,
     };
 
@@ -847,7 +843,6 @@ pub async fn spawn_server_with_specs_hub_and_state(
         activity: None,
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-        fresh_agent_respawn_counts: Default::default(),
         ownership: None,
     };
 
@@ -933,7 +928,6 @@ pub async fn spawn_server_with_specs_and_state(
         activity: None,
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-        fresh_agent_respawn_counts: Default::default(),
         ownership: None,
     };
 
@@ -1026,7 +1020,6 @@ pub async fn spawn_server_with_ledger(
         activity: None,
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-        fresh_agent_respawn_counts: Default::default(),
         ownership: None,
     };
 
@@ -1120,7 +1113,6 @@ pub async fn spawn_server_with_ledger_and_state(
         activity: None,
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-        fresh_agent_respawn_counts: Default::default(),
         ownership: None,
     };
 
@@ -1210,7 +1202,6 @@ pub async fn spawn_server_with_specs_and_activity(
         activity: Some(activity_hub.clone()),
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-        fresh_agent_respawn_counts: Default::default(),
         ownership: None,
     };
 
@@ -1300,7 +1291,6 @@ pub async fn spawn_server_with_specs_activity_and_codex_locator(
         activity: Some(activity_hub.clone()),
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-        fresh_agent_respawn_counts: Default::default(),
         ownership: None,
     };
 
@@ -1418,7 +1408,6 @@ pub async fn spawn_server_with_specs_activity_codex_locator_and_naming(
         activity: Some(activity_hub.clone()),
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-        fresh_agent_respawn_counts: Default::default(),
     };
 
     // Mirrors main.rs's sweep wiring; 150 ms is re-declared here because
@@ -1530,7 +1519,6 @@ pub async fn spawn_server_with_create_protect_probes(
         activity: None,
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-        fresh_agent_respawn_counts: Default::default(),
         ownership: None,
     };
 

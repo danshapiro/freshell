@@ -187,6 +187,10 @@ pub struct FreshClaudeState {
     /// a synchronous Drop (an aborted resume future — round-3 review I-1).
     resuming: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     resuming_changed: Arc<tokio::sync::Notify>,
+    /// Shared admitted resume outcome and failed-launch budget for each
+    /// canonical Claude conversation. The flag above remains for handoff's
+    /// exclusive refusal semantics; ordinary view recovery joins this result.
+    session_recovery: crate::session_recovery::SessionRecoveryMap<(), recovery::RuntimeResumeError>,
     /// Test seam (Task 6 round-3 review I-1): park `kill_for_handoff` with
     /// the kill ISSUED (retained stamp taken) but nothing else disturbed —
     /// the prior-reap-window abort test's deterministic hold. `None` in
@@ -786,6 +790,7 @@ impl FreshClaudeState {
             create_dedup: Arc::new(FreshAgentCreateDedup::new()),
             resuming: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             resuming_changed: Arc::new(tokio::sync::Notify::new()),
+            session_recovery: Default::default(),
             identity_sink: Arc::new(std::sync::OnceLock::new()),
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
             ownership: None,
@@ -2060,6 +2065,28 @@ impl FreshClaudeState {
                 self.identity_sink()
                     .and_then(|sink| sink.lookup_by_create_request_id(PROVIDER, &request_id))
             });
+        if let Some(resume_sid) = resume_sid.as_deref() {
+            if let Some(durable) = self.recovery_durable_id(resume_sid) {
+                // Existing live sessions retain the ordinary fenced create
+                // adoption path below. A cold known-session create joins the
+                // same server-owned operation as attach/send recovery.
+                let recovery_in_flight = self
+                    .session_recovery
+                    .try_status(&durable)
+                    .is_some_and(|status| status.in_flight);
+                if recovery_in_flight || self.try_has_live_session(&durable) == Some(false) {
+                    return self
+                        .handle_create_shared_resume(
+                            &msg,
+                            &request_id,
+                            view_id.as_deref(),
+                            &durable,
+                            session_type,
+                        )
+                        .await;
+                }
+            }
+        }
         // The durable id is known before spawning, including for a zero-turn
         // conversation. A re-driven create resolves its persisted lineage.
         let launch_id = resume_sid
@@ -2415,6 +2442,115 @@ impl FreshClaudeState {
             session_id: created,
             session_ref,
             cleanup_ownership_id,
+        }
+    }
+
+    async fn handle_create_shared_resume(
+        &self,
+        msg: &FreshAgentCreate,
+        request_id: &str,
+        view_id: Option<&str>,
+        durable: &str,
+        session_type: &str,
+    ) -> ClaudeCreateOutcome {
+        let fence =
+            match crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation) {
+                Ok(fence) => fence,
+                Err(error) => {
+                    return self.fail_create(request_id, view_id, error.code(), error.message());
+                }
+            };
+        let attach = FreshAgentAttach {
+            request_id: Some(request_id.to_string()),
+            view_id: view_id.map(str::to_string),
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: durable.to_string(),
+            session_type: msg.session_type,
+            cwd: msg.cwd.clone(),
+            observed_epoch: msg.observed_epoch,
+            observed_generation: msg.observed_generation,
+            resume_session_id: None,
+            session_ref: Some(claude_session_ref(durable)),
+            tab_id: msg.tab_id.clone(),
+            pane_id: msg.pane_id.clone(),
+        };
+        let recovery = self
+            .resume_shared(
+                attach,
+                durable.to_string(),
+                fence,
+                true,
+                "freshclaude/create-resume",
+            )
+            .await;
+        let is_owner_refusal = matches!(
+            recovery.result.as_ref(),
+            Err(crate::session_recovery::RecoveryFailure::Attempt(error)) if error.is_reserved()
+        );
+        if recovery.status.exhausted && !is_owner_refusal {
+            return self.answer_create_failure(
+                request_id,
+                view_id,
+                ClaudeCreateOutcome::Failed {
+                    code: "RECOVERY_EXHAUSTED".into(),
+                    message:
+                        "Claude could not restore this conversation after three failed launches."
+                            .into(),
+                    retryable: Some(false),
+                    owner: None,
+                },
+            );
+        }
+        match recovery.result.as_ref() {
+            Ok(()) => {
+                // The shared operation already committed the owner ticket.
+                // This request gets its own create acknowledgement and keeps
+                // the durable session identity returned by that winner.
+                self.adopt_live_create(request_id, view_id, durable, session_type)
+                    .await
+            }
+            Err(crate::session_recovery::RecoveryFailure::Attempt(
+                recovery::RuntimeResumeError::Lost,
+            )) => self.fail_create(
+                request_id,
+                view_id,
+                "CONVERSATION_NOT_FOUND",
+                "No conversation found with that session ID.",
+            ),
+            Err(crate::session_recovery::RecoveryFailure::Attempt(
+                recovery::RuntimeResumeError::Closed,
+            )) => self.fail_create(
+                request_id,
+                view_id,
+                "SESSION_CLOSED",
+                "This conversation was closed. Open it again to continue.",
+            ),
+            Err(crate::session_recovery::RecoveryFailure::Attempt(
+                recovery::RuntimeResumeError::Unavailable {
+                    code,
+                    message,
+                    owner,
+                },
+            )) => self.answer_create_failure(
+                request_id,
+                view_id,
+                ClaudeCreateOutcome::Failed {
+                    code: (*code).to_string(),
+                    message: message.clone(),
+                    retryable: Some(true),
+                    owner: owner.clone(),
+                },
+            ),
+            Err(crate::session_recovery::RecoveryFailure::Panicked) => self.answer_create_failure(
+                request_id,
+                view_id,
+                ClaudeCreateOutcome::Failed {
+                    code: "CLAUDE_ATTACH_RESUME_FAILED".into(),
+                    message: "Claude recovery stopped unexpectedly. Try again.".into(),
+                    retryable: Some(true),
+                    owner: None,
+                },
+            ),
         }
     }
 
@@ -5252,6 +5388,25 @@ impl FreshClaudeState {
                 .native_query
                 .is_none_or(|(_, live)| live)
         })
+    }
+
+    /// Inspect only the current session map without waiting. Create-with-resume
+    /// must establish its existing owner fence before blocking behind a map-hit
+    /// incumbent; if this mutex is contended, its fenced path below remains the
+    /// authority and can safely decide after it acquires the map.
+    fn try_has_live_session(&self, session_id: &str) -> Option<bool> {
+        let sessions = self.sessions.try_lock().ok()?;
+        let Some(key) = Self::session_key_in(&sessions, session_id) else {
+            return Some(false);
+        };
+        Some(sessions.get(&key).is_some_and(|session| {
+            session
+                .pending
+                .lock()
+                .expect("pending lock")
+                .native_query
+                .is_none_or(|(_, live)| live)
+        }))
     }
 
     /// A runtime that disappears after a successful resolution is a transient
@@ -9977,11 +10132,10 @@ pub(crate) mod tests {
         assert_eq!(
             resumed,
             ClaudeCreateOutcome::Created {
-                cleanup_ownership_id: Some(
-                    st.sessions.lock().await[frame["sessionId"].as_str().unwrap()]
-                        .ownership_id
-                        .clone()
-                ),
+                // A create-resume can join a server-owned recovery that other
+                // views also depend on. Its reply must not grant this one view
+                // cleanup authority over the shared runtime.
+                cleanup_ownership_id: None,
                 session_id: frame["sessionId"].as_str().unwrap().to_string(),
                 session_ref: Some(claude_session_ref(durable)),
             }
