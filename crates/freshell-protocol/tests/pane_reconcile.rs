@@ -87,6 +87,7 @@ fn ready_capabilities_advertise_pane_reconcile_v1_when_negotiated() {
             paced_terminal_replay_v1: None,
             terminal_lifetime_claim_v1: None,
             managed_runtime_v1: None,
+            fresh_agent_send_reconcile_v1: None,
             session_index_ready_v1: None,
         }),
         runtime_owners: None,

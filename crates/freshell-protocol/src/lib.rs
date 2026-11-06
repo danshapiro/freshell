@@ -40,8 +40,8 @@ pub use settings::*;
 /// contract (`shared/ws-version.ts`, `ws-message-inventory.json`) by the tests.
 pub const WS_PROTOCOL_VERSION: u32 = 10;
 
-/// Every `type` discriminant the protocol speaks, both directions, sorted.
-/// (43 client→server + 73 server→client = 116.)
+/// Every frozen `type` discriminant the protocol speaks, both directions,
+/// sorted. (44 client→server + 73 server→client = 117.)
 pub fn all_message_types() -> Vec<&'static str> {
     let mut types: Vec<&'static str> = client_messages::CLIENT_MESSAGE_TYPES
         .iter()

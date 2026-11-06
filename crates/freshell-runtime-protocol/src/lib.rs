@@ -4745,6 +4745,9 @@ pub enum AdminCommand {
     TerminalResize(TerminalResizeRequest),
     TerminalReadOutput(TerminalReadOutputRequest),
     FreshAgentSend(FreshAgentSendRequest),
+    /// Receipt-only check for an existing fresh-agent input journal entry.
+    /// This command never creates an input journal row or dispatches input.
+    FreshAgentSendReconcile(FreshAgentSendRequest),
     FreshAgentFork(FreshAgentForkRequest),
     FreshAgentCompact(FreshAgentCompactRequest),
     FreshAgentConfigure(FreshAgentConfigureRequest),
@@ -5867,6 +5870,30 @@ mod tests {
                 ["codex_dispatch_recovery_source"],
             serde_json::to_value(recovery_source).unwrap()
         );
+    }
+
+    #[test]
+    fn fresh_agent_send_reconcile_has_a_distinct_admin_discriminant() {
+        let command = AdminCommand::FreshAgentSendReconcile(FreshAgentSendRequest {
+            soul_id: SoulId::parse("soul-reconcile").unwrap(),
+            text: "original input".into(),
+            settings: Some(FreshAgentTurnSettings {
+                model: Some("gpt-5-codex".into()),
+                ..Default::default()
+            }),
+            checkpoint_logical_attempt_id: Some("attempt-1".into()),
+            expected_control_epoch: Some(7),
+        });
+        let wire = serde_json::to_value(&command).unwrap();
+        assert_eq!(wire["method"], "fresh_agent_send_reconcile");
+        assert_eq!(wire["params"]["soulId"], "soul-reconcile");
+        assert_eq!(wire["params"]["text"], "original input");
+        assert_eq!(wire["params"]["checkpointLogicalAttemptId"], "attempt-1");
+        assert_eq!(wire["params"]["expectedControlEpoch"], 7);
+        assert!(matches!(
+            serde_json::from_value::<AdminCommand>(wire).unwrap(),
+            AdminCommand::FreshAgentSendReconcile(_)
+        ));
     }
 
     #[test]

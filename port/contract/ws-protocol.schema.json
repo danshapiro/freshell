@@ -2,7 +2,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `pnpm run contract:generate`. Each entry in `schemas` is a self-contained JSON Schema for one exported Zod schema. The wire contract is frozen for the Rust port — changing it is out of scope.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "schemaCount": 94,
+  "schemaCount": 95,
   "schemas": {
     "AmplifierActivityListResponseSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -714,6 +714,10 @@
               "additionalProperties": false,
               "properties": {
                 "freshAgentAttentionReplayV1": {
+                  "const": true,
+                  "type": "boolean"
+                },
+                "freshAgentSendReconcileV1": {
                   "const": true,
                   "type": "boolean"
                 },
@@ -2442,6 +2446,165 @@
             },
             "type": {
               "const": "freshAgent.send",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "sessionId",
+            "sessionType",
+            "provider",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "checkpointIntent": {
+              "additionalProperties": false,
+              "properties": {
+                "logicalAttemptId": {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "workspace": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "path": {
+                      "maxLength": 4096,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "provenance": {
+                      "enum": [
+                        "directory-picker",
+                        "resolved-project",
+                        "legacy-checkpoint"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "path",
+                    "provenance"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "logicalAttemptId"
+              ],
+              "type": "object"
+            },
+            "cwd": {
+              "type": "string"
+            },
+            "images": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "data": {
+                    "type": "string"
+                  },
+                  "mediaType": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "mediaType",
+                  "data"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "observedEpoch": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "provider": {
+              "enum": [
+                "claude",
+                "codex",
+                "opencode"
+              ],
+              "type": "string"
+            },
+            "requestId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionType": {
+              "enum": [
+                "freshclaude",
+                "freshcodex",
+                "kilroy",
+                "freshopencode"
+              ],
+              "type": "string"
+            },
+            "settings": {
+              "additionalProperties": false,
+              "properties": {
+                "collaborationMode": {
+                  "enum": [
+                    "default",
+                    "plan"
+                  ],
+                  "type": "string"
+                },
+                "cwd": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "effort": {
+                  "anyOf": [
+                    {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "model": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "permissionMode": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "sandbox": {
+                  "enum": [
+                    "read-only",
+                    "workspace-write",
+                    "danger-full-access"
+                  ],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "text": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "freshAgent.send.reconcile",
               "type": "string"
             }
           },
@@ -4201,6 +4364,165 @@
         {
           "additionalProperties": false,
           "properties": {
+            "checkpointIntent": {
+              "additionalProperties": false,
+              "properties": {
+                "logicalAttemptId": {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "workspace": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "path": {
+                      "maxLength": 4096,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "provenance": {
+                      "enum": [
+                        "directory-picker",
+                        "resolved-project",
+                        "legacy-checkpoint"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "path",
+                    "provenance"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "logicalAttemptId"
+              ],
+              "type": "object"
+            },
+            "cwd": {
+              "type": "string"
+            },
+            "images": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "data": {
+                    "type": "string"
+                  },
+                  "mediaType": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "mediaType",
+                  "data"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "observedEpoch": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "provider": {
+              "enum": [
+                "claude",
+                "codex",
+                "opencode"
+              ],
+              "type": "string"
+            },
+            "requestId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionType": {
+              "enum": [
+                "freshclaude",
+                "freshcodex",
+                "kilroy",
+                "freshopencode"
+              ],
+              "type": "string"
+            },
+            "settings": {
+              "additionalProperties": false,
+              "properties": {
+                "collaborationMode": {
+                  "enum": [
+                    "default",
+                    "plan"
+                  ],
+                  "type": "string"
+                },
+                "cwd": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "effort": {
+                  "anyOf": [
+                    {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "model": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "permissionMode": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "sandbox": {
+                  "enum": [
+                    "read-only",
+                    "workspace-write",
+                    "danger-full-access"
+                  ],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "text": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "freshAgent.send.reconcile",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "sessionId",
+            "sessionType",
+            "provider",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
             "cwd": {
               "type": "string"
             },
@@ -5668,6 +5990,166 @@
       ],
       "type": "object"
     },
+    "FreshAgentSendReconcileSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "checkpointIntent": {
+          "additionalProperties": false,
+          "properties": {
+            "logicalAttemptId": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "workspace": {
+              "additionalProperties": false,
+              "properties": {
+                "path": {
+                  "maxLength": 4096,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "provenance": {
+                  "enum": [
+                    "directory-picker",
+                    "resolved-project",
+                    "legacy-checkpoint"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "provenance"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "logicalAttemptId"
+          ],
+          "type": "object"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "images": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "data": {
+                "type": "string"
+              },
+              "mediaType": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "mediaType",
+              "data"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "observedEpoch": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "observedGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "provider": {
+          "enum": [
+            "claude",
+            "codex",
+            "opencode"
+          ],
+          "type": "string"
+        },
+        "requestId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sessionId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sessionType": {
+          "enum": [
+            "freshclaude",
+            "freshcodex",
+            "kilroy",
+            "freshopencode"
+          ],
+          "type": "string"
+        },
+        "settings": {
+          "additionalProperties": false,
+          "properties": {
+            "collaborationMode": {
+              "enum": [
+                "default",
+                "plan"
+              ],
+              "type": "string"
+            },
+            "cwd": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "effort": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "model": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "permissionMode": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sandbox": {
+              "enum": [
+                "read-only",
+                "workspace-write",
+                "danger-full-access"
+              ],
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "text": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "freshAgent.send.reconcile",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "sessionId",
+        "sessionType",
+        "provider",
+        "text"
+      ],
+      "type": "object"
+    },
     "FreshAgentSendSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -5903,6 +6385,10 @@
           "additionalProperties": false,
           "properties": {
             "freshAgentAttentionReplayV1": {
+              "const": true,
+              "type": "boolean"
+            },
+            "freshAgentSendReconcileV1": {
               "const": true,
               "type": "boolean"
             },
@@ -8930,6 +9416,10 @@
       "additionalProperties": false,
       "properties": {
         "freshAgentAttentionReplayV1": {
+          "const": true,
+          "type": "boolean"
+        },
+        "freshAgentSendReconcileV1": {
           "const": true,
           "type": "boolean"
         },

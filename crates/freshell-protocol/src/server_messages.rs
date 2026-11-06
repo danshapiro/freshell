@@ -1332,6 +1332,10 @@ pub struct ReadyCapabilities {
     /// opted in and this server boot has an installed managed controller.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub managed_runtime_v1: Option<bool>,
+    /// Receipt-only send reconciliation, present only when the client opted
+    /// in and managed-runtime ownership is active for this connection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fresh_agent_send_reconcile_v1: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fresh_agent_attention_replay_v1: Option<bool>,
     /// Session-index readiness echo (auto-restore-warming Task 2):

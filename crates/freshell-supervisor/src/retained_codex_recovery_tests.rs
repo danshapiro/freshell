@@ -103,6 +103,7 @@ struct ControlledCodex {
     transient_status: Arc<Notify>,
     worker: Arc<AtomicBool>,
     capability: Arc<AtomicBool>,
+    receipt_capability: Arc<AtomicBool>,
     same_root_capability: Arc<AtomicBool>,
     native_observation_missing: Arc<AtomicBool>,
     readiness_root_change: Arc<AtomicBool>,
@@ -218,6 +219,7 @@ impl ControlledCodex {
         let transient_status = Arc::new(Notify::new());
         let worker = Arc::new(AtomicBool::new(true));
         let capability = Arc::new(AtomicBool::new(true));
+        let receipt_capability = Arc::new(AtomicBool::new(true));
         let same_root_capability = Arc::new(AtomicBool::new(true));
         let native_observation_missing = Arc::new(AtomicBool::new(false));
         let readiness_root_change = Arc::new(AtomicBool::new(false));
@@ -248,6 +250,7 @@ impl ControlledCodex {
             let transient_status = transient_status.clone();
             let worker = worker.clone();
             let capability = capability.clone();
+            let receipt_capability = receipt_capability.clone();
             let same_root_capability = same_root_capability.clone();
             let native_observation_missing = native_observation_missing.clone();
             let readiness_root_change = readiness_root_change.clone();
@@ -281,6 +284,7 @@ impl ControlledCodex {
                     let transient_status = transient_status.clone();
                     let worker = worker.clone();
                     let capability = capability.clone();
+                    let receipt_capability = receipt_capability.clone();
                     let same_root_capability = same_root_capability.clone();
                     let native_observation_missing = native_observation_missing.clone();
                     let readiness_root_change = readiness_root_change.clone();
@@ -322,8 +326,10 @@ impl ControlledCodex {
                                         "native-identity-observation-v1".into(),
                                         "fresh-agent-codex-dispatch-recovery-v1".into(),
                                         HOST_CAPABILITY_NATIVE_READINESS_RECEIPT_V1.into(),
-                                        HOST_CAPABILITY_CODEX_SEND_RECEIPT_V1.into(),
                                     ];
+                                    if receipt_capability.load(Ordering::SeqCst) {
+                                        values.push(HOST_CAPABILITY_CODEX_SEND_RECEIPT_V1.into());
+                                    }
                                     if capability.load(Ordering::SeqCst) {
                                         values.push("fresh-agent-codex-recovery-source-v1".into());
                                     }
@@ -371,9 +377,36 @@ impl ControlledCodex {
                             }
                             HostCommand::FreshAgentSend {
                                 request_id,
+                                text,
+                                settings,
+                                checkpoint_logical_attempt_id,
                                 receipt_only,
                                 ..
                             } => {
+                                if request_id.as_str() == "receipt-only-checkpointed" {
+                                    assert_eq!(text, "original public reference input");
+                                    assert!(settings
+                                        .as_ref()
+                                        .and_then(|settings| settings.cwd.as_deref())
+                                        .is_some_and(|cwd| std::path::Path::new(cwd).is_dir()));
+                                    assert_eq!(
+                                        settings
+                                            .as_ref()
+                                            .and_then(|settings| settings.model.as_deref()),
+                                        Some("gpt-5-codex")
+                                    );
+                                    assert_eq!(
+                                        settings.as_ref().and_then(|settings| settings
+                                            .effort
+                                            .as_ref()
+                                            .and_then(Option::as_deref)),
+                                        Some("high")
+                                    );
+                                    assert_eq!(
+                                        checkpoint_logical_attempt_id.as_deref(),
+                                        Some("logical-attempt-9")
+                                    );
+                                }
                                 if receipt_only {
                                     receipt_queries.fetch_add(1, Ordering::SeqCst);
                                     match send_receipt.lock().unwrap().clone() {
@@ -649,6 +682,7 @@ impl ControlledCodex {
             transient_status,
             worker,
             capability,
+            receipt_capability,
             same_root_capability,
             native_observation_missing,
             readiness_root_change,
@@ -661,6 +695,14 @@ impl ControlledCodex {
         }
     }
     async fn send(&self, request_id: RequestId) -> Result<AdminResult, RuntimeError> {
+        self.send_with_checkpoint(request_id, None, None).await
+    }
+    async fn send_with_checkpoint(
+        &self,
+        request_id: RequestId,
+        checkpoint_logical_attempt_id: Option<String>,
+        settings: Option<freshell_runtime_protocol::FreshAgentTurnSettings>,
+    ) -> Result<AdminResult, RuntimeError> {
         self.supervisor
             .dispatch(Envelope {
                 protocol_version: CONTROL_PROTOCOL_VERSION,
@@ -671,9 +713,34 @@ impl ControlledCodex {
                     freshell_runtime_protocol::FreshAgentSendRequest {
                         soul_id: self.soul.clone(),
                         text: "original public reference input".into(),
-                        settings: None,
+                        settings,
                         expected_control_epoch: Some(self.supervisor.registry.control_epoch()),
-                        checkpoint_logical_attempt_id: None,
+                        checkpoint_logical_attempt_id,
+                    },
+                ),
+            })
+            .await
+            .result
+    }
+    async fn reconcile_send(
+        &self,
+        request_id: RequestId,
+        checkpoint_logical_attempt_id: Option<String>,
+        settings: Option<freshell_runtime_protocol::FreshAgentTurnSettings>,
+    ) -> Result<AdminResult, RuntimeError> {
+        self.supervisor
+            .dispatch(Envelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                request_id,
+                role: ControlRole::Web,
+                auth: Some("synthetic-secret".into()),
+                body: AdminCommand::FreshAgentSendReconcile(
+                    freshell_runtime_protocol::FreshAgentSendRequest {
+                        soul_id: self.soul.clone(),
+                        text: "original public reference input".into(),
+                        settings,
+                        expected_control_epoch: Some(self.supervisor.registry.control_epoch()),
+                        checkpoint_logical_attempt_id,
                     },
                 ),
             })
@@ -1263,6 +1330,162 @@ async fn lost_retained_codex_send_reply_is_reconciled_from_host_receipt_without_
     ));
     assert_eq!(fixture.inputs.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.receipt_queries.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn explicit_receipt_reconcile_settles_ambiguous_send_without_dispatching_again() {
+    let fixture = ControlledCodex::new().await;
+    fixture.receipt_capability.store(false, Ordering::SeqCst);
+    fixture.lose_send_reply_once.store(true, Ordering::SeqCst);
+    let request_id = RequestId::parse("receipt-only-checkpointed").unwrap();
+    let checkpoint_logical_attempt_id = Some("logical-attempt-9".to_string());
+    let settings = Some(freshell_runtime_protocol::FreshAgentTurnSettings {
+        cwd: Some(fixture._root.path().to_string_lossy().into_owned()),
+        model: Some("gpt-5-codex".into()),
+        effort: Some(Some("high".into())),
+        collaboration_mode: None,
+        permission_mode: None,
+        sandbox: None,
+    });
+
+    let original_send_error = fixture
+        .send_with_checkpoint(
+            request_id.clone(),
+            checkpoint_logical_attempt_id.clone(),
+            settings.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(original_send_error.code, RuntimeErrorCode::HostUnreachable);
+    let settings_correlation = serde_json::to_vec(&(
+        settings.as_ref(),
+        checkpoint_logical_attempt_id.as_deref().unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(
+        fixture
+            .supervisor
+            .registry
+            .recorded_input_outcome(
+                fixture.soul.clone(),
+                request_id.clone(),
+                b"original public reference input",
+                Some(&settings_correlation),
+            )
+            .await
+            .unwrap(),
+        Some(InputJournalDisposition::Ambiguous)
+    );
+    assert_eq!(fixture.inputs.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.receipt_queries.load(Ordering::SeqCst), 0);
+
+    fixture.receipt_capability.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        fixture
+            .reconcile_send(request_id, checkpoint_logical_attempt_id, settings,)
+            .await
+            .unwrap(),
+        AdminResult::FreshAgentCommand {
+            state: CommandState::Completed
+        }
+    ));
+    assert_eq!(fixture.inputs.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.receipt_queries.load(Ordering::SeqCst), 1);
+    fixture.peer.abort();
+}
+
+#[tokio::test]
+async fn receipt_reconcile_does_not_create_a_missing_journal_entry() {
+    let fixture = ControlledCodex::new().await;
+    let request_id = RequestId::new();
+
+    assert!(matches!(
+        fixture
+            .reconcile_send(request_id.clone(), None, None)
+            .await
+            .unwrap(),
+        AdminResult::FreshAgentCommand {
+            state: CommandState::Ambiguous
+        }
+    ));
+    assert_eq!(fixture.inputs.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.receipt_queries.load(Ordering::SeqCst), 0);
+    let journal_rows: i64 = Connection::open(fixture.supervisor.registry.database_path())
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM input_commands WHERE soul_id=?1 AND request_id=?2",
+            params![fixture.soul.as_str(), request_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(journal_rows, 0);
+    fixture.peer.abort();
+}
+
+#[tokio::test]
+async fn receipt_reconcile_preserves_a_recorded_provider_refusal() {
+    let fixture = ControlledCodex::new().await;
+    let request_id = RequestId::new();
+    let checkpoint_logical_attempt_id = Some("logical-attempt-refused".to_string());
+    let settings = Some(freshell_runtime_protocol::FreshAgentTurnSettings {
+        cwd: Some(fixture._root.path().to_string_lossy().into_owned()),
+        model: Some("gpt-5-codex".into()),
+        ..Default::default()
+    });
+    let settings_correlation = serde_json::to_vec(&(
+        settings.as_ref(),
+        checkpoint_logical_attempt_id.as_deref().unwrap(),
+    ))
+    .unwrap();
+    let (disposition, _) = fixture
+        .supervisor
+        .registry
+        .begin_fresh_input(
+            fixture.soul.clone(),
+            request_id.clone(),
+            b"original public reference input",
+            &settings_correlation,
+            settings.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(disposition, InputJournalDisposition::Dispatch);
+    fixture
+        .supervisor
+        .registry
+        .mark_input_dispatching(fixture.soul.clone(), request_id.clone())
+        .await
+        .unwrap();
+    fixture
+        .supervisor
+        .registry
+        .mark_fresh_input_refused(
+            fixture.soul.clone(),
+            request_id.clone(),
+            freshell_runtime_protocol::FreshAgentSendDiagnostic {
+                outcome: freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused,
+                message: Some("the provider refused the original prompt".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let error = fixture
+        .reconcile_send(request_id, checkpoint_logical_attempt_id, settings)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error
+            .fresh_agent_send_diagnostic
+            .as_ref()
+            .unwrap()
+            .message
+            .as_deref(),
+        Some("the provider refused the original prompt")
+    );
+    assert_eq!(fixture.inputs.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.receipt_queries.load(Ordering::SeqCst), 0);
+    fixture.peer.abort();
 }
 
 #[tokio::test]

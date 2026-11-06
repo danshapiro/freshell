@@ -99,6 +99,12 @@ pub enum ClientMessage {
     FreshAgentAttach(FreshAgentAttach),
     #[serde(rename = "freshAgent.send")]
     FreshAgentSend(FreshAgentSend),
+    /// Receipt-only retry for a previously dispatched hosted send. Its payload
+    /// is identical to `freshAgent.send`, but the server may only consult the
+    /// existing input journal and durable host receipt; it can never dispatch
+    /// provider input.
+    #[serde(rename = "freshAgent.send.reconcile")]
+    FreshAgentSendReconcile(FreshAgentSend),
     #[serde(rename = "freshAgent.interrupt")]
     FreshAgentInterrupt(FreshAgentInterrupt),
     /// `freshAgent.configure` — apply settings (model / effort / permission
@@ -140,7 +146,7 @@ pub enum ClientMessage {
 
 /// The exact `type` discriminants of every client→server message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const CLIENT_MESSAGE_TYPES: [&str; 43] = [
+pub const CLIENT_MESSAGE_TYPES: [&str; 44] = [
     "amplifier.activity.list",
     // Promoted from EXTENSION_CLIENT_MESSAGE_TYPES by the focused-repair
     // round 2 contract reconcile (pnpm run contract:generate re-froze the
@@ -164,6 +170,7 @@ pub const CLIENT_MESSAGE_TYPES: [&str; 43] = [
     "freshAgent.question.respond",
     "freshAgent.redo",
     "freshAgent.send",
+    "freshAgent.send.reconcile",
     "freshAgent.undo",
     "hello",
     "hoststats.refresh",
@@ -234,6 +241,11 @@ pub struct HelloCapabilities {
     /// managed-runtime controller is actually installed for the current boot.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub managed_runtime_v1: Option<bool>,
+    /// Receipt-only Codex send reconciliation. This capability is useful only
+    /// with managed runtime ownership and is acknowledged only when both are
+    /// active for the connection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fresh_agent_send_reconcile_v1: Option<bool>,
     /// Replay attention missed during a same-page disconnect, seeded on reload.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fresh_agent_attention_replay_v1: Option<bool>,

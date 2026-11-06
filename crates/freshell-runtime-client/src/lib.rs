@@ -983,6 +983,36 @@ impl RuntimeClient {
         }
     }
 
+    /// Query the existing input journal and, for an exact ambiguous Codex
+    /// entry, ask the host for its durable acceptance receipt. This operation
+    /// cannot create a new journal entry or dispatch provider input.
+    pub async fn fresh_agent_send_reconcile(
+        &self,
+        request_id: RequestId,
+        soul_id: SoulId,
+        text: String,
+        settings: Option<freshell_runtime_protocol::FreshAgentTurnSettings>,
+        checkpoint_logical_attempt_id: Option<String>,
+    ) -> Result<freshell_runtime_protocol::CommandState, ClientError> {
+        let epoch = self.current_epoch().await?;
+        match self
+            .request(
+                request_id,
+                AdminCommand::FreshAgentSendReconcile(FreshAgentSendRequest {
+                    soul_id,
+                    text,
+                    settings,
+                    checkpoint_logical_attempt_id,
+                    expected_control_epoch: Some(epoch),
+                }),
+            )
+            .await?
+        {
+            AdminResult::FreshAgentCommand { state } => Ok(state),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
     pub async fn fresh_agent_fork(
         &self,
         request_id: RequestId,
@@ -1983,6 +2013,74 @@ mod tests {
             state,
             freshell_runtime_protocol::CommandState::ProviderAcked
         );
+    }
+
+    #[tokio::test]
+    async fn fresh_agent_send_reconcile_uses_its_distinct_control_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let envelope: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            let AdminCommand::FreshAgentSendReconcile(request) = &envelope.body else {
+                panic!("expected receipt-only managed fresh-agent send: {envelope:?}");
+            };
+            assert_eq!(envelope.request_id.as_str(), "request-reconcile-1");
+            assert_eq!(
+                request.soul_id,
+                SoulId::parse("checkpoint-send-soul").unwrap()
+            );
+            assert_eq!(request.text, "continue with the requested change");
+            assert_eq!(
+                request.checkpoint_logical_attempt_id.as_deref(),
+                Some("attempt-control-1")
+            );
+            assert_eq!(request.expected_control_epoch, Some(19));
+            let settings = request
+                .settings
+                .as_ref()
+                .expect("turn settings are preserved");
+            assert_eq!(settings.model.as_deref(), Some("gpt-5-codex"));
+            assert_eq!(
+                settings.effort.as_ref().and_then(Option::as_deref),
+                Some("high")
+            );
+            assert_eq!(settings.cwd.as_deref(), Some("/original/workspace"));
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: envelope.request_id,
+                    result: Ok(AdminResult::FreshAgentCommand {
+                        state: freshell_runtime_protocol::CommandState::Completed,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let client = RuntimeClient::new(&socket, "0123456789abcdef");
+        *client.control_epoch.write().await = Some(19);
+
+        let state = client
+            .fresh_agent_send_reconcile(
+                RequestId::parse("request-reconcile-1").unwrap(),
+                SoulId::parse("checkpoint-send-soul").unwrap(),
+                "continue with the requested change".into(),
+                Some(freshell_runtime_protocol::FreshAgentTurnSettings {
+                    model: Some("gpt-5-codex".into()),
+                    effort: Some(Some("high".into())),
+                    cwd: Some("/original/workspace".into()),
+                    collaboration_mode: None,
+                    permission_mode: None,
+                    sandbox: None,
+                }),
+                Some("attempt-control-1".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(state, freshell_runtime_protocol::CommandState::Completed);
+        server.await.unwrap();
     }
 
     #[tokio::test]

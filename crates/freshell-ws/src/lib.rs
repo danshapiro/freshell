@@ -635,6 +635,7 @@ pub struct HandshakeCapabilities {
     pub paced_terminal_replay_v1: bool,
     pub terminal_lifetime_claim_v1: bool,
     pub managed_runtime_v1: bool,
+    pub fresh_agent_send_reconcile_v1: bool,
     pub fresh_agent_attention_replay_v1: bool,
     pub session_index_ready_v1: bool,
 }
@@ -665,9 +666,12 @@ pub async fn build_handshake_with_capabilities(
         paced_terminal_replay_v1,
         terminal_lifetime_claim_v1,
         managed_runtime_v1,
+        fresh_agent_send_reconcile_v1: requested_fresh_agent_send_reconcile_v1,
         fresh_agent_attention_replay_v1,
         session_index_ready_v1,
     } = capabilities;
+    let fresh_agent_send_reconcile_v1 =
+        requested_fresh_agent_send_reconcile_v1 && managed_runtime_v1;
     let boot_id = state.boot_id.as_ref().clone();
     let fresh_agent_attention = if fresh_agent_attention_replay_v1 {
         let mut marks = state.fresh_claude.attention_marks();
@@ -736,6 +740,7 @@ pub async fn build_handshake_with_capabilities(
                 || paced_terminal_replay_v1
                 || terminal_lifetime_claim_v1
                 || managed_runtime_v1
+                || fresh_agent_send_reconcile_v1
                 || fresh_agent_attention_replay_v1
                 || session_index_ready_v1)
                 .then_some(freshell_protocol::ReadyCapabilities {
@@ -747,6 +752,7 @@ pub async fn build_handshake_with_capabilities(
                     paced_terminal_replay_v1: paced_terminal_replay_v1.then_some(true),
                     terminal_lifetime_claim_v1: terminal_lifetime_claim_v1.then_some(true),
                     managed_runtime_v1: managed_runtime_v1.then_some(true),
+                    fresh_agent_send_reconcile_v1: fresh_agent_send_reconcile_v1.then_some(true),
                     session_index_ready_v1: session_index_ready_v1.then_some(true),
                 }),
             // Auto-restore-warming Task 2: the CURRENT session-index
@@ -1009,6 +1015,16 @@ async fn handle_socket(
         .unwrap_or(false)
         && state.registry.has_managed_controller();
 
+    // Receipt-only send reconciliation depends on managed-runtime journal and
+    // host receipt ownership. A client opt-in alone never acknowledges or
+    // enables it.
+    let fresh_agent_send_reconcile_v1 = managed_runtime_v1
+        && value
+            .get("capabilities")
+            .and_then(|caps| caps.get("freshAgentSendReconcileV1"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
     let fresh_agent_attention_replay_v1 = value
         .get("capabilities")
         .and_then(|caps| caps.get("freshAgentAttentionReplayV1"))
@@ -1038,6 +1054,7 @@ async fn handle_socket(
             paced_terminal_replay_v1,
             terminal_lifetime_claim_v1,
             managed_runtime_v1,
+            fresh_agent_send_reconcile_v1,
             fresh_agent_attention_replay_v1,
             session_index_ready_v1,
         },
@@ -1105,6 +1122,7 @@ async fn handle_socket(
         terminal_interest_v1,
         terminal_lifetime_claim_v1,
         managed_runtime_v1,
+        fresh_agent_send_reconcile_v1,
         session_index_ready_v1,
     )
     .await;
@@ -1410,6 +1428,56 @@ mod tests {
         assert!(
             ready.get("capabilities").is_none(),
             "non-negotiating hello must not change ready's shape: {ready}"
+        );
+    }
+
+    #[tokio::test]
+    async fn receipt_reconcile_capability_requires_managed_runtime() {
+        let s = state();
+        let reconcile_only = build_handshake_with_capabilities(
+            &s,
+            HandshakeCapabilities {
+                fresh_agent_send_reconcile_v1: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let ready = serde_json::to_value(&reconcile_only[0]).unwrap();
+        assert!(
+            ready.get("capabilities").is_none(),
+            "receipt reconciliation cannot be acknowledged without managed runtime: {ready}"
+        );
+
+        let managed_only = build_handshake_with_capabilities(
+            &s,
+            HandshakeCapabilities {
+                managed_runtime_v1: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let ready = serde_json::to_value(&managed_only[0]).unwrap();
+        assert_eq!(
+            ready["capabilities"],
+            serde_json::json!({ "managedRuntimeV1": true })
+        );
+
+        let both = build_handshake_with_capabilities(
+            &s,
+            HandshakeCapabilities {
+                managed_runtime_v1: true,
+                fresh_agent_send_reconcile_v1: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let ready = serde_json::to_value(&both[0]).unwrap();
+        assert_eq!(
+            ready["capabilities"],
+            serde_json::json!({
+                "managedRuntimeV1": true,
+                "freshAgentSendReconcileV1": true
+            })
         );
     }
 

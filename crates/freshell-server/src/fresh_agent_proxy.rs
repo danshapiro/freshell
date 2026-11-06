@@ -13,7 +13,8 @@ use freshell_protocol::session_names::NamedProvider;
 use freshell_protocol::{
     AgentProvider, ErrorCode, ErrorMsg, FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent,
     FreshAgentForked, FreshAgentKilled, FreshAgentRecoveryStopped, FreshAgentSend,
-    FreshAgentSessionMaterialized, ServerMessage, SessionLocator, SessionType, StringOrNumber,
+    FreshAgentSendAccepted, FreshAgentSessionMaterialized, ServerMessage, SessionLocator,
+    SessionType, StringOrNumber,
 };
 use freshell_runtime_client::RuntimeClient;
 use freshell_runtime_protocol::{
@@ -251,6 +252,122 @@ impl HostedFreshAgentProxy {
         }
     }
 
+    /// Receipt-only recovery deliberately bypasses checkpoint capture and
+    /// post-barrier ownership admission. The operation correlates the exact
+    /// original input with the journal and asks the supervisor only for its
+    /// existing host receipt.
+    async fn dispatch_send_reconcile(&self, message: FreshAgentSend) {
+        let provider = message.provider;
+        let session_id = message.session_id.clone();
+        let session_type = message.session_type;
+        let public_request_id = message.request_id.clone();
+        let cwd = message.cwd.clone();
+        let checkpoint_logical_attempt_id = message
+            .checkpoint_intent
+            .as_ref()
+            .map(|intent| intent.logical_attempt_id.clone());
+        let Some(public_request_id) = public_request_id
+            .as_deref()
+            .filter(|request_id| !request_id.trim().is_empty())
+        else {
+            self.send_uncertain(
+                &provider,
+                &session_id,
+                session_type,
+                None,
+                &hosted_send_uncertain_reason(provider),
+            );
+            return;
+        };
+        let Ok(request_id) = RequestId::parse(public_request_id.to_string()) else {
+            self.send_uncertain(
+                &provider,
+                &session_id,
+                session_type,
+                Some(public_request_id),
+                &hosted_send_uncertain_reason(provider),
+            );
+            return;
+        };
+        let outcome = match self
+            .resolve_soul(&provider, session_type, &session_id)
+            .await
+        {
+            Some(soul) => {
+                let settings = turn_settings(message.settings, message.cwd);
+                let result = self
+                    .client
+                    .fresh_agent_send_reconcile(
+                        request_id,
+                        soul,
+                        message.text,
+                        settings,
+                        checkpoint_logical_attempt_id,
+                    )
+                    .await;
+                classify_hosted_send(provider, result)
+            }
+            None => HostedSendOutcome::Ambiguous(hosted_send_uncertain_reason(provider)),
+        };
+        match outcome {
+            HostedSendOutcome::Accepted => {
+                self.send(ServerMessage::FreshAgentSendAccepted(
+                    FreshAgentSendAccepted {
+                        provider: provider_wire(&provider),
+                        request_id: public_request_id.to_string(),
+                        session_id,
+                        session_type: session_type_wire(session_type),
+                        cwd,
+                        submitted_turn_id: None,
+                    },
+                ));
+            }
+            HostedSendOutcome::Refused(reason) => self.send_error(
+                &provider,
+                &session_id,
+                session_type,
+                Some(public_request_id),
+                "MANAGED_FRESH_AGENT_ERROR",
+                &reason,
+            ),
+            HostedSendOutcome::Ambiguous(reason) => self.send_uncertain(
+                &provider,
+                &session_id,
+                session_type,
+                Some(public_request_id),
+                &reason,
+            ),
+        }
+    }
+
+    fn send_uncertain(
+        &self,
+        provider: &AgentProvider,
+        session_id: &str,
+        session_type: SessionType,
+        request_id: Option<&str>,
+        message: &str,
+    ) {
+        tracing::warn!(
+            provider = %provider_wire(provider),
+            session_id,
+            request_id = ?request_id,
+            "freshagent.hosted_send_reconcile.uncertain"
+        );
+        let mut event = serde_json::json!({
+            "type":"freshAgent.send.uncertain", "sessionId":session_id, "message":message,
+        });
+        if let Some(request_id) = request_id.filter(|id| !id.is_empty()) {
+            event["requestId"] = serde_json::json!(request_id);
+        }
+        self.send(ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            event,
+            provider: provider_wire(provider),
+            session_id: session_id.into(),
+            session_type: session_type_wire(session_type),
+        }));
+    }
+
     fn send_error(
         &self,
         provider: &AgentProvider,
@@ -373,6 +490,9 @@ impl HostedFreshAgentProxy {
                 } else {
                     self.dispatch_send(message).await;
                 }
+            }
+            HostedFreshAgentCommand::SendReconcile(message) => {
+                self.dispatch_send_reconcile(message).await;
             }
             HostedFreshAgentCommand::Interrupt(message) => {
                 let result = match self
@@ -2103,6 +2223,15 @@ enum HostedSendOutcome {
     Ambiguous(String),
 }
 
+fn hosted_send_uncertain_reason(provider: AgentProvider) -> String {
+    let prefix = if provider == AgentProvider::Codex {
+        "CODEX_DELIVERY_AMBIGUOUS:"
+    } else {
+        "FRESH_AGENT_DELIVERY_AMBIGUOUS:"
+    };
+    format!("{prefix} The hosted session could not confirm whether this message was delivered.")
+}
+
 /// Only a typed, already-public provider diagnostic may contribute its text.
 /// Unknown transport failures remain uncertain and body-free for every caller.
 fn classify_hosted_send(
@@ -2116,9 +2245,7 @@ fn classify_hosted_send(
     } else {
         "FRESH_AGENT_DELIVERY_AMBIGUOUS:"
     };
-    let ambiguous = || {
-        format!("{prefix} The hosted session could not confirm whether this message was delivered.")
-    };
+    let ambiguous = || hosted_send_uncertain_reason(provider);
     let refused = || "The provider did not accept this message.".to_string();
     match result {
         Ok(CommandState::ProviderAcked | CommandState::Completed) => HostedSendOutcome::Accepted,

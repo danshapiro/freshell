@@ -475,6 +475,10 @@ export const HelloSchema = z.object({
     // frozen client shape.
     terminalLifetimeClaimV1: z.literal(true).optional(),
     managedRuntimeV1: z.literal(true).optional(),
+    // Receipt-only Codex send reconciliation is usable only with the managed
+    // runtime. The server acknowledges it only when both capabilities are
+    // active for this connection.
+    freshAgentSendReconcileV1: z.literal(true).optional(),
     // Session-index readiness (auto-restore-warming Task 2): the client
     // understands `ready.sessionIndexReady` and the `sessions.index.ready`
     // boot broadcast. Additive optional — DECLARED here, not just sent
@@ -942,8 +946,7 @@ export const FreshAgentAttachSchema = z.object({
   observedGeneration: z.number().int().nonnegative().optional(),
 })
 
-export const FreshAgentSendSchema = z.object({
-  type: z.literal('freshAgent.send'),
+const freshAgentSendPayloadShape = {
   requestId: z.string().min(1).optional(),
   sessionId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
@@ -977,7 +980,12 @@ export const FreshAgentSendSchema = z.object({
     mediaType: z.string(),
     data: z.string(),
   })).optional(),
-}).superRefine((send, context) => {
+}
+
+function requireCheckpointSendRequestId(
+  send: { checkpointIntent?: unknown; requestId?: string },
+  context: z.RefinementCtx,
+): void {
   if (send.checkpointIntent && !send.requestId?.trim()) {
     context.addIssue({
       code: z.ZodIssueCode.custom,
@@ -985,7 +993,20 @@ export const FreshAgentSendSchema = z.object({
       message: 'requestId is required when checkpointIntent is present',
     })
   }
-})
+}
+
+export const FreshAgentSendSchema = z.object({
+  type: z.literal('freshAgent.send'),
+  ...freshAgentSendPayloadShape,
+}).superRefine(requireCheckpointSendRequestId)
+
+/** Receipt-only counterpart to `freshAgent.send`. It carries the exact same
+ * correlated payload, but the server only checks the existing input journal
+ * and durable host receipt; it never dispatches provider input. */
+export const FreshAgentSendReconcileSchema = z.object({
+  type: z.literal('freshAgent.send.reconcile'),
+  ...freshAgentSendPayloadShape,
+}).superRefine(requireCheckpointSendRequestId)
 
 export const FreshAgentInterruptSchema = z.object({
   type: z.literal('freshAgent.interrupt'),
@@ -1160,6 +1181,7 @@ export const FreshAgentClientMessageSchema = z.discriminatedUnion('type', [
   FreshAgentCreateSchema,
   FreshAgentAttachSchema,
   FreshAgentSendSchema,
+  FreshAgentSendReconcileSchema,
   FreshAgentInterruptSchema,
   FreshAgentConfigureSchema,
   FreshAgentCompactSchema,
@@ -1293,6 +1315,7 @@ export const ReadyCapabilitiesSchema = z
     // client may send `terminal.interest.claimedTerminalIds`.
     terminalLifetimeClaimV1: z.literal(true).optional(),
     managedRuntimeV1: z.literal(true).optional(),
+    freshAgentSendReconcileV1: z.literal(true).optional(),
     freshAgentAttentionReplayV1: z.literal(true).optional(),
     // Session-index readiness echo (auto-restore-warming Task 2): present
     // iff the client's hello opted in via capabilities.sessionIndexReadyV1 —
@@ -1374,6 +1397,7 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   FreshAgentCreateSchema,
   FreshAgentAttachSchema,
   FreshAgentSendSchema,
+  FreshAgentSendReconcileSchema,
   FreshAgentInterruptSchema,
   FreshAgentConfigureSchema,
   FreshAgentCompactSchema,

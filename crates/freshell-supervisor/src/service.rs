@@ -567,6 +567,20 @@ impl Supervisor {
                 .await?;
                 Ok(AdminResult::FreshAgentCommand { state })
             }),
+            AdminCommand::FreshAgentSendReconcile(request) => Box::pin(async move {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let state = Box::pin(self.fresh_agent_send_reconcile(
+                    request_id,
+                    request.soul_id,
+                    request.text,
+                    request.settings,
+                    request.checkpoint_logical_attempt_id,
+                ))
+                .await?;
+                Ok(AdminResult::FreshAgentCommand { state })
+            }),
             AdminCommand::FreshAgentFork(request) => Box::pin(async move {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
@@ -3107,6 +3121,74 @@ impl Supervisor {
                     }
                     Err(error)
                 }
+            }
+        })
+    }
+
+    /// Reconcile an already-journaled send without entering the normal send
+    /// path. `None` and queued (`Dispatch`) rows are uncertain: neither is
+    /// permission to create a journal entry or deliver provider input.
+    fn fresh_agent_send_reconcile<'a>(
+        &'a self,
+        request_id: RequestId,
+        soul_id: SoulId,
+        text: String,
+        settings: Option<freshell_runtime_protocol::FreshAgentTurnSettings>,
+        checkpoint_logical_attempt_id: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<CommandState, RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            if text.len() > freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES / 2 {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::InvalidRequest,
+                    "fresh-agent input exceeds control-frame budget",
+                ));
+            }
+            let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
+            let _lifecycle_guard = lifecycle_lock.lock().await;
+            let settings_correlation = match checkpoint_logical_attempt_id.as_deref() {
+                Some(logical_attempt_id) => {
+                    serde_json::to_vec(&(settings.as_ref(), logical_attempt_id))
+                }
+                None => serde_json::to_vec(&settings),
+            }
+            .map_err(|_| {
+                RuntimeError::new(
+                    RuntimeErrorCode::InvalidRequest,
+                    "fresh-agent settings could not be correlated",
+                )
+            })?;
+            match self
+                .registry
+                .recorded_input_outcome(
+                    soul_id.clone(),
+                    request_id.clone(),
+                    text.as_bytes(),
+                    Some(&settings_correlation),
+                )
+                .await
+                .map_err(map_registry)?
+            {
+                Some(InputJournalDisposition::Completed) => Ok(CommandState::Completed),
+                Some(InputJournalDisposition::Ambiguous) => {
+                    if Box::pin(self.reconcile_ambiguous_codex_send_receipt(
+                        &soul_id,
+                        &request_id,
+                        &text,
+                        settings.as_ref(),
+                        checkpoint_logical_attempt_id.as_deref(),
+                        &settings_correlation,
+                    ))
+                    .await?
+                    {
+                        Ok(CommandState::Completed)
+                    } else {
+                        Ok(CommandState::Ambiguous)
+                    }
+                }
+                Some(InputJournalDisposition::Refused(diagnostic)) => {
+                    Err(fresh_send_refusal_error(diagnostic))
+                }
+                Some(InputJournalDisposition::Dispatch) | None => Ok(CommandState::Ambiguous),
             }
         })
     }
@@ -9837,6 +9919,7 @@ fn is_fresh_agent_admin_command(command: &AdminCommand) -> bool {
     matches!(
         command,
         AdminCommand::FreshAgentSend(_)
+            | AdminCommand::FreshAgentSendReconcile(_)
             | AdminCommand::FreshAgentFork(_)
             | AdminCommand::FreshAgentCompact(_)
             | AdminCommand::FreshAgentConfigure(_)

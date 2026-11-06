@@ -3,6 +3,228 @@ use freshell_runtime_protocol::{CommandState, RuntimeError};
 
 include!("fresh_agent_send_replay_tests.rs");
 
+#[derive(Default)]
+struct CheckpointBarrierSpy(std::sync::atomic::AtomicUsize);
+
+impl freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier for CheckpointBarrierSpy {
+    fn barrier_and_forward(
+        self: Arc<Self>,
+        _send: FreshAgentSend,
+        forward: futures_util::future::BoxFuture<'static, ()>,
+    ) -> futures_util::future::BoxFuture<'static, ()> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        forward
+    }
+}
+
+#[tokio::test]
+async fn receipt_reconcile_bypasses_checkpoint_barrier_and_stale_admission() {
+    use std::time::Duration;
+
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("supervisor.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let (mut health_stream, _) = listener.accept().await.unwrap();
+        let health: Envelope<AdminCommand> = read_frame(&mut health_stream).await.unwrap();
+        assert!(matches!(health.body, AdminCommand::Health));
+        write_frame(
+            &mut health_stream,
+            &AdminReply {
+                request_id: health.request_id,
+                result: Ok(AdminResult::Health {
+                    control_epoch: 7,
+                    installation_id: InstallationId::new(),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (mut reconcile_stream, _) =
+            tokio::time::timeout(Duration::from_secs(3), listener.accept())
+                .await
+                .expect("receipt-only operation reaches the supervisor")
+                .unwrap();
+        let reconcile: Envelope<AdminCommand> = read_frame(&mut reconcile_stream).await.unwrap();
+        let AdminCommand::FreshAgentSendReconcile(request) = reconcile.body else {
+            panic!(
+                "expected the distinct receipt-only command, got {:?}",
+                reconcile.body
+            );
+        };
+        assert_eq!(reconcile.request_id.as_str(), "reconcile-request-1");
+        assert_eq!(request.soul_id.as_str(), "reconcile-soul");
+        assert_eq!(request.text, "the unchanged original prompt");
+        assert_eq!(
+            request.checkpoint_logical_attempt_id.as_deref(),
+            Some("logical-attempt-9")
+        );
+        assert_eq!(request.expected_control_epoch, Some(7));
+        assert_eq!(
+            request.settings.as_ref().unwrap().model.as_deref(),
+            Some("gpt-5-codex")
+        );
+        assert_eq!(
+            request
+                .settings
+                .as_ref()
+                .unwrap()
+                .effort
+                .as_ref()
+                .and_then(Option::as_deref),
+            Some("high")
+        );
+        assert_eq!(
+            request.settings.as_ref().unwrap().cwd.as_deref(),
+            Some("/original/workspace")
+        );
+        write_frame(
+            &mut reconcile_stream,
+            &AdminReply {
+                request_id: reconcile.request_id,
+                result: Ok(AdminResult::FreshAgentCommand {
+                    state: CommandState::Completed,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    });
+    let (proxy, mut frames) = configure_proxy(
+        &socket,
+        HashMap::from([(
+            ("codex".into(), "public-thread".into()),
+            SoulId::parse("reconcile-soul").unwrap(),
+        )]),
+    );
+    let barrier = Arc::new(CheckpointBarrierSpy::default());
+    proxy.set_checkpoint_barrier(barrier.clone());
+    proxy.set_ownership(Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new()));
+    let message: FreshAgentSend = serde_json::from_value(serde_json::json!({
+        "provider":"codex", "sessionId":"public-thread", "sessionType":"freshcodex",
+        "requestId":"reconcile-request-1", "text":"the unchanged original prompt",
+        "cwd":"/original/workspace",
+        "settings":{"model":"gpt-5-codex", "effort":"high"},
+        "checkpointIntent":{"logicalAttemptId":"logical-attempt-9"},
+        "observedEpoch":99, "observedGeneration":99
+    }))
+    .unwrap();
+
+    Arc::clone(&proxy)
+        .handle(HostedFreshAgentCommand::SendReconcile(message))
+        .await;
+    server.await.unwrap();
+    assert_eq!(
+        barrier.0.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "receipt-only reconciliation must bypass checkpoint capture"
+    );
+    let frame: serde_json::Value = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(1), frames.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(frame["type"], "freshAgent.send.accepted");
+    assert_eq!(frame["requestId"], "reconcile-request-1");
+    assert_eq!(frame["sessionId"], "public-thread");
+    assert_eq!(frame["sessionType"], "freshcodex");
+}
+
+#[tokio::test]
+async fn receipt_reconcile_publishes_correlated_uncertainty_without_a_receipt() {
+    use std::time::Duration;
+
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("supervisor.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let (mut health_stream, _) = listener.accept().await.unwrap();
+        let health: Envelope<AdminCommand> = read_frame(&mut health_stream).await.unwrap();
+        assert!(matches!(health.body, AdminCommand::Health));
+        write_frame(
+            &mut health_stream,
+            &AdminReply {
+                request_id: health.request_id,
+                result: Ok(AdminResult::Health {
+                    control_epoch: 7,
+                    installation_id: InstallationId::new(),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (mut reconcile_stream, _) =
+            tokio::time::timeout(Duration::from_secs(3), listener.accept())
+                .await
+                .expect("receipt-only operation reaches the supervisor")
+                .unwrap();
+        let reconcile: Envelope<AdminCommand> = read_frame(&mut reconcile_stream).await.unwrap();
+        let AdminCommand::FreshAgentSendReconcile(request) = reconcile.body else {
+            panic!(
+                "expected the distinct receipt-only command, got {:?}",
+                reconcile.body
+            );
+        };
+        assert_eq!(reconcile.request_id.as_str(), "reconcile-request-2");
+        assert_eq!(request.text, "the unchanged original prompt");
+        assert_eq!(
+            request.checkpoint_logical_attempt_id.as_deref(),
+            Some("logical-attempt-10")
+        );
+        write_frame(
+            &mut reconcile_stream,
+            &AdminReply {
+                request_id: reconcile.request_id,
+                result: Ok(AdminResult::FreshAgentCommand {
+                    state: CommandState::Ambiguous,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    });
+    let (proxy, mut frames) = configure_proxy(
+        &socket,
+        HashMap::from([(
+            ("codex".into(), "public-thread".into()),
+            SoulId::parse("reconcile-soul").unwrap(),
+        )]),
+    );
+    let barrier = Arc::new(CheckpointBarrierSpy::default());
+    proxy.set_checkpoint_barrier(barrier.clone());
+    let message: FreshAgentSend = serde_json::from_value(serde_json::json!({
+        "provider":"codex", "sessionId":"public-thread", "sessionType":"freshcodex",
+        "requestId":"reconcile-request-2", "text":"the unchanged original prompt",
+        "checkpointIntent":{"logicalAttemptId":"logical-attempt-10"}
+    }))
+    .unwrap();
+
+    Arc::clone(&proxy)
+        .handle(HostedFreshAgentCommand::SendReconcile(message))
+        .await;
+    server.await.unwrap();
+    assert_eq!(barrier.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let frame: serde_json::Value = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(1), frames.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(frame["type"], "freshAgent.event");
+    assert_eq!(frame["event"]["type"], "freshAgent.send.uncertain");
+    assert_eq!(frame["event"]["requestId"], "reconcile-request-2");
+    assert_eq!(frame["event"]["sessionId"], "public-thread");
+    assert!(frame["event"]["message"]
+        .as_str()
+        .unwrap()
+        .starts_with("CODEX_DELIVERY_AMBIGUOUS:"));
+}
+
 /// Exercise the real proxy and its runtime client over the control socket.
 /// The supervisor fixture returns the additive, already-public provider
 /// diagnostic before its independently delivered journal receipt can arrive.

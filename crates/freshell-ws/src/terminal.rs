@@ -160,6 +160,13 @@ fn fresh_agent_maintenance_error(request_id: String) -> ServerMessage {
     })
 }
 
+fn fresh_agent_send_reconcile_enabled(state: &WsState, conn_id: u64) -> bool {
+    state.registry.managed_runtime_connection(conn_id)
+        && state
+            .registry
+            .fresh_agent_send_reconcile_connection(conn_id)
+}
+
 async fn dispatch_hosted_fresh_agent(
     message: &ClientMessage,
     ws_tx: &mut WsSink,
@@ -383,6 +390,7 @@ pub async fn run(
     terminal_interest_v1: bool,
     terminal_lifetime_claim_v1: bool,
     managed_runtime_v1: bool,
+    fresh_agent_send_reconcile_v1: bool,
     session_index_ready_v1: bool,
 ) {
     let (ws_tx, ws_rx) = socket.split();
@@ -393,6 +401,10 @@ pub async fn run(
     state
         .registry
         .set_managed_runtime_connection(conn_id, managed_runtime_v1);
+    state.registry.set_fresh_agent_send_reconcile_connection(
+        conn_id,
+        managed_runtime_v1 && fresh_agent_send_reconcile_v1,
+    );
 
     // DIAG-01: this connection is now fully authenticated (the handshake was
     // already written by the caller) -- lifecycle event with process/
@@ -1161,7 +1173,13 @@ async fn handle_client_text(
     if let Some(reply) = fresh_agent_control_refusal(&message) {
         return send(ws_tx, &reply).await;
     }
-    if let ClientMessage::FreshAgentSend(fresh_send) = &message {
+    let fresh_send = match &message {
+        ClientMessage::FreshAgentSend(send) | ClientMessage::FreshAgentSendReconcile(send) => {
+            Some(send)
+        }
+        _ => None,
+    };
+    if let Some(fresh_send) = fresh_send {
         if fresh_send.checkpoint_intent.is_some()
             && fresh_send
                 .request_id
@@ -1195,6 +1213,13 @@ async fn handle_client_text(
             )
             .await;
         }
+    }
+    if matches!(&message, ClientMessage::FreshAgentSendReconcile(_))
+        && !fresh_agent_send_reconcile_enabled(state, conn_id)
+    {
+        // This message is a receipt-only operation. Older or unnegotiated
+        // connections must not turn it into a legacy provider send.
+        return true;
     }
     // Explicit managed fresh-agent rollout: every fresh-agent operation is
     // consumed by the external gateway when installed. It is never allowed
@@ -2269,6 +2294,10 @@ async fn handle_client_text(
             }
             true
         }
+        // A negotiated reconciliation operation is consumed by the hosted
+        // gateway above. If no gateway is installed, keep it inert instead of
+        // falling through to an in-process provider send.
+        ClientMessage::FreshAgentSendReconcile(_) => true,
         // `freshAgent.interrupt` / `freshAgent.kill`: PR-1 wired the codex provider
         // (`is_codex_provider`) to `FreshCodexState::handle_interrupt`/`handle_kill`. Batch D
         // PR-2 adds opencode's kill (full removal, shared-sidecar-safe) and a cheap
@@ -2937,6 +2966,37 @@ async fn handle_client_text(
         // dispatched BEFORE/INSIDE this match by `fresh_agent_control_refusal` + the
         // claude arms above -- they must never fall through to this silent arm again.
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod fresh_agent_send_reconcile_gate_tests {
+    use super::*;
+
+    #[test]
+    fn receipt_reconciliation_requires_both_connection_capabilities() {
+        let state = super::pane_reconcile_gate_tests::state();
+        let conn_id = state.registry.new_connection_id();
+        assert!(!fresh_agent_send_reconcile_enabled(&state, conn_id));
+
+        state.registry.set_managed_runtime_connection(conn_id, true);
+        assert!(
+            !fresh_agent_send_reconcile_enabled(&state, conn_id),
+            "managed runtime alone must not authorize the new message"
+        );
+        state
+            .registry
+            .set_fresh_agent_send_reconcile_connection(conn_id, true);
+        assert!(fresh_agent_send_reconcile_enabled(&state, conn_id));
+
+        state
+            .registry
+            .set_managed_runtime_connection(conn_id, false);
+        assert!(
+            !fresh_agent_send_reconcile_enabled(&state, conn_id),
+            "a reconcile latch without managed runtime must be inert"
+        );
+        state.registry.remove_connection(conn_id);
     }
 }
 

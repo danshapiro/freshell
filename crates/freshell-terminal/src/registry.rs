@@ -1442,6 +1442,9 @@ pub struct TerminalRegistry {
     managed_controller: Arc<std::sync::RwLock<Option<Arc<dyn ManagedTerminalController>>>>,
     /// Connections that negotiated the additive `managedRuntimeV1` capability.
     managed_runtime_connections: Arc<Mutex<std::collections::HashSet<u64>>>,
+    /// Connections authorized for receipt-only hosted send reconciliation;
+    /// the WebSocket handshake enables this only alongside managed runtime.
+    fresh_agent_send_reconcile_connections: Arc<Mutex<std::collections::HashSet<u64>>>,
     /// kata b8ke Task 4: the ONE server-wide runtime-ownership coordinator,
     /// release-only integration (the registry itself never claims — the WS/
     /// REST/auto-resume lanes claim; this crate only RELEASES on confirmed
@@ -1785,6 +1788,9 @@ impl TerminalRegistry {
             session_ref_bindings: Arc::new(Mutex::new(HashMap::new())),
             managed_controller: Arc::new(std::sync::RwLock::new(None)),
             managed_runtime_connections: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            fresh_agent_send_reconcile_connections: Arc::new(Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             ownership: None,
             session_ref_ownership: Arc::new(Mutex::new(HashMap::new())),
             terminal_create_pause: Arc::new(std::sync::RwLock::new(None)),
@@ -3906,6 +3912,7 @@ impl TerminalRegistry {
     pub fn remove_connection(&self, conn_id: u64) {
         self.active_connections.fetch_sub(1, Ordering::Relaxed);
         self.set_managed_runtime_connection(conn_id, false);
+        self.set_fresh_agent_send_reconcile_connection(conn_id, false);
         let shareds: Vec<Arc<Mutex<TerminalShared>>> = {
             let inner = self.inner.lock().expect("registry lock");
             inner
@@ -4731,6 +4738,27 @@ impl TerminalRegistry {
         self.managed_runtime_connections
             .lock()
             .expect("managed runtime connections lock")
+            .contains(&conn_id)
+    }
+
+    /// Store the connection's receipt-only fresh-agent reconciliation
+    /// capability until socket teardown.
+    pub fn set_fresh_agent_send_reconcile_connection(&self, conn_id: u64, enabled: bool) {
+        let mut connections = self
+            .fresh_agent_send_reconcile_connections
+            .lock()
+            .expect("fresh-agent send reconcile connections lock");
+        if enabled {
+            connections.insert(conn_id);
+        } else {
+            connections.remove(&conn_id);
+        }
+    }
+
+    pub fn fresh_agent_send_reconcile_connection(&self, conn_id: u64) -> bool {
+        self.fresh_agent_send_reconcile_connections
+            .lock()
+            .expect("fresh-agent send reconcile connections lock")
             .contains(&conn_id)
     }
 
@@ -7247,6 +7275,24 @@ impl RekeyInterlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receipt_reconcile_capability_is_stored_per_connection_and_cleared_on_close() {
+        let registry = TerminalRegistry::new();
+        let enabled = registry.new_connection_id();
+        let legacy = registry.new_connection_id();
+        registry.set_managed_runtime_connection(enabled, true);
+        registry.set_fresh_agent_send_reconcile_connection(enabled, true);
+
+        assert!(registry.managed_runtime_connection(enabled));
+        assert!(registry.fresh_agent_send_reconcile_connection(enabled));
+        assert!(!registry.fresh_agent_send_reconcile_connection(legacy));
+
+        registry.remove_connection(enabled);
+        assert!(!registry.managed_runtime_connection(enabled));
+        assert!(!registry.fresh_agent_send_reconcile_connection(enabled));
+        registry.remove_connection(legacy);
+    }
 
     // ── DIAG-01 lifecycle tracing events ─────────────────────────────────
     //

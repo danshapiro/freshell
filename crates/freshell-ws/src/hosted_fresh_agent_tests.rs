@@ -12,7 +12,9 @@ fn fresh_agent_sample(kind: &str) -> serde_json::Value {
     let extra = match kind {
         "freshAgent.create" => json!({"requestId": "create-1"}),
         "freshAgent.attach" => json!({}),
-        "freshAgent.send" => json!({"text": "hello"}),
+        "freshAgent.send" | "freshAgent.send.reconcile" => {
+            json!({"text": "hello", "requestId": "send-1"})
+        }
         "freshAgent.interrupt" => json!({}),
         "freshAgent.configure" => {
             json!({"requestId": "configure-1", "settings": {"model": "opus", "effort": "high"}})
@@ -46,6 +48,7 @@ fn command_wire_type(command: &HostedFreshAgentCommand) -> &'static str {
         HostedFreshAgentCommand::Create(_) => "freshAgent.create",
         HostedFreshAgentCommand::Attach(_) => "freshAgent.attach",
         HostedFreshAgentCommand::Send(_) => "freshAgent.send",
+        HostedFreshAgentCommand::SendReconcile(_) => "freshAgent.send.reconcile",
         HostedFreshAgentCommand::Interrupt(_) => "freshAgent.interrupt",
         HostedFreshAgentCommand::Configure(_) => "freshAgent.configure",
         HostedFreshAgentCommand::Kill(_) => "freshAgent.kill",

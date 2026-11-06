@@ -3203,6 +3203,9 @@
             "freshAgentAttentionReplayV1": {
               "type": "boolean"
             },
+            "freshAgentSendReconcileV1": {
+              "type": "boolean"
+            },
             "managedRuntimeV1": {
               "type": "boolean"
             },

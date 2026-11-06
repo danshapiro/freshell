@@ -102,6 +102,18 @@ fn fresh_agent_create_preserves_pane_id() {
     ));
 }
 
+#[test]
+fn fresh_agent_send_reconcile_preserves_the_original_send_payload() {
+    let wire = r#"{"type":"freshAgent.send.reconcile","provider":"codex","sessionId":"session-1","sessionType":"freshcodex","requestId":"request-1","text":"same original input","settings":{"model":"gpt-5-codex","effort":"high"},"checkpointIntent":{"logicalAttemptId":"attempt-1","workspace":{"path":"/workspace","provenance":"resolved-project"}}}"#;
+    client_roundtrip(wire, "freshAgent.send.reconcile");
+}
+
+#[test]
+fn hello_preserves_receipt_reconcile_capability() {
+    let wire = r#"{"type":"hello","protocolVersion":10,"capabilities":{"managedRuntimeV1":true,"freshAgentSendReconcileV1":true}}"#;
+    client_roundtrip(wire, "hello");
+}
+
 // --------------------------------------------------------------------------
 // 1 + 2. The real handshake transcript.
 // --------------------------------------------------------------------------

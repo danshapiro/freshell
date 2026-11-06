@@ -68,14 +68,14 @@ fn server_types_match_inventory_order_exactly() {
 }
 
 #[test]
-fn combined_surface_is_116() {
+fn combined_surface_is_117() {
     let all = all_message_types();
-    assert_eq!(all.len(), 116, "43 client + 73 server = 116 discriminants");
+    assert_eq!(all.len(), 117, "44 client + 73 server = 117 discriminants");
     // sorted + unique
     let unique: BTreeSet<&str> = all.iter().copied().collect();
     assert_eq!(
         unique.len(),
-        116,
+        117,
         "no discriminant collides across directions"
     );
 }

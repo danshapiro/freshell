@@ -1,6 +1,6 @@
 {
   "clientToServer": {
-    "count": 44,
+    "count": 45,
     "types": [
       "amplifier.activity.list",
       "antigravity.activity.list",
@@ -22,6 +22,7 @@
       "freshAgent.question.respond",
       "freshAgent.redo",
       "freshAgent.send",
+      "freshAgent.send.reconcile",
       "freshAgent.undo",
       "hello",
       "hoststats.refresh",
