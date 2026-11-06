@@ -1315,7 +1315,7 @@ enum EnsureAliveError {
     RespawnFailed(String),
     /// Task 13 (D8): another create/attach holds this sessionRef's lease -- the caller
     /// answers `freshAgent.error { code: "SESSION_RESERVED" }` (retryable, never lost).
-    Reserved,
+    Reserved(Option<crate::ownership_lane::TerminalOwnerFields>),
     /// The previous incarnation is still delivering its remaining events.
     Draining,
 }
@@ -1324,8 +1324,15 @@ impl EnsureAliveError {
     fn reservation_message(&self) -> &'static str {
         match self {
             Self::Draining => CODEX_DRAIN_RESERVATION_MESSAGE,
-            Self::Reserved => "Another resume for this session is in flight",
+            Self::Reserved(_) => "Another resume for this session is in flight",
             _ => unreachable!("only reservation errors have a reservation message"),
+        }
+    }
+
+    fn reservation_owner(&self) -> Option<&crate::ownership_lane::TerminalOwnerFields> {
+        match self {
+            Self::Reserved(owner) => owner.as_ref(),
+            _ => None,
         }
     }
 }
@@ -1370,7 +1377,7 @@ enum ResumeSessionError {
     Transient(String),
     /// Task 13 (D8): another create/attach holds this sessionRef's lease -- the caller
     /// answers `freshAgent.error { code: "SESSION_RESERVED" }` (retryable, never lost).
-    Reserved,
+    Reserved(Option<crate::ownership_lane::TerminalOwnerFields>),
     /// The previous incarnation is still delivering its remaining events.
     Draining,
 }
@@ -1379,8 +1386,15 @@ impl ResumeSessionError {
     fn reservation_message(&self) -> &'static str {
         match self {
             Self::Draining => CODEX_DRAIN_RESERVATION_MESSAGE,
-            Self::Reserved => "Another resume for this session is in flight",
+            Self::Reserved(_) => "Another resume for this session is in flight",
             _ => unreachable!("only reservation errors have a reservation message"),
+        }
+    }
+
+    fn reservation_owner(&self) -> Option<&crate::ownership_lane::TerminalOwnerFields> {
+        match self {
+            Self::Reserved(owner) => owner.as_ref(),
+            _ => None,
         }
     }
 }
@@ -2112,7 +2126,7 @@ impl FreshCodexState {
                 "codex thread not resumable".to_string(),
                 session_id.to_string(),
             )),
-            Err(ResumeSessionError::Reserved) => Err((
+            Err(ResumeSessionError::Reserved(_)) => Err((
                 "codex thread reserved by another lifecycle operation".to_string(),
                 session_id.to_string(),
             )),
@@ -3008,6 +3022,7 @@ impl FreshCodexState {
             code,
             message,
             FreshAgentErrorContext::Session,
+            None,
         );
     }
 
@@ -3027,6 +3042,7 @@ impl FreshCodexState {
                 attempt_id: None,
                 uncertain: false,
             },
+            None,
         );
     }
 
@@ -3047,6 +3063,7 @@ impl FreshCodexState {
                 attempt_id: operation_attempt_id,
                 uncertain: false,
             },
+            None,
         );
     }
 
@@ -3085,6 +3102,7 @@ impl FreshCodexState {
                 attempt_id: None,
                 uncertain: true,
             },
+            None,
         );
     }
 
@@ -3094,6 +3112,7 @@ impl FreshCodexState {
         code: &str,
         message: &str,
         context: FreshAgentErrorContext<'_>,
+        owner: Option<&crate::ownership_lane::TerminalOwnerFields>,
     ) {
         let mut event = json!({
             "type": "freshAgent.error",
@@ -3118,12 +3137,15 @@ impl FreshCodexState {
                 event["operationAttemptId"] = json!(attempt_id);
             }
         }
-        self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
-            event,
-            provider: PROVIDER.to_string(),
-            session_id: session_id.to_string(),
-            session_type: SESSION_TYPE.to_string(),
-        }));
+        self.broadcast(&with_codex_refusal_owner(
+            ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                event,
+                provider: PROVIDER.to_string(),
+                session_id: session_id.to_string(),
+                session_type: SESSION_TYPE.to_string(),
+            }),
+            owner,
+        ));
     }
 
     /// The `PATCH /api/settings` sub-router (the fresh-clients enable toggle).
@@ -5992,13 +6014,24 @@ impl FreshCodexState {
             Err(EnsureAliveError::RespawnFailed(err)) => {
                 return self.refuse_send(&request_id, "CODEX_RESPAWN_FAILED", &err);
             }
-            Err(error @ (EnsureAliveError::Reserved | EnsureAliveError::Draining)) => {
+            Err(error @ (EnsureAliveError::Reserved(_) | EnsureAliveError::Draining)) => {
                 // Task 13 (D8): another create/attach holds this sessionRef -- the
                 // retryable non-lost error channel; the client re-drive converges.
                 let message = error.reservation_message();
-                let outcome = self.refuse_send(&request_id, "SESSION_RESERVED", message);
+                let outcome = self.refuse_send_with_owner(
+                    &request_id,
+                    "SESSION_RESERVED",
+                    message,
+                    error.reservation_owner(),
+                );
                 if request_id.as_deref().is_none_or(str::is_empty) {
-                    self.emit_fresh_agent_error(&session_id, "SESSION_RESERVED", message);
+                    self.emit_fresh_agent_error_inner(
+                        &session_id,
+                        "SESSION_RESERVED",
+                        message,
+                        FreshAgentErrorContext::Session,
+                        error.reservation_owner(),
+                    );
                 }
                 return outcome;
             }
@@ -6698,32 +6731,55 @@ impl FreshCodexState {
         code: &str,
         message: &str,
     ) -> CodexSendOutcome {
-        self.send_error(request_id, code, message);
+        self.refuse_send_with_owner(request_id, code, message, None)
+    }
+
+    fn refuse_send_with_owner(
+        &self,
+        request_id: &Option<String>,
+        code: &str,
+        message: &str,
+        owner: Option<&crate::ownership_lane::TerminalOwnerFields>,
+    ) -> CodexSendOutcome {
+        self.send_error_with_owner(request_id, code, message, owner);
         CodexSendOutcome::Refused {
             code: code.into(),
             message: message.into(),
             retryable: None,
-            owner: None,
+            owner: owner.cloned(),
         }
     }
 
     fn send_error(&self, request_id: &Option<String>, code: &str, message: &str) {
-        self.broadcast(&ServerMessage::Error(ErrorMsg {
-            provider_preparation_failure: None,
-            owner_kind: None,
-            owner_generation: None,
-            owner_epoch: None,
-            code: ErrorCode::InternalError,
-            message: format!("{code}: {message}"),
-            timestamp: now_iso(),
-            actual_session_ref: None,
-            expected_session_ref: None,
-            request_id: request_id.clone(),
-            retry_after_ms: None,
-            terminal_exit_code: None,
-            terminal_id: None,
-            live_terminal_id: None,
-        }));
+        self.send_error_with_owner(request_id, code, message, None);
+    }
+
+    fn send_error_with_owner(
+        &self,
+        request_id: &Option<String>,
+        code: &str,
+        message: &str,
+        owner: Option<&crate::ownership_lane::TerminalOwnerFields>,
+    ) {
+        self.broadcast(&with_codex_refusal_owner(
+            ServerMessage::Error(ErrorMsg {
+                provider_preparation_failure: None,
+                owner_kind: None,
+                owner_generation: None,
+                owner_epoch: None,
+                code: ErrorCode::InternalError,
+                message: format!("{code}: {message}"),
+                timestamp: now_iso(),
+                actual_session_ref: None,
+                expected_session_ref: None,
+                request_id: request_id.clone(),
+                retry_after_ms: None,
+                terminal_exit_code: None,
+                terminal_id: None,
+                live_terminal_id: None,
+            }),
+            owner,
+        ));
     }
 
     // ── freshAgent.configure (WS) ────────────────────────────────────────────
@@ -7137,14 +7193,19 @@ impl FreshCodexState {
                 );
                 return;
             }
-            Err(error @ (EnsureAliveError::Reserved | EnsureAliveError::Draining)) => {
+            Err(error @ (EnsureAliveError::Reserved(_) | EnsureAliveError::Draining)) => {
                 // Task 13 (D8) discipline, mirrored from handle_send: another
                 // create/attach holds this sessionRef — retryable, never lost.
-                self.emit_fresh_agent_error_for_request(
+                self.emit_fresh_agent_error_inner(
                     &session_id,
-                    msg.request_id.as_deref(),
                     "SESSION_RESERVED",
                     error.reservation_message(),
+                    FreshAgentErrorContext::Operation {
+                        request_id: msg.request_id.as_deref(),
+                        attempt_id: None,
+                        uncertain: false,
+                    },
+                    error.reservation_owner(),
                 );
                 return;
             }
@@ -7388,11 +7449,10 @@ impl FreshCodexState {
                 reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &err));
                 return;
             }
-            Err(error @ (EnsureAliveError::Reserved | EnsureAliveError::Draining)) => {
-                reply_sink(rollback_error_frame(
-                    &op,
-                    "SESSION_RESERVED",
-                    error.reservation_message(),
+            Err(error @ (EnsureAliveError::Reserved(_) | EnsureAliveError::Draining)) => {
+                reply_sink(with_codex_refusal_owner(
+                    rollback_error_frame(&op, "SESSION_RESERVED", error.reservation_message()),
+                    error.reservation_owner(),
                 ));
                 return;
             }
@@ -7780,13 +7840,16 @@ impl FreshCodexState {
                 reply_sink(fork_error_frame(&msg.session_id, &err));
                 return;
             }
-            Err(error @ (EnsureAliveError::Reserved | EnsureAliveError::Draining)) => {
+            Err(error @ (EnsureAliveError::Reserved(_) | EnsureAliveError::Draining)) => {
                 // Task 13 (D8) discipline: retryable, never lost — answered on the
                 // requesting sink like every other fork failure.
-                reply_sink(fork_error_frame_with_code(
-                    &msg.session_id,
-                    "SESSION_RESERVED",
-                    error.reservation_message(),
+                reply_sink(with_codex_refusal_owner(
+                    fork_error_frame_with_code(
+                        &msg.session_id,
+                        "SESSION_RESERVED",
+                        error.reservation_message(),
+                    ),
+                    error.reservation_owner(),
                 ));
                 return;
             }
@@ -9559,12 +9622,14 @@ impl FreshCodexState {
                     self.send_error(&None, "CODEX_ATTACH_RESPAWN_FAILED", &err);
                     return;
                 }
-                Err(error @ (EnsureAliveError::Reserved | EnsureAliveError::Draining)) => {
+                Err(error @ (EnsureAliveError::Reserved(_) | EnsureAliveError::Draining)) => {
                     // Task 13 (D8): loser answer -- retryable, never lost.
-                    self.emit_fresh_agent_error(
+                    self.emit_fresh_agent_error_inner(
                         &msg.session_id,
                         "SESSION_RESERVED",
                         error.reservation_message(),
+                        FreshAgentErrorContext::Session,
+                        error.reservation_owner(),
                     );
                     return;
                 }
@@ -9613,12 +9678,14 @@ impl FreshCodexState {
                     self.send_error(&None, "CODEX_ATTACH_RESUME_FAILED", &err);
                     return;
                 }
-                Err(error @ (ResumeSessionError::Reserved | ResumeSessionError::Draining)) => {
+                Err(error @ (ResumeSessionError::Reserved(_) | ResumeSessionError::Draining)) => {
                     // Task 13 (D8): loser answer -- retryable, never lost.
-                    self.emit_fresh_agent_error(
+                    self.emit_fresh_agent_error_inner(
                         &msg.session_id,
                         "SESSION_RESERVED",
                         error.reservation_message(),
+                        FreshAgentErrorContext::Session,
+                        error.reservation_owner(),
                     );
                     return;
                 }
@@ -9768,7 +9835,7 @@ impl FreshCodexState {
             Err(EnsureAliveError::RespawnFailed(_)) => {
                 return Err("Codex native session recovery failed".into())
             }
-            Err(error @ (EnsureAliveError::Reserved | EnsureAliveError::Draining)) => {
+            Err(error @ (EnsureAliveError::Reserved(_) | EnsureAliveError::Draining)) => {
                 return Err(error.reservation_message().into())
             }
         };
@@ -9864,9 +9931,9 @@ impl FreshCodexState {
                                 CodexRecoveryFailure::NotFound,
                             ))
                         }
-                        Err(EnsureAliveError::Reserved) => {
+                        Err(EnsureAliveError::Reserved(owner)) => {
                             Err(crate::session_recovery::RecoveryAttemptFailure::refusal(
-                                CodexRecoveryFailure::Reserved(None),
+                                CodexRecoveryFailure::Reserved(owner),
                             ))
                         }
                         Err(EnsureAliveError::Draining) => {
@@ -9895,7 +9962,7 @@ impl FreshCodexState {
                 .has_live_session(session_id)
                 .await
                 .then_some(EnsureAliveOutcome::Recovered)
-                .ok_or(EnsureAliveError::Reserved),
+                .ok_or(EnsureAliveError::Reserved(None)),
             Ok(CodexRecoveryReady::CreateResumed(CodexCreateOutcome::Created {
                 session_id: resumed_id,
                 ..
@@ -9903,7 +9970,7 @@ impl FreshCodexState {
                 .has_live_session(session_id)
                 .await
                 .then_some(EnsureAliveOutcome::Recovered)
-                .ok_or(EnsureAliveError::Reserved),
+                .ok_or(EnsureAliveError::Reserved(None)),
             Ok(CodexRecoveryReady::CreateResumed(CodexCreateOutcome::Created {
                 session_id: resumed_id,
                 ..
@@ -9913,27 +9980,29 @@ impl FreshCodexState {
             Ok(CodexRecoveryReady::CreateResumed(CodexCreateOutcome::Failed {
                 code,
                 message,
+                owner,
                 ..
             }))
             | Err(crate::session_recovery::RecoveryFailure::Attempt(
                 CodexRecoveryFailure::CreateRefused(CodexCreateOutcome::Failed {
                     code,
                     message,
+                    owner,
                     ..
                 }),
             )) => match (code.as_str(), message.as_str()) {
                 ("SESSION_RESERVED", CODEX_DRAIN_RESERVATION_MESSAGE) => {
                     Err(EnsureAliveError::Draining)
                 }
-                ("SESSION_RESERVED", _) => Err(EnsureAliveError::Reserved),
+                ("SESSION_RESERVED", _) => Err(EnsureAliveError::Reserved(owner.clone())),
                 _ => Err(EnsureAliveError::RespawnFailed(message.clone())),
             },
             Err(crate::session_recovery::RecoveryFailure::Attempt(
                 CodexRecoveryFailure::NotFound,
             )) => Err(EnsureAliveError::NotFound),
             Err(crate::session_recovery::RecoveryFailure::Attempt(
-                CodexRecoveryFailure::Reserved(_),
-            )) => Err(EnsureAliveError::Reserved),
+                CodexRecoveryFailure::Reserved(owner),
+            )) => Err(EnsureAliveError::Reserved(owner.clone())),
             Err(crate::session_recovery::RecoveryFailure::Attempt(
                 CodexRecoveryFailure::Draining,
             )) => Err(EnsureAliveError::Draining),
@@ -9943,14 +10012,14 @@ impl FreshCodexState {
             )) => Err(EnsureAliveError::RespawnFailed(error.clone())),
             Err(crate::session_recovery::RecoveryFailure::Attempt(
                 CodexRecoveryFailure::CreateRefused(CodexCreateOutcome::Created { .. }),
-            )) => Err(EnsureAliveError::Reserved),
+            )) => Err(EnsureAliveError::Reserved(None)),
             Err(crate::session_recovery::RecoveryFailure::Attempt(
                 CodexRecoveryFailure::CreateLaunch(outcome),
             )) => match outcome {
                 CodexCreateOutcome::Failed { message, .. } => {
                     Err(EnsureAliveError::RespawnFailed(message.clone()))
                 }
-                CodexCreateOutcome::Created { .. } => Err(EnsureAliveError::Reserved),
+                CodexCreateOutcome::Created { .. } => Err(EnsureAliveError::Reserved(None)),
             },
             Err(crate::session_recovery::RecoveryFailure::Panicked) => Err(
                 EnsureAliveError::RespawnFailed("shared Codex recovery panicked".into()),
@@ -10013,7 +10082,7 @@ impl FreshCodexState {
             tracing::warn!(target: "freshell_freshagent::codex",
                 session_id = %session_id,
                 "fresh_agent_respawn_refused: a prior natural exit remains unconfirmed");
-            return Err(EnsureAliveError::Reserved);
+            return Err(EnsureAliveError::Reserved(None));
         }
         let (
             cwd,
@@ -10110,7 +10179,7 @@ impl FreshCodexState {
         if (self.terminal_liveness)(PROVIDER, session_id) {
             tracing::warn!(target: "freshell_freshagent::codex", session_id = %session_id,
                 "fresh_agent_respawn_refused: a live terminal PTY owns this session (Task 13b cross-kind live-guard)");
-            return Err(EnsureAliveError::Reserved);
+            return Err(EnsureAliveError::Reserved(None));
         }
         // kata b8ke Task 3: crash recovery FENCES through the coordinator —
         // claims/commits, no bypass (the cross-kind coverage constraint).
@@ -10137,7 +10206,7 @@ impl FreshCodexState {
                 if self.has_live_session(session_id).await {
                     return Ok(EnsureAliveOutcome::Recovered);
                 }
-                return Err(EnsureAliveError::Reserved);
+                return Err(EnsureAliveError::Reserved(None));
             }
             crate::ownership_lane::LaneClaim::Refused(outcome) => {
                 tracing::warn!(target: "freshell_freshagent::codex",
@@ -10145,7 +10214,12 @@ impl FreshCodexState {
                     "fresh_agent_respawn_refused: the ownership coordinator refused the \
                      claim (kata b8ke cross-kind authority)"
                 );
-                return Err(EnsureAliveError::Reserved);
+                return Err(EnsureAliveError::Reserved(
+                    crate::ownership_lane::fresh_agent_owner_fields_from_outcome(
+                        &self.ownership,
+                        &outcome,
+                    ),
+                ));
             }
         };
         // Task 13 (D8): the exited->respawn arm SPAWNS -- claim the per-sessionRef
@@ -10191,10 +10265,10 @@ impl FreshCodexState {
                             new_session_id: live_session_key,
                         });
                     }
-                    return Err(EnsureAliveError::Reserved);
+                    return Err(EnsureAliveError::Reserved(None));
                 }
                 crate::session_lease::FreshSessionClaim::Held { .. } => {
-                    return Err(EnsureAliveError::Reserved);
+                    return Err(EnsureAliveError::Reserved(None));
                 }
                 crate::session_lease::FreshSessionClaim::ExpiredNeedsKill { pid, ownership_id } => {
                     if round == 0
@@ -10211,7 +10285,7 @@ impl FreshCodexState {
                     }
                     tracing::error!(target: "invariant", pid, session_id = %session_id,
                         "fresh_agent_lease_expired_kill_unconfirmed: holding closed");
-                    return Err(EnsureAliveError::Reserved);
+                    return Err(EnsureAliveError::Reserved(None));
                 }
             }
         }
@@ -10227,7 +10301,7 @@ impl FreshCodexState {
                 if let Some(mut guard) = lease_guard.take() {
                     guard.fail();
                 }
-                return Err(EnsureAliveError::Reserved);
+                return Err(EnsureAliveError::Reserved(None));
             }
         }
 
@@ -10905,7 +10979,7 @@ impl FreshCodexState {
                 if let Some(mut g) = lease_guard.take() {
                     g.fail();
                 }
-                return Err(EnsureAliveError::Reserved);
+                return Err(EnsureAliveError::Reserved(None));
             }
             crate::ownership_lane::LaneClaim::Refused(outcome) => {
                 // Unreachable on a fresh UUID in practice — honored as a
@@ -10925,7 +10999,12 @@ impl FreshCodexState {
                 if let Some(mut g) = lease_guard.take() {
                     g.fail();
                 }
-                return Err(EnsureAliveError::Reserved);
+                return Err(EnsureAliveError::Reserved(
+                    crate::ownership_lane::fresh_agent_owner_fields_from_outcome(
+                        &self.ownership,
+                        &outcome,
+                    ),
+                ));
             }
         };
         let sidecar_pid = child.id();
@@ -12792,9 +12871,9 @@ impl FreshCodexState {
                                 CodexRecoveryFailure::NotFound,
                             ))
                         }
-                        Err(ResumeSessionError::Reserved) => {
+                        Err(ResumeSessionError::Reserved(owner)) => {
                             Err(crate::session_recovery::RecoveryAttemptFailure::refusal(
-                                CodexRecoveryFailure::Reserved(None),
+                                CodexRecoveryFailure::Reserved(owner),
                             ))
                         }
                         Err(ResumeSessionError::Draining) => {
@@ -12851,27 +12930,29 @@ impl FreshCodexState {
             Ok(CodexRecoveryReady::CreateResumed(CodexCreateOutcome::Failed {
                 code,
                 message,
+                owner,
                 ..
             }))
             | Err(crate::session_recovery::RecoveryFailure::Attempt(
                 CodexRecoveryFailure::CreateRefused(CodexCreateOutcome::Failed {
                     code,
                     message,
+                    owner,
                     ..
                 }),
             )) => match (code.as_str(), message.as_str()) {
                 ("SESSION_RESERVED", CODEX_DRAIN_RESERVATION_MESSAGE) => {
                     Err(ResumeSessionError::Draining)
                 }
-                ("SESSION_RESERVED", _) => Err(ResumeSessionError::Reserved),
+                ("SESSION_RESERVED", _) => Err(ResumeSessionError::Reserved(owner.clone())),
                 _ => Err(ResumeSessionError::Transient(message.clone())),
             },
             Err(crate::session_recovery::RecoveryFailure::Attempt(
                 CodexRecoveryFailure::NotFound,
             )) => Err(ResumeSessionError::NotFound),
             Err(crate::session_recovery::RecoveryFailure::Attempt(
-                CodexRecoveryFailure::Reserved(_),
-            )) => Err(ResumeSessionError::Reserved),
+                CodexRecoveryFailure::Reserved(owner),
+            )) => Err(ResumeSessionError::Reserved(owner.clone())),
             Err(crate::session_recovery::RecoveryFailure::Attempt(
                 CodexRecoveryFailure::Draining,
             )) => Err(ResumeSessionError::Draining),
@@ -12881,14 +12962,14 @@ impl FreshCodexState {
             )) => Err(ResumeSessionError::Transient(error.clone())),
             Err(crate::session_recovery::RecoveryFailure::Attempt(
                 CodexRecoveryFailure::CreateRefused(CodexCreateOutcome::Created { .. }),
-            )) => Err(ResumeSessionError::Reserved),
+            )) => Err(ResumeSessionError::Reserved(None)),
             Err(crate::session_recovery::RecoveryFailure::Attempt(
                 CodexRecoveryFailure::CreateLaunch(outcome),
             )) => match outcome {
                 CodexCreateOutcome::Failed { message, .. } => {
                     Err(ResumeSessionError::Transient(message.clone()))
                 }
-                CodexCreateOutcome::Created { .. } => Err(ResumeSessionError::Reserved),
+                CodexCreateOutcome::Created { .. } => Err(ResumeSessionError::Reserved(None)),
             },
             Err(crate::session_recovery::RecoveryFailure::Panicked) => Err(
                 ResumeSessionError::Transient("shared Codex recovery panicked".into()),
@@ -12924,7 +13005,7 @@ impl FreshCodexState {
                 .expect("condemned priors lock")
                 .contains_key(thread_id);
             if has_condemned_prior && !self.confirm_fenced_prior_dead(thread_id).await {
-                return Err(ResumeSessionError::Reserved);
+                return Err(ResumeSessionError::Reserved(None));
             }
         }
         if self.is_known_dead_thread(thread_id).await {
@@ -12956,7 +13037,7 @@ impl FreshCodexState {
                 .expect("condemned priors lock")
                 .contains_key(thread_id);
             if has_condemned_prior && !self.confirm_fenced_prior_dead(thread_id).await {
-                return Err(ResumeSessionError::Reserved);
+                return Err(ResumeSessionError::Reserved(None));
             }
         }
         // FIX (review item 1): also re-check the dead-thread cache here, not just before
@@ -12976,7 +13057,7 @@ impl FreshCodexState {
         if (self.terminal_liveness)(PROVIDER, thread_id) {
             tracing::warn!(target: "freshell_freshagent::codex", session_id = %thread_id,
                 "fresh_agent_attach_resume_refused: a live terminal PTY owns this session (Task 13b cross-kind live-guard)");
-            return Err(ResumeSessionError::Reserved);
+            return Err(ResumeSessionError::Reserved(None));
         }
         // kata b8ke Task 3: the coordinator claim comes FIRST — before the
         // provider lease — at every lifecycle entry point that spawns
@@ -13002,7 +13083,7 @@ impl FreshCodexState {
                     if let Some(resumed) = self.live_resumed_session(thread_id).await {
                         return Ok(resumed);
                     }
-                    return Err(ResumeSessionError::Reserved);
+                    return Err(ResumeSessionError::Reserved(None));
                 }
                 crate::ownership_lane::LaneClaim::Refused(outcome) => {
                     tracing::warn!(target: "freshell_freshagent::codex",
@@ -13010,7 +13091,12 @@ impl FreshCodexState {
                         "fresh_agent_attach_resume_refused: the ownership coordinator \
                          refused the claim (kata b8ke cross-kind authority)"
                     );
-                    return Err(ResumeSessionError::Reserved);
+                    return Err(ResumeSessionError::Reserved(
+                        crate::ownership_lane::fresh_agent_owner_fields_from_outcome(
+                            &self.ownership,
+                            &outcome,
+                        ),
+                    ));
                 }
             }
         };
@@ -13051,10 +13137,10 @@ impl FreshCodexState {
                     if let Some(resumed) = self.live_resumed_session(thread_id).await {
                         return Ok(resumed);
                     }
-                    return Err(ResumeSessionError::Reserved);
+                    return Err(ResumeSessionError::Reserved(None));
                 }
                 crate::session_lease::FreshSessionClaim::Held { .. } => {
-                    return Err(ResumeSessionError::Reserved);
+                    return Err(ResumeSessionError::Reserved(None));
                 }
                 crate::session_lease::FreshSessionClaim::ExpiredNeedsKill { pid, ownership_id } => {
                     if round == 0
@@ -13071,7 +13157,7 @@ impl FreshCodexState {
                     }
                     tracing::error!(target: "invariant", pid, session_id = %thread_id,
                         "fresh_agent_lease_expired_kill_unconfirmed: holding closed");
-                    return Err(ResumeSessionError::Reserved);
+                    return Err(ResumeSessionError::Reserved(None));
                 }
             }
         }
@@ -13090,7 +13176,7 @@ impl FreshCodexState {
                 if let Some(mut guard) = lease_guard.take() {
                     guard.fail();
                 }
-                return Err(ResumeSessionError::Reserved);
+                return Err(ResumeSessionError::Reserved(None));
             }
         }
 
@@ -13265,7 +13351,7 @@ impl FreshCodexState {
                         if let Some(mut guard) = lease_guard.take() {
                             guard.fail();
                         }
-                        return Err(ResumeSessionError::Reserved);
+                        return Err(ResumeSessionError::Reserved(None));
                     }
                     resume_fence.disarm();
                 }
@@ -16685,6 +16771,29 @@ fn fork_error_frame_with_code(session_id: &str, code: &str, message: &str) -> Se
         session_id: session_id.to_string(),
         session_type: SESSION_TYPE.to_string(),
     })
+}
+
+/// Keep the owner observed by the refusal itself through both WS envelopes.
+fn with_codex_refusal_owner(
+    mut frame: ServerMessage,
+    owner: Option<&crate::ownership_lane::TerminalOwnerFields>,
+) -> ServerMessage {
+    if let Some(owner) = owner {
+        match &mut frame {
+            ServerMessage::Error(error) => {
+                error.owner_kind = Some(owner.owner_kind.into());
+                error.owner_epoch = Some(owner.owner_epoch);
+                error.owner_generation = Some(owner.owner_generation);
+            }
+            ServerMessage::FreshAgentEvent(frame) => {
+                frame.event["ownerKind"] = json!(owner.owner_kind);
+                frame.event["ownerEpoch"] = json!(owner.owner_epoch);
+                frame.event["ownerGeneration"] = json!(owner.owner_generation);
+            }
+            _ => unreachable!("Codex refusal owner fields belong on error frames"),
+        }
+    }
+    frame
 }
 
 /// Tear down a fork-child sidecar whose registration never completed (close the client,
@@ -27003,6 +27112,7 @@ pub(crate) mod tests {
                 .operation_id;
             let mut msg = create_msg("shared-next-requester");
             msg.resume_session_id = Some(id.clone());
+            msg.view_id = Some("shared-next-view".into());
             let st = state.clone();
             let next = tokio::spawn(async move { st.handle_create(msg, None).await });
             tokio::time::timeout(Duration::from_secs(5), async {
@@ -27030,6 +27140,18 @@ pub(crate) mod tests {
             assert!(
                 matches!(outcome, CodexCreateOutcome::Created { ref session_id, .. } if session_id == &id)
             );
+            let replies: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
+                .map(|raw| serde_json::from_str::<Value>(&raw).unwrap())
+                .filter(|frame| frame["requestId"] == "shared-next-requester")
+                .collect();
+            assert_eq!(
+                replies.len(),
+                1,
+                "one wire reply for the surviving requester: {replies:?}"
+            );
+            assert_eq!(replies[0]["type"], "freshAgent.created");
+            assert_eq!(replies[0]["viewId"], "shared-next-view");
+            assert_eq!(replies[0]["sessionId"], id);
             let after = registry.observe(PROVIDER, &id);
             assert_eq!(after.generation, before.generation);
             assert!(matches!(
@@ -27738,10 +27860,10 @@ pub(crate) mod tests {
         state.set_ownership(registry.clone());
         let id = "cancel-replaced-startup";
         let stall = sink.arm_binding_stall(PROVIDER, id);
-        let mut msg = create_msg("cancel-replaced-startup");
-        msg.resume_session_id = Some(id.into());
         let st = state.clone();
-        let task = tokio::spawn(async move { st.handle_create(msg, None).await });
+        let task = tokio::spawn(async move {
+            create_resume_operation_for_test(&st, "cancel-replaced-startup", id).await
+        });
         stall.entered.recv_timeout(Duration::from_secs(15)).unwrap();
         let original = state.sessions.lock().await.remove(id).unwrap();
         let original_pid = original.sidecar_pid.unwrap();
@@ -27783,6 +27905,13 @@ pub(crate) mod tests {
 
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !crate::ownership_lane::partial_pid_confirmed_dead(original_pid) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("canceling the provider operation tears down its writer before binding resumes");
         let _ = stall.release.send(());
         tokio::time::timeout(Duration::from_secs(10), async {
             while sink.repairs.lock().unwrap().is_empty() {
@@ -34938,7 +35067,7 @@ pub(crate) mod tests {
                     Some("task005-r2-codex-preflight-late-attach".into()),
                 )
                 .await,
-            Err(EnsureAliveError::Reserved)
+            Err(EnsureAliveError::Reserved(None))
         ));
         assert!(matches!(
             state
@@ -34950,7 +35079,7 @@ pub(crate) mod tests {
                     Some("task005-r2-codex-preflight-late-send".into()),
                 )
                 .await,
-            Err(ResumeSessionError::Reserved)
+            Err(ResumeSessionError::Reserved(None))
         ));
 
         let after_handoff = state
