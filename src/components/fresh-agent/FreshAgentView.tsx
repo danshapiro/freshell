@@ -5052,7 +5052,11 @@ export function FreshAgentView({
     summary: localEcho.text,
     items: [{ id: `__local-echo-item:${localEcho.requestId}`, kind: 'text', text: localEcho.text }],
   } as FreshAgentTurn : undefined), [localEcho])
-  const transcriptTurns = snapshot?.turns ?? EMPTY_TRANSCRIPT_TURNS
+  // Identity transitions are committed to Redux before the effect below can
+  // clear stale snapshot metadata. Hide turns from the previous conversation
+  // in that render; otherwise a newly reset pane can briefly show the old
+  // transcript while its first snapshot for the new identity is still loading.
+  const transcriptTurns = hasCurrentSnapshot ? snapshot?.turns ?? EMPTY_TRANSCRIPT_TURNS : EMPTY_TRANSCRIPT_TURNS
   // Render-phase reads of refs: every pendingSendMetadataRef mutation rides
   // a state transition that re-renders (a send creates the local echo; an
   // outcome arrival publishes checkpoint availability and persists the pane

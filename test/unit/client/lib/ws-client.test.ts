@@ -533,6 +533,42 @@ describe('WsClient.connect', () => {
     ])
   })
 
+  it('flushes an offline Codex send before reconnect receipt reconciliation', async () => {
+    const c = new WsClient('ws://example/ws')
+    const sendFrame = {
+      type: 'freshAgent.send',
+      requestId: 'codex-send-queued-offline',
+      sessionId: 'ses-reconnect-send',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      text: 'the original user input',
+    }
+    c.onReconnect(() => {
+      c.send({ ...sendFrame, type: 'freshAgent.send.reconcile' })
+    })
+
+    const p1 = c.connect()
+    MockWebSocket.instances[0]._open()
+    MockWebSocket.instances[0]._message({ type: 'ready' })
+    await p1
+    MockWebSocket.instances[0]._close(1006, 'disconnect before the queued send')
+    c.send(sendFrame)
+
+    const p2 = c.connect()
+    MockWebSocket.instances[1]._open()
+    MockWebSocket.instances[1]._message({ type: 'ready' })
+    await p2
+
+    const sendAndReceiptFrames = MockWebSocket.instances[1].sent
+      .map((x) => JSON.parse(x))
+      .filter((message) => message.requestId === sendFrame.requestId)
+      .map(({ type }) => type)
+    expect(sendAndReceiptFrames).toEqual([
+      'freshAgent.send',
+      'freshAgent.send.reconcile',
+    ])
+  })
+
   it('drops queued terminal.input on reconnect instead of replaying it against a stale terminalId', async () => {
     const c = new WsClient('ws://example/ws')
 
