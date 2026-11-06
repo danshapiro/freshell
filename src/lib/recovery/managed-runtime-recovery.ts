@@ -3,7 +3,7 @@ import { managedTerminalPaneStatus } from '../managed-terminal.js'
 import type { AppStore, RootState } from '@/store/store'
 import { addTab, updateTab } from '@/store/tabsSlice'
 import { initLayout, updatePaneContent } from '@/store/panesSlice'
-import { nativeProjectionRetired, snapshotSourceChanged } from '@/store/freshAgentLiveSlice'
+import { nativeProjectionRetired, snapshotSourceChanged, snapshotSourceRetirementPromoted, snapshotNativeClaimed } from '@/store/freshAgentLiveSlice'
 import type { FreshAgentSessionLocator } from '@/store/freshAgentTypes'
 import { memoryWarningSourceChanged } from '@/store/freshAgentSlice'
 import { findPaneContent } from '@/lib/pane-utils'
@@ -472,19 +472,28 @@ export function buildManagedRuntimeMergePlan(
 function invalidateCodexSource(
   store: Pick<AppStore, 'dispatch'>,
   locator: FreshAgentSessionLocator,
-  invalidated: Set<string>,
+  invalidated: Map<string, 'claim' | 'retired'>,
+  claimNative?: string,
 ): void {
   const key = makeFreshAgentSessionKey(locator)
-  if (invalidated.has(key)) return
+  const previous = invalidated.get(key)
+  if (previous) {
+    if (previous === 'claim' && !claimNative) {
+      store.dispatch(snapshotSourceRetirementPromoted(locator))
+      invalidated.set(key, 'retired')
+    }
+    return
+  }
   streamBatcherFor(store.dispatch).flush(locator)
-  store.dispatch(snapshotSourceChanged(locator))
-  invalidated.add(key)
+  if (claimNative) store.dispatch(snapshotNativeClaimed({ ...locator, nativeSessionId: claimNative }))
+  else store.dispatch(snapshotSourceChanged(locator))
+  invalidated.set(key, claimNative ? 'claim' : 'retired')
 }
 
 export function applyManagedRuntimeMergePlan(
   store: Pick<AppStore, 'dispatch' | 'getState'>,
   plan: ManagedRuntimeMergePlan,
-  invalidatedSources = new Set<string>(),
+  invalidatedSources = new Map<string, 'claim' | 'retired'>(),
 ): void {
   for (const update of plan.updates) {
     const layout = store.getState().panes.layouts[update.tabId]
@@ -544,12 +553,32 @@ function inventoryCodexSource(souls: ManagedRuntimeSoul[], sessionType: string, 
   return matches.length === 1 && matches[0].freshAgentSessionType === sessionType ? matches[0] : undefined
 }
 
+/** Only an unambiguous first claim of the same known running fallback is
+ * uncertain. Untyped or competing recorded owners cannot establish absence. */
+function isUnchangedNativeClaim(previous: ManagedRuntimeSoul[], next: ManagedRuntimeSoul[], sessionType: string, sessionId: string): boolean {
+  const recorded = (soul: ManagedRuntimeSoul) => soul.freshAgentSessionId === sessionId || soul.freshAgentPresentationIds?.includes(sessionId)
+  if (previous.some(recorded)) return false
+  const nextOwners = next.filter(recorded)
+  if (nextOwners.length !== 1) return false
+  const nextOwner = nextOwners[0]
+  const fallbacks = previous.filter((soul) => soul.provider === 'codex' && soul.nativeSessionId === sessionId
+    && soul.desiredState === 'running' && soul.launchState === 'running')
+  if (fallbacks.length !== 1) return false
+  const fallback = fallbacks[0]
+  return fallback.freshAgentSessionType === sessionType && nextOwner.provider === 'codex'
+    && nextOwner.desiredState === 'running' && nextOwner.launchState === 'running'
+    && nextOwner.freshAgentSessionType === sessionType && nextOwner.nativeSessionId === sessionId
+    && fallback.soulId === nextOwner.soulId && fallback.incarnationId === nextOwner.incarnationId
+    && fallback.executionGeneration === nextOwner.executionGeneration
+    && !(fallback.hostBootId && nextOwner.hostBootId && fallback.hostBootId !== nextOwner.hostBootId)
+}
+
 function invalidateChangedInventorySources(
   store: Pick<AppStore, 'dispatch' | 'getState'>,
   snapshot: ManagedRuntimeInventorySnapshot,
-): Set<string> {
+): Map<string, 'claim' | 'retired'> {
   const state = store.getState()
-  const invalidated = new Set<string>()
+  const invalidated = new Map<string, 'claim' | 'retired'>()
   const checked = new Set<string>()
   const previousSouls = [...latestSoulViews(state.managedRuntime.souls).values()]
   const nextSouls = [...latestSoulViews(snapshot.souls).values()]
@@ -568,13 +597,17 @@ function invalidateChangedInventorySources(
       // The earlier inventory did not establish an owner. A response may
       // still have used the gateway's native fallback before this route was
       // recorded, so a newly recognized route cannot inherit its authority.
-      if (state.managedRuntime.readiness !== undefined) invalidateCodexSource(store, locator, invalidated)
+      if (state.managedRuntime.readiness !== undefined) {
+        const unchanged = isUnchangedNativeClaim(previousSouls, nextSouls, locator.sessionType, locator.sessionId)
+        invalidateCodexSource(store, locator, invalidated, unchanged ? locator.sessionId : undefined)
+      }
       continue
     }
     const changed = previous.soulId !== next.soulId
       || Boolean(previous.incarnationId && next.incarnationId && previous.incarnationId !== next.incarnationId)
       || Boolean(previous.nativeSessionId && next.nativeSessionId && previous.nativeSessionId !== next.nativeSessionId)
       || Boolean(previous.hostBootId && next.hostBootId && previous.hostBootId !== next.hostBootId)
+      || previous.executionGeneration !== next.executionGeneration
     if (!changed) continue
     invalidateCodexSource(store, locator, invalidated)
   }

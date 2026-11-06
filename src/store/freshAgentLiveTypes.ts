@@ -99,7 +99,13 @@ export type FreshAgentLiveSession = {
   uncertainProjectionIds?: Record<string, {
     /** Coverage observed after an announcement; never stores an unverified body. */
     observed?: { nativeSessionId: string; historyGeneration: number; revision: number }
+    nativeClaim?: true
   }>
+  /** A first route claim fences output until a checked live read settles it. */
+  nativeClaim?: { projectionId: string; nativeSessionId: string; observationVersion: number; competing?: { projectionId: string; historyGeneration: number; revision: number } }
+  /** A route response identifies a projection, not its managed producer. */
+  routeOnlyProjectionId?: string
+  routeOnlyObservationVersion?: number
   projection?: TranscriptProjection
   /** Native source of the shared projection, independently of pane references and connection state. */
   projectionNativeSessionId?: string

@@ -107,6 +107,7 @@ export class NetworkError extends Error {
 
 export type ApiRequestOptions = {
   signal?: AbortSignal
+  cache?: RequestCache
 }
 
 function getApiErrorMessage(data: unknown, fallback: string): string {
@@ -750,6 +751,8 @@ export async function getFreshAgentThreadSnapshot(
   options: ApiRequestOptions = {},
 ): Promise<any> {
   const signal = query.signal ?? options.signal
+  // A Codex route read can settle a source fence, so it must reach the route
+  // instead of reusing a browser-cached response from before that fence.
   const data = await api.get(
     query.soulId ? `/api/runtime/souls/${encodeURIComponent(query.soulId)}/history` :
     `/api/fresh-agent/threads/${encodeURIComponent(sessionType)}/${encodeURIComponent(provider)}/${encodeURIComponent(threadId)}${buildQueryString([
@@ -757,7 +760,7 @@ export async function getFreshAgentThreadSnapshot(
       ['cwd', query.cwd],
       ['trigger', query.trigger],
     ])}`,
-    { ...options, signal },
+    { ...options, ...(!query.soulId && provider === 'codex' ? { cache: 'no-store' as const } : {}), signal },
   )
   const parsed = FreshAgentSnapshotSchema.safeParse(data)
   if (!parsed.success) {

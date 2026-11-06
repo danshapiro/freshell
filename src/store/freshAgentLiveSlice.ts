@@ -105,6 +105,13 @@ function retireLiveProjection(session: FreshAgentLiveSession, nextNativeSessionI
   session.expectedTurnIds = []
 }
 
+function promoteNativeClaimRetirement(session: FreshAgentLiveSession): void {
+  if (session.nativeClaim) delete session.uncertainProjectionIds?.[session.nativeClaim.projectionId]
+  delete session.nativeClaim
+  delete session.routeOnlyProjectionId
+  delete session.routeOnlyObservationVersion
+}
+
 /** Session keys are `${sessionType}:${provider}:${sessionId}`; the id may itself contain ':'. */
 function sessionIdOfKey(key: string): string {
   return key.split(':').slice(2).join(':')
@@ -141,8 +148,8 @@ function isViewed(state: FreshAgentLiveState, key: string): boolean {
 }
 
 function dropUnviewedTail(state: FreshAgentLiveState, key: string): void {
-  const { retiredProjectionIds, retiredRetainedSourceKeys, uncertainProjectionIds, uncertainRetainedSourceKeys, awaitingNativeSessionId } = state.bySession[key]
-  if (!retiredProjectionIds && !retiredRetainedSourceKeys && !uncertainProjectionIds && !uncertainRetainedSourceKeys && !awaitingNativeSessionId) {
+  const { retiredProjectionIds, retiredRetainedSourceKeys, uncertainProjectionIds, uncertainRetainedSourceKeys, awaitingNativeSessionId, nativeClaim, routeOnlyProjectionId, routeOnlyObservationVersion } = state.bySession[key]
+  if (!retiredProjectionIds && !retiredRetainedSourceKeys && !uncertainProjectionIds && !uncertainRetainedSourceKeys && !awaitingNativeSessionId && !nativeClaim && !routeOnlyProjectionId) {
     delete state.bySession[key]
     return
   }
@@ -155,6 +162,9 @@ function dropUnviewedTail(state: FreshAgentLiveState, key: string): void {
     ...(uncertainProjectionIds ? { uncertainProjectionIds } : {}),
     ...(uncertainRetainedSourceKeys ? { uncertainRetainedSourceKeys } : {}),
     ...(awaitingNativeSessionId ? { awaitingNativeSessionId } : {}),
+    ...(nativeClaim ? { nativeClaim } : {}),
+    ...(routeOnlyProjectionId ? { routeOnlyProjectionId } : {}),
+    ...(routeOnlyObservationVersion !== undefined ? { routeOnlyObservationVersion } : {}),
   }
 }
 
@@ -188,6 +198,28 @@ function observeUncertainProjection(
   }
 }
 
+function observeCompetingProjection(
+  state: FreshAgentLiveState,
+  locator: FreshAgentSessionLocator,
+  session: FreshAgentLiveSession,
+  projectionId: string,
+  historyGeneration: number,
+  revision: number,
+): void {
+  const claim = session.nativeClaim!
+  const previous = claim.competing
+  const different = !previous || previous.projectionId !== projectionId
+  claim.observationVersion += 1
+  if (different || previous.historyGeneration < historyGeneration) {
+    claim.competing = { projectionId, historyGeneration, revision }
+  } else if (previous.historyGeneration === historyGeneration) {
+    previous.revision = Math.max(previous.revision, revision)
+  }
+  // A newly observed projection needs a read started after it. Later patches
+  // advance coverage without continually restarting a read of that same Q.
+  if (different) advanceSnapshotSourceRevision(state, makeFreshAgentSessionKey(locator))
+}
+
 /** A source-identified snapshot can resolve an unknown projection only after
  * this connection announces the same source. Known retired sources stay fenced. */
 export function acceptsTranscriptProjectionSnapshot(
@@ -195,6 +227,8 @@ export function acceptsTranscriptProjectionSnapshot(
   locator: FreshAgentSessionLocator,
   projectionId: string,
   nativeSessionId?: string,
+  fromCurrentNativeClaimRead = false,
+  retainedSourceKey?: string,
 ): boolean {
   const key = makeFreshAgentSessionKey(locator)
   const session = state.bySession[key]
@@ -204,6 +238,8 @@ export function acceptsTranscriptProjectionSnapshot(
   const expected = session?.awaitingNativeSessionId ?? announced
   if (locator.provider === 'codex' && nativeSessionId && expected && nativeSessionId !== expected) return false
   if (uncertain) {
+    if (uncertain.nativeClaim) return (fromCurrentNativeClaimRead || Boolean(retainedSourceKey && isCurrentNativeAnnouncement(state, locator, nativeSessionId)))
+      && nativeSessionId === session?.nativeClaim?.nativeSessionId
     return isCurrentNativeAnnouncement(state, locator, nativeSessionId)
   }
   return true
@@ -288,11 +324,35 @@ const freshAgentLiveSlice = createSlice({
       const key = makeFreshAgentSessionKey(action.payload)
       advanceSnapshotSourceRevision(state, key)
       const session = state.bySession[key]
-      if (session) retireLiveProjection(session, undefined, true)
+      if (session) {
+        retireLiveProjection(session, undefined, true)
+        promoteNativeClaimRetirement(session)
+      }
+    },
+    snapshotSourceRetirementPromoted(state, action: PayloadAction<FreshAgentSessionLocator>) {
+      const session = state.bySession[makeFreshAgentSessionKey(action.payload)]
+      if (!session) return
+      retireLiveProjection(session, undefined, true)
+      promoteNativeClaimRetirement(session)
+    },
+    snapshotNativeClaimed(state, action: PayloadAction<FreshAgentSessionLocator & { nativeSessionId: string }>) {
+      const { nativeSessionId, ...locator } = action.payload
+      const key = makeFreshAgentSessionKey(locator)
+      advanceSnapshotSourceRevision(state, key)
+      const session = state.bySession[key]
+      const projectionId = session?.projection?.id
+      if (!session || !projectionId || session.retiredProjectionIds?.[projectionId]) return
+      const retainedSourceKey = session.retainedSourceKey
+      retireLiveProjection(session, undefined, true)
+      const uncertain = session.uncertainProjectionIds ??= {}
+      uncertain[projectionId] = { nativeClaim: true }
+      session.nativeClaim = { projectionId, nativeSessionId, observationVersion: 0 }
+      if (retainedSourceKey) (session.uncertainRetainedSourceKeys ??= {})[retainedSourceKey] = true
     },
     nativeProjectionRetired(state, action: PayloadAction<FreshAgentSessionLocator & { awaitingNativeSessionId: string }>) {
       const { awaitingNativeSessionId, ...locator } = action.payload
       const session = sessionFor(state, locator)
+      promoteNativeClaimRetirement(session)
       retireLiveProjection(session, awaitingNativeSessionId)
       const key = makeFreshAgentSessionKey(locator)
       advanceSnapshotSourceRevision(state, key)
@@ -322,7 +382,14 @@ const freshAgentLiveSlice = createSlice({
     transcriptProjectionBound(state, action: PayloadAction<FreshAgentSessionLocator & { projectionId: string; historyGeneration: number }>) {
       const { projectionId, historyGeneration, ...locator } = action.payload
       const session = sessionFor(state, locator)
-      if (session.retiredProjectionIds?.[projectionId] || session.uncertainProjectionIds?.[projectionId]) return
+      if (session.retiredProjectionIds?.[projectionId] && !session.uncertainProjectionIds?.[projectionId]) return
+      if (session.nativeClaim) {
+        if (session.nativeClaim.projectionId !== projectionId) {
+          observeCompetingProjection(state, locator, session, projectionId, historyGeneration, 0)
+        }
+        return
+      }
+      if (session.uncertainProjectionIds?.[projectionId]) return
       const previous = session.projection
       // A later incarnation is accepted through the view's fenced snapshot
       // request. Delayed init frames cannot replace an already-bound source.
@@ -347,12 +414,17 @@ const freshAgentLiveSlice = createSlice({
     transcriptPatchApplied(state, action: PayloadAction<FreshAgentSessionLocator & { patch: FreshAgentTranscriptPatch }>) {
       const { patch, ...locator } = action.payload
       const session = sessionFor(state, locator)
-      const uncertain = session.uncertainProjectionIds?.[patch.projectionId]
-      if (uncertain) {
-        observeUncertainProjection(session, patch, state.announcedNativeBySession[makeFreshAgentSessionKey(locator)])
+      if (session.retiredProjectionIds?.[patch.projectionId] && !session.uncertainProjectionIds?.[patch.projectionId]) return
+      if (session.nativeClaim && session.nativeClaim.projectionId !== patch.projectionId) {
+        const revision = patch.ops.reduce((maximum, op) => Math.max(maximum, op.revision), 0)
+        observeCompetingProjection(state, locator, session, patch.projectionId, patch.historyGeneration, revision)
         return
       }
-      if (session.retiredProjectionIds?.[patch.projectionId]) return
+      const uncertain = session.uncertainProjectionIds?.[patch.projectionId]
+      if (uncertain) {
+        observeUncertainProjection(session, patch, session.nativeClaim?.nativeSessionId ?? state.announcedNativeBySession[makeFreshAgentSessionKey(locator)])
+        return
+      }
       if (session.projection?.id === patch.projectionId) session.projection = applyFreshAgentTranscriptPatch(session.projection, patch)
       else {
         // Buffer a bounded reconnect race without adopting its source. The
@@ -366,12 +438,17 @@ const freshAgentLiveSlice = createSlice({
         else watermark.gap = true
       }
     },
-    transcriptProjectionSnapshotReceived(state, action: PayloadAction<FreshAgentSessionLocator & { snapshot: FreshAgentSnapshot; retainedSourceKey?: string; nativeSessionId?: string }>) {
-      const { snapshot, retainedSourceKey, nativeSessionId, ...locator } = action.payload
+    transcriptProjectionSnapshotReceived(state, action: PayloadAction<FreshAgentSessionLocator & { snapshot: FreshAgentSnapshot; retainedSourceKey?: string; nativeSessionId?: string; fromCurrentNativeClaimRead?: boolean; retainedSourceVerified?: boolean }>) {
+      const { snapshot, retainedSourceKey, nativeSessionId, fromCurrentNativeClaimRead = false, retainedSourceVerified = false, ...locator } = action.payload
       const metadata = readTranscriptProjection(snapshot)
       if (!metadata) return
-      if (!acceptsTranscriptProjectionSnapshot(state, locator, metadata.id, nativeSessionId)) return
+      const existing = state.bySession[makeFreshAgentSessionKey(locator)]
+      const verifiedRetainedSource = retainedSourceVerified ? retainedSourceKey : undefined
+      if (retainedSourceKey && (existing?.nativeClaim || existing?.routeOnlyProjectionId) && !verifiedRetainedSource) return
+      if (!acceptsTranscriptProjectionSnapshot(state, locator, metadata.id, nativeSessionId, fromCurrentNativeClaimRead, verifiedRetainedSource)) return
       const session = sessionFor(state, locator)
+      const claim = session.nativeClaim
+      if (claim && !fromCurrentNativeClaimRead && !verifiedRetainedSource) return
       const sameProjection = session.projection?.id === metadata.id
       const observed = session.uncertainProjectionIds?.[metadata.id]?.observed
       if (retainedSourceKey) {
@@ -389,6 +466,7 @@ const freshAgentLiveSlice = createSlice({
           delete session.uncertainRetainedSourceKeys![retainedSourceKey]
           delete session.retiredRetainedSourceKeys![retainedSourceKey]
         }
+        if (retainedSourceVerified && (claim || session.routeOnlyProjectionId)) advanceSnapshotSourceRevision(state, makeFreshAgentSessionKey(locator))
       }
       if (session.projection && session.projection.id !== metadata.id) {
         session.retiredProjectionIds ??= {}
@@ -396,12 +474,25 @@ const freshAgentLiveSlice = createSlice({
         if (!retainedSourceKey) retireRetainedSource(session)
       }
       if (!session.projection || session.projection.id !== metadata.id || session.projection.historyGeneration < metadata.historyGeneration) {
-        session.projection = bindTranscriptProjection(session.projection, metadata.id, metadata.historyGeneration)
+        const previous = session.routeOnlyProjectionId && session.routeOnlyProjectionId !== metadata.id ? undefined : session.projection
+        session.projection = bindTranscriptProjection(previous, metadata.id, metadata.historyGeneration)
       }
       if (session.uncertainProjectionIds?.[metadata.id]) {
         delete session.uncertainProjectionIds[metadata.id]
         delete session.retiredProjectionIds![metadata.id]
       }
+      if (claim) {
+        if (claim.projectionId !== metadata.id) delete session.uncertainProjectionIds?.[claim.projectionId]
+        delete session.nativeClaim
+        if (fromCurrentNativeClaimRead) {
+          session.routeOnlyProjectionId = metadata.id
+          session.routeOnlyObservationVersion = claim.observationVersion
+        }
+      }
+      if (retainedSourceKey) {
+        delete session.routeOnlyProjectionId
+        delete session.routeOnlyObservationVersion
+      } else if (session.routeOnlyProjectionId) session.routeOnlyProjectionId = metadata.id
       if (locator.provider === 'codex') {
         if (nativeSessionId) session.projectionNativeSessionId = nativeSessionId
         else if (!sameProjection) delete session.projectionNativeSessionId
@@ -417,6 +508,15 @@ const freshAgentLiveSlice = createSlice({
         }
         session.projection.needsResnapshot = true
         session.projection.eventRevision = Math.max(session.projection.eventRevision, observed.revision)
+      }
+      const competing = claim?.competing
+      if (competing?.projectionId === metadata.id && (competing.historyGeneration > metadata.historyGeneration
+        || competing.historyGeneration === metadata.historyGeneration && competing.revision > metadata.eventRevision)) {
+        if (competing.historyGeneration > session.projection.historyGeneration) {
+          session.projection = bindTranscriptProjection(session.projection, metadata.id, competing.historyGeneration)
+        }
+        session.projection.needsResnapshot = true
+        session.projection.eventRevision = Math.max(session.projection.eventRevision, competing.revision)
       }
       for (const patch of session.unboundTranscriptPatches ?? []) {
         if (patch.projectionId === metadata.id) session.projection = applyFreshAgentTranscriptPatch(session.projection, patch)
@@ -622,6 +722,8 @@ const freshAgentLiveSlice = createSlice({
 
 export const {
   snapshotSourceChanged,
+  snapshotNativeClaimed,
+  snapshotSourceRetirementPromoted,
   nativeProjectionRetired,
   nativeSourceAnnounced,
   nativeSourceAnnouncementCleared,

@@ -3740,7 +3740,7 @@ export function FreshAgentView({
       return { initialCapture: previous === null, ...Object.fromEntries(Object.entries(inputs)
         .map(([name, value]) => [name, previous !== null && previous[name] !== value])) }
     })
-    const applySnapshot = (next: FreshAgentSnapshot) => {
+    const applySnapshot = (next: FreshAgentSnapshot, ordinaryRoute: boolean, claimObservation?: number) => {
       const currentPane = currentSnapshotPane()
       if (!currentPane) return
       const historyOnly = isNativeHistoryOnlySnapshot(next)
@@ -3756,6 +3756,33 @@ export function FreshAgentView({
       const liveState = appStore.getState().freshAgentLive
       const liveSession = liveState?.bySession[projectionKey]
       const liveProjection = liveSession?.projection
+      const claim = liveSession?.nativeClaim
+      if (claim && claimObservation !== claim.observationVersion && projectionMetadata?.id !== claim.competing?.projectionId) {
+        auditRequest('identity_rejected', () => ({ reason: 'competing_projection_after_read' }))
+        requestSnapshotRefresh('event')
+        return
+      }
+      // Another pane can settle the claim while this read is in flight. Its
+      // older observation still cannot overwrite that pane's later result.
+      if (!claim && liveSession?.routeOnlyProjectionId
+        && claimObservation !== liveSession.routeOnlyObservationVersion) {
+        auditRequest('identity_rejected', () => ({ reason: 'native_claim_settled_after_read' }))
+        requestSnapshotRefresh('event')
+        return
+      }
+      const currentNativeClaimRead = Boolean(claim && ordinaryRoute && provider === 'codex' && !requestReadOnly && !historyOnly
+        && resolved.extensions?.codex?.statusFromLiveState === true
+        && resolved.provider === provider && resolved.sessionType === requestSessionType
+        && resolved.threadId === claim.nativeSessionId && projectionMetadata?.id
+        && projectionMetadata.historyGeneration >= 0 && projectionMetadata.eventRevision >= 0)
+      // History, a malformed projection, or a soul-history fallback cannot
+      // settle the route claim. Only the checked ordinary live read can.
+      if (claim && !currentNativeClaimRead) {
+        auditRequest('identity_rejected', () => ({ reason: 'unverified_native_claim_read' }))
+        return
+      }
+      const routeOnlyManaged = Boolean(currentPane.soulId && ordinaryRoute
+        && (currentNativeClaimRead || liveSession?.routeOnlyProjectionId))
       const announcedNative = liveSession?.awaitingNativeSessionId ?? liveState?.announcedNativeBySession?.[projectionKey]
       if (provider === 'codex' && !requestReadOnly && !historyOnly
         && resolved.extensions?.codex?.statusFromLiveState === true
@@ -3776,7 +3803,7 @@ export function FreshAgentView({
       const identifiedNative = provider === 'codex'
         && (liveCodexProjection || historyOnly || (requestPaneSoulId && resolved.extensions?.[provider]?.statusFromLiveState === true))
         ? resolved.threadId : undefined
-      if (projectionMetadata && !acceptsTranscriptProjectionSnapshot(liveState, projectionLocator, projectionMetadata.id, identifiedNative)) {
+      if (projectionMetadata && !acceptsTranscriptProjectionSnapshot(liveState, projectionLocator, projectionMetadata.id, identifiedNative, currentNativeClaimRead)) {
         auditRequest('identity_rejected', () => ({ reason: 'projection_source_or_retirement' }))
         return
       }
@@ -3813,9 +3840,9 @@ export function FreshAgentView({
       const snapshotAccepted = displaySnapshot !== previousSnapshot
       if (snapshotAccepted) snapshotRequestAuthorityRef.current.applied = requestSerial
       if (snapshotAccepted && projectionMetadata) dispatch(transcriptProjectionSnapshotReceived({
-        ...projectionLocator, snapshot: resolved, nativeSessionId: snapshotNativeSessionId,
+        ...projectionLocator, snapshot: resolved, nativeSessionId: snapshotNativeSessionId, fromCurrentNativeClaimRead: currentNativeClaimRead,
       }))
-      const snapshotStatusAuthoritative = !requestReadOnly && !historyOnly && (provider === 'codex'
+      const snapshotStatusAuthoritative = !routeOnlyManaged && !requestReadOnly && !historyOnly && (provider === 'codex'
         || resolved.extensions?.[provider]?.statusFromLiveState === true)
       const outgoing = outgoingTurnRef.current
       if (
@@ -3885,7 +3912,7 @@ export function FreshAgentView({
       }
       // This read has no live actor authority, even if Retry cleared the intervention while it ran.
       const liveProviderState = resolved.extensions?.[provider]
-      if (requestReadOnly || historyOnly) return
+      if (requestReadOnly || historyOnly || routeOnlyManaged) return
       // An older coalesced reader may already display this exact response.
       // The current reader can still authorize recovery; rejected revisions cannot.
       const snapshotAcceptedForRecovery = snapshotAccepted || displaySnapshot === resolved
@@ -4203,19 +4230,21 @@ export function FreshAgentView({
     void getSnapshotScheduler().schedule(key, trigger, async () => {
       ran = true
       auditRequest('run_started')
+      const liveAtStart = appStore.getState().freshAgentLive?.bySession[projectionKey]
+      const claimObservation = liveAtStart?.nativeClaim?.observationVersion ?? liveAtStart?.routeOnlyObservationVersion
       // NO signal: the run may execute on behalf of other panes sharing the
       // key, or after this effect cleaned up (A2). Staleness is handled by
       // isStaleSnapshotRequest() when the outcome is applied, not by aborting.
       const options = { ...(requestCwd ? { cwd: requestCwd } : {}), trigger }
       if (requestSoulId) {
         auditRequest('soul_started', () => ({ source: 'direct' }))
-        return getFreshAgentThreadSnapshot(requestSessionType, provider, sessionId, { ...options, soulId: requestSoulId })
+        return { snapshot: await getFreshAgentThreadSnapshot(requestSessionType, provider, sessionId, { ...options, soulId: requestSoulId }), ordinaryRoute: false, claimObservation }
       }
       try {
         auditRequest('native_started')
         const snapshot = await getFreshAgentThreadSnapshot(requestSessionType, provider, sessionId, options)
         auditRequest('native_completed', () => snapshotAuditData(snapshot))
-        if (!requestPaneSoulId || !isNativeHistoryOnlySnapshot(snapshot)) return snapshot
+        if (!requestPaneSoulId || !isNativeHistoryOnlySnapshot(snapshot)) return { snapshot, ordinaryRoute: true, claimObservation }
       } catch (error) {
         auditRequest('native_failed', () => ({ errorKind: error instanceof Error && error.name === 'AbortError' ? 'abort' : 'error' }))
         if (!requestPaneSoulId || isStaleSnapshotRequest('native-error')) throw error
@@ -4224,13 +4253,13 @@ export function FreshAgentView({
       // Capture the soul with the request and retain the existing application fences.
       if (isStaleSnapshotRequest('before-soul')) throw new Error('Conversation source changed during snapshot read')
       auditRequest('soul_started', () => ({ source: 'fallback' }))
-      return getFreshAgentThreadSnapshot(requestSessionType, provider, sessionId, { ...options, soulId: requestPaneSoulId })
+      return { snapshot: await getFreshAgentThreadSnapshot(requestSessionType, provider, sessionId, { ...options, soulId: requestPaneSoulId }), ordinaryRoute: false, claimObservation }
     },
     ).then((outcome) => {
       auditRequest('outcome_received', () => ({ outcome: outcome.status, ran }))
       if (isStaleSnapshotRequest('outcome')) return
       if (outcome.status === 'ok') {
-        applySnapshot(outcome.value as FreshAgentSnapshot)
+        applySnapshot(outcome.value.snapshot as FreshAgentSnapshot, outcome.value.ordinaryRoute, outcome.value.claimObservation)
         return
       }
       if (outcome.status === 'rate-limited' || outcome.status === 'backoff') {

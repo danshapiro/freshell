@@ -364,6 +364,15 @@ describe('visible-first read-model helpers', () => {
     )
   })
 
+  it('fetches an ordinary Codex snapshot without reusing a cached response', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson(codexContractSnapshot))
+    await getFreshAgentThreadSnapshot('freshcodex', 'codex', 'thread-1')
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/api/fresh-agent/threads/freshcodex/codex/thread-1',
+      expect.objectContaining({ cache: 'no-store' }),
+    )
+  })
+
   it('reads managed history from the exact soul after web restart without an alias lookup', async () => {
     mockFetch.mockResolvedValueOnce(mockJson(codexContractSnapshot))
     await getFreshAgentThreadSnapshot('freshcodex', 'codex', 'presentation-alias', { soulId: 'retained-soul' })

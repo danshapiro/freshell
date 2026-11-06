@@ -587,7 +587,12 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         // A retained snapshot names its thread even on older frames that do
         // not repeat that identity in source.nativeSessionId.
         const nativeSessionId = locator.provider === 'codex' ? snapshot.threadId : undefined
-        innerDispatch(transcriptProjectionSnapshotReceived({ ...locator, snapshot, retainedSourceKey: sourceKey, nativeSessionId }))
+        const owners = root.managedRuntime?.souls.filter((candidate) => candidate.freshAgentSessionId === sessionId
+          || candidate.freshAgentPresentationIds?.includes(sessionId)) ?? []
+        const retainedSourceVerified = Boolean(soul && owners.length === 1 && owners[0].soulId === soul.soulId
+          && soul.provider === 'codex' && soul.freshAgentSessionType === locator.sessionType
+          && soul.nativeSessionId === nativeSessionId)
+        innerDispatch(transcriptProjectionSnapshotReceived({ ...locator, snapshot, retainedSourceKey: sourceKey, nativeSessionId, retainedSourceVerified }))
         const live = getState().freshAgentLive?.bySession[makeFreshAgentSessionKey(locator)]
         if (live?.retainedSourceKey !== sourceKey || live.retainedSnapshot !== snapshot) return
         const status = (['creating', 'starting', 'connected', 'running', 'idle', 'compacting', 'exited', 'stuck'] as const).find((status) => status === snapshot.status)
