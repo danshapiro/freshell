@@ -2959,6 +2959,137 @@ describe('FreshAgentView', () => {
     }
   })
 
+  it('keeps a displayed projection live when its unchanged native fallback is first recorded', async () => {
+    const route = await mountProjectionReviewRoute('inventory-native-claim-displayed', false, false, 'native-b')
+    const held = createDeferred<unknown>()
+    const current = createDeferred<unknown>()
+    const key = 'freshcodex:codex:native-b'
+    try {
+      const previous = managedCodexInventory('native-b')
+      previous.souls = [previous.souls[0]]
+      previous.viewIntents[0].kind = 'explicit'
+      previous.viewIntents[0].visibility = 'hidden'
+      apiMock.getManagedRuntimeInventory.mockResolvedValueOnce(previous)
+      await act(async () => queueManagedRuntimeRefresh(route.store as any, 'before displayed claim'))
+      await act(async () => route.initial.resolve(hostedCodexProjectionSnapshot('native-b', 'unchanged-q', 'Before native claim', 1)))
+      await expectRenderedText('Before native claim')
+      expect(route.store.getState().freshAgentLive.bySession[key]?.projection?.id).toBe('unchanged-q')
+
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(held.promise)
+      act(() => route.store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === held.promise)).toBe(true))
+      const beforeRevision = route.store.getState().freshAgentLive.snapshotSourceRevisionBySession[key] ?? 0
+      const claimed = managedCodexInventory('native-b')
+      claimed.souls = [claimed.souls[0]]
+      claimed.souls[0].freshAgentPresentationIds = ['native-b']
+      claimed.viewIntents[0].kind = 'explicit'
+      claimed.viewIntents[0].visibility = 'hidden'
+      claimed.revision += 1
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(current.promise)
+      apiMock.getManagedRuntimeInventory.mockResolvedValueOnce(claimed)
+      await act(async () => queueManagedRuntimeRefresh(route.store as any, 'record displayed claim'))
+      expect(route.store.getState().freshAgentLive.snapshotSourceRevisionBySession[key]).toBe(beforeRevision + 1)
+      const status = route.store.getState().freshAgent.sessions[key]?.status
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === current.promise)).toBe(true))
+      await act(async () => held.resolve({ ...hostedCodexProjectionSnapshot('native-b', 'unchanged-q', 'Stale held claim response', 2), status: 'exited' }))
+      expect(screen.queryByText('Stale held claim response')).not.toBeInTheDocument()
+      expect(route.store.getState().freshAgent.sessions[key]?.status).toBe(status)
+      await act(async () => current.resolve(hostedCodexProjectionSnapshot('native-b', 'unchanged-q', 'After native claim', 2)))
+      const live = route.store.getState().freshAgentLive.bySession[key]
+      expect(live?.projection?.id, `same projection retired: ${Boolean(live?.retiredProjectionIds?.['unchanged-q'])}`).toBe('unchanged-q')
+      await expectRenderedText('After native claim')
+      act(() => route.patch('unchanged-q', 3, 'After native claim patch'))
+      await expectRenderedText('After native claim patch')
+    } finally {
+      cleanup()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial snapshot'))
+      held.resolve(hostedCodexSnapshot('native-b', 'Held snapshot'))
+      current.resolve(hostedCodexSnapshot('native-b', 'Current snapshot'))
+    }
+  })
+
+  it('retires an old projection when a first native claim and a proven replacement share one refresh', async () => {
+    const route = await mountProjectionReviewRoute('inventory-native-claim-replaced', false, false, 'native-b')
+    const held = createDeferred<unknown>()
+    const current = createDeferred<unknown>()
+    const key = 'freshcodex:codex:native-b'
+    try {
+      const previous = managedCodexInventory('native-b')
+      previous.souls = [previous.souls[0]]
+      previous.souls[0].hostBootId = 'host-one'
+      previous.viewIntents[0].kind = 'explicit'
+      previous.viewIntents[0].visibility = 'hidden'
+      apiMock.getManagedRuntimeInventory.mockResolvedValueOnce(previous)
+      await act(async () => queueManagedRuntimeRefresh(route.store as any, 'before replacement claim'))
+      await act(async () => route.initial.resolve(hostedCodexProjectionSnapshot('native-b', 'replaced-q', 'Before replacement claim', 1)))
+      await expectRenderedText('Before replacement claim')
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(held.promise)
+      act(() => route.store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === held.promise)).toBe(true))
+
+      act(() => route.store.dispatch(initLayout({ tabId: 'tab-2', paneId: 'pane-2', content: {
+        kind: 'fresh-agent', ...route.locator, createRequestId: 'replacement-claim-owned-pane', status: 'idle',
+        soulId: 'soul-one', viewIntentId: 'view-one', incarnationId: 'incarnation-one',
+        sessionRef: { provider: 'codex', sessionId: 'native-b' },
+      } })))
+      const replacement = managedCodexInventory('native-b')
+      replacement.souls = [replacement.souls[0]]
+      replacement.souls[0].incarnationId = 'incarnation-replacement'
+      replacement.souls[0].hostBootId = 'host-two'
+      replacement.souls[0].freshAgentPresentationIds = ['native-b']
+      replacement.viewIntents[0].kind = 'explicit'
+      replacement.viewIntents[0].visibility = 'hidden'
+      replacement.revision += 1
+      const plan = buildManagedRuntimeMergePlan(replacement, route.store.getState() as any)
+      expect(plan.updates.find((update) => update.paneId === 'pane-2')?.content).toMatchObject({
+        sessionId: 'native-b', incarnationId: 'incarnation-replacement',
+      })
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(current.promise)
+      apiMock.getManagedRuntimeInventory.mockResolvedValueOnce(replacement)
+      await act(async () => queueManagedRuntimeRefresh(route.store as any, 'replacement and first claim'))
+      const status = route.store.getState().freshAgent.sessions[key]?.status
+      expect(screen.queryByText('Before replacement claim')).not.toBeInTheDocument()
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === current.promise)).toBe(true))
+      await act(async () => held.resolve({ ...hostedCodexProjectionSnapshot('native-b', 'replaced-q', 'Held replaced output', 2), status: 'exited' }))
+      act(() => {
+        route.announce('native-b')
+        route.init('replaced-q')
+        route.patch('replaced-q', 3, 'Replaced patch')
+        route.event({ type: 'freshAgent.host.backpressure', retainedState: {
+          source: { soulId: 'soul-one', incarnationId: 'incarnation-one', hostBootId: 'host-one',
+            nativeSessionId: 'native-b', projectionId: 'replaced-q', ownerEpoch: 0, ownerGeneration: 0 },
+          snapshot: hostedCodexProjectionSnapshot('native-b', 'replaced-q', 'Replaced retained output', 3),
+          pendingControls: [], attentionMarks: [],
+        } })
+      })
+      expect(screen.queryByText('Held replaced output')).not.toBeInTheDocument()
+      expect(screen.queryByText('Replaced patch')).not.toBeInTheDocument()
+      expect(screen.queryByText('Replaced retained output')).not.toBeInTheDocument()
+      expect(route.store.getState().freshAgent.sessions[key]?.status).toBe(status)
+      expect(route.store.getState().freshAgentLive.bySession[key]?.projection).toBeUndefined()
+      act(() => route.event({ type: 'freshAgent.host.backpressure', retainedState: {
+        source: { soulId: 'soul-one', incarnationId: 'incarnation-replacement', hostBootId: 'host-two',
+          nativeSessionId: 'native-b', projectionId: 'replacement-q', ownerEpoch: 0, ownerGeneration: 0 },
+        snapshot: hostedCodexProjectionSnapshot('native-b', 'replacement-q', 'Replacement claim output', 1),
+        pendingControls: [], attentionMarks: [],
+      } }))
+      await expectRenderedText('Replacement claim output')
+      expect(route.store.getState().freshAgentLive.bySession[key]?.projection?.id).toBe('replacement-q')
+      act(() => route.patch('replacement-q', 2, 'Replacement claim patch'))
+      await expectRenderedText('Replacement claim patch')
+      await act(async () => current.resolve(hostedCodexProjectionSnapshot('native-b', 'replaced-q', 'Late replaced response', 4)))
+      act(() => route.patch('replaced-q', 5, 'Late replaced patch'))
+      expect(screen.queryByText('Late replaced response')).not.toBeInTheDocument()
+      expect(screen.queryByText('Late replaced patch')).not.toBeInTheDocument()
+      expect(route.store.getState().freshAgentLive.bySession[key]?.projection?.id).toBe('replacement-q')
+    } finally {
+      cleanup()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial snapshot'))
+      held.resolve(hostedCodexSnapshot('native-b', 'Held snapshot'))
+      current.resolve(hostedCodexSnapshot('native-b', 'Current snapshot'))
+    }
+  })
+
   it.each(['same', 'replacement'] as const)('fences a native fallback when its presentation is recorded with the %s incarnation', async (incarnation) => {
     const route = await mountProjectionReviewRoute(`inventory-native-claim-${incarnation}`, false, false, 'native-b')
     const current = createDeferred<unknown>()
