@@ -2983,7 +2983,11 @@ impl FreshCodexState {
             let state = self.clone();
             let operation_request_id = request_id.clone();
             let operation_view_id = view_id.clone();
-            let operation_session_id = resume_session_id.clone();
+            // Recovery-map identity, requester identity, and the provider's
+            // native thread id are separate. Resolve the native id before the
+            // shared operation starts so an alias-first create cannot submit
+            // its provisional coordinator key to `thread/resume`.
+            let provider_native_thread_id = self.resolve_ownership_key(&resume_session_id);
             let operation_cwd = cwd.clone();
             let operation_model = model.clone();
             let operation_effort = effort.clone();
@@ -3004,12 +3008,12 @@ impl FreshCodexState {
                     Some(request_id.clone()),
                     move || preflight_state.recovery_admission_refusal(&preflight_session_id),
                     move || async move {
-                        if state.is_known_dead_thread(&operation_session_id).await {
+                        if state.is_known_dead_thread(&provider_native_thread_id).await {
                             let outcome = state.fail_create(
                                 &operation_request_id,
                                 operation_view_id.as_deref(),
                                 "FRESH_AGENT_CREATE_FAILED",
-                                &format!("codex thread {operation_session_id} not found"),
+                                &format!("codex thread {provider_native_thread_id} not found"),
                             );
                             return Err(crate::session_recovery::RecoveryAttemptFailure::refusal(
                                 CodexRecoveryFailure::CreateRefused(outcome),
@@ -3019,7 +3023,7 @@ impl FreshCodexState {
                             .handle_create_resume_operation(
                                 operation_request_id,
                                 operation_view_id,
-                                operation_session_id,
+                                provider_native_thread_id,
                                 operation_cwd,
                                 operation_model,
                                 operation_effort,
@@ -8533,7 +8537,7 @@ impl FreshCodexState {
         }
 
         let state = self.clone();
-        let operation_session_id = session_id.to_string();
+        let provider_native_thread_id = self.resolve_ownership_key(session_id);
         let preflight_state = self.clone();
         let preflight_session_id = session_id.to_string();
         let answer = self
@@ -8544,7 +8548,7 @@ impl FreshCodexState {
                 move || preflight_state.recovery_admission_refusal(&preflight_session_id),
                 move || async move {
                     match state
-                        .ensure_session_alive_once(&operation_session_id, observed)
+                        .ensure_session_alive_once(&provider_native_thread_id, observed)
                         .await
                     {
                         Ok(outcome) => Ok(CodexRecoveryReady::Alive(outcome)),
@@ -11092,7 +11096,7 @@ impl FreshCodexState {
         }
 
         let state = self.clone();
-        let operation_thread_id = thread_id.to_string();
+        let provider_native_thread_id = self.resolve_ownership_key(thread_id);
         let operation_cwd = cwd.map(str::to_string);
         let recovery_key = self.recovery_map_key(thread_id);
         let preflight_state = self.clone();
@@ -11106,7 +11110,7 @@ impl FreshCodexState {
                 move || async move {
                     match state
                         .ensure_session_resumable_once(
-                            &operation_thread_id,
+                            &provider_native_thread_id,
                             operation_cwd.as_deref(),
                             observed,
                             None,
@@ -30286,6 +30290,175 @@ pub(crate) mod tests {
             !operations.contains(&alias_id),
             "the provisional ownership alias is never sent to Codex: {operations}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn task005_round3_codex_alias_and_canonical_start_orders_use_native_id() {
+        let _guard = ENV_LOCK.lock().await;
+        for alias_starts_first in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let order = if alias_starts_first {
+                "alias_first"
+            } else {
+                "canonical_first"
+            };
+            let log_path = temp.path().join("native-operations.jsonl");
+            configure_fake_codex_cmd(
+                &json!({
+                    "delayMethodsMs": { "thread/resume": 800 },
+                    "appendThreadOperationLogPath": log_path.to_string_lossy(),
+                    "overrides": {
+                        "thread/resume": {
+                            "error": { "code": -32000, "message": "temporary resume failure" }
+                        }
+                    }
+                })
+                .to_string(),
+            );
+            let (mut state, _rx) = state_with_bus();
+            let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+            let alias_id = format!("{PENDING_CREATE_PREFIX}task005-r3-codex-{order}");
+            let canonical_id = format!("thread-task005-r3-codex-{order}");
+            let operation_id = format!("task005-r3-codex-{order}-seed");
+            let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
+                PROVIDER,
+                &alias_id,
+                freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                &operation_id,
+                None,
+                "task005-r3-test",
+                1,
+            ) else {
+                panic!("the provisional id obtains its normal create-start fence");
+            };
+            assert!(matches!(
+                registry.rekey_starting(
+                    PROVIDER,
+                    &alias_id,
+                    &canonical_id,
+                    &operation_id,
+                    generation,
+                ),
+                freshell_ownership::CommitOutcome::Committed
+            ));
+            registry.fail(PROVIDER, &canonical_id, &operation_id, generation, false);
+            state.set_ownership(Arc::clone(&registry));
+            assert_eq!(state.resolve_ownership_key(&alias_id), canonical_id);
+
+            let first_id = if alias_starts_first {
+                alias_id.clone()
+            } else {
+                canonical_id.clone()
+            };
+            let first_request_id = format!("task005-r3-codex-{order}-first");
+            let first_state = state.clone();
+            let first_request_for_task = first_request_id.clone();
+            let first = tokio::spawn(async move {
+                first_state
+                    .ensure_session_resumable_for_request(
+                        &first_id,
+                        None,
+                        None,
+                        None,
+                        Some(first_request_for_task),
+                    )
+                    .await
+            });
+            let first_in_flight = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if matches!(
+                        registry.observe(PROVIDER, &canonical_id).state,
+                        freshell_ownership::OwnershipState::Starting { .. }
+                    ) {
+                        return true;
+                    }
+                    if first.is_finished() {
+                        return false;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the first request either starts or settles promptly");
+
+            let second_id = if alias_starts_first {
+                canonical_id.clone()
+            } else {
+                alias_id.clone()
+            };
+            let second_request_id = format!("task005-r3-codex-{order}-second");
+            let second_state = state.clone();
+            let second_request_for_task = second_request_id.clone();
+            let second = tokio::spawn(async move {
+                second_state
+                    .ensure_session_resumable_for_request(
+                        &second_id,
+                        None,
+                        None,
+                        None,
+                        Some(second_request_for_task),
+                    )
+                    .await
+            });
+            if first_in_flight {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while state
+                        .session_recovery
+                        .waiter_count_for_test(&format!("codex:{canonical_id}"))
+                        .await
+                        < 2
+                    {
+                        if second.is_finished() {
+                            return;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the second request joins the first recovery operation");
+            }
+
+            let (first_outcome, second_outcome) = tokio::join!(first, second);
+            assert!(
+                matches!(first_outcome.unwrap(), Err(ResumeSessionError::Transient(_))),
+                "the first requester receives the provider attempt result: alias_first={alias_starts_first}"
+            );
+            assert!(
+                matches!(second_outcome.unwrap(), Err(ResumeSessionError::Transient(_))),
+                "the second requester receives the shared provider attempt result: alias_first={alias_starts_first}"
+            );
+
+            let canonical_status = state
+                .recovery_status(&canonical_id)
+                .await
+                .expect("the shared recovery is retained for the canonical id");
+            let alias_status = state
+                .recovery_status(&alias_id)
+                .await
+                .expect("the provisional alias resolves to the same recovery facts");
+            assert_eq!(alias_status.operation_id, canonical_status.operation_id);
+            assert_eq!(canonical_status.failed_launches, 1);
+            assert_eq!(alias_status.failed_launches, 1);
+
+            let operations = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(
+                operations
+                    .lines()
+                    .filter(|line| line.contains("\"thread/resume\""))
+                    .count(),
+                1,
+                "both requesters share one native Codex resume: {operations}"
+            );
+            assert!(
+                operations.contains(&canonical_id),
+                "the native operation uses the durable Codex thread id regardless of start order: {operations}"
+            );
+            assert!(
+                !operations.contains(&alias_id),
+                "the provisional ownership alias is never sent to Codex: {operations}"
+            );
+            assert_ne!(first_request_id, second_request_id);
+        }
     }
 
     // -- TERM-25: wrong-thread resume rejection --

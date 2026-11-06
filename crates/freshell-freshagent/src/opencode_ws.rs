@@ -298,6 +298,12 @@ pub struct FreshOpencodeState {
     /// [`Self::arm_rescue_lookup_stall`].
     #[cfg(test)]
     rescue_lookup_stall: Arc<StdMutex<Option<RescueStallGate>>>,
+    /// Task 5 round-3 test seam: pause a create/attach map-hit after it has
+    /// observed `Starting`, but before existing-recovery admission. This lets
+    /// provider tests settle a failed recovery and install a terminal Handoff
+    /// in the exact stale-observation window under review.
+    #[cfg(test)]
+    map_hit_join_pause: Arc<StdMutex<Option<MapHitJoinPause>>>,
 }
 
 /// The armed rescue-stall gate's state (ep2-r3 test seam, `cfg(test)`-only).
@@ -318,6 +324,19 @@ struct RevivalCompletionPause {
     session_id: String,
     entered: tokio::sync::oneshot::Sender<()>,
     release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+struct MapHitJoinPause {
+    key: String,
+    entered: std::sync::mpsc::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+struct MapHitJoinPauseHandles {
+    entered: std::sync::mpsc::Receiver<()>,
+    release: tokio::sync::oneshot::Sender<()>,
 }
 
 /// The handles [`FreshOpencodeState::arm_rescue_stall`] hands the test
@@ -1100,6 +1119,8 @@ impl FreshOpencodeState {
             rescue_stall: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             rescue_lookup_stall: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            map_hit_join_pause: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -1249,6 +1270,33 @@ impl FreshOpencodeState {
         match guard.as_ref() {
             Some(g) if g.key == durable => guard.take(),
             _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn arm_map_hit_join_pause(&self, durable: &str) -> MapHitJoinPauseHandles {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        *self.map_hit_join_pause.lock().expect("map-hit join pause") = Some(MapHitJoinPause {
+            key: durable.to_string(),
+            entered: entered_tx,
+            release: release_rx,
+        });
+        MapHitJoinPauseHandles { entered, release }
+    }
+
+    #[cfg(test)]
+    async fn pause_map_hit_join_if_armed(&self, durable: &str) {
+        let pause = {
+            let mut guard = self.map_hit_join_pause.lock().expect("map-hit join pause");
+            match guard.as_ref() {
+                Some(pause) if pause.key == durable => guard.take(),
+                _ => None,
+            }
+        };
+        if let Some(pause) = pause {
+            let _ = pause.entered.send(());
+            let _ = pause.release.await;
         }
     }
 
@@ -8379,7 +8427,11 @@ impl FreshOpencodeState {
         }
 
         let state = self.clone();
-        let operation_session_id = session_id.to_string();
+        // Keep requester identity (the caller's id) separate from the
+        // provider-native durable id and the recovery-map key. Resolve the
+        // alias before starting shared work so a placeholder-first caller
+        // reaches OpenCode with its `ses_*` id.
+        let provider_native_session_id = self.resolve_ownership_key(session_id);
         let operation_cwd = cwd.map(str::to_string);
         let recovery_request_id = request_id.clone();
         let recovery_key = self.recovery_map_key(session_id);
@@ -8394,7 +8446,7 @@ impl FreshOpencodeState {
                 move || async move {
                     match state
                         .resume_durable_session_once_for_request(
-                            &operation_session_id,
+                            &provider_native_session_id,
                             operation_cwd.as_deref(),
                             provenance,
                             observed,
@@ -8455,10 +8507,19 @@ impl FreshOpencodeState {
         session_id: &str,
         request_id: Option<&str>,
     ) -> Result<Arc<OpencodeSessionCell>, ResumeOpencodeError> {
+        #[cfg(test)]
+        self.pause_map_hit_join_if_armed(session_id).await;
+
         let recovery_key = self.recovery_map_key(session_id);
+        let preflight_state = self.clone();
+        let preflight_session_id = session_id.to_string();
         let answer = self
             .session_recovery
-            .join_existing(&recovery_key, request_id.map(str::to_string))
+            .join_existing_with_requester_preflight(
+                &recovery_key,
+                request_id.map(str::to_string),
+                move || preflight_state.recovery_admission_refusal(&preflight_session_id),
+            )
             .await
             .ok_or(ResumeOpencodeError::Reserved)?;
 
@@ -10374,8 +10435,10 @@ mod tests {
 
     /// Fakes `/session` create (returns a fresh incrementing `ses_N` id each call) and
     /// answers everything else (health, prompt, abort, status) with a benign `{}`.
+    #[derive(Default)]
     struct FakeHttp {
         next_session: AtomicUsize,
+        get_session_ids: StdMutex<Vec<String>>,
     }
     impl ServeHttp for FakeHttp {
         fn request<'a>(
@@ -10393,6 +10456,23 @@ mod tests {
                 && !req.url.contains("/abort")
                 && !req.url.contains("/status")
                 && matches!(req.method, freshell_opencode::serve::HttpMethod::Post);
+            if matches!(req.method, freshell_opencode::serve::HttpMethod::Get)
+                && req.url.contains("/session/")
+            {
+                let session_id = req
+                    .url
+                    .split("/session/")
+                    .nth(1)
+                    .unwrap_or_default()
+                    .split(['/', '?'])
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                self.get_session_ids
+                    .lock()
+                    .expect("fake OpenCode GET ids")
+                    .push(session_id);
+            }
             let body = if is_create {
                 let n = self.next_session.fetch_add(1, Ordering::SeqCst) + 1;
                 serde_json::to_vec(&json!({ "id": format!("ses_{n}"), "directory": null })).unwrap()
@@ -10987,6 +11067,7 @@ mod tests {
             }),
             http: Arc::new(FakeHttp {
                 next_session: AtomicUsize::new(0),
+                ..FakeHttp::default()
             }),
             ports: Arc::new(FakeAllocator),
             events: Arc::new(NoopEventSource),
@@ -11415,6 +11496,164 @@ mod tests {
             vec![canonical_id],
             "the provider receives the durable native id once; the placeholder is map-only"
         );
+    }
+
+    async fn exercise_task005_round3_opencode_alias_recovery_order(alias_starts_first: bool) {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let http = Arc::new(GatedRecoveryFailureHttp::default());
+        let manager = OpencodeServeManager::new(
+            ServeDeps {
+                spawner: Arc::new(TrackedSpawner {
+                    killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                }),
+                http: http.clone(),
+                ports: Arc::new(FakeAllocator),
+                events: Arc::new(NoopEventSource),
+            },
+            ServeConfig::default(),
+        );
+        manager.ensure_started().await.expect("fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let mut state = FreshOpencodeState::new(fresh_agent);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let order = if alias_starts_first {
+            "alias_first"
+        } else {
+            "canonical_first"
+        };
+        let alias_id = format!("{}task005-r3-{order}", crate::OPENCODE_PLACEHOLDER_PREFIX);
+        let canonical_id = format!("ses_task005_r3_opencode_{order}");
+        let operation_id = format!("task005-r3-opencode-{order}-seed");
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
+            PROVIDER,
+            &canonical_id,
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            &operation_id,
+            None,
+            "task005-r3-test",
+            1,
+        ) else {
+            panic!("the durable OpenCode id obtains a start fence for the alias fixture");
+        };
+        registry.fail(PROVIDER, &canonical_id, &operation_id, generation, false);
+        assert!(matches!(
+            registry.alias_vacant_key(
+                PROVIDER,
+                &alias_id,
+                &canonical_id,
+                &format!("task005-r3-opencode-placeholder-{order}"),
+                "task005-r3-test",
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        ));
+        state.set_ownership(Arc::clone(&registry));
+        assert_eq!(state.resolve_ownership_key(&alias_id), canonical_id);
+
+        let first_id = if alias_starts_first {
+            alias_id.clone()
+        } else {
+            canonical_id.clone()
+        };
+        let first_request_id = format!("task005-r3-opencode-{order}-first");
+        let first_state = state.clone();
+        let first_request_for_task = first_request_id.clone();
+        let first = tokio::spawn(async move {
+            first_state
+                .resume_durable_session_for_request(
+                    &first_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(first_request_for_task),
+                )
+                .await
+        });
+        let first_started_native = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if http.get_requests.load(Ordering::SeqCst) > 0 {
+                    return true;
+                }
+                if first.is_finished() {
+                    return false;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first request either reaches OpenCode or settles promptly");
+
+        let second_id = if alias_starts_first {
+            canonical_id.clone()
+        } else {
+            alias_id.clone()
+        };
+        let second_request_id = format!("task005-r3-opencode-{order}-second");
+        let second_state = state.clone();
+        let second_request_for_task = second_request_id.clone();
+        let second = tokio::spawn(async move {
+            second_state
+                .resume_durable_session_for_request(
+                    &second_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(second_request_for_task),
+                )
+                .await
+        });
+        if first_started_native {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while state
+                    .session_recovery
+                    .waiter_count_for_test(&format!("opencode:{canonical_id}"))
+                    .await
+                    < 2
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the second request joins the first provider operation");
+        }
+
+        http.release_failures();
+        let (first_outcome, second_outcome) = tokio::join!(first, second);
+        assert!(
+            matches!(first_outcome.unwrap(), Err(ResumeOpencodeError::Manager(_))),
+            "the first request receives the shared provider failure: alias_first={alias_starts_first}"
+        );
+        assert!(
+            matches!(second_outcome.unwrap(), Err(ResumeOpencodeError::Manager(_))),
+            "the second request receives the shared provider failure: alias_first={alias_starts_first}"
+        );
+
+        let canonical_status = state
+            .recovery_status(&canonical_id)
+            .await
+            .expect("one shared provider result remains cached");
+        let alias_status = state
+            .recovery_status(&alias_id)
+            .await
+            .expect("the placeholder resolves to the same recovery facts");
+        assert_eq!(alias_status.operation_id, canonical_status.operation_id);
+        assert_eq!(canonical_status.failed_launches, 1);
+        assert_eq!(alias_status.failed_launches, 1);
+        assert_eq!(http.get_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *http.get_session_ids.lock().expect("recovery HTTP ids"),
+            vec![canonical_id],
+            "the provider GET uses the durable id regardless of which requester starts first"
+        );
+        assert_ne!(first_request_id, second_request_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn task005_round3_opencode_alias_and_canonical_start_orders_use_native_id() {
+        exercise_task005_round3_opencode_alias_recovery_order(true).await;
+        exercise_task005_round3_opencode_alias_recovery_order(false).await;
     }
 
     fn create_msg(request_id: &str) -> FreshAgentCreate {
@@ -12670,6 +12909,34 @@ mod tests {
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         st.set_ownership(Arc::clone(&registry));
         (st, rx, registry)
+    }
+
+    async fn tracked_fake_http_state() -> (
+        FreshOpencodeState,
+        tokio::sync::broadcast::Receiver<String>,
+        Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+        Arc<FakeHttp>,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(256);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let http = Arc::new(FakeHttp::default());
+        let manager = OpencodeServeManager::new(
+            ServeDeps {
+                spawner: Arc::new(TrackedSpawner {
+                    killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                }),
+                http: http.clone(),
+                ports: Arc::new(FakeAllocator),
+                events: Arc::new(NoopEventSource),
+            },
+            ServeConfig::default(),
+        );
+        manager.ensure_started().await.expect("fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let mut state = FreshOpencodeState::new(fresh_agent);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        state.set_ownership(Arc::clone(&registry));
+        (state, rx, registry, http)
     }
 
     /// The send-time claim-refusal contract, shared by every arm: a first
@@ -18185,6 +18452,164 @@ mod tests {
         for fail_startup in [false, true] {
             exercise_late_recovery_map_hit(LateRecoveryJoinCall::Create, fail_startup).await;
         }
+    }
+
+    async fn exercise_cached_map_hit_refuses_handoff(call: LateRecoveryJoinCall) {
+        let durable_id = match call {
+            LateRecoveryJoinCall::Attach => "ses_task005_r3_cached_attach_handoff",
+            LateRecoveryJoinCall::Create => "ses_task005_r3_cached_create_handoff",
+        };
+        let (state, mut rx, registry, http) = tracked_fake_http_state().await;
+        let identity = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(identity.clone());
+        let identity_stall = identity.arm_binding_stall_result(PROVIDER, durable_id, true);
+        let recovery_state = state.clone();
+        let recovery_id = durable_id.to_string();
+        let recovery = tokio::spawn(async move {
+            recovery_state
+                .resume_durable_session(&recovery_id, None, None, None, None)
+                .await
+        });
+        identity_stall
+            .entered
+            .recv_timeout(Duration::from_secs(15))
+            .expect("recovery publishes its session row before owner commit");
+
+        let starting = registry.observe(PROVIDER, durable_id);
+        assert!(matches!(
+            starting.state,
+            freshell_ownership::OwnershipState::Starting { .. }
+        ));
+        assert!(state.sessions.lock().await.contains_key(durable_id));
+        let pause = state.arm_map_hit_join_pause(durable_id);
+        let request_id = match call {
+            LateRecoveryJoinCall::Attach => "task005-r3-cached-attach-request",
+            LateRecoveryJoinCall::Create => "task005-r3-cached-create-request",
+        };
+        let (request, attach_capture) = match call {
+            LateRecoveryJoinCall::Attach => {
+                let mut attach = attach_msg(durable_id);
+                attach.request_id = Some(request_id.to_string());
+                attach.view_id = Some("task005-r3-cached-map-hit-view".to_string());
+                attach.observed_epoch = Some(starting.epoch);
+                attach.observed_generation = Some(starting.generation);
+                let (reply, captured) = capturing_sink();
+                let attach_state = state.clone();
+                (
+                    tokio::spawn(async move {
+                        attach_state.handle_attach(attach, reply).await;
+                    }),
+                    Some(captured),
+                )
+            }
+            LateRecoveryJoinCall::Create => {
+                let mut create = create_msg(request_id);
+                create.resume_session_id = Some(durable_id.to_string());
+                create.session_ref = Some(SessionLocator {
+                    provider: PROVIDER.to_string(),
+                    session_id: durable_id.to_string(),
+                });
+                create.observed_epoch = Some(starting.epoch);
+                create.observed_generation = Some(starting.generation);
+                let create_state = state.clone();
+                (
+                    tokio::spawn(async move { create_state.handle_create(create, None).await }),
+                    None,
+                )
+            }
+        };
+        pause
+            .entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the handler observed Starting and paused before map admission");
+
+        let _ = identity_stall.release.send(());
+        let recovery_result = tokio::time::timeout(Duration::from_secs(10), recovery)
+            .await
+            .expect("the shared provider attempt settles")
+            .unwrap();
+        assert!(
+            recovery_result.is_err(),
+            "the identity commit is configured to fail"
+        );
+        let failed = state
+            .recovery_status(durable_id)
+            .await
+            .expect("the provider failure is retained during the retry floor");
+        assert_eq!(failed.failed_launches, 1);
+        assert!(!failed.in_flight);
+        assert_eq!(
+            *http.get_session_ids.lock().expect("fake OpenCode GET ids"),
+            vec![durable_id],
+            "the shared recovery made exactly one provider GET before the late join"
+        );
+
+        assert!(matches!(
+            registry.begin_handoff(
+                PROVIDER,
+                durable_id,
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "task005-r3-cached-map-hit-terminal-handoff",
+                None,
+                "task005-r3-test",
+                1,
+            ),
+            freshell_ownership::BeginOutcome::Granted { .. }
+        ));
+        let _ = pause.release.send(());
+        tokio::time::timeout(Duration::from_secs(10), request)
+            .await
+            .expect("the late map-hit returns after cached admission")
+            .unwrap();
+
+        match (call, attach_capture) {
+            (LateRecoveryJoinCall::Attach, Some(captured)) => {
+                let replies = captured.lock().unwrap().clone();
+                assert!(
+                    replies.iter().any(|message| matches!(message,
+                        ServerMessage::FreshAgentAttachFailed(failed)
+                            if failed.request_id == request_id
+                                && failed.view_id.as_deref() == Some("task005-r3-cached-map-hit-view")
+                                && failed.session_id == durable_id
+                                && failed.code == "SESSION_RESERVED"
+                    )),
+                    "attach receives a requester-scoped reservation after Handoff: {replies:?}"
+                );
+            }
+            (LateRecoveryJoinCall::Create, None) => {
+                let frames = drain_frames(&mut rx);
+                assert!(
+                    frames
+                        .iter()
+                        .any(|frame| frame["type"] == "freshAgent.create.failed"
+                            && frame["requestId"] == request_id
+                            && frame["code"] == "SESSION_RESERVED"),
+                    "create receives its requester-scoped reservation after Handoff: {frames:?}"
+                );
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            *http.get_session_ids.lock().expect("fake OpenCode GET ids"),
+            vec![durable_id],
+            "a cached refusal makes no additional provider GET"
+        );
+        let after = state
+            .recovery_status(durable_id)
+            .await
+            .expect("request-scoped reservation preserves the cached outcome");
+        assert_eq!(after.failed_launches, 1);
+        assert!(!after.in_flight);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn task005_round3_opencode_create_cached_map_hit_refuses_terminal_handoff() {
+        exercise_cached_map_hit_refuses_handoff(LateRecoveryJoinCall::Create).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn task005_round3_opencode_attach_cached_map_hit_refuses_terminal_handoff() {
+        exercise_cached_map_hit_refuses_handoff(LateRecoveryJoinCall::Attach).await;
     }
 
     async fn cancel_parked_startup<T>(task: &mut tokio::task::JoinHandle<T>) {
@@ -26889,6 +27314,7 @@ mod tests {
             }),
             http: Arc::new(FakeHttp {
                 next_session: AtomicUsize::new(0),
+                ..FakeHttp::default()
             }),
             ports: Arc::new(FakeAllocator),
             events: Arc::new(NoopEventSource),
@@ -27904,6 +28330,7 @@ mod tests {
             }),
             http: Arc::new(FakeHttp {
                 next_session: AtomicUsize::new(0),
+                ..FakeHttp::default()
             }),
             ports: Arc::new(FakeAllocator),
             events: Arc::new(NoopEventSource),
