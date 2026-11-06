@@ -1297,6 +1297,7 @@ enum CodexRecoveryReady {
 enum CodexRecoveryFailure {
     NotFound,
     Reserved,
+    Draining,
     CrashRecovery(String),
     HistoricalResume(String),
     CreateRefused(CodexCreateOutcome),
@@ -3800,6 +3801,16 @@ impl FreshCodexState {
                     false,
                 ),
                 Err(crate::session_recovery::RecoveryFailure::Attempt(
+                    CodexRecoveryFailure::Draining,
+                )) => (
+                    Self::failed_create_outcome(
+                        "SESSION_RESERVED",
+                        CODEX_DRAIN_RESERVATION_MESSAGE,
+                        None,
+                    ),
+                    false,
+                ),
+                Err(crate::session_recovery::RecoveryFailure::Attempt(
                     CodexRecoveryFailure::NotFound,
                 )) => (
                     Self::failed_create_outcome(
@@ -3827,7 +3838,7 @@ impl FreshCodexState {
             };
             let typed_native_not_found = classify_native_readiness_not_found
                 && matches!(
-                    &answer.result,
+                    answer.result.as_ref(),
                     Err(crate::session_recovery::RecoveryFailure::Attempt(
                         CodexRecoveryFailure::CreateRefused(CodexCreateOutcome::Failed {
                             code,
@@ -5481,11 +5492,7 @@ impl FreshCodexState {
         provenance: Option<crate::BindProvenance>,
     ) -> CodexCreateOutcome {
         self.adopt_live_create_with_starting_ticket(
-            request_id,
-            view_id,
-            thread_id,
-            provenance,
-            None,
+            request_id, view_id, thread_id, provenance, None,
         )
         .await
     }
@@ -5509,11 +5516,13 @@ impl FreshCodexState {
             Some(claim.clone()),
             self.identity_sink(),
         );
-        let runtime = Arc::new(StdMutex::new(None::<(
-            String,
-            Option<u32>,
-            crate::identity_sink::FreshAgentSettings,
-        )>));
+        let runtime = Arc::new(StdMutex::new(
+            None::<(
+                String,
+                Option<u32>,
+                crate::identity_sink::FreshAgentSettings,
+            )>,
+        ));
         let probe_runtime = runtime.clone();
         let probe_state = self.clone();
         let probe_id = thread_id.to_string();
@@ -5677,10 +5686,7 @@ impl FreshCodexState {
                         },
                     )
                 })
-                .unwrap_or((
-                    None,
-                    crate::identity_sink::FreshAgentSettings::default(),
-                ))
+                .unwrap_or((None, crate::identity_sink::FreshAgentSettings::default()))
         };
         let adoption_settings_update = if provenance.is_some()
             && adopted_settings != crate::identity_sink::FreshAgentSettings::default()
@@ -9793,13 +9799,8 @@ impl FreshCodexState {
         observed: Option<freshell_ownership::ObservedFence>,
         dead_thread_cache_policy: DeadThreadCachePolicy,
     ) -> Result<EnsureAliveOutcome, EnsureAliveError> {
-        self.ensure_session_alive_for_request(
-            session_id,
-            observed,
-            dead_thread_cache_policy,
-            None,
-        )
-        .await
+        self.ensure_session_alive_for_request(session_id, observed, dead_thread_cache_policy, None)
+            .await
     }
 
     async fn ensure_session_alive_for_request(
@@ -9809,23 +9810,31 @@ impl FreshCodexState {
         dead_thread_cache_policy: DeadThreadCachePolicy,
         request_id: Option<String>,
     ) -> Result<EnsureAliveOutcome, EnsureAliveError> {
-        let recovery_key = if dead_thread_cache_policy
-            == DeadThreadCachePolicy::RecheckAfterFreshNativeEvidence
-        {
-            self.native_readiness_recovery_map_key(session_id)
-        } else {
-            self.recovery_map_key(session_id)
-        };
+        let recovery_key =
+            if dead_thread_cache_policy == DeadThreadCachePolicy::RecheckAfterFreshNativeEvidence {
+                self.native_readiness_recovery_map_key(session_id)
+            } else {
+                self.recovery_map_key(session_id)
+            };
         let shared_recovery_in_flight = self
             .session_recovery
             .try_status(&recovery_key)
             .is_some_and(|status| status.in_flight);
-        if !shared_recovery_in_flight && self.has_live_session(session_id).await {
-            // Preserve the provider's existing live-session command ordering.
-            // The shared flight is needed for a cold recovery, while an
-            // already-live sidecar needs no spawned operation or extra turn
-            // scheduling point.
-            return Ok(EnsureAliveOutcome::AlreadyRunning);
+        if !shared_recovery_in_flight {
+            let sessions = self.sessions.lock().await;
+            if let Some(session) = sessions.get(session_id) {
+                // The exit watcher retains `exited == false` while queued
+                // notifications drain. Read both flags under the same lock
+                // it uses to begin draining before taking the live shortcut.
+                if session.notification_drain_pending() {
+                    return Err(EnsureAliveError::Draining);
+                }
+                if !session.exited.load(Ordering::SeqCst) {
+                    // A live sidecar needs no spawned recovery operation or
+                    // extra scheduling point before its next command.
+                    return Ok(EnsureAliveOutcome::AlreadyRunning);
+                }
+            }
         }
 
         let state = self.clone();
@@ -9856,6 +9865,11 @@ impl FreshCodexState {
                         Err(EnsureAliveError::Reserved) => {
                             Err(crate::session_recovery::RecoveryAttemptFailure::refusal(
                                 CodexRecoveryFailure::Reserved,
+                            ))
+                        }
+                        Err(EnsureAliveError::Draining) => {
+                            Err(crate::session_recovery::RecoveryAttemptFailure::refusal(
+                                CodexRecoveryFailure::Draining,
                             ))
                         }
                         Err(EnsureAliveError::RespawnFailed(error)) => {
@@ -9898,13 +9912,20 @@ impl FreshCodexState {
                 code,
                 message,
                 ..
-            })) => {
-                if code == "SESSION_RESERVED" {
-                    Err(EnsureAliveError::Reserved)
-                } else {
-                    Err(EnsureAliveError::RespawnFailed(message.clone()))
+            }))
+            | Err(crate::session_recovery::RecoveryFailure::Attempt(
+                CodexRecoveryFailure::CreateRefused(CodexCreateOutcome::Failed {
+                    code,
+                    message,
+                    ..
+                }),
+            )) => match (code.as_str(), message.as_str()) {
+                ("SESSION_RESERVED", CODEX_DRAIN_RESERVATION_MESSAGE) => {
+                    Err(EnsureAliveError::Draining)
                 }
-            }
+                ("SESSION_RESERVED", _) => Err(EnsureAliveError::Reserved),
+                _ => Err(EnsureAliveError::RespawnFailed(message.clone())),
+            },
             Err(crate::session_recovery::RecoveryFailure::Attempt(
                 CodexRecoveryFailure::NotFound,
             )) => Err(EnsureAliveError::NotFound),
@@ -9912,20 +9933,15 @@ impl FreshCodexState {
                 CodexRecoveryFailure::Reserved,
             )) => Err(EnsureAliveError::Reserved),
             Err(crate::session_recovery::RecoveryFailure::Attempt(
+                CodexRecoveryFailure::Draining,
+            )) => Err(EnsureAliveError::Draining),
+            Err(crate::session_recovery::RecoveryFailure::Attempt(
                 CodexRecoveryFailure::CrashRecovery(error)
                 | CodexRecoveryFailure::HistoricalResume(error),
             )) => Err(EnsureAliveError::RespawnFailed(error.clone())),
             Err(crate::session_recovery::RecoveryFailure::Attempt(
-                CodexRecoveryFailure::CreateRefused(outcome),
-            )) => match outcome {
-                CodexCreateOutcome::Failed { code, message, .. } if code == "SESSION_RESERVED" => {
-                    Err(EnsureAliveError::Reserved)
-                }
-                CodexCreateOutcome::Failed { message, .. } => {
-                    Err(EnsureAliveError::RespawnFailed(message.clone()))
-                }
-                CodexCreateOutcome::Created { .. } => Err(EnsureAliveError::Reserved),
-            },
+                CodexRecoveryFailure::CreateRefused(CodexCreateOutcome::Created { .. }),
+            )) => Err(EnsureAliveError::Reserved),
             Err(crate::session_recovery::RecoveryFailure::Attempt(
                 CodexRecoveryFailure::CreateLaunch(outcome),
             )) => match outcome {
@@ -10668,13 +10684,12 @@ impl FreshCodexState {
             cwd: cwd.clone(),
             plugins: None,
         };
-        let settings_update = if recovered_settings
-            == crate::identity_sink::FreshAgentSettings::default()
-        {
-            crate::identity_sink::SettingsUpdate::Keep
-        } else {
-            crate::identity_sink::SettingsUpdate::Replace(recovered_settings)
-        };
+        let settings_update =
+            if recovered_settings == crate::identity_sink::FreshAgentSettings::default() {
+                crate::identity_sink::SettingsUpdate::Keep
+            } else {
+                crate::identity_sink::SettingsUpdate::Replace(recovered_settings)
+            };
         if let Err(error) = self
             .record_codex_binding(
                 session_id,
@@ -12780,6 +12795,11 @@ impl FreshCodexState {
                                 CodexRecoveryFailure::Reserved,
                             ))
                         }
+                        Err(ResumeSessionError::Draining) => {
+                            Err(crate::session_recovery::RecoveryAttemptFailure::refusal(
+                                CodexRecoveryFailure::Draining,
+                            ))
+                        }
                         Err(ResumeSessionError::Transient(error)) => {
                             Err(crate::session_recovery::RecoveryAttemptFailure::launch(
                                 CodexRecoveryFailure::HistoricalResume(error),
@@ -12830,13 +12850,20 @@ impl FreshCodexState {
                 code,
                 message,
                 ..
-            })) => {
-                if code == "SESSION_RESERVED" {
-                    Err(ResumeSessionError::Reserved)
-                } else {
-                    Err(ResumeSessionError::Transient(message.clone()))
+            }))
+            | Err(crate::session_recovery::RecoveryFailure::Attempt(
+                CodexRecoveryFailure::CreateRefused(CodexCreateOutcome::Failed {
+                    code,
+                    message,
+                    ..
+                }),
+            )) => match (code.as_str(), message.as_str()) {
+                ("SESSION_RESERVED", CODEX_DRAIN_RESERVATION_MESSAGE) => {
+                    Err(ResumeSessionError::Draining)
                 }
-            }
+                ("SESSION_RESERVED", _) => Err(ResumeSessionError::Reserved),
+                _ => Err(ResumeSessionError::Transient(message.clone())),
+            },
             Err(crate::session_recovery::RecoveryFailure::Attempt(
                 CodexRecoveryFailure::NotFound,
             )) => Err(ResumeSessionError::NotFound),
@@ -12844,20 +12871,15 @@ impl FreshCodexState {
                 CodexRecoveryFailure::Reserved,
             )) => Err(ResumeSessionError::Reserved),
             Err(crate::session_recovery::RecoveryFailure::Attempt(
+                CodexRecoveryFailure::Draining,
+            )) => Err(ResumeSessionError::Draining),
+            Err(crate::session_recovery::RecoveryFailure::Attempt(
                 CodexRecoveryFailure::CrashRecovery(error)
                 | CodexRecoveryFailure::HistoricalResume(error),
             )) => Err(ResumeSessionError::Transient(error.clone())),
             Err(crate::session_recovery::RecoveryFailure::Attempt(
-                CodexRecoveryFailure::CreateRefused(outcome),
-            )) => match outcome {
-                CodexCreateOutcome::Failed { code, message, .. } if code == "SESSION_RESERVED" => {
-                    Err(ResumeSessionError::Reserved)
-                }
-                CodexCreateOutcome::Failed { message, .. } => {
-                    Err(ResumeSessionError::Transient(message.clone()))
-                }
-                CodexCreateOutcome::Created { .. } => Err(ResumeSessionError::Reserved),
-            },
+                CodexRecoveryFailure::CreateRefused(CodexCreateOutcome::Created { .. }),
+            )) => Err(ResumeSessionError::Reserved),
             Err(crate::session_recovery::RecoveryFailure::Attempt(
                 CodexRecoveryFailure::CreateLaunch(outcome),
             )) => match outcome {
@@ -21430,6 +21452,127 @@ pub(crate) mod tests {
         assert_eq!(frame["requestId"], "recover-1");
         assert_eq!(frame["sessionId"], "thread-recover");
         assert_eq!(frame["success"], true);
+    }
+
+    async fn assert_shared_drain_refusal(create_starts: bool) {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let (state, mut events) = state_with_bus();
+        let session_id = "thread-shared-drain";
+        insert_fake_session(
+            &state,
+            session_id,
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-shared-drain",
+        )
+        .await;
+        let (drain, _completed) = CodexNotificationDrain::new();
+        drain.pending.store(true, Ordering::SeqCst);
+        let mut sessions = state.sessions.lock().await;
+        sessions.get_mut(session_id).unwrap().notification_drain = Some(drain);
+
+        // Hold the session lookup until every requester has joined the same
+        // operation. The initiating adapter still produces the real refusal.
+        let mut message = create_msg("shared-drain-create");
+        message.resume_session_id = Some(session_id.into());
+        let create_state = state.clone();
+        let create = async move { create_state.handle_create(message, None).await };
+        let resume_state = state.clone();
+        let resume = async move {
+            resume_state
+                .ensure_session_resumable(session_id, None, None, None)
+                .await
+        };
+        let recovery_key = state.recovery_map_key(session_id);
+        let wait_for_requesters = |count| {
+            let state = state.clone();
+            let recovery_key = recovery_key.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while state
+                        .session_recovery
+                        .waiter_count_for_test(&recovery_key)
+                        .await
+                        != count
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the requesters join the blocked shared recovery");
+            }
+        };
+        let (create, resume) = if create_starts {
+            let create = tokio::spawn(create);
+            wait_for_requesters(1).await;
+            (create, tokio::spawn(resume))
+        } else {
+            let resume = tokio::spawn(resume);
+            wait_for_requesters(1).await;
+            (tokio::spawn(create), resume)
+        };
+        let alive_state = state.clone();
+        let alive = tokio::spawn(async move {
+            alive_state
+                .ensure_session_alive(session_id, None, DeadThreadCachePolicy::Respect)
+                .await
+        });
+        wait_for_requesters(3).await;
+        drop(sessions);
+
+        let (create, resume, alive) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(create, resume, alive)
+        })
+        .await
+        .expect("a drain refusal settles all three requesters");
+        let status = state.session_recovery.status(&recovery_key).await.unwrap();
+        let native_request =
+            tokio::time::timeout(Duration::from_millis(100), peer.next_frame()).await;
+        state.shutdown().await;
+
+        assert!(matches!(
+            create.unwrap(),
+            CodexCreateOutcome::Failed { code, message, .. }
+                if code == "SESSION_RESERVED" && message == CODEX_DRAIN_RESERVATION_MESSAGE
+        ));
+        assert!(matches!(resume.unwrap(), Err(ResumeSessionError::Draining)));
+        assert!(matches!(alive.unwrap(), Err(EnsureAliveError::Draining)));
+        assert_eq!(status.failed_launches, 0);
+        assert!(!status.in_flight);
+        assert!(!status.exhausted);
+        assert!(
+            native_request.is_err(),
+            "draining must not issue a native RPC"
+        );
+        let mut replies = Vec::new();
+        while let Ok(frame) = events.try_recv() {
+            let frame: Value = serde_json::from_str(&frame).unwrap();
+            if frame["type"] == "freshAgent.create.failed"
+                && frame["requestId"] == "shared-drain-create"
+            {
+                replies.push(frame);
+            }
+        }
+        assert_eq!(
+            replies.len(),
+            1,
+            "the create requester gets exactly one reply"
+        );
+        assert_eq!(replies[0]["code"], "SESSION_RESERVED");
+        assert_eq!(replies[0]["message"], CODEX_DRAIN_RESERVATION_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn shared_recovery_preserves_create_drain_refusal_for_native_waiters() {
+        assert_shared_drain_refusal(true).await;
+    }
+
+    #[tokio::test]
+    async fn shared_recovery_preserves_native_drain_refusal_for_create_waiters() {
+        assert_shared_drain_refusal(false).await;
     }
 
     #[tokio::test]
@@ -34250,6 +34393,7 @@ pub(crate) mod tests {
                     observed_epoch: None,
                     observed_generation: None,
                     request_id: "req-native-readiness-not-found".into(),
+                    view_id: None,
                     session_type: freshell_protocol::SessionType::Freshcodex,
                     provider: Some(freshell_protocol::AgentProvider::Codex),
                     cwd: Some(resume_cwd),
@@ -34562,6 +34706,7 @@ pub(crate) mod tests {
                 .ensure_session_alive_for_request(
                     session_id,
                     None,
+                    DeadThreadCachePolicy::Respect,
                     Some("task005-r2-codex-preflight-late-attach".into()),
                 )
                 .await,
