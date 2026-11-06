@@ -1983,10 +1983,11 @@ tool_timeout_sec = 120
       throw new Error(`unexpected Codex app-server processes after cold recovery: ${JSON.stringify(observedNativeAppServers)}`)
     })
     expect(recoveredNativeAppServers).toEqual([{ pid: recoveredNativeContext.pid, cwd: recoveryCwd }])
-    // Busy refusals back off to a durable 60s cooldown after six attempts.
-    // Leave room for that retry and its provider read/write confirmation.
+    // Cold replacement can still contend across two six-refusal windows.
+    // Allow both durable 60s cooldowns and the provider read/write confirmation;
+    // otherwise this can expire just before its already-scheduled next retry.
     await waitForNativeNameSync(recoveredNameRef, recoveredCanonicalName, 'recovered native name synchronization',
-      recoveredId, () => readNativeName(recoveredId, recoveredNativeContext), 150_000)
+      recoveredId, () => readNativeName(recoveredId, recoveredNativeContext), 240_000)
     await waitFor('recovered source native name writeback', async () => (await readNativeName(recoveredId, recoveredNativeContext)).title === 'Managed recovered saved name' ? true : undefined, 15_000)
     const recoveredCapture = await fetch(`${rig.info.baseUrl}/api/panes/${paneId}/capture`, { headers })
     expect(recoveredCapture.ok, await recoveredCapture.clone().text()).toBe(true)
@@ -2003,7 +2004,7 @@ tool_timeout_sec = 120
       oldName: await readName(), firstNewName: recoveredName, finalNewName: await readNameFor(recoveredNameRef),
       nativeName: await readNativeName(recoveredId, recoveredNativeContext), recoveredNativeContext, newTraffic })
 
-  }, 360_000)
+  }, 480_000)
 
   it('finalizes the supervisor GDB observer before teardown', async () => {
     if (process.env.FRESHELL_CAPTURE_SUPERVISOR_CRASH !== '1') return
