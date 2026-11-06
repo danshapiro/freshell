@@ -341,6 +341,9 @@ function projectTurnItemsView(turn, itemsView = 'summary') {
 
 function makeThread(id, params = {}) {
   const handle = getThreadHandle(id)
+  const completedTurns = behavior.recordTurns
+    ? loadRecordedTurns(id).filter((turn) => turn.status === 'completed').length
+    : 0
   return {
     id,
     sessionId: id,
@@ -348,7 +351,10 @@ function makeThread(id, params = {}) {
     ephemeral: false,
     modelProvider: 'openai',
     createdAt: 1770000000,
-    updatedAt: 1770000007,
+    // A recorded turn advances the fixture's native history revision only
+    // once its saved row reaches completed. This lets clients distinguish a
+    // committed snapshot from a still-held in-progress turn.
+    updatedAt: 1770000007 + completedTurns,
     status: { type: 'idle' },
     cwd: params.cwd ?? process.cwd(),
     cliVersion: 'codex-cli 0.129.0',

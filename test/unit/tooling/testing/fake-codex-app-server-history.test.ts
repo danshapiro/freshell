@@ -184,6 +184,8 @@ describe('fake Codex app-server history transcript', () => {
       let current = await start()
       const started = await rpc(current, 'thread-start', 'thread/start', { cwd: workspace })
       const rolloutPath = started.result?.thread?.path
+      const initialUpdatedAt = started.result?.thread?.updatedAt
+      expect(initialUpdatedAt).toEqual(expect.any(Number))
       for (const [index, prompt] of prompts.entries()) {
         if (index > 0) {
           current.close()
@@ -197,6 +199,7 @@ describe('fake Codex app-server history transcript', () => {
           input: [{ type: 'text', text: prompt }],
         })
         const read = await rpc(current, `thread-read-${index}`, 'thread/read', { threadId, includeTurns: true })
+        expect(read.result?.thread?.updatedAt).toBe(initialUpdatedAt + index + 1)
         const recent = await rpc(current, `recent-turn-${index}`, 'thread/turns/list', {
           threadId, sortDirection: 'desc', itemsView: 'full', limit: 1,
         })

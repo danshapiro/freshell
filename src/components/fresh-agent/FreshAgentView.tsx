@@ -68,6 +68,13 @@ import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
 import { getRebindQueue } from '@/lib/rebind-queue'
 import { getSnapshotScheduler, makeSnapshotKey, type SnapshotTrigger } from '@/lib/fresh-agent-snapshot-scheduler'
 import {
+  armRefreshDeadline,
+  beginRefresh,
+  settleRefresh,
+  type RefreshAttempt,
+  type RefreshDeadlineDisposer,
+} from '@/lib/fresh-agent-refresh'
+import {
   getEffectiveFreshAgentEffort,
   getFreshAgentRequestEffort,
   resolveEffectiveFreshAgentModel,
@@ -192,7 +199,6 @@ export const FRESH_AGENT_RESERVE_RETRY_FLOOR_MS = 1_000
 // up). Exported so tests assert the cap against the real constant.
 export const IDLE_INCOMPLETE_MAX_RETRIES = 5
 const IDLE_INCOMPLETE_RETRY_DELAY_MS = 1_000
-const REVEAL_REFRESH_MAX_WAIT_MS = 15_000
 const log = createLogger('FreshAgentView')
 let nextSnapshotAuditView = 0
 
@@ -219,6 +225,7 @@ const ProjectedFreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fre
 type SnapshotAuditStage = 'refresh_requested' | 'effect_skipped' | 'request_captured' | 'request_queued'
   | 'run_started' | 'native_started' | 'native_completed' | 'native_failed' | 'soul_started'
   | 'outcome_received' | 'currentness_checked' | 'identity_rejected' | 'display_committed'
+  | 'reveal_refresh_evaluated' | 'reveal_retry_clicked' | 'reveal_refresh_suppressed'
 
 /** Supervisor ownership survives its recovering-to-live projection change. */
 function isSupervisorRecoveryOwned(content: FreshAgentPaneContent): boolean {
@@ -1375,6 +1382,12 @@ export function FreshAgentView({
   const ownerDivergenceRef = useRef(ownerDivergence)
   ownerDivergenceRef.current = ownerDivergence
   const isActivePane = !hidden && activeTabId === tabId && activePaneId === paneId
+  const activeTabIdRef = useRef(activeTabId)
+  activeTabIdRef.current = activeTabId
+  const activePaneIdRef = useRef(activePaneId)
+  activePaneIdRef.current = activePaneId
+  const isActivePaneRef = useRef(isActivePane)
+  isActivePaneRef.current = isActivePane
   // Mount-time focus adoption gate (agent focus neutrality): an eligible
   // REMOUNT only re-focuses if this pane owned DOM focus before teardown — an
   // agent-driven split while the user is in app chrome must not yank it back.
@@ -1420,7 +1433,8 @@ export function FreshAgentView({
   const snapshotDirtyBaseRevisionRef = useRef<number | null>(null)
   const snapshotDirtyRequiresRevisionAdvanceRef = useRef(false)
   const revealRefreshVersionRef = useRef<number | null>(null)
-  const revealRefreshStartedAtRef = useRef<number | null>(null)
+  const revealRefreshAttemptRef = useRef<RefreshAttempt | null>(null)
+  const revealRefreshDeadlineDisposerRef = useRef<RefreshDeadlineDisposer | null>(null)
   const revealRefreshRetryTimerRef = useRef<number | null>(null)
   const snapshotRefreshSerialRef = useRef(0)
   const [snapshotRevealError, setSnapshotRevealError] = useState<string | null>(null)
@@ -2069,8 +2083,8 @@ export function FreshAgentView({
   // G26: a NON-blocking surface refresh owed at next reveal, set when an
   // approval/question (or its cancellation) arrives while hidden. These do not
   // change the transcript, so they must not take the blocking reveal path:
-  // its overlay clears only on a newer transcript revision, which an approval
-  // never produces (it would spin for REVEAL_REFRESH_MAX_WAIT_MS, then error).
+  // its overlay clears only on transcript or projection freshness, which an
+  // approval does not change.
   const surfaceRefreshOwedRef = useRef(false)
   // Release callback for an in-flight queued CREATE rebind; released by the
   // freshAgent.created / create-failed ack (or the queue's 10s backstop).
@@ -2129,7 +2143,13 @@ export function FreshAgentView({
     snapshotDirtyBaseRevisionRef.current = null
     snapshotDirtyRequiresRevisionAdvanceRef.current = false
     revealRefreshVersionRef.current = null
-    revealRefreshStartedAtRef.current = null
+    const refreshAttempt = revealRefreshAttemptRef.current
+    if (refreshAttempt?.state === 'pending') {
+      revealRefreshAttemptRef.current = settleRefresh(refreshAttempt, refreshAttempt.identity, refreshAttempt.requestId, 'superseded')
+    }
+    revealRefreshDeadlineDisposerRef.current?.()
+    revealRefreshDeadlineDisposerRef.current = null
+    revealRefreshAttemptRef.current = null
     if (revealRefreshRetryTimerRef.current !== null) {
       clearTimeout(revealRefreshRetryTimerRef.current)
       revealRefreshRetryTimerRef.current = null
@@ -2227,6 +2247,12 @@ export function FreshAgentView({
         clearFreshAgentAttachDecisionRoute(attachRoute.viewId, attachRoute.requestId)
         attachmentDecisionRouteRef.current = null
       }
+      const refreshAttempt = revealRefreshAttemptRef.current
+      if (refreshAttempt?.state === 'pending') {
+        revealRefreshAttemptRef.current = settleRefresh(refreshAttempt, refreshAttempt.identity, refreshAttempt.requestId, 'disposed')
+      }
+      revealRefreshDeadlineDisposerRef.current?.()
+      revealRefreshDeadlineDisposerRef.current = null
       if (revealRefreshRetryTimerRef.current !== null) {
         clearTimeout(revealRefreshRetryTimerRef.current)
         revealRefreshRetryTimerRef.current = null
@@ -2239,9 +2265,10 @@ export function FreshAgentView({
   // scheduler (debounce/coalesce now live there, not in this component).
   const requestSnapshotRefresh = useCallback((trigger: SnapshotTrigger) => {
     snapshotRefreshTriggerRef.current = trigger
-    snapshotRefreshSerialRef.current += 1
-    recordSnapshotAudit('refresh_requested', () => ({ trigger, refreshSerial: snapshotRefreshSerialRef.current }))
+    const refreshSerial = ++snapshotRefreshSerialRef.current
+    recordSnapshotAudit('refresh_requested', () => ({ trigger, refreshSerial }))
     setSnapshotRefreshNonce((value) => value + 1)
+    return refreshSerial
   }, [])
 
   const markSnapshotDirty = useCallback((cause: 'reconnect' | 'attach' | 'transcript' | 'send-accepted') => {
@@ -2260,14 +2287,110 @@ export function FreshAgentView({
   }, [])
 
   const requestRevealRefresh = useCallback((force = false) => {
-    if (hiddenRef.current || !snapshotDirtyRef.current) return
+    if (hiddenRef.current || !snapshotDirtyRef.current) {
+      const attempt = revealRefreshAttemptRef.current
+      recordSnapshotAudit('reveal_refresh_suppressed', () => ({
+        reason: hiddenRef.current ? 'hidden' : 'clean',
+        force,
+        tabId,
+        paneId,
+        activeTabId: activeTabIdRef.current,
+        activePaneId: activePaneIdRef.current,
+        isActivePane: isActivePaneRef.current,
+        hidden: hiddenRef.current,
+        dirty: snapshotDirtyRef.current,
+        dirtyVersion: snapshotDirtyVersionRef.current,
+        revealVersion: revealRefreshVersionRef.current,
+        attemptRequestId: attempt?.requestId,
+        attemptState: attempt?.state,
+        attemptIdentity: attempt?.identity,
+        deadlineAt: attempt?.deadlineAt,
+      }))
+      return
+    }
     const version = snapshotDirtyVersionRef.current
-    if (!force && revealRefreshVersionRef.current === version) return
+    if (!force && revealRefreshVersionRef.current === version) {
+      const attempt = revealRefreshAttemptRef.current
+      recordSnapshotAudit('reveal_refresh_suppressed', () => ({
+        reason: 'already-requested',
+        force,
+        tabId,
+        paneId,
+        activeTabId: activeTabIdRef.current,
+        activePaneId: activePaneIdRef.current,
+        isActivePane: isActivePaneRef.current,
+        hidden: hiddenRef.current,
+        dirty: snapshotDirtyRef.current,
+        dirtyVersion: snapshotDirtyVersionRef.current,
+        revealVersion: revealRefreshVersionRef.current,
+        attemptRequestId: attempt?.requestId,
+        attemptState: attempt?.state,
+        attemptIdentity: attempt?.identity,
+        deadlineAt: attempt?.deadlineAt,
+      }))
+      return
+    }
     revealRefreshVersionRef.current = version
-    if (revealRefreshStartedAtRef.current === null) revealRefreshStartedAtRef.current = Date.now()
+    const content = paneContentRef.current
+    const currentState = appStore.getState()
+    const identity = JSON.stringify({
+      createRequestId: content.createRequestId,
+      sessionType: content.sessionType,
+      provider: content.provider,
+      threadId: snapshotThreadIdRef.current,
+      soulId: content.soulId ?? null,
+      soulIntentRevision: content.soulIntentRevision ?? null,
+      bootId: currentState.connection.bootId ?? null,
+      ownerFence: selectPaneOwnerFence(currentState, content),
+    })
+    const previousAttempt = revealRefreshAttemptRef.current
+    const requestId = String(snapshotRefreshSerialRef.current + 1)
+    const nextAttempt = beginRefresh({
+      identity,
+      requestId,
+      now: Date.now(),
+      previous: previousAttempt ?? undefined,
+      preserveDeadline: previousAttempt?.state === 'pending' && previousAttempt.identity === identity,
+    })
+    if (previousAttempt?.state === 'pending') {
+      revealRefreshAttemptRef.current = settleRefresh(
+        previousAttempt,
+        previousAttempt.identity,
+        previousAttempt.requestId,
+        'superseded',
+      )
+    }
+    revealRefreshDeadlineDisposerRef.current?.()
+    revealRefreshAttemptRef.current = nextAttempt
+    revealRefreshDeadlineDisposerRef.current = armRefreshDeadline(nextAttempt, () => {
+      const settled = settleRefresh(revealRefreshAttemptRef.current, identity, requestId, 'timed-out')
+      if (!settled) return
+      revealRefreshAttemptRef.current = settled
+      revealRefreshDeadlineDisposerRef.current = null
+      if (revealRefreshRetryTimerRef.current !== null) {
+        clearTimeout(revealRefreshRetryTimerRef.current)
+        revealRefreshRetryTimerRef.current = null
+      }
+      if (rateLimitRetryTimerRef.current !== null) {
+        clearTimeout(rateLimitRetryTimerRef.current)
+        rateLimitRetryTimerRef.current = null
+        setRateLimitedUntil(null)
+      }
+      if (!isMountedRef.current || hiddenRef.current || !snapshotDirtyRef.current
+        || revealRefreshVersionRef.current !== snapshotDirtyVersionRef.current) return
+      log.warn({
+        event: 'fresh_agent.snapshot_refresh_timed_out',
+        provider: content.provider,
+        sessionType: content.sessionType,
+        sessionId: snapshotThreadIdRef.current,
+        requestId,
+        deadlineAt: nextAttempt.deadlineAt,
+      })
+      setSnapshotRevealError('The conversation did not finish refreshing. Try again.')
+    })
     setSnapshotRevealError(null)
     requestSnapshotRefresh('reveal')
-  }, [requestSnapshotRefresh])
+  }, [appStore, paneId, recordSnapshotAudit, requestSnapshotRefresh, tabId])
 
   // kata b8ke (round-3 F6): the ONE fenced attach sender — every
   // freshAgent.attach producer (mount rebind, reconnect re-attach,
@@ -4285,7 +4408,9 @@ export function FreshAgentView({
         requestRevealRefresh(true)
       } else if (messageBelongsToPane && (isSnapshotInvalidatingFreshAgentEvent(message) || unattributedCodexDiagnosticChanged || pendingCodexDiagnosticChanged)) {
         if (!hiddenRef.current) requestSnapshotRefresh('event')
-        else if (eventClass === 'surface' || unattributedCodexDiagnosticChanged || pendingCodexDiagnosticChanged) surfaceRefreshOwedRef.current = true
+        else if (eventClass === 'surface' || unattributedCodexDiagnosticChanged || pendingCodexDiagnosticChanged) {
+          surfaceRefreshOwedRef.current = true
+        }
       }
       // kata 1wxv: the requesting-sink ack drives the composer refill; rollback
       // refusals render their server-pinned message verbatim. Both match on the
@@ -4444,6 +4569,16 @@ export function FreshAgentView({
     const requestPaneSoulRevision = paneContent.soulIntentRevision
     const requestOwnerFence = selectPaneOwnerFence(appStore.getState(), paneContent)
     const requestBootId = appStore.getState().connection.bootId
+    const requestRevealAttemptIdentity = JSON.stringify({
+      createRequestId: requestCreateRequestId,
+      sessionType: requestSessionType,
+      provider,
+      threadId: sessionId,
+      soulId: requestPaneSoulId ?? null,
+      soulIntentRevision: requestPaneSoulRevision ?? null,
+      bootId: requestBootId ?? null,
+      ownerFence: requestOwnerFence,
+    })
     // A missing soul uses the owned snapshot route, but remains a history-only
     // read: its status and errors cannot authorize runtime recovery.
     const requestReadOnly = snapshotReadOnly
@@ -4474,6 +4609,12 @@ export function FreshAgentView({
       // The initial history read can still supply history while a resumed live read waits.
       if (requestReadGeneration !== snapshotRequestAuthorityRef.current.generation
         && (!requestReadOnly || snapshotRequestAuthorityRef.current.readOnlySource)) return rejected('read_generation')
+      if (trigger === 'reveal') {
+        const refreshAttempt = revealRefreshAttemptRef.current
+        if (refreshAttempt?.state !== 'pending'
+          || refreshAttempt.requestId !== String(refreshSerial)
+          || refreshAttempt.identity !== requestRevealAttemptIdentity) return rejected('refresh_attempt')
+      }
       if (!requestReadOnly && isFreshAgentLifecycleBlocked(paneContentRef.current)) return rejected('recovery')
       if (paneContentRef.current.provider !== provider) return rejected('provider')
       if (paneContentRef.current.sessionType !== requestSessionType) return rejected('session_type')
@@ -4497,7 +4638,8 @@ export function FreshAgentView({
     const refreshSerial = snapshotRefreshSerialRef.current
     const snapshotAuditData = (value: FreshAgentSnapshot) => ({ historyOnly: isNativeHistoryOnlySnapshot(value),
       live: value.extensions?.[provider]?.statusFromLiveState === true,
-      vacant: value.extensions?.[provider]?.ownerKind === 'vacant', rows: value.turns.length })
+      vacant: value.extensions?.[provider]?.ownerKind === 'vacant', rows: value.turns.length,
+      ...(typeof value.revision === 'number' ? { revision: value.revision } : {}) })
     auditRequest('request_captured', () => {
       const inputs = { createChanged: requestCreateRequestId, soulChanged: requestPaneSoulId,
         revisionChanged: requestPaneSoulRevision, bootChanged: requestBootId,
@@ -4530,7 +4672,8 @@ export function FreshAgentView({
         const missingCoverage = liveProjection.historyGeneration === projectionMetadata.historyGeneration
           && liveProjection.needsResnapshot && projectionMetadata.eventRevision < liveProjection.eventRevision
         if (olderHistory || missingCoverage) {
-          requestSnapshotRefresh(olderHistory ? 'reconnect' : 'event')
+          if (trigger === 'reveal' && snapshotDirtyRef.current) requestRevealRefresh(true)
+          else requestSnapshotRefresh(olderHistory ? 'reconnect' : 'event')
           return
         }
       }
@@ -4551,7 +4694,10 @@ export function FreshAgentView({
         isManagedFreshAgentStopped(paneContentRef.current),
       ))
       const snapshotAccepted = displaySnapshot !== previousSnapshot
-      if (snapshotAccepted) snapshotRequestAuthorityRef.current.applied = requestSerial
+      // Verification is independent of whether mergeSnapshotForDisplay can
+      // reuse the current display object. A successful current read still
+      // advances the authority serial for an unchanged transcript.
+      snapshotRequestAuthorityRef.current.applied = requestSerial
       if (snapshotAccepted && projectionMetadata) dispatch(transcriptProjectionSnapshotReceived({ ...projectionLocator, snapshot: resolved }))
       if (provider === 'codex' && (snapshotAccepted || displaySnapshot === resolved)
         && requestCodexDiagnosticVersion === codexDiagnosticVersionRef.current) {
@@ -4660,35 +4806,53 @@ export function FreshAgentView({
         baseRevision: snapshotDirtyBaseRevisionRef.current,
         requiresRevisionAdvance: snapshotDirtyRequiresRevisionAdvanceRef.current,
         snapshotRevision: resolved.revision,
+        verifiedCurrent: true,
         projectionNeedsResnapshot: liveProjection?.needsResnapshot === true,
         projectionRevisionIsFresh,
       })
+      auditRequest('reveal_refresh_evaluated', () => ({
+        requestSource: requestSoulId ? 'soul-direct' : 'native',
+        snapshotRevision: resolved.revision,
+        dirty: snapshotDirtyRef.current,
+        dirtyBaseRevision: snapshotDirtyBaseRevisionRef.current,
+        requiresRevisionAdvance: snapshotDirtyRequiresRevisionAdvanceRef.current,
+        revealRefreshIsCurrent,
+        revealRevisionIsFresh,
+        projectionNeedsResnapshot: liveProjection?.needsResnapshot === true,
+        projectionRevisionIsFresh,
+      }))
       if (revealRefreshIsCurrent && revealRevisionIsFresh) {
+        const refreshAttempt = revealRefreshAttemptRef.current
+        const settledAttempt = refreshAttempt?.requestId === String(refreshSerial)
+          ? settleRefresh(
+            refreshAttempt,
+            requestRevealAttemptIdentity,
+            String(refreshSerial),
+            'succeeded',
+          )
+          : null
+        if (!settledAttempt) return
         if (revealRefreshRetryTimerRef.current !== null) {
           clearTimeout(revealRefreshRetryTimerRef.current)
           revealRefreshRetryTimerRef.current = null
         }
+        revealRefreshAttemptRef.current = settledAttempt
+        revealRefreshDeadlineDisposerRef.current?.()
+        revealRefreshDeadlineDisposerRef.current = null
         snapshotDirtyRef.current = false
         snapshotDirtyBaseRevisionRef.current = null
         snapshotDirtyRequiresRevisionAdvanceRef.current = false
         revealRefreshVersionRef.current = null
-        revealRefreshStartedAtRef.current = null
         setSnapshotDirty(false)
         setSnapshotRevealError(null)
       } else if (revealRefreshIsCurrent && !revealRevisionIsFresh
-        && revealRefreshRetryTimerRef.current === null) {
-        const startedAt = revealRefreshStartedAtRef.current ?? Date.now()
-        const remaining = startedAt + REVEAL_REFRESH_MAX_WAIT_MS - Date.now()
-        if (remaining <= 0) {
-          revealRefreshStartedAtRef.current = null
-          setSnapshotRevealError('The conversation did not finish refreshing. Try again.')
-        } else {
-          revealRefreshRetryTimerRef.current = window.setTimeout(() => {
-            revealRefreshRetryTimerRef.current = null
-            if (!isMountedRef.current || hiddenRef.current || !snapshotDirtyRef.current) return
-            requestRevealRefresh(true)
-          }, Math.min(250, remaining))
-        }
+        && revealRefreshRetryTimerRef.current === null
+        && revealRefreshAttemptRef.current?.state === 'pending') {
+        revealRefreshRetryTimerRef.current = window.setTimeout(() => {
+          revealRefreshRetryTimerRef.current = null
+          if (!isMountedRef.current || hiddenRef.current || !snapshotDirtyRef.current) return
+          requestRevealRefresh(true)
+        }, 250)
       }
       // This read has no live actor authority, even if Retry cleared the intervention while it ran.
       const liveProviderState = resolved.extensions?.[provider]
@@ -4999,7 +5163,6 @@ export function FreshAgentView({
             // "Refreshing conversation" overlay forever. Otherwise refetch
             // via 'manual'.
             if (trigger === 'reveal' && snapshotDirtyRef.current) {
-              revealRefreshStartedAtRef.current = null
               setSnapshotRevealError(null)
               requestRevealRefresh(true)
             } else {
@@ -5025,7 +5188,19 @@ export function FreshAgentView({
         // setLoadError below so the user sees the honest state.
       }
       if (trigger === 'reveal' && snapshotDirtyRef.current) {
-        revealRefreshStartedAtRef.current = null
+        const refreshAttempt = revealRefreshAttemptRef.current
+        // The view deadline may have settled this request while the shared
+        // scheduler was finishing its own (slightly later) timeout. That old
+        // outcome must not replace the Retry surface or settle a newer attempt.
+        if (refreshAttempt?.state !== 'pending' || refreshAttempt.requestId !== String(refreshSerial)) return
+        revealRefreshAttemptRef.current = settleRefresh(
+          refreshAttempt,
+          refreshAttempt.identity,
+          refreshAttempt.requestId,
+          'failed',
+        )
+        revealRefreshDeadlineDisposerRef.current?.()
+        revealRefreshDeadlineDisposerRef.current = null
         setSnapshotRevealError(error instanceof Error ? error.message : 'Failed to refresh conversation')
         return
       }
@@ -5036,14 +5211,14 @@ export function FreshAgentView({
       soulId: requestPaneSoulId, soulIntentRevision: requestPaneSoulRevision })
       + `:read-generation:${requestReadGeneration}:boot:${requestBootId ?? ''}:owner:${requestOwnerFence?.epoch ?? ''}:${requestOwnerFence?.generation ?? ''}`
     let ran = false
+    const observerController = new AbortController()
     auditRequest('request_queued')
-    void getSnapshotScheduler().schedule(key, trigger, async () => {
+    void getSnapshotScheduler().schedule(key, trigger, async (signal) => {
       ran = true
       auditRequest('run_started')
-      // NO signal: the run may execute on behalf of other panes sharing the
-      // key, or after this effect cleaned up (A2). Staleness is handled by
-      // isStaleSnapshotRequest() when the outcome is applied, not by aborting.
-      const options = { ...(requestCwd ? { cwd: requestCwd } : {}), trigger }
+      // This scheduler-owned signal survives one view unsubscribing and aborts
+      // only when the shared read reaches its deadline or loses all lifetime.
+      const options = { ...(requestCwd ? { cwd: requestCwd } : {}), trigger, signal }
       if (requestSoulId) {
         auditRequest('soul_started', () => ({ source: 'direct' }))
         return getFreshAgentThreadSnapshot(requestSessionType, provider, sessionId, { ...options, soulId: requestSoulId })
@@ -5062,8 +5237,7 @@ export function FreshAgentView({
       if (isStaleSnapshotRequest('before-soul')) throw new Error('Conversation source changed during snapshot read')
       auditRequest('soul_started', () => ({ source: 'fallback' }))
       return getFreshAgentThreadSnapshot(requestSessionType, provider, sessionId, { ...options, soulId: requestPaneSoulId })
-    },
-    ).then((outcome) => {
+    }, { signal: observerController.signal }).then((outcome) => {
       auditRequest('outcome_received', () => ({ outcome: outcome.status, ran }))
       if (isStaleSnapshotRequest('outcome')) return
       if (outcome.status === 'ok') {
@@ -5077,15 +5251,6 @@ export function FreshAgentView({
         setRateLimitedUntil(outcome.retryAtMs)
         if (rateLimitRetryTimerRef.current === null) {
           const delay = Math.max(0, outcome.retryAtMs - Date.now())
-          if (
-            trigger === 'reveal'
-            && revealRefreshStartedAtRef.current !== null
-            && Date.now() + delay > revealRefreshStartedAtRef.current + REVEAL_REFRESH_MAX_WAIT_MS
-          ) {
-            revealRefreshStartedAtRef.current = null
-            setSnapshotRevealError('The conversation did not finish refreshing. Try again.')
-            return
-          }
           rateLimitRetryTimerRef.current = window.setTimeout(() => {
             rateLimitRetryTimerRef.current = null
             setRateLimitedUntil(null)
@@ -5101,6 +5266,7 @@ export function FreshAgentView({
       if (outcome.status === 'coalesced') return
       handleSnapshotError(outcome.error)
     })
+    return () => observerController.abort()
     // Identity changes and newer status activity during managed lost recovery
     // load a current snapshot. Ordinary status updates stay outside this effect.
     // This effect dispatches updatePaneContent to persist its resolved resumeSessionId/
@@ -5485,7 +5651,9 @@ export function FreshAgentView({
     setSnapshotDirty(false)
     setSnapshotRevealError(null)
     if (!hiddenRef.current) requestSnapshotRefresh('event')
-    else surfaceRefreshOwedRef.current = true
+    else {
+      surfaceRefreshOwedRef.current = true
+    }
   }, [retainedSnapshot, commitSnapshot, requestSnapshotRefresh])
   const rawCodexLiveMetadata = useAppSelector((state) => liveSessionKey ? state.freshAgentLive?.bySession[liveSessionKey]?.codexMetadata : undefined)
   const boundProjectionIdentity = useAppSelector((state) => {
@@ -6645,7 +6813,26 @@ export function FreshAgentView({
                         <button
                           type="button"
                           className="shrink-0 rounded border border-border/70 px-2 py-1 text-xs"
-                          onClick={() => requestRevealRefresh(true)}
+                          onClick={() => {
+                            const attempt = revealRefreshAttemptRef.current
+                            recordSnapshotAudit('reveal_retry_clicked', () => ({
+                              tabId,
+                              paneId,
+                              activeTabId,
+                              activePaneId,
+                              isActivePane,
+                              hidden: hiddenRef.current,
+                              dirty: snapshotDirtyRef.current,
+                              dirtyVersion: snapshotDirtyVersionRef.current,
+                              revealVersion: revealRefreshVersionRef.current,
+                              attemptRequestId: attempt?.requestId,
+                              attemptState: attempt?.state,
+                              attemptIdentity: attempt?.identity,
+                              deadlineAt: attempt?.deadlineAt,
+                              errorVisible: Boolean(snapshotRevealError),
+                            }))
+                            requestRevealRefresh(true)
+                          }}
                         >
                           Retry
                         </button>

@@ -98,6 +98,63 @@ describe('FreshAgentSnapshotScheduler', () => {
     expect(run).toHaveBeenCalledTimes(1)                      // the trailing run is cancelled: no second network call
   })
 
+  it('bounds a shared hung run, aborts it, releases the key for Retry, and ignores its late completion', async () => {
+    const scheduler = getSnapshotScheduler()
+    let releaseOldRun!: (value: string) => void
+    const oldRun = new Promise<string>((resolve) => { releaseOldRun = resolve })
+    let runSignal!: AbortSignal
+    const run = vi.fn((signal: AbortSignal) => {
+      runSignal = signal
+      return oldRun
+    })
+    const firstWaiter = scheduler.schedule(KEY, 'event', run)
+    const secondWaiter = scheduler.schedule(KEY, 'event', run)
+
+    await vi.advanceTimersByTimeAsync(250)
+    expect(run).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(15_000)
+
+    const [first, second] = await Promise.all([firstWaiter, secondWaiter])
+    expect(first.status).toBe('error')
+    expect(second).toEqual(first)
+    if (first.status !== 'error') throw new Error('expected a bounded run failure')
+    expect(first.error).toMatchObject({ name: 'SnapshotRunTimeoutError' })
+    expect(runSignal.aborted).toBe(true)
+
+    const retry = await scheduler.schedule(KEY, 'manual', async () => 'retry succeeded')
+    expect(retry).toEqual({ status: 'ok', value: 'retry succeeded' })
+    expect(run).toHaveBeenCalledTimes(1)
+
+    releaseOldRun('late old result')
+    await Promise.resolve()
+    expect(scheduler.getBackoffUntil(KEY)).toBeNull()
+    expect(await scheduler.schedule(KEY, 'manual', async () => 'still current')).toEqual({ status: 'ok', value: 'still current' })
+  })
+
+  it('unsubscribing one waiter does not abort a shared run needed by another', async () => {
+    const scheduler = getSnapshotScheduler()
+    const firstObserver = new AbortController()
+    let releaseRun!: (value: string) => void
+    const gate = new Promise<string>((resolve) => { releaseRun = resolve })
+    let runSignal!: AbortSignal
+    const run = vi.fn((signal: AbortSignal) => {
+      runSignal = signal
+      return gate
+    })
+    const firstWaiter = scheduler.schedule(KEY, 'event', run, { signal: firstObserver.signal })
+    const secondWaiter = scheduler.schedule(KEY, 'event', run)
+
+    await vi.advanceTimersByTimeAsync(250)
+    firstObserver.abort()
+    await expect(firstWaiter).resolves.toEqual({ status: 'coalesced' })
+    expect(runSignal.aborted).toBe(false)
+
+    releaseRun('shared result')
+    await expect(secondWaiter).resolves.toEqual({ status: 'ok', value: 'shared result' })
+    expect(run).toHaveBeenCalledTimes(1)
+    expect(runSignal.aborted).toBe(false)
+  })
+
   it('falls back to exponential backoff when Retry-After is absent and doubles per consecutive 429', async () => {
     const scheduler = getSnapshotScheduler()
     const run429 = vi.fn(async () => { throw new ApiError(429, 'Too many requests') })

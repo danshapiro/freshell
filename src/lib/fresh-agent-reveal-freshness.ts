@@ -3,6 +3,7 @@ export interface FreshAgentRevealFreshnessInput {
   baseRevision: number | null
   requiresRevisionAdvance: boolean
   snapshotRevision: number | undefined
+  verifiedCurrent: boolean
   projectionNeedsResnapshot: boolean
   projectionRevisionIsFresh: boolean
 }
@@ -12,13 +13,16 @@ export function isFreshAgentRevealRevisionFresh({
   baseRevision,
   requiresRevisionAdvance,
   snapshotRevision,
+  verifiedCurrent,
   projectionNeedsResnapshot,
   projectionRevisionIsFresh,
 }: FreshAgentRevealFreshnessInput): boolean {
   if (projectionNeedsResnapshot) return projectionRevisionIsFresh
-  if (baseRevision === null || projectionRevisionIsFresh || typeof snapshotRevision !== 'number') return true
-  if (snapshotRevision > baseRevision) return true
-  return provider === 'opencode'
-    && !requiresRevisionAdvance
-    && snapshotRevision === baseRevision
+  if (baseRevision === null || projectionRevisionIsFresh) return true
+  if (typeof snapshotRevision === 'number' && snapshotRevision > baseRevision) return true
+  if (snapshotRevision !== undefined && snapshotRevision < baseRevision) return false
+  // Equality, or the absence of a transcript revision, is useful only when
+  // this request was itself verified against the current read identity/fence.
+  // A transcript-changing event still requires evidence newer than its base.
+  return verifiedCurrent && !requiresRevisionAdvance
 }
