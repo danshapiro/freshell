@@ -763,6 +763,163 @@ describe('FreshAgentView obsolete attach authority retry', () => {
     expect(sentOfType('freshAgent.create')).toHaveLength(0)
   })
 
+  it('refreshes the owner for a legacy SESSION_RESERVED attach failure with omitted retryable', async () => {
+    act(() => { store.dispatch(applyRuntimeOwner(initialOwner)) })
+    renderFreshAgentPane({
+      sessionId: DURABLE,
+      status: 'connected',
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+    })
+    await flush()
+    const first = sentOfType('freshAgent.attach').at(-1)!
+
+    receiveWs({
+      type: 'freshAgent.attach.failed',
+      requestId: first.requestId,
+      viewId: first.viewId,
+      provider: 'claude',
+      sessionType: 'freshclaude',
+      sessionId: DURABLE,
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+      status: 'failed',
+      code: 'SESSION_RESERVED',
+      message: 'retry with the owner reported by the reservation refusal',
+      ownerKind: 'fresh-agent',
+      ownerEpoch: 5,
+      ownerGeneration: 3,
+    })
+    await flush()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS + 20)
+    })
+
+    const retry = sentOfType('freshAgent.attach').at(-1)!
+    expect(retry.requestId).not.toBe(first.requestId)
+    expect(retry).toMatchObject({
+      type: 'freshAgent.attach',
+      sessionId: DURABLE,
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+      viewId: first.viewId,
+      observedEpoch: 5,
+      observedGeneration: 3,
+    })
+  })
+
+  it('uses read-only reconcile when a legacy typed reservation has no owner authority', async () => {
+    act(() => { store.dispatch(applyRuntimeOwner(initialOwner)) })
+    renderFreshAgentPane({
+      sessionId: DURABLE,
+      status: 'connected',
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+    })
+    await flush()
+    const first = sentOfType('freshAgent.attach').at(-1)!
+
+    receiveWs({
+      type: 'freshAgent.attach.failed',
+      requestId: first.requestId,
+      viewId: first.viewId,
+      provider: 'claude',
+      sessionType: 'freshclaude',
+      sessionId: DURABLE,
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+      status: 'failed',
+      code: 'SESSION_RESERVED',
+      message: 'reconcile before retrying this legacy reservation',
+    })
+    await flush()
+
+    expect(sentOfType('pane.reconcile.request')).toHaveLength(1)
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS * 2)
+    })
+
+    expect(sentOfType('pane.reconcile.request')).toHaveLength(1)
+    expect(sentOfType('freshAgent.attach')).toHaveLength(1)
+    expect(sentOfType('freshAgent.create')).toHaveLength(0)
+  })
+
+  it('uses one read-only reconcile when typed stale authority omits every owner field', async () => {
+    act(() => { store.dispatch(applyRuntimeOwner(initialOwner)) })
+    renderFreshAgentPane({
+      sessionId: DURABLE,
+      status: 'connected',
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+    })
+    await flush()
+    const first = sentOfType('freshAgent.attach').at(-1)!
+    expect(first).toMatchObject({ observedEpoch: 4, observedGeneration: 2 })
+
+    receiveWs({
+      type: 'freshAgent.attach.failed',
+      requestId: first.requestId,
+      viewId: first.viewId,
+      provider: 'claude',
+      sessionType: 'freshclaude',
+      sessionId: DURABLE,
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+      status: 'failed',
+      code: 'SESSION_RESERVED',
+      message: 'refresh owner before retrying',
+      retryable: true,
+    })
+    await flush()
+
+    const reconciles = sentOfType('pane.reconcile.request')
+    expect(reconciles).toHaveLength(1)
+    expect(reconciles[0]).toMatchObject({
+      type: 'pane.reconcile.request',
+      panes: [{ paneKey: `${tabId}:${paneId}`, kind: 'fresh-agent' }],
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS * 2)
+    })
+
+    expect(sentOfType('pane.reconcile.request')).toHaveLength(1)
+    expect(sentOfType('freshAgent.attach')).toHaveLength(1)
+    expect(sentOfType('freshAgent.create')).toHaveLength(0)
+  })
+
+  it('settles a non-reservation failure with complete fresh-agent owner metadata without retrying', async () => {
+    act(() => { store.dispatch(applyRuntimeOwner(initialOwner)) })
+    renderFreshAgentPane({
+      sessionId: DURABLE,
+      status: 'connected',
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+    })
+    await flush()
+    const first = sentOfType('freshAgent.attach').at(-1)!
+    const attachesBefore = sentOfType('freshAgent.attach').length
+    const createsBefore = sentOfType('freshAgent.create').length
+    const message = 'The attach fence was rejected.'
+
+    receiveWs({
+      type: 'freshAgent.attach.failed',
+      requestId: first.requestId,
+      viewId: first.viewId,
+      provider: 'claude',
+      sessionType: 'freshclaude',
+      sessionId: DURABLE,
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+      status: 'failed',
+      code: 'INVALID_FENCE',
+      message,
+      ownerKind: 'fresh-agent',
+      ownerEpoch: 5,
+      ownerGeneration: 3,
+    })
+    await flush()
+
+    expect(screen.getByText(message)).toBeVisible()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS + 20)
+    })
+
+    expect(sentOfType('freshAgent.attach')).toHaveLength(attachesBefore)
+    expect(sentOfType('freshAgent.create')).toHaveLength(createsBefore)
+    expect(screen.getByText(message)).toBeVisible()
+  })
+
   it('shows terminal divergence and sends no retry when the refusal names a terminal owner', async () => {
     act(() => { store.dispatch(applyRuntimeOwner(initialOwner)) })
     renderFreshAgentPane({

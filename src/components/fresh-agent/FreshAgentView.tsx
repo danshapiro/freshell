@@ -3821,11 +3821,19 @@ export function FreshAgentView({
         const current = paneContentRef.current
         const canonicalSession = resolveCanonicalPaneSession(appStore.getState(), current)
         const ownerAuthority = readFreshAgentAttachOwnerAuthority(message)
+        const typedStaleOwnerRetry = message.code === 'SESSION_RESERVED' && message.retryable === true
+        const legacyReservationRetry = message.code === 'SESSION_RESERVED' && message.retryable === undefined
+        const reservationRetry = typedStaleOwnerRetry || legacyReservationRetry
         if (hasFreshAgentAttachOwnerAuthority(message)) {
           const attempt = attachmentAttemptRef.current
           if (!attempt || !canonicalSession || !ownerAuthority || ownerAuthority.ownerEpoch === undefined) {
-            if (attempt) reconcileAttachAuthorityReadOnly(attempt)
-            else setNotice(message.message || 'The conversation owner could not be confirmed.')
+            if (reservationRetry && attempt) {
+              clearReserveRedrive()
+              reconcileAttachAuthorityReadOnly(attempt)
+            } else {
+              clearReserveRedrive()
+              setNotice(message.message || 'The conversation owner could not be confirmed.')
+            }
             return
           }
           const ownerBefore = selectSessionRuntimeOwner(
@@ -3834,7 +3842,13 @@ export function FreshAgentView({
             canonicalSession.sessionId,
           )
           if (!ownerBefore) {
-            reconcileAttachAuthorityReadOnly(attempt)
+            if (reservationRetry) {
+              clearReserveRedrive()
+              reconcileAttachAuthorityReadOnly(attempt)
+            } else {
+              clearReserveRedrive()
+              setNotice(message.message || 'The conversation owner could not be confirmed.')
+            }
             return
           }
           dispatch(applyRefusalFence({
@@ -3850,7 +3864,18 @@ export function FreshAgentView({
             canonicalSession.sessionId,
           )
           if (!ownerAfter) {
-            reconcileAttachAuthorityReadOnly(attempt)
+            if (reservationRetry) {
+              clearReserveRedrive()
+              reconcileAttachAuthorityReadOnly(attempt)
+            } else {
+              clearReserveRedrive()
+              setNotice(message.message || 'The conversation owner could not be confirmed.')
+            }
+            return
+          }
+          if (!reservationRetry) {
+            clearReserveRedrive()
+            setNotice(message.message || 'The conversation could not be attached.')
             return
           }
           if (ownerAfter.ownerKind === 'terminal') {
@@ -3858,12 +3883,8 @@ export function FreshAgentView({
             return
           }
           if (ownerAfter.ownerKind !== 'fresh-agent') {
-            reconcileAttachAuthorityReadOnly(attempt)
-            return
-          }
-          if (message.retryable === false) {
             clearReserveRedrive()
-            setNotice(message.message || 'The conversation could not be attached.')
+            reconcileAttachAuthorityReadOnly(attempt)
             return
           }
 
@@ -3875,15 +3896,22 @@ export function FreshAgentView({
           redriveAfterSessionReserved(nextAttempt)
           return
         }
-        if (message.code === 'SESSION_RESERVED' && message.retryable !== false) {
-          // A transient reservation re-drives only the matching view's
-          // immutable attach decision. Default provider attach refusals keep
-          // the legacy shape, which omits retryable; an explicit false still
-          // prevents re-drive.
-          redriveAfterSessionReserved()
-        } else {
-          setNotice(message.message || 'The conversation could not be attached.')
+        if (reservationRetry) {
+          // A reservation result without complete owner authority cannot
+          // authorize a replacement attach decision. Refresh the pane's
+          // server-side verdict read-only instead of retrying its old fence.
+          clearReserveRedrive()
+          const attempt = attachmentAttemptRef.current
+          if (attempt) reconcileAttachAuthorityReadOnly(attempt)
+          else setNotice(message.message || 'The conversation owner could not be confirmed.')
+          return
         }
+        // Legacy reservation retries are handled by the separate
+        // freshAgent.event / freshAgent.error path below. A typed attach
+        // failure without a recognized reservation classification is an
+        // error and cannot authorize a new immutable attach attempt.
+        clearReserveRedrive()
+        setNotice(message.message || 'The conversation could not be attached.')
         return
       }
       if (
