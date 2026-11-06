@@ -470,6 +470,10 @@ export type FreshAgentPendingLocalEcho = {
   requestId: string
   text: string
   submittedTurnId?: string
+  /** Delivery has not been confirmed; retain the text until the user can review it. */
+  deliveryUnconfirmed?: boolean
+  /** Wall-clock deadline for showing unconfirmed delivery, retained across remounts. */
+  confirmationDeadlineMs?: number
   /** Turn keys that existed when the message was sent — the send-time
    * boundary, persisted WITH the echo so a reloaded pane can tell earlier
    * rows (every landed user row is inside the set) from later ones (a key
@@ -496,6 +500,9 @@ export function normalizeFreshAgentPendingLocalEcho(value: unknown): FreshAgentP
     ...(typeof record.submittedTurnId === 'string' && record.submittedTurnId.length > 0
       ? { submittedTurnId: record.submittedTurnId }
       : {}),
+    ...(record.deliveryUnconfirmed === true ? { deliveryUnconfirmed: true } : {}),
+    ...(typeof record.confirmationDeadlineMs === 'number' && Number.isFinite(record.confirmationDeadlineMs)
+      ? { confirmationDeadlineMs: record.confirmationDeadlineMs } : {}),
     ...(previousTurnKeys ? { previousTurnKeys } : {}),
   }
 }

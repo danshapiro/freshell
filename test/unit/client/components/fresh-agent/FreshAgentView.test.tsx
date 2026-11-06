@@ -1761,6 +1761,8 @@ describe('new conversation close acceptance', () => {
     try {
       await waitFor(() => expect(screen.getByText(historyText)).toBeInTheDocument())
       expect(screen.getByText('Retained submitted optimistic message')).toBeInTheDocument()
+      const echoBeforeClose = structuredClone(fixture.getContent().pendingLocalEcho)
+      expect(echoBeforeClose).toMatchObject(fixture.content.pendingLocalEcho!)
       const composer = screen.getByRole('textbox', { name: 'Chat message input' })
       expect(composer).toBeEnabled()
       fireEvent.change(composer, { target: { value: 'Retained queued work' } })
@@ -1781,7 +1783,7 @@ describe('new conversation close acceptance', () => {
         expect(screen.getByText(historyText)).toBeInTheDocument()
         expect(screen.getByText('Retained submitted optimistic message')).toBeInTheDocument()
         expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
-        expect(fixture.getContent().pendingLocalEcho).toEqual(fixture.content.pendingLocalEcho)
+        expect(fixture.getContent().pendingLocalEcho).toEqual(echoBeforeClose)
         expect(composer).toHaveValue(draftText)
         expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(reads)
         expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
@@ -1937,12 +1939,13 @@ describe('FreshAgentView', () => {
       ownerKind: 'vacant', nativeHistoryAvailable: true, statusFromLiveState: false, projection: undefined } } })
   }
 
-  function claimSnapshotWithUserTurn(turnId: string, text: string, revision: number) {
+  function claimSnapshotWithUserTurn(turnId: string, text: string, revision: number, clientId?: string) {
     const snapshot = hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Assistant before send', revision)
     const projection = snapshot.extensions!.codex!.projection!
     return { ...snapshot,
       turns: [...snapshot.turns, { id: turnId, turnId, role: 'user' as const, summary: '',
-        items: [{ id: `${turnId}-text`, kind: 'text' as const, text }] }],
+        items: [{ id: `${turnId}-text`, kind: 'text' as const, text,
+          ...(clientId ? { extensions: { codex: { clientId } } } : {}) }] }],
       extensions: { codex: { ...snapshot.extensions!.codex!, projection: {
         ...projection, eventOwnedTurnIds: ['turn', turnId], turnRows: { turn: ['turn'], [turnId]: [turnId] },
       } } },
@@ -1951,7 +1954,7 @@ describe('FreshAgentView', () => {
 
   // A single-input completed turn exercises scheduling with the producer's
   // split rows. A native turn ID does not identify an individual steer.
-  function claimSnapshotWithCompletedNativeTurn(nativeTurnId: string, text: string, revision: number) {
+  function claimSnapshotWithCompletedNativeTurn(nativeTurnId: string, text: string, revision: number, clientId?: string) {
     const snapshot = hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Assistant before send', revision)
     const projection = snapshot.extensions!.codex!.projection!
     const userRow = `${nativeTurnId}:row-0`
@@ -1959,7 +1962,8 @@ describe('FreshAgentView', () => {
     return FreshAgentSnapshotSchema.parse({ ...snapshot,
       turns: [...snapshot.turns,
         { id: userRow, turnId: userRow, nativeTurnId, ordinal: 1, source: 'durable', role: 'user',
-          summary: text, summaryKind: 'echo', items: [{ id: 'user-item-1:part:0', kind: 'text', text }] },
+          summary: text, summaryKind: 'echo', items: [{ id: 'user-item-1:part:0', kind: 'text', text,
+            ...(clientId ? { extensions: { codex: { clientId } } } : {}) }] },
         { id: assistantRow, turnId: assistantRow, ordinal: 2, source: 'durable', role: 'assistant',
           summary: 'answer', summaryKind: 'echo', items: [{ id: 'assistant-item-1', kind: 'text', text: 'answer' }] },
       ],
@@ -1973,8 +1977,8 @@ describe('FreshAgentView', () => {
 
   // A different client can already have put its user item and an assistant
   // item in the still-running turn before this pane's input is steered into it.
-  function claimSnapshotWithRunningNativePreview(nativeTurnId: string, text: string, revision: number) {
-    const snapshot = claimSnapshotWithCompletedNativeTurn(nativeTurnId, text, revision)
+  function claimSnapshotWithRunningNativePreview(nativeTurnId: string, text: string, revision: number, clientId?: string) {
+    const snapshot = claimSnapshotWithCompletedNativeTurn(nativeTurnId, text, revision, clientId)
     const projection = snapshot.extensions!.codex!.projection!
     return FreshAgentSnapshotSchema.parse({ ...snapshot, status: 'running',
       turns: snapshot.turns.map((turn) => turn.turnId === `${nativeTurnId}:row-1` ? { ...turn, ordinal: 1 } : turn),
@@ -4924,7 +4928,8 @@ describe('FreshAgentView', () => {
       const observedEchoIds: Array<string | undefined> = []
       unsubscribe = route.store.subscribe(() => observedEchoIds.push(getFreshAgentPaneContent(route.store).pendingLocalEcho?.requestId))
       const turnId = correlation === 'correlated' ? 'my-submitted-turn' : 'someone-elses-turn'
-      const response = claimSnapshotWithCompletedNativeTurn(turnId, 'My accepted message', 3)
+      const response = claimSnapshotWithCompletedNativeTurn(turnId, 'My accepted message', 3,
+        correlation === 'correlated' ? String(first.requestId) : 'different-input-id')
       apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(response)
       await act(async () => sentSnapshot.resolve(response))
       expect(route.store.getState().freshAgentLive.bySession[key]?.projection).toMatchObject({ id: 'claim-q', eventRevision: 3 })
@@ -5020,7 +5025,8 @@ describe('FreshAgentView', () => {
           requestId: first.requestId, text: sentText, submittedTurnId: 'shared-running-turn',
         })
         const response = turnRelationship === 'shared'
-          ? claimSnapshotWithRunningNativePreview('shared-running-turn', earlierText, 3)
+          ? claimSnapshotWithRunningNativePreview('shared-running-turn', earlierText, 3,
+              textRelationship === 'different' ? 'another-client-input' : undefined)
           : FreshAgentSnapshotSchema.parse({
               ...claimSnapshotWithCompletedNativeTurn('earlier-completed-turn', earlierText, 3), status: 'running',
             })
@@ -5038,6 +5044,21 @@ describe('FreshAgentView', () => {
         expect.soft(userTurns.map((turn) => turn.textContent)).toEqual([
           expect.stringContaining(earlierText), expect.stringContaining(sentText),
         ])
+        if (turnRelationship === 'shared') {
+          const next = claimSnapshotWithRunningNativePreview('shared-running-turn', earlierText, 4, 'another-client-input')
+          const withMatchingItem = FreshAgentSnapshotSchema.parse({ ...next, turns: next.turns.map((turn) => (
+            turn.turnId === 'shared-running-turn:row-0' ? { ...turn, items: [...turn.items,
+              { id: 'my-native-input:part:0', kind: 'text', text: sentText,
+                extensions: { codex: { clientId: first.requestId } } }] } : turn
+          )) })
+          apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(withMatchingItem)
+          act(() => route.receive({ type: 'freshAgent.send.accepted', ...route.locator,
+            requestId: first.requestId, submittedTurnId: 'shared-running-turn' }))
+          await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+          expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toBeUndefined()
+          expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+          expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+        }
       } finally {
         cleanup()
         resetSnapshotSchedulerForTests()
@@ -5048,6 +5069,231 @@ describe('FreshAgentView', () => {
       }
     },
   )
+
+  it('keeps an ambiguous Codex input visible and blocks later sends across idle and remount', async () => {
+    const route = await mountProjectionReviewRoute('claim-unconfirmed-input-remount', false)
+    let claimRead: ReturnType<typeof createDeferred<unknown>> | undefined
+    try {
+      ;({ current: claimRead } = await prepareNativeClaim(route))
+      const ready = hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Ready for input', 2)
+      await act(async () => claimRead!.resolve(ready))
+      await expectRenderedText('Ready for input')
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(ready)
+      const send = (text: string) => {
+        fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), { target: { value: text } })
+        fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      }
+      send('Unconfirmed original input')
+      send('Queued follow-up')
+      const first = sentFreshAgentMessages('freshAgent.send')[0]
+      expect(first).toMatchObject({ text: 'Unconfirmed original input', sessionId: 'native-b' })
+      act(() => route.receive({ type: 'error', code: 'INTERNAL_ERROR', requestId: first.requestId,
+        message: 'CODEX_DELIVERY_AMBIGUOUS: the reply was lost' }))
+      expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({
+        requestId: first.requestId, text: 'Unconfirmed original input',
+      })
+      expect(screen.getByText('Unconfirmed original input')).toBeInTheDocument()
+      expect(screen.getByText(/may already have been delivered/i)).toBeInTheDocument()
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      act(() => {
+        route.event({ type: 'freshAgent.status', status: 'running' })
+        route.event({ type: 'freshAgent.status', status: 'idle' })
+      })
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+
+      route.view.unmount()
+      render(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      expect(await screen.findByText('Unconfirmed original input')).toBeInTheDocument()
+      expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({
+        requestId: first.requestId, text: 'Unconfirmed original input',
+      })
+      await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeEnabled())
+      send('Follow-up after remount')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      fireEvent.click(screen.getByRole('button', { name: 'Check conversation' }))
+      const proceed = screen.getByRole('button', { name: 'Continue without confirmation' })
+      await waitFor(() => expect(proceed).toBeEnabled())
+      fireEvent.click(proceed)
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+      expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Follow-up after remount' })
+      expect(sentFreshAgentMessages('freshAgent.send').filter((frame) => frame.text === 'Unconfirmed original input')).toHaveLength(1)
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('Unconfirmed original input')
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      claimRead?.resolve(hostedCodexSnapshot('native-b', 'Claim'))
+    }
+  })
+
+  it('keeps a send with no receipt through the bounded wait and accepts a later matching item', async () => {
+    const route = await mountProjectionReviewRoute('claim-missing-receipt', false)
+    let claimRead: ReturnType<typeof createDeferred<unknown>> | undefined
+    try {
+      ;({ current: claimRead } = await prepareNativeClaim(route))
+      const ready = hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Ready without receipt', 2)
+      await act(async () => claimRead!.resolve(ready))
+      await expectRenderedText('Ready without receipt')
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(FreshAgentSnapshotSchema.parse({ ...ready, status: 'running' }))
+      vi.useFakeTimers()
+      const send = (text: string) => {
+        fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), { target: { value: text } })
+        fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      }
+      send('Input with no receipt')
+      send('Follow-up after missing receipt')
+      const first = sentFreshAgentMessages('freshAgent.send')[0]
+      act(() => route.event({ type: 'freshAgent.status', status: 'running' }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(4_999) })
+      expect(screen.queryByRole('status', { name: 'Unconfirmed message' })).not.toBeInTheDocument()
+      await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+      expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({ requestId: first.requestId, text: 'Input with no receipt', deliveryUnconfirmed: true })
+      expect(screen.getByText('Input with no receipt')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Continue without confirmation' })).toBeDisabled()
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+
+      route.view.rerender(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden /></Provider>)
+      expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({ requestId: first.requestId, deliveryUnconfirmed: true })
+      act(() => route.event({ type: 'freshAgent.status', status: 'idle' }))
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      const landed = claimSnapshotWithCompletedNativeTurn('late-input-turn', 'Input with no receipt', 3, String(first.requestId))
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(landed)
+      route.view.rerender(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      act(() => route.event({ type: 'freshAgent.session.changed', reason: 'codex-thread' }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
+      expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Follow-up after missing receipt' })
+      expect(sentFreshAgentMessages('freshAgent.send').filter((frame) => frame.text === 'Input with no receipt')).toHaveLength(1)
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      claimRead?.resolve(hostedCodexSnapshot('native-b', 'Claim'))
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not restart the unconfirmed wait when a pending input is remounted', async () => {
+    const route = await mountProjectionReviewRoute('claim-unconfirmed-remount-deadline', false)
+    let claimRead: ReturnType<typeof createDeferred<unknown>> | undefined
+    try {
+      ;({ current: claimRead } = await prepareNativeClaim(route))
+      const ready = hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Ready before remount', 2)
+      await act(async () => claimRead!.resolve(ready))
+      await expectRenderedText('Ready before remount')
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(ready)
+      vi.useFakeTimers()
+      fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), { target: { value: 'Pending across a remount' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      const first = sentFreshAgentMessages('freshAgent.send')[0]
+      await act(async () => { await vi.advanceTimersByTimeAsync(4_000) })
+      expect(screen.queryByRole('status', { name: 'Unconfirmed message' })).not.toBeInTheDocument()
+      route.view.unmount()
+      render(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      expect(screen.getByText('Pending across a remount')).toBeInTheDocument()
+      await act(async () => { await vi.advanceTimersByTimeAsync(999) })
+      expect(screen.queryByRole('status', { name: 'Unconfirmed message' })).not.toBeInTheDocument()
+      await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+      expect(screen.getByRole('status', { name: 'Unconfirmed message' })).toBeInTheDocument()
+      expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({ requestId: first.requestId, text: 'Pending across a remount', deliveryUnconfirmed: true })
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      claimRead?.resolve(hostedCodexSnapshot('native-b', 'Claim'))
+      vi.useRealTimers()
+    }
+  })
+
+  it('bounds the wait across remounts for an older pending input without a deadline', async () => {
+    const route = await mountProjectionReviewRoute('claim-legacy-unconfirmed-deadline', false)
+    let claimRead: ReturnType<typeof createDeferred<unknown>> | undefined
+    try {
+      ;({ current: claimRead } = await prepareNativeClaim(route))
+      const ready = hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Ready for older input', 2)
+      await act(async () => claimRead!.resolve(ready))
+      await expectRenderedText('Ready for older input')
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(ready)
+      vi.useFakeTimers()
+      act(() => route.store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: {
+        pendingLocalEcho: { requestId: 'older-request', text: 'Older pending input' },
+      } })))
+      await act(async () => { await vi.advanceTimersByTimeAsync(4_000) })
+      route.view.unmount()
+      render(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      expect(screen.getByText('Older pending input')).toBeInTheDocument()
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_000) })
+      expect(screen.getByRole('status', { name: 'Unconfirmed message' })).toBeInTheDocument()
+      expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({ requestId: 'older-request', text: 'Older pending input', deliveryUnconfirmed: true })
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      claimRead?.resolve(hostedCodexSnapshot('native-b', 'Claim'))
+      vi.useRealTimers()
+    }
+  })
+
+  it('requires a current idle read before continuing an unconfirmed input', async () => {
+    const route = await mountProjectionReviewRoute('claim-unconfirmed-current-idle', false)
+    const oldRead = createDeferred<unknown>()
+    let claimRead: ReturnType<typeof createDeferred<unknown>> | undefined
+    try {
+      ;({ current: claimRead } = await prepareNativeClaim(route))
+      const ready = hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Current idle conversation', 2)
+      await act(async () => claimRead!.resolve(ready))
+      await expectRenderedText('Current idle conversation')
+      vi.useFakeTimers()
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(oldRead.promise)
+      act(() => route.event({ type: 'freshAgent.session.changed', reason: 'codex-thread' }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === oldRead.promise)).toBe(true)
+      const send = (text: string) => {
+        fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), { target: { value: text } })
+        fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      }
+      send('Input awaiting review')
+      send('Queued after review')
+      const first = sentFreshAgentMessages('freshAgent.send')[0]
+      await act(async () => { await vi.advanceTimersByTimeAsync(5_000) })
+      const proceed = screen.getByRole('button', { name: 'Continue without confirmation' })
+      expect(proceed).toBeDisabled()
+      await act(async () => oldRead.resolve(ready))
+      expect(proceed).toBeDisabled()
+      expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({ requestId: first.requestId })
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(ready)
+      fireEvent.click(screen.getByRole('button', { name: 'Check conversation' }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      expect(proceed).toBeEnabled()
+      act(() => route.event({ type: 'freshAgent.status', status: 'running' }))
+      expect(proceed).toBeDisabled()
+      act(() => route.event({ type: 'freshAgent.status', status: 'idle' }))
+      fireEvent.click(proceed)
+      expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({ requestId: first.requestId })
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      expect(proceed).toBeEnabled()
+      fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), { target: { value: 'Newer draft' } })
+      fireEvent.click(proceed)
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
+      expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Queued after review' })
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('Input awaiting review\nNewer draft')
+      expect(sentFreshAgentMessages('freshAgent.send').filter((frame) => frame.text === 'Input awaiting review')).toHaveLength(1)
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      oldRead.resolve(hostedCodexSnapshot('native-b', 'Old'))
+      claimRead?.resolve(hostedCodexSnapshot('native-b', 'Claim'))
+      vi.useRealTimers()
+    }
+  })
 
   it('does not reconcile an unbound send from a read started before that send', async () => {
     const route = await mountProjectionReviewRoute('claim-unbound-pre-send-read', false)
@@ -5079,7 +5325,7 @@ describe('FreshAgentView', () => {
       expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({ requestId: first.requestId })
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
       await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === current.promise)).toBe(true))
-      await act(async () => current.resolve(claimSnapshotWithUserTurn('turn-after-held-read', 'Message after read started', 4)))
+      await act(async () => current.resolve(claimSnapshotWithUserTurn('turn-after-held-read', 'Message after read started', 4, String(first.requestId))))
       await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
       expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Follow-up after held read' })
     } finally {
@@ -5136,9 +5382,10 @@ describe('FreshAgentView', () => {
       apiMock.getFreshAgentThreadSnapshot.mockReturnValue(current.promise)
       const observedEchoIds: Array<string | undefined> = []
       unsubscribe = route.store.subscribe(() => observedEchoIds.push(getFreshAgentPaneContent(route.store).pendingLocalEcho?.requestId))
-      await act(async () => stale.resolve(claimSnapshotWithCompletedNativeTurn('revision-checked-turn', 'Message with newer projection', 3)))
+      await act(async () => stale.resolve(claimSnapshotWithCompletedNativeTurn('revision-checked-turn', 'Outdated projection input', 3, String(first.requestId))))
       expect(route.store.getState().freshAgentLive.bySession[key]?.projection?.eventRevision).toBe(4)
       expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({ requestId: first.requestId })
+      expect(screen.getByText('Message with newer projection')).toBeInTheDocument()
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
       expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
       expect(apiMock.getFreshAgentThreadSnapshot.mock.calls).toHaveLength(readsBeforeStale)
@@ -5149,7 +5396,7 @@ describe('FreshAgentView', () => {
       expect(apiMock.getFreshAgentThreadSnapshot.mock.calls).toHaveLength(readsBeforeStale + 1)
       expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[coveringCall]).toMatchObject(['freshcodex', 'codex', 'native-b', { trigger: 'idle-incomplete' }])
       expect(route.store.getState().freshAgentLive.snapshotSourceRevisionBySession[key]).toBe(sourceRevision)
-      await act(async () => current.resolve(claimSnapshotWithCompletedNativeTurn('revision-checked-turn', 'Message with newer projection', 5)))
+      await act(async () => current.resolve(claimSnapshotWithCompletedNativeTurn('revision-checked-turn', 'Message with newer projection', 5, String(first.requestId))))
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
       expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Follow-up after newer projection' })
       expect(observedEchoIds).toContain(undefined)
@@ -5200,7 +5447,7 @@ describe('FreshAgentView', () => {
       expect(route.store.getState().freshAgentLive.bySession[key]?.projection?.needsResnapshot).not.toBe(true)
       const shared = route.store.getState().freshAgent.sessions[key]
       const sourceRevision = route.store.getState().freshAgentLive.snapshotSourceRevisionBySession[key]
-      await act(async () => stale.resolve(claimSnapshotWithCompletedNativeTurn('overlap-turn', 'Accepted message awaiting coverage', 3)))
+      await act(async () => stale.resolve(claimSnapshotWithCompletedNativeTurn('overlap-turn', 'Accepted message awaiting coverage', 3, String(first.requestId))))
       expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({ requestId: first.requestId })
 
       apiMock.getFreshAgentThreadSnapshot.mockReturnValue(incomplete.promise)
@@ -5231,7 +5478,7 @@ describe('FreshAgentView', () => {
         expect(coveringCall).toBeGreaterThanOrEqual(0)
         expect(apiMock.getFreshAgentThreadSnapshot.mock.calls).toHaveLength(reads + 1)
         expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[coveringCall]).toMatchObject(['freshcodex', 'codex', 'native-b', { trigger: 'idle-incomplete' }])
-        await act(async () => covering.resolve(claimSnapshotWithCompletedNativeTurn('overlap-turn', 'Accepted message awaiting coverage', 5)))
+        await act(async () => covering.resolve(claimSnapshotWithCompletedNativeTurn('overlap-turn', 'Accepted message awaiting coverage', 5, String(first.requestId))))
         expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
         expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Queued follow-up after overlap' })
       }
@@ -5283,7 +5530,7 @@ describe('FreshAgentView', () => {
       expect(route.store.getState().freshAgentLive.bySession[key]?.projection?.needsResnapshot).not.toBe(true)
       const sourceRevision = route.store.getState().freshAgentLive.snapshotSourceRevisionBySession[key]
       const shared = route.store.getState().freshAgent.sessions[key]
-      await act(async () => stale.resolve(claimSnapshotWithCompletedNativeTurn('accepted-turn', 'Accepted pending coverage', 3)))
+      await act(async () => stale.resolve(claimSnapshotWithCompletedNativeTurn('accepted-turn', 'Accepted pending coverage', 3, String(first.requestId))))
       expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({ requestId: first.requestId })
       apiMock.getFreshAgentThreadSnapshot.mockReturnValue(nonLive.promise)
       act(() => route.event({ type: 'freshAgent.session.changed', reason: 'codex-thread' }))
@@ -5292,11 +5539,17 @@ describe('FreshAgentView', () => {
       expect(nonLiveCall).toBeGreaterThanOrEqual(0)
       expect(nonLiveCall).not.toBe(staleCall)
       expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[nonLiveCall]).toMatchObject(['freshcodex', 'codex', 'native-b', { trigger: 'event' }])
-      const invalid = hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Invalid newer result', 4)
-      await act(async () => nonLive.resolve(kind === 'history' ? transientClaimHistory() : FreshAgentSnapshotSchema.parse({
+      const invalidBase = hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Invalid newer result', 4)
+      const invalidItem = { id: 'nonlive-user', turnId: 'nonlive-user', role: 'user' as const, summary: '',
+        items: [{ id: 'nonlive-input', kind: 'text' as const, text: 'Input from a non-live read', extensions: { codex: { clientId: first.requestId } } }] }
+      const invalid = { ...invalidBase, turns: [...invalidBase.turns, invalidItem] }
+      const historyBase = transientClaimHistory()
+      const history = { ...historyBase, turns: [...historyBase.turns, invalidItem] }
+      await act(async () => nonLive.resolve(kind === 'history' ? history : FreshAgentSnapshotSchema.parse({
         ...invalid, extensions: { codex: { ...invalid.extensions!.codex!, projection: { id: 'claim-q' } } },
       })))
       expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({ requestId: first.requestId })
+      expect(screen.getByText('Accepted pending coverage')).toBeInTheDocument()
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
       const reads = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
       apiMock.getFreshAgentThreadSnapshot.mockReturnValue(covering.promise)
@@ -5308,16 +5561,17 @@ describe('FreshAgentView', () => {
       expect(apiMock.getFreshAgentThreadSnapshot.mock.calls).toHaveLength(reads + 1)
       expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[coveringCall]).toMatchObject(['freshcodex', 'codex', 'native-b', { trigger: 'idle-incomplete' }])
       apiMock.getFreshAgentThreadSnapshot.mockReturnValue(final.promise)
-      await act(async () => covering.resolve(kind === 'history' ? transientClaimHistory() : FreshAgentSnapshotSchema.parse({
+      await act(async () => covering.resolve(kind === 'history' ? history : FreshAgentSnapshotSchema.parse({
         ...invalid, extensions: { codex: { ...invalid.extensions!.codex!, projection: { id: 'claim-q' } } },
       })))
       expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({ requestId: first.requestId })
+      expect(screen.getByText('Accepted pending coverage')).toBeInTheDocument()
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
       await act(async () => { await vi.advanceTimersByTimeAsync(1_001 + SNAPSHOT_DEBOUNCE_MS) })
       const finalCall = apiMock.getFreshAgentThreadSnapshot.mock.results.findIndex((result) => result.value === final.promise)
       expect(finalCall).toBeGreaterThanOrEqual(0)
       expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[finalCall]).toMatchObject(['freshcodex', 'codex', 'native-b', { trigger: 'idle-incomplete' }])
-      await act(async () => final.resolve(claimSnapshotWithCompletedNativeTurn('accepted-turn', 'Accepted pending coverage', 5)))
+      await act(async () => final.resolve(claimSnapshotWithCompletedNativeTurn('accepted-turn', 'Accepted pending coverage', 5, String(first.requestId))))
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
       expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Queued after coverage' })
       expect(route.store.getState().freshAgentLive.snapshotSourceRevisionBySession[key]).toBe(sourceRevision)
@@ -5367,7 +5621,7 @@ describe('FreshAgentView', () => {
       expect(route.store.getState().freshAgentLive.bySession[key]?.projection?.needsResnapshot).not.toBe(true)
       const sourceRevision = route.store.getState().freshAgentLive.snapshotSourceRevisionBySession[key]
       const shared = route.store.getState().freshAgent.sessions[key]
-      await act(async () => stale.resolve(claimSnapshotWithCompletedNativeTurn('accepted-turn', 'Accepted before hiding', 3)))
+      await act(async () => stale.resolve(claimSnapshotWithCompletedNativeTurn('accepted-turn', 'Accepted before hiding', 3, String(first.requestId))))
       expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({ requestId: first.requestId })
       const reads = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
       apiMock.getFreshAgentThreadSnapshot.mockReturnValue(covering.promise)
@@ -5392,9 +5646,9 @@ describe('FreshAgentView', () => {
         const finalCall = apiMock.getFreshAgentThreadSnapshot.mock.results.findIndex((result) => result.value === final.promise)
         expect(finalCall).toBeGreaterThanOrEqual(0)
         expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[finalCall]).toMatchObject(['freshcodex', 'codex', 'native-b', { trigger: 'idle-incomplete' }])
-        await act(async () => final.resolve(claimSnapshotWithCompletedNativeTurn('accepted-turn', 'Accepted before hiding', 5)))
+        await act(async () => final.resolve(claimSnapshotWithCompletedNativeTurn('accepted-turn', 'Accepted before hiding', 5, String(first.requestId))))
       } else {
-        await act(async () => covering.resolve(claimSnapshotWithCompletedNativeTurn('accepted-turn', 'Accepted before hiding', 5)))
+        await act(async () => covering.resolve(claimSnapshotWithCompletedNativeTurn('accepted-turn', 'Accepted before hiding', 5, String(first.requestId))))
       }
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
       expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Queued after reveal' })
@@ -5498,7 +5752,7 @@ describe('FreshAgentView', () => {
       await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
       expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === staleA.promise)).toBe(true)
       advanceClaimProjectionWithoutGap(route)
-      await act(async () => staleA.resolve(claimSnapshotWithCompletedNativeTurn('first-turn', 'First message', 3)))
+      await act(async () => staleA.resolve(claimSnapshotWithCompletedNativeTurn('first-turn', 'First message', 3, String(first.requestId))))
       expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({ requestId: first.requestId })
       apiMock.getFreshAgentThreadSnapshot.mockReturnValue(currentA.promise)
       act(() => route.event({ type: 'freshAgent.session.changed', reason: 'codex-thread' }))
@@ -5506,7 +5760,7 @@ describe('FreshAgentView', () => {
       const currentACall = apiMock.getFreshAgentThreadSnapshot.mock.results.findIndex((result) => result.value === currentA.promise)
       expect(currentACall).toBeGreaterThanOrEqual(0)
       expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[currentACall]).toMatchObject(['freshcodex', 'codex', 'native-b', { trigger: 'event' }])
-      await act(async () => currentA.resolve(claimSnapshotWithCompletedNativeTurn('first-turn', 'First message', 4)))
+      await act(async () => currentA.resolve(claimSnapshotWithCompletedNativeTurn('first-turn', 'First message', 4, String(first.requestId))))
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
       const second = sentFreshAgentMessages('freshAgent.send')[1]
       expect(second).toMatchObject({ text: 'Second message' })
@@ -5522,7 +5776,7 @@ describe('FreshAgentView', () => {
       expect(route.store.getState().freshAgentLive.bySession[key]?.projection?.needsResnapshot).not.toBe(true)
       const sourceRevision = route.store.getState().freshAgentLive.snapshotSourceRevisionBySession[key]
       const shared = route.store.getState().freshAgent.sessions[key]
-      const behindB = claimSnapshotWithCompletedNativeTurn('second-turn', 'Second message', 5)
+      const behindB = claimSnapshotWithCompletedNativeTurn('second-turn', 'Second message', 5, String(second.requestId))
       await act(async () => staleB.resolve(behindB))
       expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({ requestId: second.requestId })
       apiMock.getFreshAgentThreadSnapshot.mockReturnValue(interveningB.promise)
@@ -5596,7 +5850,7 @@ describe('FreshAgentView', () => {
       advanceClaimProjectionWithoutGap(route)
       expect(route.store.getState().freshAgentLive.bySession[key]?.projection).toMatchObject({ id: 'claim-q', eventRevision: 4 })
       expect(route.store.getState().freshAgentLive.bySession[key]?.projection?.needsResnapshot).not.toBe(true)
-      const behind = claimSnapshotWithCompletedNativeTurn('coverage-turn', 'Message awaiting coverage', 3)
+      const behind = claimSnapshotWithCompletedNativeTurn('coverage-turn', 'Message awaiting coverage', 3, String(first.requestId))
       apiMock.getFreshAgentThreadSnapshot.mockReturnValue(later.promise)
       await act(async () => stale.resolve(behind))
       expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({ requestId: first.requestId })
@@ -7409,8 +7663,19 @@ describe('FreshAgentView', () => {
         event: { type: 'freshAgent.session.snapshot', sessionId: locator.sessionId, latestTurnId: null,
           timelineSessionId: locator.sessionId, status } })
     })
+    expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+    const confirmed = hostedCodexProjectionSnapshot('native-b', 'queue-b', 'Current B confirmation', 2)
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(FreshAgentSnapshotSchema.parse({ ...confirmed,
+      turns: [...confirmed.turns, { id: 'current-b-turn:row-0', turnId: 'current-b-turn:row-0', nativeTurnId: 'current-b-turn', role: 'user', summary: 'First B message',
+        items: [{ id: 'first-b-input', kind: 'text', text: 'First B message', extensions: { codex: { clientId: first.requestId } } }] }],
+      extensions: { codex: { ...confirmed.extensions!.codex!, projection: { ...confirmed.extensions!.codex!.projection!,
+        eventOwnedTurnIds: ['turn', 'current-b-turn'], turnRows: { turn: ['turn'], 'current-b-turn': ['current-b-turn:row-0'] } } } },
+    }))
+    act(() => receive({ type: 'freshAgent.send.accepted', ...locator, requestId: first.requestId, submittedTurnId: 'current-b-turn' }))
+    await expectRenderedText('Current B confirmation')
     await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
     expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Second B message' })
+    expect(getFreshAgentPaneContent(store).pendingLocalEcho).toMatchObject({ requestId: sentFreshAgentMessages('freshAgent.send')[1].requestId, text: 'Second B message' })
   })
 
   it('restores only the matching send when the gateway refuses an operation while B is pending', async () => {
@@ -7498,8 +7763,10 @@ describe('FreshAgentView', () => {
         event: { type: 'freshAgent.session.snapshot', sessionId: locator.sessionId, latestTurnId: null,
           timelineSessionId: locator.sessionId, status } } as never)
     })
-    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
-    expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Queued behind it' })
+    expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+    expect(getFreshAgentPaneContent(store).pendingLocalEcho).toMatchObject({ requestId, text: 'Possibly delivered', deliveryUnconfirmed: true })
+    expect(screen.getByText('Possibly delivered')).toBeInTheDocument()
+    expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
   })
 
   it('reattaches and receives the current source when a second replacement overtakes inventory', async () => {
@@ -8186,7 +8453,21 @@ describe('FreshAgentView', () => {
         fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), { target: { value: text } })
         fireEvent.click(screen.getByRole('button', { name: 'Send' }))
       }
-      return { send, store, status: (nextStatus: string) => {
+      const confirm = async (requestId: unknown, text: string, nextStatus: 'running' | 'idle') => {
+        const previousReads = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+        apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+          sessionId: content.sessionId, status: nextStatus, capabilities: { send: canSend, interrupt: true },
+          turns: [
+            { id: 'confirmed-user', role: 'user', items: [{ id: 'confirmed-input', kind: 'text', text, extensions: { codex: { clientId: requestId } } }] },
+            { id: 'confirmation-marker', role: 'assistant', items: [{ id: 'marker-text', kind: 'text', text: 'Confirmation snapshot loaded' }] },
+          ],
+        })
+        const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+        act(() => listener({ type: 'freshAgent.send.accepted', sessionId: content.sessionId, sessionType: content.sessionType, provider, requestId }))
+        await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeGreaterThan(previousReads))
+        await screen.findByText('Confirmation snapshot loaded')
+      }
+      return { send, confirm, store, status: (nextStatus: string) => {
         act(() => store.dispatch(setSessionStatus({
           sessionId: content.sessionId, sessionType: content.sessionType, provider,
           status: nextStatus as 'idle',
@@ -8212,6 +8493,7 @@ describe('FreshAgentView', () => {
       expect(sentFreshAgentMessages('freshAgent.send')[0]).toMatchObject({ text: 'First follow-up' })
       expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
       queue.status('running')
+      await queue.confirm(sentFreshAgentMessages('freshAgent.send')[0].requestId, 'First follow-up', 'running')
       queue.status('idle')
       await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
       expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Second follow-up' })
@@ -8233,20 +8515,22 @@ describe('FreshAgentView', () => {
       const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
       act(() => listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: first.requestId,
         message: 'CODEX_DELIVERY_AMBIGUOUS: response was lost' }))
-      await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('Original uncertain input'))
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('')
+      expect(screen.getByText('Original uncertain input')).toBeInTheDocument()
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
       expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
       expect(screen.getByText(`Delivery uncertain (${first.requestId}): response was lost. Check the conversation before sending again.`)).toBeInTheDocument()
       act(() => listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: first.requestId,
         message: 'CODEX_DELIVERY_AMBIGUOUS: response was lost' }))
-      expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('Original uncertain input')
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('')
+      expect(screen.getByText('Original uncertain input')).toBeInTheDocument()
       queue.status('running')
       queue.status('idle')
-      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
-      expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Later queued input' })
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
     })
 
-    it('advances after a fast interrupted turn whose status updates share one render', async () => {
+    it('waits for the input after a fast interrupted turn whose status updates share one render', async () => {
       const queue = await setup('idle')
       queue.send('First message')
       queue.send('Second message')
@@ -8257,10 +8541,12 @@ describe('FreshAgentView', () => {
         queue.store.dispatch(setSessionStatus({ ...locator, status: 'running' }))
         queue.store.dispatch(setSessionStatus({ ...locator, status: 'idle' }))
       })
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      await queue.confirm(sentFreshAgentMessages('freshAgent.send')[0].requestId, 'First message', 'idle')
       await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
     })
 
-    it('advances after real Codex snapshot lifecycle frames complete within one render', async () => {
+    it('waits for the input after real Codex snapshot lifecycle frames complete within one render', async () => {
       const queue = await setup('idle')
       queue.send('First message')
       queue.send('Second message')
@@ -8273,6 +8559,8 @@ describe('FreshAgentView', () => {
           listener(message)
         }
       })
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      await queue.confirm(sentFreshAgentMessages('freshAgent.send')[0].requestId, 'First message', 'idle')
       await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
       expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Second message' })
     })
@@ -8281,12 +8569,15 @@ describe('FreshAgentView', () => {
       const queue = await setup('idle')
       queue.send('Repeat this task')
       const first = sentFreshAgentMessages('freshAgent.send')[0]
+      queue.status('running')
+      await queue.confirm(first.requestId, 'Repeat this task', 'running')
       const snapshot = createDeferred<ReturnType<typeof freshopencodeSnapshot>>()
+      const readsBeforeHeld = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
       apiMock.getFreshAgentThreadSnapshot.mockImplementationOnce(() => snapshot.promise)
       const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
       const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
       act(() => listener({ type: 'freshAgent.send.accepted', ...locator, requestId: first.requestId }))
-      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(readsBeforeHeld + 1))
       queue.send('Repeat this task')
       queue.send('Last follow-up')
       act(() => {
@@ -8300,7 +8591,7 @@ describe('FreshAgentView', () => {
       await act(async () => snapshot.resolve({
         ...freshopencodeSnapshot('finished first turn', 1),
         sessionType: 'freshcodex', provider: 'codex', sessionId: locator.sessionId, threadId: locator.sessionId,
-        turns: [{ id: 'first-user-turn', turnId: 'first-user-turn', role: 'user', summary: 'Repeat this task', items: [{ id: 'first-user-text', kind: 'text', text: 'Repeat this task' }] }],
+        turns: [{ id: 'first-user-turn', turnId: 'first-user-turn', role: 'user', summary: 'Repeat this task', items: [{ id: 'first-user-text', kind: 'text', text: 'Repeat this task', extensions: { codex: { clientId: first.requestId } } }] }],
       }))
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
       expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
@@ -8337,7 +8628,8 @@ describe('FreshAgentView', () => {
       apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
         sessionId: first.sessionId, status: 'idle', capabilities: { send: true, interrupt: true },
         extensions: provider === 'claude' ? { claude: { statusFromLiveState: true } } : {},
-        turns: [{ id: 'completed-user-turn', role: 'user', requestId: first.requestId, items: [{ id: 'user-text', kind: 'text', text: 'First message' }] }],
+        turns: [{ id: 'completed-user-turn', role: 'user', requestId: first.requestId, items: [{ id: 'user-text', kind: 'text', text: 'First message',
+          ...(provider === 'codex' ? { extensions: { codex: { clientId: first.requestId } } } : {}) }] }],
       })
       act(() => {
         queue.store.dispatch({ type: 'connection/setStatus', payload: 'ready' })
@@ -10810,7 +11102,7 @@ describe('FreshAgentView', () => {
         capabilities: { send: true, interrupt: true, fork: true },
         turns: [],
       })
-      .mockResolvedValueOnce({
+      .mockImplementationOnce(async () => ({
         status: 'idle',
         summary: 'answered',
         capabilities: { send: true, interrupt: true, fork: true },
@@ -10821,7 +11113,7 @@ describe('FreshAgentView', () => {
             nativeTurnId: 'codex-turn-17',
             role: 'user',
             summary: 'Ship it',
-            items: [{ id: 'user-text-1', kind: 'text', text: 'Ship it' }],
+            items: [{ id: 'user-text-1', kind: 'text', text: 'Ship it', extensions: { codex: { clientId: sentFreshAgentMessages('freshAgent.send')[0]?.requestId } } }],
           },
           {
             id: 'native-assistant-turn',
@@ -10831,8 +11123,8 @@ describe('FreshAgentView', () => {
             items: [{ id: 'assistant-text-1', kind: 'text', text: 'Done.' }],
           },
         ],
-      })
-      .mockResolvedValue({
+      }))
+      .mockImplementation(async () => ({
         status: 'idle',
         summary: 'answered after materialization',
         capabilities: { send: true, interrupt: true, fork: true },
@@ -10843,7 +11135,7 @@ describe('FreshAgentView', () => {
             nativeTurnId: 'codex-turn-17',
             role: 'user',
             summary: 'Ship it',
-            items: [{ id: 'user-text-1', kind: 'text', text: 'Ship it' }],
+            items: [{ id: 'user-text-1', kind: 'text', text: 'Ship it', extensions: { codex: { clientId: sentFreshAgentMessages('freshAgent.send')[0]?.requestId } } }],
           },
           {
             id: 'native-assistant-turn',
@@ -10853,7 +11145,7 @@ describe('FreshAgentView', () => {
             items: [{ id: 'assistant-text-1', kind: 'text', text: 'Done.' }],
           },
         ],
-      })
+      }))
     apiMock.post.mockResolvedValue({ ok: true })
     store.dispatch(initLayout({
       tabId: 'tab-1',
@@ -11674,13 +11966,13 @@ describe('FreshAgentView', () => {
   // holds the newest user row during the echo window, and a bound capture is
   // never downgraded by the busy fallback.
   describe('fresh-agent rewind availability honesty', () => {
-    const unboundModernUserTurn = (id: string, text: string) => ({
+    const unboundModernUserTurn = (id: string, text: string, clientId?: string) => ({
       id,
       turnId: id,
       source: 'durable' as const,
       role: 'user' as const,
       summary: text,
-      items: [{ id: `${id}-text`, kind: 'text' as const, text }],
+      items: [{ id: `${id}-text`, kind: 'text' as const, text, ...(clientId ? { extensions: { codex: { clientId } } } : {}) }],
     })
 
     const emitSessionSnapshotStatus = (
@@ -11947,7 +12239,7 @@ describe('FreshAgentView', () => {
       act(() => {
         snapshotTurns = [
           ...snapshotTurns,
-          unboundModernUserTurn('msg_new', 'Composer prompt whose capture never enriches'),
+          unboundModernUserTurn('msg_new', 'Composer prompt whose capture never enriches', requestId),
         ]
         onMessage?.({
           type: 'freshAgent.send.accepted',
@@ -12119,7 +12411,7 @@ describe('FreshAgentView', () => {
       act(() => {
         snapshotTurns = [
           ...snapshotTurns,
-          unboundModernUserTurn('msg_settled', 'Composer prompt whose row lands after the settle'),
+          unboundModernUserTurn('msg_settled', 'Composer prompt whose row lands after the settle', requestId),
         ]
       })
       emitSessionSnapshotStatus(store, onMessage, sessionId, 'idle')
@@ -12240,7 +12532,7 @@ describe('FreshAgentView', () => {
       // the request-keyed outcome, so its verdict flows through the
       // unbound fallback.
       act(() => {
-        snapshotTurns = [unboundModernUserTurn('msg_new', 'Prompt sent from a non-Git directory')]
+        snapshotTurns = [unboundModernUserTurn('msg_new', 'Prompt sent from a non-Git directory', requestId)]
         onMessage?.({
           type: 'freshAgent.send.accepted',
           requestId,
@@ -15755,7 +16047,7 @@ describe('FreshAgentView', () => {
           },
         ],
       })
-      .mockResolvedValueOnce({
+      .mockImplementationOnce(async () => ({
         sessionType: 'freshcodex',
         provider: 'codex',
         threadId: 'thread-partial-refresh',
@@ -15768,10 +16060,10 @@ describe('FreshAgentView', () => {
             turnId: 'turn-new-user',
             role: 'user',
             summary: 'New user request',
-            items: [{ id: 'item-new-user', kind: 'text', text: 'New user request' }],
+            items: [{ id: 'item-new-user', kind: 'text', text: 'New user request', extensions: { codex: { clientId: sentFreshAgentMessages('freshAgent.send')[0]?.requestId } } }],
           },
         ],
-      })
+      }))
     store.dispatch(initLayout({
       tabId: 'tab-1',
       paneId: 'pane-1',
@@ -20234,11 +20526,17 @@ describe('FreshAgentView', () => {
       onMessage?.({ type: 'error', code, message, requestId: sendFrame?.requestId, timestamp: new Date().toISOString() })
     })
 
-    await waitFor(() => expect(composer).toHaveValue(provider === 'codex' ? 'please keep this\nnewer draft' : 'please keep this'))
+    const ambiguous = message.startsWith('CODEX_DELIVERY_AMBIGUOUS:')
+    await waitFor(() => expect(composer).toHaveValue(ambiguous ? 'newer draft' : provider === 'codex' ? 'please keep this\nnewer draft' : 'please keep this'))
     expect(screen.getByText(message.startsWith('CODEX_DELIVERY_AMBIGUOUS:')
       ? `Delivery uncertain (${sendFrame?.requestId}): ${reason}. Check the conversation before sending again.`
       : `Message not sent: ${reason}`)).toBeInTheDocument()
-    expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
+    if (ambiguous) {
+      expect(getFreshAgentPaneContent(store).pendingLocalEcho).toMatchObject({ requestId: sendFrame?.requestId, text: 'please keep this', deliveryUnconfirmed: true })
+      expect(screen.getByText('please keep this')).toBeInTheDocument()
+    } else {
+      expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
+    }
   })
 
   it('keeps an established freshclaude pane interactive after remount when snapshot loading is unavailable', async () => {
@@ -25109,8 +25407,13 @@ describe('task6 hosted recovery in the mounted view', () => {
       // A fresh transcript cannot decide this request's outcome.
       expect(screen.getByText('Sending answer as a message')).toBeInTheDocument()
       deliver(outcome==='accepted'?{type:'freshAgent.send.accepted',...locator,requestId:sent.requestId,submittedTurnId:'native-receipt-turn'}:{type:'error',code:'INTERNAL_ERROR',requestId:sent.requestId,message:outcome==='ambiguous'?'CODEX_DELIVERY_AMBIGUOUS: native response was lost':'CODEX_TURN_START_FAILED: native input refused'})
-      await waitFor(()=>expect(screen.getByText(outcome==='accepted'?'Answer accepted as a message':outcome==='ambiguous'?'Answer delivery uncertain; review the composer before sending again.':'Answer not sent; your draft is in the composer.')).toBeInTheDocument())
-      if(outcome!=='accepted') expect(composer).toHaveValue(draft)
+      await waitFor(()=>expect(screen.getByText(outcome==='accepted'?'Answer accepted as a message':outcome==='ambiguous'?'Answer delivery uncertain; check the conversation before continuing.':'Answer not sent; your draft is in the composer.')).toBeInTheDocument())
+      if(outcome==='refused') expect(composer).toHaveValue(draft)
+      if(outcome==='ambiguous') {
+        expect(composer).toHaveValue('')
+        expect(getFreshAgentPaneContent(store).pendingLocalEcho).toMatchObject({requestId:sent.requestId,text:draft,deliveryUnconfirmed:true})
+        expect(screen.getByText(draft)).toBeInTheDocument()
+      }
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
       expect(sentFreshAgentMessages('freshAgent.question.respond')).toHaveLength(0)
     } finally {cleanup();await act(async()=>held.resolve(retained))}

@@ -60,6 +60,29 @@ describe('Panes Persistence Integration', () => {
     vi.useRealTimers()
   })
 
+  it('retains an unconfirmed Codex input and its wait deadline through a real layout flush and load', () => {
+    const store = configureStore({ reducer: { tabs: tabsReducer, panes: panesReducer },
+      middleware: getDefault => getDefault().concat(persistMiddleware as any) })
+    store.dispatch(addTab({ mode: 'shell' }))
+    const tabId = store.getState().tabs.tabs[0].id
+    const pendingLocalEcho = {
+      requestId: 'uncertain-request', text: 'Keep this message', deliveryUnconfirmed: true,
+      confirmationDeadlineMs: Date.now() + 5_000,
+    }
+    store.dispatch(initLayout({ tabId, content: {
+      kind: 'fresh-agent', provider: 'codex', sessionType: 'freshcodex', createRequestId: 'persist-uncertain',
+      status: 'idle', pendingLocalEcho,
+    } }))
+    store.dispatch(flushPersistedLayoutNow())
+    resetPersistedLayoutCacheForTests()
+    resetPersistedPanesCacheForTests()
+    const loaded = loadPersistedPanes()
+    expect(loaded).toBeTruthy()
+    const restored = configureStore({ reducer: { tabs: tabsReducer, panes: panesReducer } })
+    restored.dispatch(hydratePanes(loaded))
+    expect((restored.getState().panes.layouts[tabId] as any).content.pendingLocalEcho).toEqual(pendingLocalEcho)
+  })
+
   it.each(['managed-preparation', 'ordinary', 'owner-stamped', 'reserved'] as const)(
     'restores only the safe managed preparation failure across a real flush/load: %s', (kind) => {
       const failure: LaunchFailure = Object.assign({ code: kind === 'reserved' ? 'SESSION_RESERVED' as const : 'LAUNCH_FAILED' as const,

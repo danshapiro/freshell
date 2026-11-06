@@ -17,7 +17,7 @@ const ASYNC_ANSWER_STATUS: Record<AsyncQuestionAnswerStatus, string> = {
   sending: 'Sending answer as a message',
   accepted: 'Answer accepted as a message',
   refused: 'Answer not sent; your draft is in the composer.',
-  ambiguous: 'Answer delivery uncertain; review the composer before sending again.',
+  ambiguous: 'Answer delivery uncertain; check the conversation before continuing.',
 }
 
 function formatJson(value: unknown): string {

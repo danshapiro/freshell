@@ -179,6 +179,7 @@ export const FRESH_AGENT_RESERVE_RETRY_FLOOR_MS = 1_000
 // up). Exported so tests assert the cap against the real constant.
 export const IDLE_INCOMPLETE_MAX_RETRIES = 5
 const IDLE_INCOMPLETE_RETRY_DELAY_MS = 1_000
+const CODEX_INPUT_CONFIRMATION_WAIT_MS = 5_000
 const NATIVE_CLAIM_MAX_RETRIES = 5
 const REVEAL_REFRESH_MAX_WAIT_MS = 15_000
 const RATE_LIMIT_RETRY_MARGIN_MS = 50
@@ -191,7 +192,8 @@ const ProjectedFreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fre
   snapshot: FreshAgentSnapshot | null
   sessionKey?: string
   hidden: boolean
-}>(function ProjectedFreshAgentTranscript({ snapshot, sessionKey, hidden, turns: savedTurns, localEcho, ...props }, ref) {
+  preservePendingCodexEcho?: boolean
+}>(function ProjectedFreshAgentTranscript({ snapshot, sessionKey, hidden, turns: savedTurns, localEcho, preservePendingCodexEcho, ...props }, ref) {
   const projection = useAppSelector((state) => !hidden && sessionKey ? state.freshAgentLive?.bySession[sessionKey]?.projection : undefined)
   const previousTurns = useRef<FreshAgentTurn[]>([])
   const turns = useMemo(() => {
@@ -199,7 +201,11 @@ const ProjectedFreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fre
     previousTurns.current = shareUnchangedTurns(previousTurns.current, next)
     return previousTurns.current
   }, [snapshot, projection, savedTurns])
-  const echoLanded = localEcho && turns.some((row) => row.role === 'user' && (row.nativeTurnId === localEcho.turnId || row.turnId === localEcho.turnId))
+  // Codex reconciliation already applies the input-ID and current-source
+  // fences before clearing the stored echo. Read-only or superseded history
+  // may still be displayed, so it must not make a separate render-time claim.
+  const echoLanded = localEcho && !preservePendingCodexEcho
+    && turns.some((row) => row.role === 'user' && (row.nativeTurnId === localEcho.turnId || row.turnId === localEcho.turnId))
   return <FreshAgentTranscript {...props} ref={ref} turns={turns} localEcho={echoLanded ? undefined : localEcho} />
 })
 type SnapshotAuditStage = 'refresh_requested' | 'effect_skipped' | 'request_captured' | 'request_queued'
@@ -250,6 +256,8 @@ type LocalEcho = {
   text: string
   requestId: string
   submittedTurnId?: string
+  deliveryUnconfirmed?: boolean
+  confirmationDeadlineMs?: number
   /** Turn keys captured at send time — the send boundary. Persisted WITH
    * the echo record (the store's echo normalizer keep-lists the field), so
    * a reloaded pane restores the boundary and can prove which rows predate
@@ -267,6 +275,8 @@ function sameLocalEcho(a: LocalEcho | null | undefined, b: LocalEcho | null | un
   return (a?.requestId ?? null) === (b?.requestId ?? null)
     && (a?.text ?? null) === (b?.text ?? null)
     && (a?.submittedTurnId ?? null) === (b?.submittedTurnId ?? null)
+    && Boolean(a?.deliveryUnconfirmed) === Boolean(b?.deliveryUnconfirmed)
+    && (a?.confirmationDeadlineMs ?? null) === (b?.confirmationDeadlineMs ?? null)
 }
 
 type PendingSendMetadata = {
@@ -519,6 +529,13 @@ function paneCaptureInFlight(
   return false
 }
 
+function codexInputObserved(turns: readonly FreshAgentTurn[], requestId: string): boolean {
+  return turns.some((turn) => turn.role === 'user' && turn.items.some((item) => (
+    item.kind === 'text' && isRecord(item.extensions?.codex)
+    && item.extensions.codex.clientId === requestId
+  )))
+}
+
 function localEchoLanded(
   turns: readonly FreshAgentTurn[],
   echo: LocalEcho,
@@ -527,8 +544,10 @@ function localEchoLanded(
     allowTextMatch?: boolean
     previousTurnKeys?: Set<string> | null
     requireCorrelation?: boolean
+    codex?: boolean
   } = {},
 ): boolean {
+  if (options.codex) return codexInputObserved(turns, echo.requestId)
   const needle = echo.text.slice(0, 80)
   const submittedTurnId = echo.submittedTurnId ?? pending?.submittedTurnId
   const previousTurnKeys = options.previousTurnKeys ?? null
@@ -562,11 +581,12 @@ function shouldClearStaleLocalEcho(
   echo: LocalEcho,
   pending?: PendingSendMetadata,
   requireCorrelation = false,
+  codex = false,
 ): boolean {
   if (isSnapshotInFlight(snapshot)) return false
   const accepted = Boolean(echo.submittedTurnId || pending?.submittedTurnId || pending?.legacyAccepted)
   if (!accepted) return false
-  return !localEchoLanded(snapshot.turns, echo, pending, { requireCorrelation })
+  return !localEchoLanded(snapshot.turns, echo, pending, { requireCorrelation, codex })
 }
 
 function isNativeHistoryOnlySnapshot(snapshot: FreshAgentSnapshot | null): boolean {
@@ -1320,6 +1340,8 @@ export function FreshAgentView({
   const [localEcho, setLocalEchoState] = useState<LocalEcho | null>(() => paneContent.pendingLocalEcho ?? null)
   const localEchoRef = useRef<LocalEcho | null>(null)
   localEchoRef.current = localEcho
+  const [unconfirmedContinueId, setUnconfirmedContinueId] = useState<string | null>(null)
+  const unconfirmedContinueGuardRef = useRef<(() => boolean) | null>(null)
   // The send-time turn-key boundary of THIS mount's composer send: which
   // turns already existed when the CURRENT optimistic echo was dispatched.
   // It must ride a ref, not the echo state: the pane-content sync effect
@@ -1795,6 +1817,8 @@ export function FreshAgentView({
           requestId: next.requestId,
           text: next.text,
           ...(next.submittedTurnId ? { submittedTurnId: next.submittedTurnId } : {}),
+          ...(next.deliveryUnconfirmed ? { deliveryUnconfirmed: true } : {}),
+          ...(next.confirmationDeadlineMs !== undefined ? { confirmationDeadlineMs: next.confirmationDeadlineMs } : {}),
           ...(next.previousTurnKeys ? { previousTurnKeys: [...next.previousTurnKeys] } : {}),
         }
       : undefined
@@ -1813,6 +1837,8 @@ export function FreshAgentView({
     paneContent.pendingLocalEcho?.requestId,
     paneContent.pendingLocalEcho?.submittedTurnId,
     paneContent.pendingLocalEcho?.text,
+    paneContent.pendingLocalEcho?.deliveryUnconfirmed,
+    paneContent.pendingLocalEcho?.confirmationDeadlineMs,
   ])
   const restoreTimeoutRef = useRef<number | null>(null)
   const createSentRef = useRef(false)
@@ -2073,6 +2099,24 @@ export function FreshAgentView({
     recordSnapshotAudit('refresh_requested', () => ({ trigger, refreshSerial: snapshotRefreshSerialRef.current }))
     setSnapshotRefreshNonce((value) => value + 1)
   }, [])
+
+  useEffect(() => {
+    if (paneContent.provider !== 'codex' || !localEcho || localEcho.deliveryUnconfirmed) return
+    const requestId = localEcho.requestId
+    // Older persisted echoes predate the deadline field. Assign it once so
+    // repeated remounts cannot keep postponing their recovery path.
+    if (localEcho.confirmationDeadlineMs === undefined) {
+      setLocalEcho({ ...localEcho, confirmationDeadlineMs: Date.now() + CODEX_INPUT_CONFIRMATION_WAIT_MS })
+      return
+    }
+    const remaining = Math.max(0, Math.min(CODEX_INPUT_CONFIRMATION_WAIT_MS, localEcho.confirmationDeadlineMs - Date.now()))
+    const timer = window.setTimeout(() => {
+      const current = localEchoRef.current
+      if (paneContentRef.current.provider !== 'codex' || current?.requestId !== requestId) return
+      setLocalEcho({ ...current, deliveryUnconfirmed: true })
+    }, remaining)
+    return () => window.clearTimeout(timer)
+  }, [localEcho?.confirmationDeadlineMs, localEcho?.deliveryUnconfirmed, localEcho?.requestId, paneContent.provider, setLocalEcho])
 
   const markSnapshotDirty = useCallback((cause: 'reconnect' | 'transcript' | 'send-accepted') => {
     if (!snapshotDirtyRef.current) {
@@ -3588,13 +3632,15 @@ export function FreshAgentView({
           // accepted native input. Only later lifecycle/history evidence may
           // release it. A snapshot read never replays the prompt.
           recordPendingSendMetadata(failedRequestId, { deliveryAmbiguous: true })
+          const echo = localEchoRef.current
+          if (echo?.requestId === failedRequestId) setLocalEcho({ ...echo, deliveryUnconfirmed: true })
           requestSnapshotRefresh('poll')
         } else pendingSendMetadataRef.current.delete(failedRequestId)
         if (!ambiguous && outgoingTurnRef.current?.requestId === failedRequestId) {
           outgoingTurnRef.current = null
           refreshOutgoingTurn()
         }
-        if (localEchoRef.current?.requestId === failedRequestId) {
+        if (!ambiguous && localEchoRef.current?.requestId === failedRequestId) {
           setLocalEcho(null)
         }
         if (current.provider === 'opencode' && current.status === 'running') {
@@ -3604,7 +3650,7 @@ export function FreshAgentView({
         // example its session ended — so the text goes back into the
         // composer with the reason instead of vanishing with the echo.
         if ((current.provider === 'claude' || current.provider === 'codex') && failedText) {
-          composerRef.current?.restoreText(failedText)
+          if (!ambiguous) composerRef.current?.restoreText(failedText)
           const failureNotice = ambiguous
             ? `Delivery uncertain (${failedRequestId}): ${sendFailureReason(sendFailure.message)}. Check the conversation before sending again.`
             : `Message not sent: ${sendFailureReason(sendFailure.message)}`
@@ -4079,16 +4125,20 @@ export function FreshAgentView({
         && appliedProjection?.id === projectionMetadata.id
         && appliedProjection.historyGeneration === projectionMetadata.historyGeneration
         && !appliedProjection.needsResnapshot && projectionMetadata.eventRevision >= appliedProjection.eventRevision
+      const evidenceTurns = provider === 'codex' && !appliedProjection?.needsResnapshot
+        ? mergeFreshAgentTranscriptProjection(displaySnapshot, appliedProjection)
+        : displaySnapshot.turns
       const outgoing = outgoingTurnRef.current
       if (
         outgoing && outgoing.requestId === requestOutgoingTurnId
         && snapshotAccepted && displaySnapshot.status === 'idle'
         && (snapshotStatusAuthoritative || routeOnlyLocalEvidence)
         && agentSessionStatusVersionRef.current === requestAgentSessionStatusVersion
-        && localEchoLanded(displaySnapshot.turns, outgoing, pendingSendMetadataRef.current.get(outgoing.requestId), {
+        && localEchoLanded(evidenceTurns, outgoing, pendingSendMetadataRef.current.get(outgoing.requestId), {
           allowTextMatch: true,
           previousTurnKeys: new Set((outgoing.previousTurns ?? []).map(getTurnKey)),
           requireCorrelation: routeOnlyManaged,
+          codex: provider === 'codex',
         })
       ) {
         // Reconnect may miss every stream/status event. A current idle snapshot
@@ -4186,23 +4236,36 @@ export function FreshAgentView({
       // even if its eventual response happens to include a matching turn.
       if (routeOnlyManaged && echo && echo.requestId !== requestLocalEchoId) return
       const echoPendingMetadata = echo ? pendingSendMetadataRef.current.get(echo.requestId) : undefined
+      if (provider === 'codex' && echo?.deliveryUnconfirmed && echo.requestId === requestLocalEchoId
+        && snapshotAcceptedForRecovery && displaySnapshot.status === 'idle'
+        && (snapshotStatusAuthoritative || routeOnlyLocalEvidence)
+        && agentSessionStatusVersionRef.current === requestAgentSessionStatusVersion && !isPaneBusyNow()) {
+        const requestId = echo.requestId
+        unconfirmedContinueGuardRef.current = () => localEchoRef.current?.requestId === requestId
+          && !isStaleSnapshotRequest('outcome')
+          && agentSessionStatusVersionRef.current === requestAgentSessionStatusVersion
+          && !isPaneBusyNow()
+          && appStore.getState().connection.status === 'ready'
+        setUnconfirmedContinueId(requestId)
+      }
       const landedEcho = echo
-        ? localEchoLanded(displaySnapshot.turns, echo, echoPendingMetadata, {
+        ? localEchoLanded(evidenceTurns, echo, echoPendingMetadata, {
             allowTextMatch: snapshotAccepted,
             previousTurnKeys: echo.previousTurnKeys ? new Set(echo.previousTurnKeys) : null,
             requireCorrelation: routeOnlyManaged,
+            codex: provider === 'codex',
           })
         : false
       // Task 16: 'accepted but not landed' -- the raw input predicate of the
       // stale-echo clear, INDEPENDENT of the retry-exhaustion gate below.
       const echoStillPending = echo
-        ? !landedEcho && shouldClearStaleLocalEcho(displaySnapshot, echo, echoPendingMetadata, routeOnlyManaged)
+        ? !landedEcho && shouldClearStaleLocalEcho(displaySnapshot, echo, echoPendingMetadata, routeOnlyManaged, provider === 'codex')
         : false
       // The echo is the idle-incomplete re-poll loop's marker: it may only be
       // cleared as STALE once the bounded retry budget is exhausted. A landed
       // echo still clears immediately.
       const staleEcho = echo
-        ? !routeOnlyManaged && snapshotAccepted
+        ? provider !== 'codex' && !routeOnlyManaged && snapshotAccepted
           && idleIncompleteRetryCountRef.current >= IDLE_INCOMPLETE_MAX_RETRIES
           && shouldClearStaleLocalEcho(displaySnapshot, echo, echoPendingMetadata)
         : false
@@ -5205,8 +5268,37 @@ export function FreshAgentView({
     const outgoing = outgoingTurnRef.current
     if (!outgoing) return
     if (isBusy) outgoing.sawBusy = true
-    else if (outgoing.sawBusy || sessionEnded) outgoingTurnRef.current = null
-  }, [agentSession?.statusVersion, isBusy, sessionEnded])
+    else if ((outgoing.sawBusy || sessionEnded)
+      && !(paneContent.provider === 'codex' && localEchoRef.current?.requestId === outgoing.requestId)) {
+      outgoingTurnRef.current = null
+    }
+    // A Codex input can become visible after the busy-to-idle transition.
+    // Revisit the recorded completion when its pending echo clears.
+  }, [agentSession?.statusVersion, isBusy, localEcho, paneContent.provider, sessionEnded])
+
+  const canContinueUnconfirmed = Boolean(paneContent.provider === 'codex' && localEcho?.deliveryUnconfirmed
+    && unconfirmedContinueId === localEcho.requestId && !isBusy && !sessionEnded && canSend
+    && connectionStatus === 'ready' && !isRestoring && !hasRestoreFailure && !ownerDivergence)
+  const continueUnconfirmed = useCallback(() => {
+    const echo = localEchoRef.current
+    if (!echo || !canContinueUnconfirmed || !unconfirmedContinueGuardRef.current?.() || !composerRef.current) {
+      setUnconfirmedContinueId(null)
+      requestSnapshotRefresh('manual')
+      return
+    }
+    // Continuing never sends the uncertain message. Preserve it as a draft
+    // before permitting another queued input to use the pending-echo slot.
+    composerRef.current.restoreText(echo.text)
+    if (outgoingTurnRef.current?.requestId === echo.requestId) outgoingTurnRef.current = null
+    setLocalEcho(null)
+    unconfirmedContinueGuardRef.current = null
+    setUnconfirmedContinueId(null)
+    if (deliveryNoticeRef.current) {
+      deliveryNoticeRef.current = null
+      setNotice(null)
+    }
+    refreshOutgoingTurn()
+  }, [canContinueUnconfirmed, requestSnapshotRefresh, setLocalEcho])
 
   useEffect(() => {
     if (!isActivePane) return
@@ -5253,6 +5345,7 @@ export function FreshAgentView({
   const sendUserText = useCallback((text: string) => {
     const current = paneContentRef.current
     if (!current.sessionId || isFreshAgentLifecycleBlocked(current)) return
+    if (current.provider === 'codex' && (localEchoRef.current || current.pendingLocalEcho)) return
     const requestId = nanoid()
     const logicalAttemptId = nanoid()
     outgoingTurnRef.current = { requestId, text, sawBusy: false, previousTurns: snapshotRef.current?.turns ?? [] }
@@ -5305,6 +5398,7 @@ export function FreshAgentView({
     const nextLocalEcho: LocalEcho = {
       text,
       requestId,
+      ...(current.provider === 'codex' ? { confirmationDeadlineMs: Date.now() + CODEX_INPUT_CONFIRMATION_WAIT_MS } : {}),
       previousTurnKeys: (snapshotRef.current?.turns ?? []).map(getTurnKey),
     }
     localEchoSendBoundaryRef.current = {
@@ -5336,10 +5430,11 @@ export function FreshAgentView({
   useEffect(() => {
     if (isBusy || !canSend || connectionStatus !== 'ready' || isRestoring || hasRestoreFailure) return
     if (ownerDivergenceRef.current) return
+    if (paneContentRef.current.provider === 'codex' && (localEcho || paneContentRef.current.pendingLocalEcho)) return
     if (outgoingTurnRef.current || queuedMessages.length === 0 || !paneContentRef.current.sessionId) return
     sendUserText(queuedMessages[0])
     setQueuedMessages((queue) => queue.slice(1))
-  }, [agentSession?.statusVersion, canSend, connectionStatus, hasRestoreFailure, isBusy, isRestoring, outgoingTurnVersion, ownerDivergence, queuedMessages, sendUserText])
+  }, [agentSession?.statusVersion, canSend, connectionStatus, hasRestoreFailure, isBusy, isRestoring, localEcho, outgoingTurnVersion, ownerDivergence, queuedMessages, sendUserText])
 
   // Pane-scoped auto-approval (not claude): any pending approval whose tool
   // the user marked "Always allow <Tool> in this pane" is answered at once.
@@ -5732,6 +5827,16 @@ export function FreshAgentView({
               {visibleLoadError ? (
                 <FreshAgentApprovalBanner text={visibleLoadError} onDismiss={() => setLoadError(null)} />
               ) : null}
+              {paneContent.provider === 'codex' && localEcho?.deliveryUnconfirmed ? (
+                <div role="status" aria-label="Unconfirmed message"
+                  className="flex flex-wrap items-center gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm">
+                  <span>This message may already have been delivered. Check the conversation before continuing. Continuing saves it as a draft and allows queued messages to send.</span>
+                  <button type="button" className="rounded border border-border/70 px-2 py-1"
+                    onClick={() => requestSnapshotRefresh('manual')}>Check conversation</button>
+                  <button type="button" className="rounded border border-border/70 px-2 py-1"
+                    disabled={!canContinueUnconfirmed} onClick={continueUnconfirmed}>Continue without confirmation</button>
+                </div>
+              ) : null}
               {visibleClaimRetryError ? (
                 <div role="alert" aria-label="Live conversation could not be refreshed"
                   className="flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm">
@@ -5974,6 +6079,7 @@ export function FreshAgentView({
                     snapshot={snapshot}
                     sessionKey={liveSessionKey}
                     hidden={Boolean(hidden)}
+                    preservePendingCodexEcho={paneContent.provider === 'codex'}
                     ref={transcriptRef}
                     presentationPaused={revealRefreshBlocking}
                     paneId={paneId}
@@ -6170,12 +6276,14 @@ export function FreshAgentView({
     )
   }, [
     asyncQuestionContext,
+    canContinueUnconfirmed,
     canSend,
     claudeSession?.restoreFailureMessage,
     activeStyle,
     composerDisabled,
     endedSessionResumeId,
     contextUsage,
+    continueUnconfirmed,
     descriptor?.icon,
     descriptor?.label,
     freshOpenCodeRouteCwd,
@@ -6202,6 +6310,7 @@ export function FreshAgentView({
     managedStopped,
     managedRecoveryPending,
     managedRecoveryActive,
+    localEcho,
     localEchoTurn,
     splitLiveTailAtEcho,
     modelDialogOpen,

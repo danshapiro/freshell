@@ -28,6 +28,21 @@ describe('independent native reads and event bodies', () => {
     expect(mergeFreshAgentTranscriptProjection(snapshot, opened())).toHaveLength(1)
   })
 
+  it('retains distinct native input IDs when event-owned rows are selected over a saved preview', () => {
+    const userRow = { id: 't:row-0', turnId: 't:row-0', nativeTurnId: 't', role: 'user', summary: '', items: [
+      { id: 'first:part:0', kind: 'text', text: 'same', extensions: { codex: { clientId: 'first-request' } } },
+      { id: 'second:part:0', kind: 'text', text: 'same', extensions: { codex: { clientId: 'second-request' } } },
+    ] }
+    const parsed = read([userRow], { eventOwnedTurnIds: ['t'], eventRevision: 1 })
+    const live = applyFreshAgentTranscriptPatch({ id: 'p', eventRevision: 0, historyGeneration: 0, turns: [] },
+      patch([{ op: 'resetTurn', nativeTurnId: 't', turns: parsed.turns, revision: 2 }]))
+    const selected = mergeFreshAgentTranscriptProjection(read([], { eventRevision: 1 }), live)
+    expect(selected).toHaveLength(1)
+    expect(selected[0].items.map((item) => item.extensions?.codex)).toEqual([
+      { clientId: 'first-request' }, { clientId: 'second-request' },
+    ])
+  })
+
   it('keeps a read-ahead preview separate from the event append baseline', () => {
     let live = applyFreshAgentTranscriptPatch(opened(), patch([append('Hel', 2)]))
     const snapshot = read([{ ...row, items: [{ id: 'a', kind: 'text', text: 'Hello' }] }], { nativePreviewTurnIds: ['t'] })
