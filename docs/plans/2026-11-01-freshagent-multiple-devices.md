@@ -568,7 +568,7 @@ git commit -m "fix(freshagent): scope attach completion and replay to the reques
 - Produces: `RecoveryStatus{operationId,inFlight,failedLaunches,retryAfterMs?,exhausted}` and one cloneable `Result<ReadySession,RecoveryFailure>` per operation. Budget cap remains three real failed launches per current recovery episode/source; successful establishment resets it. Status reads/reconcile never mutate it.
 - Define the serializable `RecoveryStatus` in `freshell-runtime-protocol`, re-export it through `freshell-agent-runtime` for the existing default-provider dependency. Add optional defaulted `RuntimeView.fresh_agent_recovery` in the existing inventory/inspection result; supervisor populates it from its lifecycle entry, gateway maps it to attach/reconcile facts. No new RPC service or dependency edge is necessary.
 
-- [ ] **Step 1: Add red tests**
+- [x] **Step 1: Add red tests**
 
 ```text
 Rust 'shared_recovery': gate first native launch, issue attach/create(sessionRef)
@@ -594,7 +594,7 @@ lifecycle_shared_recovery_tests with these launch/result/count assertions, so
 the shared_recovery/lifecycle Cargo selectors execute actual behavior cases.
 ```
 
-- [ ] **Step 2: Red**
+- [x] **Step 2: Red**
 
 Run: `pnpm run test:sandbox "cargo test --locked -p freshell-ws --test freshagent_multiple_devices shared_recovery"`
 
@@ -602,7 +602,7 @@ Run: `pnpm run test:sandbox "cargo test --locked -p freshell-ws --test pane_reco
 
 Expected FAIL: failure waiters serially relaunch, OpenCode gets Reserved, or repeated reconcile consumes budget/resets the duplicate view.
 
-- [ ] **Step 3: Production patch**
+- [x] **Step 3: Production patch**
 
 ```text
 session_recovery stores only operation/result/budget bookkeeping, not ownership.
@@ -636,7 +636,7 @@ remint/clear identity for a legal second view. Exhaustion is a finite typed
 state, not a create loop or implicit new native session.
 ```
 
-- [ ] **Step 4: Green**
+- [x] **Step 4: Green**
 
 Run: `pnpm run test:sandbox "cargo test --locked -p freshell-ws --test freshagent_multiple_devices shared_recovery"`
 
@@ -646,11 +646,11 @@ Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium test/e2e-brows
 
 Expected PASS across four modes.
 
-- [ ] **Step 5: Refactor**
+- [x] **Step 5: Refactor**
 
 Remove obsolete answer counters and duplicate per-provider result caches; keep provider-specific admission/start/cleanup in adapters to the shared result holder. Update all hand-built WsState fixtures to the read-only status source.
 
-- [ ] **Step 6: Impacted verification**
+- [x] **Step 6: Impacted verification**
 
 Run: `pnpm run test:sandbox "cargo test --locked -p freshell-freshagent --lib shared_recovery"`
 
@@ -666,7 +666,7 @@ Run: `pnpm run test:sandbox "cargo test --locked -p freshell-runtime-protocol -p
 
 Run Step 4 browser selector; expected PASS. Provider existing resume/negative-cache and supervisor activation tests run with `pnpm run test:sandbox "cargo test --locked -p freshell-freshagent --lib recovery"` and `pnpm run test:sandbox "cargo test --locked -p freshell-supervisor --lib lifecycle"`; require nonzero matches.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/freshell-freshagent/src/session_recovery.rs crates/freshell-freshagent/src/lib.rs crates/freshell-freshagent/src/claude/recovery.rs crates/freshell-freshagent/src/claude/attach.rs crates/freshell-freshagent/src/codex.rs crates/freshell-freshagent/src/opencode_ws.rs crates/freshell-ws/src/reconcile_freshagent.rs crates/freshell-ws/src/lib.rs crates/freshell-supervisor/src/service.rs crates/freshell-supervisor/src/lib.rs crates/freshell-runtime-protocol/src/lib.rs crates/freshell-agent-runtime/src/lib.rs crates/freshell-server/src/fresh_agent_proxy.rs port/contract/managed-runtime.schema.json src/lib/pane-reconcile.ts src/store/panesSlice.ts crates/freshell-ws/tests/freshagent_multiple_devices.rs crates/freshell-ws/tests/common/multiple_devices.rs crates/freshell-ws/tests/pane_reconcile.rs test/unit/client/lib/pane-reconcile.fresh-agent.test.ts test/unit/client/store/panesSlice.fresh-agent-reconcile.test.ts test/e2e-browser/helpers/fresh-agent-multiple-devices.ts test/e2e-browser/specs/fresh-agent-multiple-devices-rust.spec.ts
