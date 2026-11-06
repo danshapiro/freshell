@@ -51,6 +51,12 @@ enum FreshNativeAdmission {
     CodexSendRecovery,
 }
 
+enum CodexSendReceiptReconciliation {
+    Accepted,
+    Refused(freshell_runtime_protocol::FreshAgentSendDiagnostic),
+    Ambiguous,
+}
+
 /// Private cause information retained before the public runtime error projection.
 type BoxedAdminDispatch<'a> =
     Pin<Box<dyn Future<Output = Result<AdminResult, RuntimeError>> + Send + 'a>>;
@@ -2666,7 +2672,7 @@ impl Supervisor {
         settings: Option<&freshell_runtime_protocol::FreshAgentTurnSettings>,
         checkpoint_logical_attempt_id: Option<&str>,
         settings_correlation: &[u8],
-    ) -> Result<bool, RuntimeError> {
+    ) -> Result<CodexSendReceiptReconciliation, RuntimeError> {
         let Some(recorded_incarnation) = self
             .registry
             .ambiguous_input_incarnation(
@@ -2678,7 +2684,7 @@ impl Supervisor {
             .await
             .map_err(map_registry)?
         else {
-            return Ok(false);
+            return Ok(CodexSendReceiptReconciliation::Ambiguous);
         };
         let Some(source) = self
             .registry
@@ -2686,10 +2692,10 @@ impl Supervisor {
             .await
             .map_err(map_registry)?
         else {
-            return Ok(false);
+            return Ok(CodexSendReceiptReconciliation::Ambiguous);
         };
         if source.handle().incarnation_id() != &recorded_incarnation {
-            return Ok(false);
+            return Ok(CodexSendReceiptReconciliation::Ambiguous);
         }
         let context = self
             .registry
@@ -2697,7 +2703,7 @@ impl Supervisor {
             .await
             .map_err(map_registry)?;
         if !source.matches_context(&context) {
-            return Ok(false);
+            return Ok(CodexSendReceiptReconciliation::Ambiguous);
         }
 
         let handle = source.handle();
@@ -2715,7 +2721,7 @@ impl Supervisor {
                     "host_authentication_failed",
                     Some(error.code),
                 );
-                return Ok(false);
+                return Ok(CodexSendReceiptReconciliation::Ambiguous);
             }
         };
         if !host
@@ -2731,7 +2737,7 @@ impl Supervisor {
                 "receipt_capability_unavailable",
                 None,
             );
-            return Ok(false);
+            return Ok(CodexSendReceiptReconciliation::Ambiguous);
         }
         let status = match self
             .host_status(handle.incarnation_id().clone(), handle.runtime_dir(), &host)
@@ -2747,7 +2753,7 @@ impl Supervisor {
                     "host_status_failed",
                     Some(error.code),
                 );
-                return Ok(false);
+                return Ok(CodexSendReceiptReconciliation::Ambiguous);
             }
         };
         if status.host_boot_id != host.host_boot_id
@@ -2762,7 +2768,7 @@ impl Supervisor {
                 "host_status_not_current_or_worker_unavailable",
                 None,
             );
-            return Ok(false);
+            return Ok(CodexSendReceiptReconciliation::Ambiguous);
         }
 
         let receipt = self
@@ -2803,7 +2809,7 @@ impl Supervisor {
                         "native_identity_mismatch",
                         None,
                     );
-                    return Ok(false);
+                    return Ok(CodexSendReceiptReconciliation::Ambiguous);
                 }
             }
             Ok(HostResult::FreshAgentCommand { .. }) => {
@@ -2815,7 +2821,7 @@ impl Supervisor {
                     "receipt_not_accepted_or_missing_identity",
                     None,
                 );
-                return Ok(false);
+                return Ok(CodexSendReceiptReconciliation::Ambiguous);
             }
             Ok(_) => {
                 self.log_codex_send_receipt_outcome(
@@ -2826,7 +2832,7 @@ impl Supervisor {
                     "unexpected_host_reply",
                     None,
                 );
-                return Ok(false);
+                return Ok(CodexSendReceiptReconciliation::Ambiguous);
             }
             Err(error) if error.code == RuntimeErrorCode::CommandAmbiguous => {
                 self.log_codex_send_receipt_outcome(
@@ -2837,7 +2843,41 @@ impl Supervisor {
                     "receipt_query_remains_ambiguous",
                     Some(error.code),
                 );
-                return Ok(false);
+                return Ok(CodexSendReceiptReconciliation::Ambiguous);
+            }
+            Err(error)
+                if error.code != RuntimeErrorCode::CommandAmbiguous
+                    && error
+                        .fresh_agent_send_diagnostic
+                        .as_ref()
+                        .is_some_and(|diagnostic| {
+                            diagnostic.outcome
+                            == freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused
+                        }) =>
+            {
+                let diagnostic = error
+                    .fresh_agent_send_diagnostic
+                    .expect("refusal guard checked the diagnostic");
+                self.registry
+                    .mark_ambiguous_fresh_input_refused(
+                        soul_id.clone(),
+                        request_id.clone(),
+                        recorded_incarnation.clone(),
+                        text.as_bytes(),
+                        Some(settings_correlation),
+                        diagnostic.clone(),
+                    )
+                    .await
+                    .map_err(map_registry)?;
+                self.log_codex_send_receipt_outcome(
+                    soul_id,
+                    request_id,
+                    &recorded_incarnation,
+                    "refused",
+                    "refused_receipt_committed",
+                    Some(error.code),
+                );
+                return Ok(CodexSendReceiptReconciliation::Refused(diagnostic));
             }
             Err(error) => {
                 self.log_codex_send_receipt_outcome(
@@ -2848,7 +2888,7 @@ impl Supervisor {
                     "receipt_lookup_failed",
                     Some(error.code),
                 );
-                return Ok(false);
+                return Ok(CodexSendReceiptReconciliation::Ambiguous);
             }
         };
 
@@ -2875,7 +2915,7 @@ impl Supervisor {
             "accepted_receipt_committed",
             None,
         );
-        Ok(true)
+        Ok(CodexSendReceiptReconciliation::Accepted)
     }
 
     fn log_codex_send_receipt_outcome(
@@ -2947,7 +2987,7 @@ impl Supervisor {
             {
                 Some(InputJournalDisposition::Completed) => return Ok(CommandState::Completed),
                 Some(InputJournalDisposition::Ambiguous) => {
-                    if Box::pin(self.reconcile_ambiguous_codex_send_receipt(
+                    match Box::pin(self.reconcile_ambiguous_codex_send_receipt(
                         &soul_id,
                         &request_id,
                         &text,
@@ -2957,11 +2997,17 @@ impl Supervisor {
                     ))
                     .await?
                     {
-                        // The registry transaction that accepted the receipt
-                        // also settles this input journal. Report the same
-                        // replay state used for any previously accepted input
-                        // so REST callers read the already-written outcome.
-                        return Ok(CommandState::Completed);
+                        CodexSendReceiptReconciliation::Accepted => {
+                            // The registry transaction that accepted the receipt
+                            // also settles this input journal. Report the same
+                            // replay state used for any previously accepted input
+                            // so REST callers read the already-written outcome.
+                            return Ok(CommandState::Completed);
+                        }
+                        CodexSendReceiptReconciliation::Refused(diagnostic) => {
+                            return Err(fresh_send_refusal_error(diagnostic));
+                        }
+                        CodexSendReceiptReconciliation::Ambiguous => {}
                     }
                     return Ok(CommandState::Ambiguous);
                 }
@@ -3207,8 +3253,8 @@ impl Supervisor {
                             .mark_input_ambiguous(soul_id.clone(), request_id.clone())
                             .await
                             .map_err(map_registry)?;
-                        if recovery_source.is_some()
-                            && Box::pin(self.reconcile_ambiguous_codex_send_receipt(
+                        if recovery_source.is_some() {
+                            match Box::pin(self.reconcile_ambiguous_codex_send_receipt(
                                 &soul_id,
                                 &request_id,
                                 &text,
@@ -3217,8 +3263,15 @@ impl Supervisor {
                                 &settings_correlation,
                             ))
                             .await?
-                        {
-                            return Ok(CommandState::Completed);
+                            {
+                                CodexSendReceiptReconciliation::Accepted => {
+                                    return Ok(CommandState::Completed);
+                                }
+                                CodexSendReceiptReconciliation::Refused(diagnostic) => {
+                                    return Err(fresh_send_refusal_error(diagnostic));
+                                }
+                                CodexSendReceiptReconciliation::Ambiguous => {}
+                            }
                         }
                     }
                     Err(error)
@@ -3272,7 +3325,7 @@ impl Supervisor {
             {
                 Some(InputJournalDisposition::Completed) => Ok(CommandState::Completed),
                 Some(InputJournalDisposition::Ambiguous) => {
-                    if Box::pin(self.reconcile_ambiguous_codex_send_receipt(
+                    match Box::pin(self.reconcile_ambiguous_codex_send_receipt(
                         &soul_id,
                         &request_id,
                         &text,
@@ -3282,9 +3335,11 @@ impl Supervisor {
                     ))
                     .await?
                     {
-                        Ok(CommandState::Completed)
-                    } else {
-                        Ok(CommandState::Ambiguous)
+                        CodexSendReceiptReconciliation::Accepted => Ok(CommandState::Completed),
+                        CodexSendReceiptReconciliation::Refused(diagnostic) => {
+                            Err(fresh_send_refusal_error(diagnostic))
+                        }
+                        CodexSendReceiptReconciliation::Ambiguous => Ok(CommandState::Ambiguous),
                     }
                 }
                 Some(InputJournalDisposition::Refused(diagnostic)) => {

@@ -440,6 +440,52 @@ impl Supervisor {
                 {
                     return Ok(());
                 }
+                // Status can describe an in-flight host-side transition that
+                // completed while this observer waited for the lifecycle
+                // lock (for example, Codex same-root readiness during
+                // Compact). Refresh only observations that could trigger
+                // recovery; otherwise a stale pre-lock `exited`/error result
+                // can spend a recovery attempt against a now-healthy actor.
+                let recheck_host_observation = match &host_observation {
+                    Some(Err(_)) => true,
+                    Some(Ok((_, status))) => status.exited,
+                    None => false,
+                };
+                let host_observation = if recheck_host_observation {
+                    Some(match supervisor
+                            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+                            .await
+                        {
+                            Ok(host) => match supervisor
+                                .host_status(
+                                    handle.incarnation_id().clone(),
+                                    handle.runtime_dir(),
+                                    &host,
+                                )
+                                .await
+                            {
+                                Ok(status) => Ok((host, status)),
+                                Err(error) => {
+                                    append_event(
+                                        &supervisor.config.lifecycle_log,
+                                        "supervisor.runtime_observer.host_status_recheck_failed",
+                                        serde_json::json!({"soulId":view.soul_id,"errorCode":error.code,"message":error.message}),
+                                    );
+                                    Err(RecoveryTrigger::HostUnreachable)
+                                }
+                            },
+                            Err(error) => {
+                                append_event(
+                                    &supervisor.config.lifecycle_log,
+                                    "supervisor.runtime_observer.authenticate_recheck_failed",
+                                    serde_json::json!({"soulId":view.soul_id,"errorCode":error.code,"message":error.message}),
+                                );
+                                Err(RecoveryTrigger::HostUnreachable)
+                            }
+                        })
+                } else {
+                    host_observation
+                };
                 let mut retained_source = None;
                 let trigger = match (inspection, host_observation) {
                     (Ok(inspection), _)
@@ -1085,6 +1131,9 @@ mod tests {
             !observer.is_finished(),
             "observer must retain the host-loss trigger while the lifecycle lock is busy"
         );
+        // The trigger is valid only if host status remains unavailable after
+        // the lock opens; an in-flight transition may have resolved meanwhile.
+        fixture.fail_status_once.store(true, Ordering::SeqCst);
         drop(lifecycle_guard);
         tokio::time::timeout(Duration::from_secs(15), observer)
             .await

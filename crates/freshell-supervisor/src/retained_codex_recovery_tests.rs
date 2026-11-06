@@ -89,6 +89,7 @@ struct ControlledCodex {
     inputs: Arc<AtomicUsize>,
     receipt_queries: Arc<AtomicUsize>,
     receipt_identity_mismatch: Arc<AtomicBool>,
+    receipt_refused: Arc<AtomicBool>,
     lose_send_reply_once: Arc<AtomicBool>,
     native_prepares: Arc<AtomicUsize>,
     recovery_probes: Arc<AtomicUsize>,
@@ -103,6 +104,7 @@ struct ControlledCodex {
     release: Arc<Notify>,
     transient_status: Arc<Notify>,
     status_observed: Arc<Notify>,
+    status_busy: Arc<AtomicBool>,
     worker: Arc<AtomicBool>,
     capability: Arc<AtomicBool>,
     receipt_capability: Arc<AtomicBool>,
@@ -204,6 +206,7 @@ impl ControlledCodex {
         let inputs = Arc::new(AtomicUsize::new(0));
         let receipt_queries = Arc::new(AtomicUsize::new(0));
         let receipt_identity_mismatch = Arc::new(AtomicBool::new(false));
+        let receipt_refused = Arc::new(AtomicBool::new(false));
         let lose_send_reply_once = Arc::new(AtomicBool::new(false));
         let send_receipt = Arc::new(std::sync::Mutex::new(
             None::<(RequestId, NativeDispatchIdentity)>,
@@ -221,6 +224,7 @@ impl ControlledCodex {
         let release = Arc::new(Notify::new());
         let transient_status = Arc::new(Notify::new());
         let status_observed = Arc::new(Notify::new());
+        let status_busy = Arc::new(AtomicBool::new(false));
         let worker = Arc::new(AtomicBool::new(true));
         let capability = Arc::new(AtomicBool::new(true));
         let receipt_capability = Arc::new(AtomicBool::new(true));
@@ -239,6 +243,7 @@ impl ControlledCodex {
             let inputs = inputs.clone();
             let receipt_queries = receipt_queries.clone();
             let receipt_identity_mismatch = receipt_identity_mismatch.clone();
+            let receipt_refused = receipt_refused.clone();
             let lose_send_reply_once = lose_send_reply_once.clone();
             let send_receipt = send_receipt.clone();
             let native_prepares = native_prepares.clone();
@@ -254,6 +259,7 @@ impl ControlledCodex {
             let release = release.clone();
             let transient_status = transient_status.clone();
             let status_observed = status_observed.clone();
+            let status_busy = status_busy.clone();
             let worker = worker.clone();
             let capability = capability.clone();
             let receipt_capability = receipt_capability.clone();
@@ -273,6 +279,7 @@ impl ControlledCodex {
                     let inputs = inputs.clone();
                     let receipt_queries = receipt_queries.clone();
                     let receipt_identity_mismatch = receipt_identity_mismatch.clone();
+                    let receipt_refused = receipt_refused.clone();
                     let lose_send_reply_once = lose_send_reply_once.clone();
                     let send_receipt = send_receipt.clone();
                     let native_prepares = native_prepares.clone();
@@ -290,6 +297,7 @@ impl ControlledCodex {
                     let launch = launch.clone();
                     let transient_status = transient_status.clone();
                     let status_observed = status_observed.clone();
+                    let status_busy = status_busy.clone();
                     let worker = worker.clone();
                     let capability = capability.clone();
                     let receipt_capability = receipt_capability.clone();
@@ -314,6 +322,13 @@ impl ControlledCodex {
                                 ))
                             );
                         }
+                        let receipt_only_request = matches!(
+                            &request.body,
+                            HostCommand::FreshAgentSend {
+                                receipt_only: true,
+                                ..
+                            }
+                        );
                         let mut drop_reply = false;
                         let result = match request.body {
                             HostCommand::Hello {
@@ -353,11 +368,14 @@ impl ControlledCodex {
                             HostCommand::Status { .. } => {
                                 statuses.fetch_add(1, Ordering::SeqCst);
                                 status_observed.notify_one();
-                                let ended = exited.load(Ordering::SeqCst);
+                                let temporarily_busy = status_busy.load(Ordering::SeqCst)
+                                    && hold_ack.load(Ordering::SeqCst);
+                                let ended = exited.load(Ordering::SeqCst) || temporarily_busy;
                                 let observation = source.lock().unwrap().clone();
                                 HostResult::Status {
-                                    fresh_agent_recovery_source: if hold_ack.load(Ordering::SeqCst)
-                                        && inputs.load(Ordering::SeqCst) > 0
+                                    fresh_agent_recovery_source: if temporarily_busy
+                                        || (hold_ack.load(Ordering::SeqCst)
+                                            && inputs.load(Ordering::SeqCst) > 0)
                                     {
                                         transient_status.notify_one();
                                         None
@@ -637,7 +655,22 @@ impl ControlledCodex {
                                 &mut socket,
                                 &HostReply {
                                     request_id: request.request_id,
-                                    result: Ok(result),
+                                    result: if receipt_only_request
+                                        && receipt_refused.swap(false, Ordering::SeqCst)
+                                    {
+                                        Err(freshell_runtime_protocol::RuntimeError::new(
+                                            freshell_runtime_protocol::RuntimeErrorCode::HostUnreachable,
+                                            "hosted fresh-agent command failed",
+                                        )
+                                        .with_fresh_agent_send_diagnostic(
+                                            freshell_runtime_protocol::FreshAgentSendDiagnostic {
+                                                outcome: freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused,
+                                                message: Some("provider refused the original input".into()),
+                                            },
+                                        ))
+                                    } else {
+                                        Ok(result)
+                                    },
                                 },
                             )
                             .await
@@ -681,6 +714,7 @@ impl ControlledCodex {
             inputs,
             receipt_queries,
             receipt_identity_mismatch,
+            receipt_refused,
             lose_send_reply_once,
             native_prepares,
             recovery_probes,
@@ -695,6 +729,7 @@ impl ControlledCodex {
             release,
             transient_status,
             status_observed,
+            status_busy,
             worker,
             capability,
             receipt_capability,
@@ -1600,6 +1635,89 @@ async fn receipt_reconcile_preserves_a_recorded_provider_refusal() {
 }
 
 #[tokio::test]
+async fn receipt_reconcile_persists_a_proven_refusal_for_an_ambiguous_send() {
+    let fixture = ControlledCodex::new().await;
+    let request_id = RequestId::new();
+    let checkpoint_logical_attempt_id = Some("logical-attempt-receipt-refused".to_string());
+    let settings = Some(freshell_runtime_protocol::FreshAgentTurnSettings {
+        cwd: Some(fixture._root.path().to_string_lossy().into_owned()),
+        model: Some("gpt-5-codex".into()),
+        ..Default::default()
+    });
+    let settings_correlation = serde_json::to_vec(&(
+        settings.as_ref(),
+        checkpoint_logical_attempt_id.as_deref().unwrap(),
+    ))
+    .unwrap();
+    let (disposition, _) = fixture
+        .supervisor
+        .registry
+        .begin_fresh_input(
+            fixture.soul.clone(),
+            request_id.clone(),
+            b"original public reference input",
+            &settings_correlation,
+            settings.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(disposition, InputJournalDisposition::Dispatch);
+    fixture
+        .supervisor
+        .registry
+        .mark_input_dispatching(fixture.soul.clone(), request_id.clone())
+        .await
+        .unwrap();
+    fixture.receipt_refused.store(true, Ordering::SeqCst);
+
+    let error = fixture
+        .reconcile_send(
+            request_id.clone(),
+            checkpoint_logical_attempt_id.clone(),
+            settings.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error
+            .fresh_agent_send_diagnostic
+            .as_ref()
+            .and_then(|diagnostic| diagnostic.message.as_deref()),
+        Some("provider refused the original input")
+    );
+    assert_eq!(
+        fixture
+            .supervisor
+            .registry
+            .recorded_input_outcome(
+                fixture.soul.clone(),
+                request_id.clone(),
+                b"original public reference input",
+                Some(&settings_correlation),
+            )
+            .await
+            .unwrap(),
+        Some(InputJournalDisposition::Refused(
+            error.fresh_agent_send_diagnostic.clone().unwrap()
+        ))
+    );
+    assert_eq!(fixture.inputs.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.receipt_queries.load(Ordering::SeqCst), 1);
+
+    let repeated = fixture
+        .reconcile_send(request_id, checkpoint_logical_attempt_id, settings)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        repeated.fresh_agent_send_diagnostic,
+        error.fresh_agent_send_diagnostic
+    );
+    assert_eq!(fixture.inputs.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.receipt_queries.load(Ordering::SeqCst), 1);
+    fixture.peer.abort();
+}
+
+#[tokio::test]
 async fn ordinary_same_root_codex_send_skips_identity_rewrite_after_intent_change() {
     let fixture = ControlledCodex::new().await;
     fixture.exited.store(false, Ordering::SeqCst);
@@ -1763,7 +1881,7 @@ async fn manual_retry_classifies_blocked_codex_when_readiness_fails_without_a_pe
 }
 
 #[tokio::test]
-async fn manual_retry_preserves_fence_when_host_receipt_state_is_unavailable() {
+async fn manual_retry_uses_offline_recovery_when_host_receipt_state_is_unavailable() {
     let fixture = ControlledCodex::new().await;
     let before = fixture
         .supervisor
@@ -1799,10 +1917,16 @@ async fn manual_retry_preserves_fence_when_host_receipt_state_is_unavailable() {
             expected_intent_revision: Some(blocked.intent_revision),
             expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
         })
-        .await;
+        .await
+        .expect("manual retry should reach the normal offline recovery classifier");
+    assert_eq!(
+        result.outcome,
+        RecoveryOutcome::Blocked,
+        "the controlled backend cannot create a replacement, but the retry must reach that stage"
+    );
     assert!(
-        result.is_err(),
-        "unknown receipt state must not advance intent"
+        fixture.backend.stops.load(Ordering::SeqCst) > 0,
+        "offline recovery must verify cleanup of the prior runtime before replacement"
     );
 
     let after = fixture
@@ -1811,11 +1935,11 @@ async fn manual_retry_preserves_fence_when_host_receipt_state_is_unavailable() {
         .recovery_context(fixture.soul.clone())
         .await
         .unwrap();
-    assert_eq!(after.intent_revision, blocked.intent_revision);
+    assert_eq!(after.intent_revision, blocked.intent_revision + 1);
     assert_eq!(after.recovery_state, RecoveryState::Blocked);
-    assert_eq!(after.recovery_attempt_id, blocked.recovery_attempt_id);
-    assert_eq!(after.native_identity_launch, blocked.native_identity_launch);
-    assert_eq!(after.native_session_id, blocked.native_session_id);
+    let lifecycle = std::fs::read_to_string(&fixture.supervisor.config.lifecycle_log).unwrap();
+    assert!(lifecycle.contains("supervisor.manual_retry_readiness_deferred"));
+    assert!(lifecycle.contains("create_stopped_runtime"));
 }
 
 #[tokio::test]
@@ -2085,15 +2209,34 @@ async fn observer_during_compact_readiness_and_compact_does_not_spend_attempt() 
             tokio::spawn(async move { fixture.compact().await })
         };
         fixture.sending.notified().await;
-        tokio::time::timeout(Duration::from_secs(2), fixture.supervisor.observe_once())
-            .await
-            .unwrap()
-            .unwrap();
+        fixture.status_busy.store(preparing, Ordering::SeqCst);
+        let statuses_before_observer = fixture.statuses.load(Ordering::SeqCst);
+        let observer = {
+            let fixture = fixture.clone();
+            tokio::spawn(async move { fixture.supervisor.observe_once().await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fixture.statuses.load(Ordering::SeqCst) <= statuses_before_observer {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("observer must take its own host Status snapshot while Compact is held");
+        assert!(
+            !observer.is_finished(),
+            "observer should wait for the lifecycle lock instead of dropping its observation"
+        );
         fixture.assert_retained().await;
         fixture.hold_ack.store(false, Ordering::SeqCst);
         fixture.release.notify_one();
         operation.await.unwrap().unwrap();
+        observer.await.unwrap().unwrap();
         fixture.assert_retained().await;
+        assert_eq!(
+            fixture.attempts(),
+            0,
+            "a status captured during Codex same-root preparation must not schedule recovery after Compact succeeds"
+        );
         fixture.peer.abort();
         fixture.backend.ended.store(true, Ordering::SeqCst);
         fixture.supervisor.observe_once().await.unwrap();
