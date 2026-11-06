@@ -29149,6 +29149,66 @@ mod tests {
     // ── fresheyes ep2-r5: the rescue is bound to the committed session
     // instance and ownership fence, never to a same-key replacement ──
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn public_resumes_share_the_operation_parked_after_commit() {
+        let (mut state, _rx, _exited, spawns, _manager) = selfheal_state(60_000, 120_000).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        state.set_ownership(registry.clone());
+        state.set_identity_sink(Arc::new(crate::identity_sink::FakeIdentitySink::default()));
+        let id = "ses_shared_post_commit";
+        let stall = state.arm_rescue_lookup_stall(id);
+        let st = state.clone();
+        let first =
+            tokio::spawn(
+                async move { st.resume_durable_session(id, None, None, None, None).await },
+            );
+        stall.entered.recv_timeout(Duration::from_secs(15)).unwrap();
+        let owner = registry.observe(PROVIDER, id);
+        assert!(matches!(
+            owner.state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ));
+        let st = state.clone();
+        let second =
+            tokio::spawn(
+                async move { st.resume_durable_session(id, None, None, None, None).await },
+            );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state
+                .session_recovery
+                .waiter_count_for_test(&state.recovery_map_key(id))
+                .await
+                != 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both public resumes join the same recovery operation");
+        assert!(!first.is_finished());
+        assert!(!second.is_finished());
+        assert_eq!(registry.observe(PROVIDER, id).generation, owner.generation);
+        stall.release.send(()).unwrap();
+        let (first, second) = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(first, second)
+        })
+        .await
+        .expect("both public resumes settle after the shared rescue resumes");
+        let Ok(first) = first.unwrap() else {
+            panic!("first shared resume must succeed");
+        };
+        let Ok(second) = second.unwrap() else {
+            panic!("second shared resume must succeed");
+        };
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "both requesters receive the same registered session"
+        );
+        assert_eq!(registry.observe(PROVIDER, id).generation, owner.generation);
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
+        assert!(session_serve_bridge_alive(&state, id).await);
+    }
+
     /// fresheyes ep2-r5 Major (the rescue adopts a same-key replacement
     /// for the committed session): the post-commit rescue verified
     /// whichever session currently occupies the durable id — not the
@@ -29219,15 +29279,19 @@ mod tests {
         // The mover, part 1: a REAL kill of the committed session, driven
         // through the REAL path to completion (the durable close, every
         // map key, the killed flag, the bridge abort, Stopping→Vacant).
-        st.handle_kill(FreshAgentKill {
-            provider: AgentProvider::Opencode,
-            session_id: durable.to_string(),
-            session_type: SessionType::Freshopencode,
-            cwd: None,
-            observed_epoch: None,
-            observed_generation: None,
-        })
-        .await;
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            st.handle_kill(FreshAgentKill {
+                provider: AgentProvider::Opencode,
+                session_id: durable.to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+                observed_epoch: None,
+                observed_generation: None,
+            }),
+        )
+        .await
+        .expect("the committed original session is killed before its replacement starts");
         assert!(
             !st.has_live_session(durable).await,
             "fixture: the kill removed the committed session's map key"
@@ -29245,9 +29309,14 @@ mod tests {
         // BRAND-NEW instance under the SAME durable id and commits it
         // Live at a strictly newer generation — the finding's same-key
         // replacement.
-        let replacement = match st
-            .resume_durable_session(durable, None, None, None, None)
-            .await
+        // This race deliberately installs an independent provider operation.
+        // The public wrapper would join the original parked recovery, so
+        // awaiting it before releasing the original would deadlock this fixture.
+        let replacement = match tokio::time::timeout(
+            Duration::from_secs(15),
+            st.resume_durable_session_once(durable, None, None, None, None),
+        )
+            .await.expect("the independent replacement resume settles")
         {
             Ok(arc) => arc,
             Err(ResumeOpencodeError::Manager(err)) => panic!(
@@ -29284,7 +29353,10 @@ mod tests {
         // REPLACEMENT under the key. Only the committed-instance binding
         // and the committed-fence check can refuse it.
         stall.release.send(()).expect("release the parked rescue");
-        let out = original.await.expect("the original resume settles");
+        let out = tokio::time::timeout(Duration::from_secs(15), original)
+            .await
+            .expect("the original resume settles after releasing its rescue")
+            .expect("the original task completes");
 
         // THE outcome: the typed ownership-changed refusal — never Ok
         // over the retired original instance (pre-fix: the rescue

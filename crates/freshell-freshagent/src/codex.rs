@@ -1296,7 +1296,7 @@ enum CodexRecoveryReady {
 #[derive(Debug)]
 enum CodexRecoveryFailure {
     NotFound,
-    Reserved,
+    Reserved(Option<crate::ownership_lane::TerminalOwnerFields>),
     Draining,
     CrashRecovery(String),
     HistoricalResume(String),
@@ -2200,7 +2200,9 @@ impl FreshCodexState {
             | freshell_ownership::OwnershipState::Aliased { .. } => false,
         };
         if coordinator_blocks_claim || (self.terminal_liveness)(PROVIDER, &owner_key) {
-            Some(CodexRecoveryFailure::Reserved)
+            Some(CodexRecoveryFailure::Reserved(
+                crate::ownership_lane::terminal_owner_fields_from_snapshot(&snapshot),
+            ))
         } else {
             None
         }
@@ -3791,12 +3793,12 @@ impl FreshCodexState {
                     | CodexRecoveryFailure::CreateLaunch(outcome),
                 )) => (outcome.clone(), true),
                 Err(crate::session_recovery::RecoveryFailure::Attempt(
-                    CodexRecoveryFailure::Reserved,
+                    CodexRecoveryFailure::Reserved(owner),
                 )) => (
                     Self::failed_create_outcome(
                         "SESSION_RESERVED",
                         "Another resume for this session is in flight",
-                        None,
+                        owner.clone(),
                     ),
                     false,
                 ),
@@ -9864,7 +9866,7 @@ impl FreshCodexState {
                         }
                         Err(EnsureAliveError::Reserved) => {
                             Err(crate::session_recovery::RecoveryAttemptFailure::refusal(
-                                CodexRecoveryFailure::Reserved,
+                                CodexRecoveryFailure::Reserved(None),
                             ))
                         }
                         Err(EnsureAliveError::Draining) => {
@@ -9930,7 +9932,7 @@ impl FreshCodexState {
                 CodexRecoveryFailure::NotFound,
             )) => Err(EnsureAliveError::NotFound),
             Err(crate::session_recovery::RecoveryFailure::Attempt(
-                CodexRecoveryFailure::Reserved,
+                CodexRecoveryFailure::Reserved(_),
             )) => Err(EnsureAliveError::Reserved),
             Err(crate::session_recovery::RecoveryFailure::Attempt(
                 CodexRecoveryFailure::Draining,
@@ -12792,7 +12794,7 @@ impl FreshCodexState {
                         }
                         Err(ResumeSessionError::Reserved) => {
                             Err(crate::session_recovery::RecoveryAttemptFailure::refusal(
-                                CodexRecoveryFailure::Reserved,
+                                CodexRecoveryFailure::Reserved(None),
                             ))
                         }
                         Err(ResumeSessionError::Draining) => {
@@ -12868,7 +12870,7 @@ impl FreshCodexState {
                 CodexRecoveryFailure::NotFound,
             )) => Err(ResumeSessionError::NotFound),
             Err(crate::session_recovery::RecoveryFailure::Attempt(
-                CodexRecoveryFailure::Reserved,
+                CodexRecoveryFailure::Reserved(_),
             )) => Err(ResumeSessionError::Reserved),
             Err(crate::session_recovery::RecoveryFailure::Attempt(
                 CodexRecoveryFailure::Draining,
@@ -26922,6 +26924,153 @@ pub(crate) mod tests {
         }
     }
 
+    // These cleanup tests cancel the provider operation itself. Canceling
+    // handle_create only drops a requester of the server-owned shared recovery.
+    async fn create_resume_operation_for_test(
+        state: &FreshCodexState,
+        request_id: &str,
+        session_id: &str,
+    ) -> CodexCreateOutcome {
+        state
+            .handle_create_resume_operation(
+                request_id.into(),
+                None,
+                session_id.into(),
+                None,
+                String::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canceled_create_requester_keeps_shared_resume_and_incumbent_for_the_next_requester() {
+        let _guard = ENV_LOCK.lock().await;
+        for map_hit in [false, true] {
+            let logs = tempfile::tempdir().unwrap();
+            let operations = logs.path().join("operations.jsonl");
+            configure_fake_codex_cmd(
+                &json!({"appendThreadOperationLogPath":operations}).to_string(),
+            );
+            let (mut state, mut rx, sink) = state_with_sink();
+            let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+            state.set_ownership(registry.clone());
+            let id = if map_hit {
+                let id = create_real_fake_session(&state, &mut rx).await;
+                vacate_codex_owner_for_map_hit(&registry, &id);
+                id
+            } else {
+                "shared-canceled-requester".into()
+            };
+            let stall = sink.arm_binding_stall(PROVIDER, &id);
+            let mut msg = create_msg("shared-first-requester");
+            msg.resume_session_id = Some(id.clone());
+            let st = state.clone();
+            let first = tokio::spawn(async move { st.handle_create(msg, None).await });
+            stall.entered.recv_timeout(Duration::from_secs(15)).unwrap();
+            let before = registry.observe(PROVIDER, &id);
+            assert!(matches!(
+                before.state,
+                freshell_ownership::OwnershipState::Starting { .. }
+            ));
+            let (pid, writer) = {
+                let sessions = state.sessions.lock().await;
+                let session = sessions.get(&id).unwrap();
+                (
+                    session.sidecar_pid.unwrap(),
+                    session.sidecar_ownership_id.clone(),
+                )
+            };
+            first.abort();
+            assert!(first.await.unwrap_err().is_cancelled());
+            assert_eq!(registry.observe(PROVIDER, &id).state, before.state);
+            assert!(!crate::ownership_lane::partial_pid_confirmed_dead(pid));
+
+            let key = state.recovery_map_key(&id);
+            let operation = state
+                .session_recovery
+                .status(&key)
+                .await
+                .unwrap()
+                .operation_id;
+            let mut msg = create_msg("shared-next-requester");
+            msg.resume_session_id = Some(id.clone());
+            let st = state.clone();
+            let next = tokio::spawn(async move { st.handle_create(msg, None).await });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while state.session_recovery.waiter_count_for_test(&key).await != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the next requester joins the retained provider operation");
+            assert_eq!(
+                state
+                    .session_recovery
+                    .status(&key)
+                    .await
+                    .unwrap()
+                    .operation_id,
+                operation
+            );
+            assert!(!next.is_finished());
+            stall.release.send(()).unwrap();
+            let outcome = tokio::time::timeout(Duration::from_secs(15), next)
+                .await
+                .expect("the surviving requester settles")
+                .unwrap();
+            assert!(
+                matches!(outcome, CodexCreateOutcome::Created { ref session_id, .. } if session_id == &id)
+            );
+            let after = registry.observe(PROVIDER, &id);
+            assert_eq!(after.generation, before.generation);
+            assert!(matches!(
+                after.state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ));
+            assert_eq!(
+                state
+                    .sessions
+                    .lock()
+                    .await
+                    .get(&id)
+                    .unwrap()
+                    .sidecar_ownership_id,
+                writer
+            );
+            assert!(!crate::ownership_lane::partial_pid_confirmed_dead(pid));
+            assert!(sink.repairs.lock().unwrap().is_empty());
+            let native: Vec<Value> = std::fs::read_to_string(&operations)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(
+                native.len(),
+                1,
+                "one native writer serves both requesters: {native:?}"
+            );
+            assert_eq!(
+                native[0]["method"],
+                if map_hit {
+                    "thread/start"
+                } else {
+                    "thread/resume"
+                }
+            );
+            assert_eq!(native[0]["pid"], pid);
+            state.shutdown().await;
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn canceled_map_hit_before_session_lookup_keeps_incumbent_owned() {
         let _guard = ENV_LOCK.lock().await;
@@ -26940,9 +27089,8 @@ pub(crate) mod tests {
                 .unwrap()
                 .sidecar_ownership_id
                 .clone();
-            let mut msg = create_msg(&format!("cancel-before-incumbent-lookup-{lookup}"));
-            msg.resume_session_id = Some(id.clone());
-            let mut request = Box::pin(state.handle_create(msg, None));
+            let request_id = format!("cancel-before-incumbent-lookup-{lookup}");
+            let mut request = Box::pin(create_resume_operation_for_test(&state, &request_id, &id));
             assert!(futures_util::poll!(&mut request).is_pending());
             for _ in 1..lookup {
                 let mut next = Box::pin(state.sessions.lock());
@@ -26995,10 +27143,10 @@ pub(crate) mod tests {
         state.set_ownership(registry.clone());
         let id = "cancel-registered-startup";
         let stall = sink.arm_binding_stall(PROVIDER, id);
-        let mut msg = create_msg("cancel-registered-startup");
-        msg.resume_session_id = Some(id.into());
         let st = state.clone();
-        let task = tokio::spawn(async move { st.handle_create(msg, None).await });
+        let task = tokio::spawn(async move {
+            create_resume_operation_for_test(&st, "cancel-registered-startup", id).await
+        });
         stall.entered.recv_timeout(Duration::from_secs(15)).unwrap();
         let sessions = state.sessions.lock().await;
         let session = sessions
@@ -27075,10 +27223,11 @@ pub(crate) mod tests {
             })
         }));
 
-        let mut msg = create_msg("registered-startup-handoff-removal-race");
-        msg.resume_session_id = Some(id.into());
         let st = state.clone();
-        let task = tokio::spawn(async move { st.handle_create(msg, None).await });
+        let task = tokio::spawn(async move {
+            create_resume_operation_for_test(&st, "registered-startup-handoff-removal-race", id)
+                .await
+        });
         stall.entered.recv_timeout(Duration::from_secs(15)).unwrap();
         let sessions = state.sessions.lock().await;
         let pid = sessions
@@ -32887,6 +33036,81 @@ pub(crate) mod tests {
         }
     }
 
+    fn attach_native_witness_behavior(session_id: &str, log: &std::path::Path) -> Value {
+        json!({
+            "appendNativeNotificationLogPath": log,
+            // Requested only AFTER attach settles. Observing this native event
+            // proves the consumer processed the earlier cold-load notification.
+            "notificationsAfterMethods": {"thread/loaded/list": [{
+                "method": "thread/status/changed",
+                "params": {"threadId": session_id, "status": {"type": "active"}}
+            }]}
+        })
+    }
+
+    async fn assert_attach_native_snapshots(
+        state: &FreshCodexState,
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        session_id: &str,
+        notification_log: &std::path::Path,
+    ) -> Vec<Value> {
+        let client = state
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .unwrap()
+            .client
+            .clone();
+        client
+            .list_loaded_threads()
+            .await
+            .expect("native consumer barrier request");
+        let mut frames = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut frames = Vec::new();
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                let barrier = frame["event"]["type"] == "freshAgent.session.snapshot"
+                    && frame["event"]["status"] == "running";
+                frames.push(frame);
+                if barrier {
+                    return frames;
+                }
+            }
+        })
+        .await
+        .expect("the native consumer processes the post-attach barrier");
+        frames.extend(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .map(|raw| serde_json::from_str::<Value>(&raw).unwrap()),
+        );
+        let snapshots: Vec<_> = frames
+            .iter()
+            .filter(|frame| frame["event"]["type"] == "freshAgent.session.snapshot")
+            .map(|frame| json!([frame["sessionId"], frame["event"]["status"]]))
+            .collect();
+        assert_eq!(snapshots, vec![json!([session_id, "idle"]), json!([session_id, "running"])],
+            "only native cold-load and barrier snapshots reach peers; no attach reply leaks: {frames:?}");
+        let native: Vec<Value> = std::fs::read_to_string(notification_log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|row| row["method"] == "thread/status/changed")
+            .collect();
+        assert_eq!(
+            native,
+            vec![
+                json!({"method":"thread/status/changed", "threadId":session_id}),
+                json!({"method":"thread/status/changed", "threadId":session_id}),
+            ],
+            "the separate provider process emitted exactly the two observed status edges"
+        );
+        assert!(frames
+            .iter()
+            .all(|frame| frame["type"] != "freshAgent.attached"));
+        frames
+    }
+
     /// THE FIX (defect 2): a thread id outside the live in-memory map -- e.g. a page
     /// reload re-attaching a fresh-agent pane's WS session after a server restart --
     /// must NOT be declared lost. It must be resumed on demand by the attach lane
@@ -32896,7 +33120,11 @@ pub(crate) mod tests {
     async fn handle_attach_unknown_session_resumes_via_fake_app_server_and_registers_idle_snapshot()
     {
         let _guard = ENV_LOCK.lock().await;
-        configure_fake_codex_cmd("{}");
+        let logs = tempfile::tempdir().unwrap();
+        let native_log = logs.path().join("native.jsonl");
+        configure_fake_codex_cmd(
+            &attach_native_witness_behavior("historical-thread-attach", &native_log).to_string(),
+        );
         let (st, mut rx) = state_with_bus();
         let mut attach = attach_msg("historical-thread-attach");
         attach.request_id = Some("codex-cold-attach".into());
@@ -32905,10 +33133,16 @@ pub(crate) mod tests {
         st.handle_attach(attach, reply).await;
 
         let replies = captured.lock().expect("capture mutex").clone();
+        assert_eq!(
+            replies.len(),
+            1,
+            "exactly one requester settlement: {replies:?}"
+        );
         let Some(ServerMessage::FreshAgentAttached(attached)) = replies.first() else {
             panic!("the cold-resume request must receive its attach result: {replies:?}");
         };
         assert_eq!(attached.request_id, "codex-cold-attach");
+        assert_eq!(attached.view_id.as_deref(), Some("codex-cold-view"));
         assert_eq!(attached.session_id, "historical-thread-attach");
         assert_eq!(
             attached.snapshot.as_ref().unwrap()["type"],
@@ -32920,14 +33154,7 @@ pub(crate) mod tests {
             "INVALID_SESSION_ID",
             "a resumable historical thread must never be declared lost"
         );
-        assert!(
-            std::iter::from_fn(|| rx.try_recv().ok()).all(|raw| {
-                let frame: Value = serde_json::from_str(&raw).unwrap();
-                !(frame["type"] == "freshAgent.event"
-                    && frame["event"]["type"] == "freshAgent.session.snapshot")
-            }),
-            "the cold-resume snapshot belongs to the requester, not the shared bus"
-        );
+        assert_attach_native_snapshots(&st, &mut rx, "historical-thread-attach", &native_log).await;
 
         assert!(
             st.sessions
@@ -32936,6 +33163,7 @@ pub(crate) mod tests {
                 .contains_key("historical-thread-attach"),
             "the resumed thread must be registered for reuse by a later send/attach"
         );
+        st.shutdown().await;
     }
 
     /// Focused-ep5-r2 Finding 4 (retire-on-kill round 3), the codex lane: an
@@ -35453,7 +35681,11 @@ pub(crate) mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
 
         // Now the thread is genuinely resumable.
-        configure_fake_codex_cmd("{}");
+        let logs = tempfile::tempdir().unwrap();
+        let native_log = logs.path().join("native.jsonl");
+        configure_fake_codex_cmd(
+            &attach_native_witness_behavior("thread-temporarily-dead", &native_log).to_string(),
+        );
 
         let mut second_attach = attach_msg("thread-temporarily-dead");
         second_attach.request_id = Some("codex-dead-cache-retry-attach".into());
@@ -35464,19 +35696,10 @@ pub(crate) mod tests {
         assert_eq!(second.len(), 1, "one retry settlement: {second:?}");
         assert_eq!(second[0]["type"], "freshAgent.attached");
         assert_eq!(second[0]["requestId"], "codex-dead-cache-retry-attach");
+        assert_eq!(second[0]["viewId"], "codex-dead-cache-view");
         assert_eq!(second[0]["sessionId"], "thread-temporarily-dead");
-        let shared_frames: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
-            .filter_map(|raw| serde_json::from_str(&raw).ok())
-            .collect();
-        assert!(
-            !shared_frames.iter().any(|frame| {
-                frame["type"] == "freshAgent.event"
-                    && frame["sessionId"] == "thread-temporarily-dead"
-                    && frame["event"]["type"] == "freshAgent.session.snapshot"
-                    && frame["event"]["revision"].as_u64().is_none()
-            }),
-            "the synthetic attach snapshot is requester-only: {shared_frames:?}"
-        );
+        assert_eq!(second[0]["snapshot"]["status"], "idle");
+        assert_attach_native_snapshots(&st, &mut rx, "thread-temporarily-dead", &native_log).await;
         assert!(
             st.sessions
                 .lock()
@@ -35495,6 +35718,7 @@ pub(crate) mod tests {
             "expiry must allow a genuine SECOND spawn attempt (not permanently blocked): \
              {spawn_count}"
         );
+        st.shutdown().await;
     }
 
     /// REVIEW FIX (Important, item 1): two GENUINELY CONCURRENT attaches racing against a
@@ -36366,7 +36590,16 @@ pub(crate) mod tests {
         let capture = tracing_capture::capture_by_session("attach-owner-status-marker-unused");
         let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         st.set_ownership(Arc::clone(&ownership));
-        configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-original"}"#);
+        configure_fake_codex_cmd(
+            &json!({
+                "threadStartThreadId":"thread-original",
+                "notificationsAfterMethods":{"thread/start":[{
+                    "method":"thread/status/changed",
+                    "params":{"threadId":"thread-original","status":{"type":"idle"}}
+                }]}
+            })
+            .to_string(),
+        );
         let thread_id = create_real_fake_session(&st, &mut peer_bus).await;
         simulate_unrequested_crash(&st, &thread_id).await;
         drain_create_time_snapshot(&mut peer_bus, &thread_id).await;
@@ -36399,17 +36632,18 @@ pub(crate) mod tests {
         let exited: Value = serde_json::from_str(&peer_bus.try_recv().unwrap()).unwrap();
         assert_eq!(exited["event"]["status"], "exited");
 
-        configure_fake_codex_cmd(
-            &json!({
-                "threadStartThreadId": "thread-respawned",
-                "overrides": {
-                    "thread/resume": {
-                        "error": { "code": -32001, "message": "Thread not found" }
-                    }
-                }
-            })
-            .to_string(),
-        );
+        let logs = tempfile::tempdir().unwrap();
+        let native_log = logs.path().join("native.jsonl");
+        let mut behavior = attach_native_witness_behavior("thread-respawned", &native_log);
+        behavior["threadStartThreadId"] = json!("thread-respawned");
+        behavior["overrides"] = json!({"thread/resume": {
+            "error": {"code":-32600,"message":"no rollout found for thread id thread-original"}
+        }});
+        behavior["notificationsAfterMethods"]["thread/start"] = json!([{
+            "method":"thread/status/changed",
+            "params":{"threadId":"thread-respawned","status":{"type":"idle"}}
+        }]);
+        configure_fake_codex_cmd(&behavior.to_string());
         let mut attach = attach_msg(&thread_id);
         attach.request_id = Some("codex-replacement-recovery".into());
         attach.view_id = Some("codex-replacement-view".into());
@@ -36420,10 +36654,16 @@ pub(crate) mod tests {
         st.handle_attach(attach, reply).await;
 
         let replies = requester.lock().expect("requester capture mutex").clone();
+        assert_eq!(
+            replies.len(),
+            1,
+            "exactly one requester settlement: {replies:?}"
+        );
         let Some(ServerMessage::FreshAgentAttached(attached)) = replies.last() else {
             panic!("replacement recovery must settle the attach requester: {replies:?}");
         };
         assert_eq!(attached.request_id, "codex-replacement-recovery");
+        assert_eq!(attached.view_id.as_deref(), Some("codex-replacement-view"));
         assert_eq!(attached.session_id, "thread-respawned");
         let canonical_owner = ownership.observe(PROVIDER, &attached.session_id);
         assert!(matches!(
@@ -36434,20 +36674,16 @@ pub(crate) mod tests {
         assert_eq!(attached.owner_kind.as_deref(), Some("fresh-agent"));
         assert_eq!(attached.owner_epoch, Some(canonical_owner.epoch));
         assert_eq!(attached.owner_generation, Some(canonical_owner.generation));
-        let shared_status = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let frame: Value = serde_json::from_str(&peer_bus.recv().await.unwrap()).unwrap();
-                if frame["type"] == "freshAgent.event"
-                    && frame["event"]["type"] == "freshAgent.status"
+        let shared_frames =
+            assert_attach_native_snapshots(&st, &mut peer_bus, "thread-respawned", &native_log)
+                .await;
+        let shared_status = shared_frames
+            .iter()
+            .find(|frame| {
+                frame["event"]["type"] == "freshAgent.status"
                     && frame["sessionId"] == "thread-respawned"
-                    && matches!(frame["event"]["status"].as_str(), Some("idle" | "running"))
-                {
-                    return frame;
-                }
-            }
-        })
-        .await
-        .expect("the peer receives the canonical recovered status");
+            })
+            .expect("the peer receives the canonical recovered status");
         assert_eq!(shared_status["event"]["status"], "idle");
         assert_eq!(
             spawn_count(&capture),
@@ -36464,17 +36700,7 @@ pub(crate) mod tests {
         );
         assert!(st.sessions.lock().await.contains_key("thread-respawned"));
         assert!(!st.sessions.lock().await.contains_key(&thread_id));
-        let shared_frames: Vec<Value> = std::iter::from_fn(|| peer_bus.try_recv().ok())
-            .map(|raw| serde_json::from_str(&raw).unwrap())
-            .collect();
-        assert!(
-            shared_frames.iter().all(|frame| {
-                !(frame["type"] == "freshAgent.event"
-                    && frame["event"]["type"] == "freshAgent.session.snapshot"
-                    && frame["event"].get("revision").is_none())
-            }),
-            "the attach-only replacement snapshot belongs to the requester; canonical revisioned provider snapshots remain shared: {shared_frames:?}"
-        );
+        st.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -37077,7 +37303,11 @@ pub(crate) mod tests {
         // nothing off the bus — see `drain_create_time_snapshot`).
         drain_create_time_snapshot(&mut rx, &thread_id).await;
 
-        configure_fake_codex_cmd("{}");
+        let logs = tempfile::tempdir().unwrap();
+        let native_log = logs.path().join("native.jsonl");
+        configure_fake_codex_cmd(
+            &attach_native_witness_behavior(&thread_id, &native_log).to_string(),
+        );
         let mut attach = FreshAgentAttach {
             request_id: None,
             view_id: None,
@@ -37101,7 +37331,13 @@ pub(crate) mod tests {
         let Some(ServerMessage::FreshAgentAttached(attached)) = replies.last() else {
             panic!("attach recovers and settles its requester: {replies:?}");
         };
+        assert_eq!(
+            replies.len(),
+            1,
+            "exactly one requester settlement: {replies:?}"
+        );
         assert_eq!(attached.request_id, "codex-same-id-recovery");
+        assert_eq!(attached.view_id.as_deref(), Some("codex-recovery-view"));
         assert_eq!(attached.session_id, thread_id);
         assert_eq!(
             attached.snapshot.as_ref().unwrap()["type"],
@@ -37112,17 +37348,8 @@ pub(crate) mod tests {
             thread_id,
             "the post-recovery snapshot must carry the SAME thread id"
         );
-        let shared_frames: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
-            .map(|raw| serde_json::from_str(&raw).unwrap())
-            .collect();
-        assert!(
-            shared_frames.iter().all(|frame| {
-                !(frame["type"] == "freshAgent.event"
-                    && frame["event"]["type"] == "freshAgent.session.snapshot"
-                    && frame["event"].get("revision").is_none())
-            }),
-            "the attach-only recovery snapshot belongs to the requester; canonical revisioned provider snapshots remain shared: {shared_frames:?}"
-        );
+        assert_attach_native_snapshots(&st, &mut rx, &thread_id, &native_log).await;
+        st.shutdown().await;
     }
 
     /// b8ke focused episode-2 round-2 F4 (+ the b8ke ext r20 F1 reshape):
