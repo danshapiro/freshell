@@ -683,7 +683,7 @@ git commit -m "fix(freshagent): share recovery outcomes and count actual failed 
 - Consumes: Task 4 correlated complete refusal authority and Task 5 shared recovery outcomes; existing immutable attachment decision capture.
 - Produces: one new immutable attempt after authority refresh, never in-place mutation/repeated resend of an obsolete epoch/generation.
 
-- [ ] **Step 1: Add red tests**
+- [x] **Step 1: Add red tests**
 
 ```text
 Start decision request A at epoch E/generation N. Deliver typed stale refusal
@@ -696,13 +696,13 @@ not redrive. Browser 'stage2 stale authority' delays A until B's recovery wins
 and verifies A joins the winner with one runtime and bounded requests.
 ```
 
-- [ ] **Step 2: Red**
+- [x] **Step 2: Red**
 
 Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:vitest run test/unit/client/components/fresh-agent/FreshAgentView.reconcile.test.tsx -t 'authority|obsolete' --config config/vitest/vitest.config.ts`
 
 Expected FAIL: `redriveAfterSessionReserved` repeats its captured obsolete fence or mixes refreshed generation with the old epoch.
 
-- [ ] **Step 3: Production patch**
+- [x] **Step 3: Production patch**
 
 ```text
 Route modern attach replies by viewId/requestId first. For a current typed
@@ -716,7 +716,7 @@ states settle error. Stale results only settle their own transport bookkeeping.
 Generalize OpenCode's 409 handling to this helper and retain full epoch.
 ```
 
-- [ ] **Step 4: Green**
+- [x] **Step 4: Green**
 
 Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:vitest run test/unit/client/components/fresh-agent/FreshAgentView.reconcile.test.tsx -t 'authority|obsolete' --config config/vitest/vitest.config.ts`
 
@@ -724,17 +724,17 @@ Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium test/e2e-brows
 
 Expected PASS.
 
-- [ ] **Step 5: Refactor**
+- [x] **Step 5: Refactor**
 
 Replace repeated provider-specific owner-retry branches with one typed transition helper. Keep native provider errors and terminal divergence presentation intact.
 
-- [ ] **Step 6: Impacted verification**
+- [x] **Step 6: Impacted verification**
 
 Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:vitest run test/unit/client/components/fresh-agent/FreshAgentView.reconcile.test.tsx test/unit/client/lib/fresh-agent-view-attachment.test.ts test/unit/client/lib/fresh-agent-ws.test.ts --config config/vitest/vitest.config.ts`
 
 Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium test/e2e-browser/specs/fresh-agent-multiple-devices-rust.spec.ts test/e2e-browser/specs/freshopencode-snapshot-409-recovery.spec.ts --grep 'stage2 stale authority|409'`; expected PASS and nonzero matches for both files.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/components/fresh-agent/FreshAgentView.tsx src/lib/fresh-agent-view-attachment.ts src/lib/fresh-agent-ws.ts test/unit/client/components/fresh-agent/FreshAgentView.reconcile.test.tsx test/unit/client/lib/fresh-agent-view-attachment.test.ts test/e2e-browser/helpers/fresh-agent-multiple-devices.ts test/e2e-browser/specs/fresh-agent-multiple-devices-rust.spec.ts
