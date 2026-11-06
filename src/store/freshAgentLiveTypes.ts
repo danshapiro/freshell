@@ -94,7 +94,12 @@ export type FreshAgentLiveSession = {
    * Transcript bodies and patch buffers have their own finite bounds. */
   retiredRetainedSourceKeys?: Record<string, true>
   retiredProjectionIds?: Record<string, true>
+  /** Unidentified sources are fenced until a current, identified snapshot proves them. */
+  uncertainRetainedSourceKeys?: Record<string, true>
+  uncertainProjectionIds?: Record<string, true>
   projection?: TranscriptProjection
+  /** Native source of the shared projection, independently of pane references and connection state. */
+  projectionNativeSessionId?: string
   codexMetadata?: Record<string, unknown>
   unboundTranscriptPatches?: FreshAgentTranscriptPatch[]
   unboundTranscriptWatermarks?: Record<string, { revision: number; gap: boolean }>

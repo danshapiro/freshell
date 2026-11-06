@@ -61,6 +61,23 @@ function createFreshAgentPaneStore(seenActionTypes: string[] = []) {
 }
 
 describe('fresh-agent-ws', () => {
+  it('keeps current Codex metadata when its source is announced again before a projection exists', () => {
+    const store = configureStore({ reducer: {
+      freshAgent: freshAgentReducer, freshAgentLive: freshAgentLiveReducer, panes: panesReducer,
+    } })
+    const locator = { provider: 'codex', sessionType: 'freshcodex', sessionId: 'managed-public' } as const
+    const announce = () => handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.session.materialized', ...locator, previousSessionId: locator.sessionId,
+      sessionRef: { provider: 'codex', sessionId: 'native-b' },
+    })
+    announce()
+    handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator,
+      event: { type: 'freshAgent.session.metadata', codex: { contextWindow: 100 } } })
+    announce()
+    expect(store.getState().freshAgentLive.bySession['freshcodex:codex:managed-public']?.codexMetadata)
+      .toEqual({ contextWindow: 100 })
+  })
+
   it('does not redisplay a consumed warning when a presentation returns to an earlier native source', async () => {
     const { WsClient } = await vi.importActual<typeof import('@/lib/ws-client')>('@/lib/ws-client')
     const client = new WsClient('ws://source-return.test/ws')

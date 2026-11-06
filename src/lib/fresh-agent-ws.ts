@@ -8,7 +8,7 @@ import { collectPaneEntries } from '@/lib/pane-utils'
 import { consumeCancelledCreate, consumeCreateRoute, rememberCreateRoute } from '@/lib/create-cancellation'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { KILL_FAILED_MESSAGE } from '@/lib/kill-ack'
-import { freshAgentPaneMatchesMaterializedSession, materializeFreshAgentSession as materializeFreshAgentPaneSession } from '@/store/panesSlice'
+import { materializeFreshAgentSession as materializeFreshAgentPaneSession } from '@/store/panesSlice'
 import { applyFreshAgentCompletion, applyFreshAgentWaiting, applyFreshAgentQuestionAvailable, observeFreshAgentSession, rekeyFreshAgentAttention } from '@/store/turnCompletionThunks'
 import { revokeFreshAgentAttention } from '@/store/turnCompletionAttention'
 import type { ObservedOwnerFence } from '@/store/selectors/runtimeOwner'
@@ -286,28 +286,14 @@ export function handleFreshAgentMessage(
         }
         let replaceLiveProjection = false
         if (materialized.provider === 'codex' && materialized.previousSessionId === materialized.sessionId && newNative) {
-          // Read the announcement from before this frame: clearing a pending
-          // fence above must not make a replacement look like a repeat.
-          if (previouslyAnnouncedNative) {
-            replaceLiveProjection = previouslyAnnouncedNative !== newNative
-          } else {
-            const panes = Object.values(getState().panes?.layouts ?? {}).flatMap(collectPaneEntries)
-              .map(({ content }) => content)
-              .filter((content) => content.kind === 'fresh-agent' && content.provider === materialized.provider
-                && content.sessionType === materialized.sessionType && freshAgentPaneMatchesMaterializedSession(content, materialized))
-            const knownNatives = panes.flatMap((content) => {
-              if (content.kind !== 'fresh-agent') return []
-              const native = content.sessionRef?.provider === 'codex' ? content.sessionRef.sessionId : content.resumeSessionId
-              return native ? [native] : []
-            })
-            // A public-only pane does not identify a different native source
-            // when another view already identifies this one, including after
-            // reconnect cleared the per-connection announcement cache.
-            replaceLiveProjection = knownNatives.some((native) => native !== newNative)
-              || (!knownNatives.includes(newNative) && panes.some((content) =>
-                content.kind === 'fresh-agent' && !content.sessionRef && !content.resumeSessionId
-                && content.sessionId !== newNative))
-          }
+          // Pane references have independent ages and do not identify shared
+          // output. Only the projection's own source can prove a repeat; when
+          // there is no projection, the connection announcement identifies
+          // subsequent non-projection live state.
+          const live = getState().freshAgentLive?.bySession[makeFreshAgentSessionKey(locator)]
+          replaceLiveProjection = Boolean(live && (live.projection
+            ? live.projectionNativeSessionId !== newNative
+            : previouslyAnnouncedNative !== newNative))
         }
         innerDispatch(materializeFreshAgentSessionState({
           previousSessionId: materialized.previousSessionId,
@@ -598,7 +584,10 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         if (owner && (owner.epoch !== source.ownerEpoch || owner.generation !== source.ownerGeneration || owner.ownerKind !== 'fresh-agent')) return
         const soul = root.managedRuntime?.souls.find((soul) => soul.soulId === source.soulId)
         if (soul && (soul.incarnationId !== source.incarnationId || soul.hostBootId && soul.hostBootId !== source.hostBootId)) return
-        innerDispatch(transcriptProjectionSnapshotReceived({ ...locator, snapshot, retainedSourceKey: sourceKey }))
+        // A retained snapshot names its thread even on older frames that do
+        // not repeat that identity in source.nativeSessionId.
+        const nativeSessionId = locator.provider === 'codex' ? snapshot.threadId : undefined
+        innerDispatch(transcriptProjectionSnapshotReceived({ ...locator, snapshot, retainedSourceKey: sourceKey, nativeSessionId }))
         const live = getState().freshAgentLive?.bySession[makeFreshAgentSessionKey(locator)]
         if (live?.retainedSourceKey !== sourceKey || live.retainedSnapshot !== snapshot) return
         const status = (['creating', 'starting', 'connected', 'running', 'idle', 'compacting', 'exited', 'stuck'] as const).find((status) => status === snapshot.status)

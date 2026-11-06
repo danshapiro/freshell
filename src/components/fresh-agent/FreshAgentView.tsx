@@ -136,7 +136,7 @@ import { asyncQuestionKey, asyncQuestionDraftPrefix, asyncQuestionKeysInText, fo
 import FreshAgentElicitationBanner from './FreshAgentElicitationBanner.js'
 import { FreshAgentTranscript, type FreshAgentTranscriptHandle, type FreshAgentTranscriptProps } from './FreshAgentTranscript'
 import { mergeFreshAgentTranscriptProjection, readTranscriptProjection } from '@/lib/fresh-agent-transcript-projection'
-import { transcriptProjectionSnapshotReceived } from '@/store/freshAgentLiveSlice'
+import { acceptsTranscriptProjectionSnapshot, transcriptProjectionSnapshotReceived } from '@/store/freshAgentLiveSlice'
 import { FreshAgentLiveTail, liveTailShowsContent } from './FreshAgentLiveTail'
 import { useTranscriptLandings } from './useTranscriptLandings'
 import { landedTranscriptOf } from '@/lib/fresh-agent-landed-transcript'
@@ -3741,9 +3741,13 @@ export function FreshAgentView({
       const resolved = next as FreshAgentSnapshot
       const projectionMetadata = readTranscriptProjection(resolved)
       const projectionLocator = { sessionType: requestSessionType, provider, sessionId }
-      const liveSession = appStore.getState().freshAgentLive?.bySession[makeFreshAgentSessionKey(projectionLocator)]
+      const liveState = appStore.getState().freshAgentLive
+      const liveSession = liveState?.bySession[makeFreshAgentSessionKey(projectionLocator)]
       const liveProjection = liveSession?.projection
-      if (projectionMetadata && liveSession?.retiredProjectionIds?.[projectionMetadata.id] === true) return
+      const snapshotNativeSessionId = provider === 'codex'
+        && (historyOnly || (requestPaneSoulId && resolved.extensions?.[provider]?.statusFromLiveState === true))
+        ? resolved.threadId : undefined
+      if (projectionMetadata && !acceptsTranscriptProjectionSnapshot(liveState, projectionLocator, projectionMetadata.id, snapshotNativeSessionId)) return
       if (projectionMetadata && liveProjection?.id === projectionMetadata.id) {
         const olderHistory = liveProjection.historyGeneration > projectionMetadata.historyGeneration
         const missingCoverage = liveProjection.historyGeneration === projectionMetadata.historyGeneration
@@ -3771,7 +3775,9 @@ export function FreshAgentView({
       ))
       const snapshotAccepted = displaySnapshot !== previousSnapshot
       if (snapshotAccepted) snapshotRequestAuthorityRef.current.applied = requestSerial
-      if (snapshotAccepted && projectionMetadata) dispatch(transcriptProjectionSnapshotReceived({ ...projectionLocator, snapshot: resolved }))
+      if (snapshotAccepted && projectionMetadata) dispatch(transcriptProjectionSnapshotReceived({
+        ...projectionLocator, snapshot: resolved, nativeSessionId: snapshotNativeSessionId,
+      }))
       const snapshotStatusAuthoritative = !requestReadOnly && !historyOnly && (provider === 'codex'
         || resolved.extensions?.[provider]?.statusFromLiveState === true)
       const outgoing = outgoingTurnRef.current
