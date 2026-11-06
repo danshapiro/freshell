@@ -1261,6 +1261,14 @@ export function FreshAgentView({
   const idleIncompleteRetryAppliedSerialRef = useRef(0)
   const idleIncompleteRetryDueRef = useRef(false)
   const coveringRetryRequestIdRef = useRef<string | null>(null)
+  const clearIdleIncompleteRetry = useCallback(() => {
+    if (idleIncompleteRetryTimerRef.current !== null) window.clearTimeout(idleIncompleteRetryTimerRef.current)
+    idleIncompleteRetryTimerRef.current = null
+    idleIncompleteRetryGuardRef.current = undefined
+    idleIncompleteRetryDueRef.current = false
+    coveringRetryRequestIdRef.current = null
+    idleIncompleteRetryCountRef.current = 0
+  }, [])
   const [nativeClaimRetry, setNativeClaimRetry] = useState<{
     key: string
     revision: string
@@ -1915,13 +1923,8 @@ export function FreshAgentView({
   useEffect(() => {
     if (previousCodexRetryIdentityRef.current === codexRetryIdentity) return
     previousCodexRetryIdentityRef.current = codexRetryIdentity
-    if (idleIncompleteRetryTimerRef.current !== null) window.clearTimeout(idleIncompleteRetryTimerRef.current)
-    idleIncompleteRetryTimerRef.current = null
-    idleIncompleteRetryGuardRef.current = undefined
-    idleIncompleteRetryDueRef.current = false
-    coveringRetryRequestIdRef.current = null
-    idleIncompleteRetryCountRef.current = 0
-  }, [codexRetryIdentity])
+    clearIdleIncompleteRetry()
+  }, [clearIdleIncompleteRetry, codexRetryIdentity])
   const previousManagedCodexNativeIdRef = useRef(managedCodexNativeId)
   useEffect(() => {
     const previous = previousManagedCodexNativeIdRef.current
@@ -2073,7 +2076,7 @@ export function FreshAgentView({
     requestSnapshotRefresh('reveal')
   }, [requestSnapshotRefresh])
 
-  const nativeClaimRetryIsCurrent = useCallback((retry: NonNullable<typeof nativeClaimRetry>) => {
+  const nativeClaimRetryIsCurrent = useCallback((retry: NonNullable<typeof nativeClaimRetry>, requireVisible = true) => {
     const state = appStore.getState()
     const layout = state.panes.layouts[tabId]
     const pane = layout ? findPaneContent(layout, paneId) : retry.hadStoredLayout ? undefined : paneContentRef.current
@@ -2087,7 +2090,7 @@ export function FreshAgentView({
     const claimStillCurrent = claim
       ? claim.projectionId === retry.projectionId && claim.nativeSessionId === retry.nativeSessionId
       : Boolean(liveSession?.routeOnlyProjectionId)
-    return isMountedRef.current && !hiddenRef.current && pane?.kind === 'fresh-agent'
+    return isMountedRef.current && (!requireVisible || !hiddenRef.current) && pane?.kind === 'fresh-agent'
       && pane.createRequestId === retry.createRequestId && paneKey === retry.key && !isFreshAgentLifecycleBlocked(pane)
       && codexSnapshotSourceRevision(state.freshAgentLive, retry.key) === retry.revision
       && codexPaneRetryIdentity(state, pane, paneKey, codexSnapshotSourceRevision(state.freshAgentLive, retry.key)) === retry.identity
@@ -2214,14 +2217,7 @@ export function FreshAgentView({
   }, [])
 
   // Task 16: never leak a pending idle-incomplete retry timer past unmount.
-  useEffect(() => () => {
-    if (idleIncompleteRetryTimerRef.current !== null) {
-      window.clearTimeout(idleIncompleteRetryTimerRef.current)
-      idleIncompleteRetryTimerRef.current = null
-    }
-    idleIncompleteRetryGuardRef.current = undefined
-    idleIncompleteRetryDueRef.current = false
-  }, [])
+  useEffect(() => () => clearIdleIncompleteRetry(), [clearIdleIncompleteRetry])
 
   const recordPendingSendMetadata = useCallback((requestId: string, patch: PendingSendMetadata) => {
     const current = pendingSendMetadataRef.current.get(requestId) ?? {}
@@ -3826,6 +3822,7 @@ export function FreshAgentView({
     const requestOutgoingTurnId = outgoingTurnRef.current?.requestId
     const requestLocalEchoId = localEchoRef.current?.requestId
     const trigger = snapshotRefreshTriggerRef.current
+    const requestClaimRetry = nativeClaimRetryRef.current
     const refreshSerial = snapshotRefreshSerialRef.current
     const snapshotAuditData = (value: FreshAgentSnapshot) => ({ historyOnly: isNativeHistoryOnlySnapshot(value),
       live: value.extensions?.[provider]?.statusFromLiveState === true,
@@ -4431,6 +4428,13 @@ export function FreshAgentView({
         // carried no fenceable generation): do NOT clear errors and do NOT
         // refetch again — fall through to the reveal error arm /
         // setLoadError below so the user sees the honest state.
+      }
+      // A failed read consumes the in-flight attempt. Keep recovery actionable
+      // for the same pane even if it became hidden while the GET was running.
+      if (!requestReadOnly && requestClaimRetry && !requestClaimRetry.pending && !requestClaimRetry.exhausted
+        && nativeClaimRetryRef.current === requestClaimRetry && nativeClaimRetryIsCurrent(requestClaimRetry, false)) {
+        setNativeClaimRetry((current) => current === requestClaimRetry
+          ? { ...current, pending: false, exhausted: true } : current)
       }
       if (trigger === 'reveal' && snapshotDirtyRef.current) {
         revealRefreshStartedAtRef.current = null
@@ -5130,7 +5134,9 @@ export function FreshAgentView({
     const requestId = nanoid()
     const logicalAttemptId = nanoid()
     outgoingTurnRef.current = { requestId, text, sawBusy: false, previousTurns: snapshotRef.current?.turns ?? [] }
-    // Task 16: a new send starts a fresh idle-incomplete re-poll budget.
+    // A covering timer belongs to the preceding send, including when it
+    // became due while hidden. The new send gets its own deadline and budget.
+    if (coveringRetryRequestIdRef.current !== null) clearIdleIncompleteRetry()
     idleIncompleteRetryCountRef.current = 0
     coveringRetryRequestIdRef.current = null
     const routeCwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
@@ -5197,7 +5203,7 @@ export function FreshAgentView({
       checkpointAvailabilityScope(latest) === checkpointScope
       && latest.sessionId === current.sessionId
     ) sendFreshAgentSendFrame(requestId, text, routeCwd)
-  }, [dispatch, paneId, publishCheckpointAvailability, recordPendingSendMetadata, sendFreshAgentSendFrame, snapshotConfirmsNoUserTurns, tabId])
+  }, [clearIdleIncompleteRetry, dispatch, paneId, publishCheckpointAvailability, recordPendingSendMetadata, sendFreshAgentSendFrame, snapshotConfirmsNoUserTurns, tabId])
 
   // Providers accept one active turn. Keep follow-ups until the session can
   // actually accept them, including across disconnects and provider failures.
