@@ -81,6 +81,7 @@ describe('WsClient pane-reconcile capability', () => {
       uiScreenshotV1: true,
       terminalOutputBatchV1: true,
       paneReconcileV1: true,
+      freshAgentSendReconcileV1: true,
     })
 
     MockWebSocket.instances[0]._message({ type: 'ready' })
@@ -112,16 +113,19 @@ describe('WsClient pane-reconcile capability', () => {
         paneReconcileV1: true,
         pacedTerminalReplayV1: true,
         terminalLifetimeClaimV1: true,
+        freshAgentSendReconcileV1: true,
       },
     })
     expect(client.getServerCapabilities().paneReconcileV1).toBe(true)
     expect(client.getServerCapabilities().pacedTerminalReplayV1).toBe(true)
     expect(client.getServerCapabilities().terminalLifetimeClaimV1).toBe(true)
+    expect(client.getServerCapabilities().freshAgentSendReconcileV1).toBe(true)
 
     MockWebSocket.instances[0]._close(1006, 'drop')
     expect(client.getServerCapabilities().paneReconcileV1).toBeUndefined()
     expect(client.getServerCapabilities().pacedTerminalReplayV1).toBeUndefined()
     expect(client.getServerCapabilities().terminalLifetimeClaimV1).toBeUndefined()
+    expect(client.getServerCapabilities().freshAgentSendReconcileV1).toBeUndefined()
     expect(client.getServerCapabilities()).toEqual({})
   })
 

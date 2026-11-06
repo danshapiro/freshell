@@ -302,9 +302,8 @@ type PendingSendMetadata = {
   submittedTurnId?: string
   legacyAccepted?: boolean
   deliveryAmbiguous?: boolean
-  /** The exact original send frame is retained in memory so a reconnect can
-   * safely re-submit the same request id and settings to the supervisor's
-   * idempotency journal. */
+  /** The exact original Codex send frame is retained in memory so reconnect
+   * recovery can query its durable receipt without dispatching provider input. */
   sendFrame?: Record<string, unknown>
   /** The exact text of the freshAgent.send frame -- retained as the resend
    * payload for the lost-session retry (Task 10). Never read back from the
@@ -2362,12 +2361,12 @@ export function FreshAgentView({
         ...(getFreshAgentRequestEffort(current, providerDefaults) !== undefined ? { effort: getFreshAgentRequestEffort(current, providerDefaults) } : {}),
       },
     }
-    recordPendingSendMetadata(requestId, { sendFrame: frame })
+    if (current.provider === 'codex') recordPendingSendMetadata(requestId, { sendFrame: frame })
     sendFreshAgentMessage(frame)
   }, [appStore, providerDefaults, recordPendingSendMetadata, sendFreshAgentMessage])
 
   const replayPendingCodexSendFrames = useCallback((current: FreshAgentPaneContent) => {
-    if (current.provider !== 'codex') return
+    if (current.provider !== 'codex' || ws.getServerCapabilities().freshAgentSendReconcileV1 !== true) return
     const currentScope = paneSessionScope(current)
     for (const [requestId, pending] of pendingSendMetadataRef.current) {
       if (pending.submittedTurnId || pending.legacyAccepted || !pending.sendFrame) continue
@@ -2377,11 +2376,12 @@ export function FreshAgentView({
         || !scopeToPaneSession(pending, currentScope.sourceSessionKey, currentScope.sourceCanonicalSessionKey)) {
         continue
       }
-      // Same ID and exact payload: the supervisor returns the durable result
-      // or checks the host receipt. It never dispatches this input a second time.
-      sendFreshAgentMessage(pending.sendFrame)
+      // Preserve the request ID and full original payload so the supervisor
+      // can check its journal and durable host receipt. This route never
+      // dispatches the provider input a second time.
+      sendFreshAgentMessage({ ...pending.sendFrame, type: 'freshAgent.send.reconcile' })
     }
-  }, [sendFreshAgentMessage])
+  }, [sendFreshAgentMessage, ws])
 
   /** Task 10: re-issue a failed send under a fresh requestId with the
    * retained text + route cwd. The retry gets its own pending-metadata entry

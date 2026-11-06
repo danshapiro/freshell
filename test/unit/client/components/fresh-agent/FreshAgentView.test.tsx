@@ -306,6 +306,7 @@ const wsMock = vi.hoisted(() => ({
   send: vi.fn(),
   onMessage: vi.fn(() => () => {}),
   onReconnect: vi.fn(() => () => {}),
+  getServerCapabilities: vi.fn(() => ({})),
 }))
 
 const apiMock = vi.hoisted(() => ({
@@ -577,8 +578,10 @@ beforeEach(() => {
   wsMock.send.mockReset()
   wsMock.onMessage.mockReset()
   wsMock.onReconnect.mockReset()
+  wsMock.getServerCapabilities.mockReset()
   wsMock.onMessage.mockImplementation(() => () => {})
   wsMock.onReconnect.mockImplementation(() => () => {})
+  wsMock.getServerCapabilities.mockImplementation(() => ({}))
   window.sessionStorage.clear()
   window.localStorage.removeItem('fresh-agent-prompt-history:freshcodex')
   window.localStorage.removeItem('fresh-agent-prompt-history:freshclaude')
@@ -22043,7 +22046,7 @@ describe('task6 hosted recovery in the mounted view', () => {
   })
 
   it.each([false, true] as const)(
-    'replays a pending Codex send with the exact same request frame after reconnect (prior ambiguity: %s)',
+    'reconciles a pending Codex send after reconnect without resending provider input (prior ambiguity: %s)',
     async (reportedAmbiguity) => {
       const store = createStore()
       const handlers = new Set<(message: unknown) => void>()
@@ -22053,6 +22056,7 @@ describe('task6 hosted recovery in the mounted view', () => {
         reconnectHandler = handler
         return () => { reconnectHandler = undefined }
       })
+      wsMock.getServerCapabilities.mockReturnValue({ freshAgentSendReconcileV1: true })
       const locator = { sessionId: 'codex-reconnect-receipt', sessionType: 'freshcodex', provider: 'codex' }
       apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
         ...locator, threadId: locator.sessionId, status: 'idle',
@@ -22094,8 +22098,12 @@ describe('task6 hosted recovery in the mounted view', () => {
         tabId: 'tab-1', paneId: 'pane-1', updates: { collaborationMode: 'plan' },
       })))
       act(() => reconnectHandler?.())
-      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
-      expect(sentFreshAgentMessages('freshAgent.send')[1]).toEqual(originalFrame)
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(1))
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      expect(sentFreshAgentMessages('freshAgent.send.reconcile')[0]).toEqual({
+        ...originalFrame,
+        type: 'freshAgent.send.reconcile',
+      })
 
       act(() => {
         const accepted = {
@@ -22108,9 +22116,46 @@ describe('task6 hosted recovery in the mounted view', () => {
       await waitFor(() => expect(screen.queryByText(/Delivery is uncertain/)).not.toBeInTheDocument())
       act(() => reconnectHandler?.())
       await act(async () => { await Promise.resolve() })
-      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(1)
     },
   )
+
+  it('does not replay a pending Codex send when the server lacks receipt reconciliation', async () => {
+    const store = createStore()
+    let reconnectHandler: (() => void) | undefined
+    wsMock.onReconnect.mockImplementation((handler: () => void) => {
+      reconnectHandler = handler
+      return () => { reconnectHandler = undefined }
+    })
+    const locator = { sessionId: 'codex-reconnect-no-reconcile', sessionType: 'freshcodex', provider: 'codex' }
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      ...locator, threadId: locator.sessionId, status: 'idle',
+      capabilities: { send: true, interrupt: true }, turns: [],
+      extensions: { codex: { ownerKind: 'fresh-agent', statusFromLiveState: true } },
+    })
+    store.dispatch(sessionInit(locator))
+    store.dispatch(setSessionStatus({ ...locator, status: 'idle' }))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      kind: 'fresh-agent', ...locator, sessionRef: { provider: 'codex', sessionId: locator.sessionId },
+      createRequestId: 'codex-reconnect-no-reconcile-create', status: 'idle', soulId: 'codex-reconnect-no-reconcile-soul',
+      soulIntentRevision: 1,
+      recoverySummary: { desiredState: 'running', recoveryState: 'live',
+        durabilityState: 'resume_captured', allocationState: 'verified_durable' },
+    } }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+    await waitFor(() => expect(composer).toBeEnabled())
+
+    fireEvent.change(composer, { target: { value: 'Do not send this twice' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1))
+    act(() => reconnectHandler?.())
+    await act(async () => { await Promise.resolve() })
+
+    expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+    expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(0)
+  })
 
   it.each(([
     ['freshcodex', 'codex', 'CODEX_DELIVERY_AMBIGUOUS'],
