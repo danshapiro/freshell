@@ -1666,6 +1666,31 @@ impl FreshCodexState {
         }
     }
 
+    fn recovery_map_key(&self, session_id: &str) -> String {
+        format!("codex:{}", self.resolve_ownership_key(session_id))
+    }
+
+    fn recovery_admission_refusal(&self, session_id: &str) -> Option<CodexRecoveryFailure> {
+        let owner_key = self.resolve_ownership_key(session_id);
+        let snapshot = self.ownership_snapshot(PROVIDER, &owner_key);
+        let coordinator_blocks_claim = match &snapshot.state {
+            freshell_ownership::OwnershipState::Live { owner, .. } => {
+                owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal
+            }
+            freshell_ownership::OwnershipState::Starting { .. }
+            | freshell_ownership::OwnershipState::Handoff { .. }
+            | freshell_ownership::OwnershipState::Stopping { .. }
+            | freshell_ownership::OwnershipState::Fenced { .. } => true,
+            freshell_ownership::OwnershipState::Vacant
+            | freshell_ownership::OwnershipState::Aliased { .. } => false,
+        };
+        if coordinator_blocks_claim || (self.terminal_liveness)(PROVIDER, &owner_key) {
+            Some(CodexRecoveryFailure::Reserved)
+        } else {
+            None
+        }
+    }
+
     fn begin_lane_claim_at(
         &self,
         session_id: &str,
@@ -2969,11 +2994,15 @@ impl FreshCodexState {
             let operation_naming_handle = naming_handle.clone();
             let observed_epoch = msg.observed_epoch;
             let observed_generation = msg.observed_generation;
+            let recovery_key = self.recovery_map_key(&resume_session_id);
+            let preflight_state = self.clone();
+            let preflight_session_id = resume_session_id.clone();
             let answer = self
                 .session_recovery
-                .run_with_requester(
-                    format!("codex:{resume_session_id}"),
+                .run_with_requester_preflight(
+                    recovery_key,
                     Some(request_id.clone()),
+                    move || preflight_state.recovery_admission_refusal(&preflight_session_id),
                     move || async move {
                         if state.is_known_dead_thread(&operation_session_id).await {
                             let outcome = state.fail_create(
@@ -8176,9 +8205,10 @@ impl FreshCodexState {
         let mut tracked_attach_guard = None;
         if tracked {
             let snap = self.ownership_snapshot(PROVIDER, &msg.session_id);
+            let recovery_key = self.recovery_map_key(&msg.session_id);
             let shared_recovery_in_flight = self
                 .session_recovery
-                .status(&format!("codex:{}", msg.session_id))
+                .status(&recovery_key)
                 .await
                 .is_some_and(|status| status.in_flight);
             match snap.state {
@@ -8489,9 +8519,10 @@ impl FreshCodexState {
         observed: Option<freshell_ownership::ObservedFence>,
         request_id: Option<String>,
     ) -> Result<EnsureAliveOutcome, EnsureAliveError> {
+        let recovery_key = self.recovery_map_key(session_id);
         let shared_recovery_in_flight = self
             .session_recovery
-            .try_status(&format!("codex:{session_id}"))
+            .try_status(&recovery_key)
             .is_some_and(|status| status.in_flight);
         if !shared_recovery_in_flight && self.has_live_session(session_id).await {
             // Preserve the provider's existing live-session command ordering.
@@ -8503,11 +8534,14 @@ impl FreshCodexState {
 
         let state = self.clone();
         let operation_session_id = session_id.to_string();
+        let preflight_state = self.clone();
+        let preflight_session_id = session_id.to_string();
         let answer = self
             .session_recovery
-            .run_with_requester(
-                format!("codex:{session_id}"),
+            .run_with_requester_preflight(
+                recovery_key,
                 request_id,
+                move || preflight_state.recovery_admission_refusal(&preflight_session_id),
                 move || async move {
                     match state
                         .ensure_session_alive_once(&operation_session_id, observed)
@@ -8610,9 +8644,8 @@ impl FreshCodexState {
         &self,
         thread_id: &str,
     ) -> Option<freshell_agent_runtime::RecoveryStatus> {
-        self.session_recovery
-            .status(&format!("codex:{thread_id}"))
-            .await
+        let recovery_key = self.recovery_map_key(thread_id);
+        self.session_recovery.status(&recovery_key).await
     }
 
     async fn ensure_session_alive_once(
@@ -11061,11 +11094,15 @@ impl FreshCodexState {
         let state = self.clone();
         let operation_thread_id = thread_id.to_string();
         let operation_cwd = cwd.map(str::to_string);
+        let recovery_key = self.recovery_map_key(thread_id);
+        let preflight_state = self.clone();
+        let preflight_thread_id = thread_id.to_string();
         let answer = self
             .session_recovery
-            .run_with_requester(
-                format!("codex:{thread_id}"),
+            .run_with_requester_preflight(
+                recovery_key,
                 request_id,
+                move || preflight_state.recovery_admission_refusal(&preflight_thread_id),
                 move || async move {
                     match state
                         .ensure_session_resumable_once(
@@ -30008,6 +30045,247 @@ pub(crate) mod tests {
             "one shared failed native resume: {log}"
         );
         let _ = std::fs::remove_file(&log_path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn task005_round2_codex_recovery_preflight_preserves_failed_cohort_and_refuses_handoff() {
+        let _guard = ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let log_path = temp.path().join("provider-operations.jsonl");
+        configure_fake_codex_cmd(
+            &json!({
+                "delayMethodsMs": { "thread/resume": 350 },
+                "appendThreadOperationLogPath": log_path.to_string_lossy(),
+                "overrides": {
+                    "thread/resume": {
+                        "error": { "code": -32000, "message": "temporary resume failure" }
+                    }
+                }
+            })
+            .to_string(),
+        );
+        let (mut state, _rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        state.set_ownership(Arc::clone(&registry));
+        let session_id = "thread-task005-r2-codex-preflight";
+
+        let mut first_message = create_msg("task005-r2-codex-preflight-a");
+        first_message.resume_session_id = Some(session_id.to_string());
+        let first_state = state.clone();
+        let first =
+            tokio::spawn(async move { first_state.handle_create(first_message, None).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(
+                registry.observe(PROVIDER, session_id).state,
+                freshell_ownership::OwnershipState::Starting { .. }
+            ) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first create owns the recovery start before its native resume");
+
+        let mut second_message = create_msg("task005-r2-codex-preflight-b");
+        second_message.resume_session_id = Some(session_id.to_string());
+        let second_state = state.clone();
+        let second =
+            tokio::spawn(async move { second_state.handle_create(second_message, None).await });
+
+        let (first_outcome, second_outcome) = tokio::join!(first, second);
+        for outcome in [first_outcome.unwrap(), second_outcome.unwrap()] {
+            assert!(matches!(
+                outcome,
+                CodexCreateOutcome::Failed { code, .. } if code == "FRESH_AGENT_CREATE_FAILED"
+            ));
+        }
+        let before_handoff = state
+            .session_recovery
+            .status(&format!("codex:{session_id}"))
+            .await
+            .expect("the failed provider result remains cached during the retry floor");
+        assert_eq!(before_handoff.failed_launches, 1);
+        assert!(!before_handoff.in_flight);
+
+        assert!(matches!(
+            registry.begin_handoff(
+                PROVIDER,
+                session_id,
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "task005-r2-codex-terminal-handoff",
+                None,
+                "task005-r2-test",
+                1,
+            ),
+            freshell_ownership::BeginOutcome::Granted { .. }
+        ));
+
+        let mut late_create = create_msg("task005-r2-codex-preflight-late-create");
+        late_create.resume_session_id = Some(session_id.to_string());
+        assert!(matches!(
+            state.handle_create(late_create, None).await,
+            CodexCreateOutcome::Failed { code, .. } if code == "SESSION_RESERVED"
+        ));
+        assert!(matches!(
+            state
+                .ensure_session_alive_for_request(
+                    session_id,
+                    None,
+                    Some("task005-r2-codex-preflight-late-attach".into()),
+                )
+                .await,
+            Err(EnsureAliveError::Reserved)
+        ));
+        assert!(matches!(
+            state
+                .ensure_session_resumable_for_request(
+                    session_id,
+                    None,
+                    None,
+                    None,
+                    Some("task005-r2-codex-preflight-late-send".into()),
+                )
+                .await,
+            Err(ResumeSessionError::Reserved)
+        ));
+
+        let after_handoff = state
+            .session_recovery
+            .status(&format!("codex:{session_id}"))
+            .await
+            .expect("requester-scoped refusals leave the cached cohort facts intact");
+        assert_eq!(after_handoff.failed_launches, 1);
+        assert!(!after_handoff.in_flight);
+        let operations = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(
+            operations
+                .lines()
+                .filter(|line| line.contains("\"thread/resume\""))
+                .count(),
+            1,
+            "the refused requests must not start another native resume: {operations}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn task005_round2_codex_rekey_alias_joins_canonical_recovery() {
+        let _guard = ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let log_path = temp.path().join("native-operations.jsonl");
+        configure_fake_codex_cmd(
+            &json!({
+                "delayMethodsMs": { "thread/resume": 800 },
+                "appendThreadOperationLogPath": log_path.to_string_lossy(),
+                "overrides": {
+                    "thread/resume": {
+                        "error": { "code": -32000, "message": "temporary resume failure" }
+                    }
+                }
+            })
+            .to_string(),
+        );
+        let (mut state, _rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let alias_id = format!("{PENDING_CREATE_PREFIX}task005-r2-codex-alias");
+        let canonical_id = "thread-task005-r2-codex-canonical";
+        let operation_id = "task005-r2-codex-alias-seed";
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
+            PROVIDER,
+            &alias_id,
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            operation_id,
+            None,
+            "task005-r2-test",
+            1,
+        ) else {
+            panic!("the Codex provisional id obtains its normal create-start fence");
+        };
+        assert!(matches!(
+            registry.rekey_starting(PROVIDER, &alias_id, canonical_id, operation_id, generation,),
+            freshell_ownership::CommitOutcome::Committed
+        ));
+        registry.fail(PROVIDER, canonical_id, operation_id, generation, false);
+        state.set_ownership(Arc::clone(&registry));
+        assert_eq!(state.resolve_ownership_key(&alias_id), canonical_id);
+
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            first_state
+                .ensure_session_resumable_for_request(canonical_id, None, None, None, None)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(
+                registry.observe(PROVIDER, canonical_id).state,
+                freshell_ownership::OwnershipState::Starting { .. }
+            ) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the canonical provider request owns the active recovery");
+
+        let alias_state = state.clone();
+        let operation_alias_id = alias_id.clone();
+        let alias = tokio::spawn(async move {
+            alias_state
+                .ensure_session_resumable_for_request(&operation_alias_id, None, None, None, None)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if alias.is_finished()
+                    || state
+                        .session_recovery
+                        .waiter_count_for_test(&format!("codex:{canonical_id}"))
+                        .await
+                        >= 2
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the alias request either joins the canonical cohort or exposes a refusal");
+
+        let (first_outcome, alias_outcome) = tokio::join!(first, alias);
+        assert!(matches!(
+            first_outcome.unwrap(),
+            Err(ResumeSessionError::Transient(_))
+        ));
+        assert!(matches!(
+            alias_outcome.unwrap(),
+            Err(ResumeSessionError::Transient(_))
+        ));
+        let canonical_status = state
+            .recovery_status(canonical_id)
+            .await
+            .expect("the provider failure remains cached for the canonical session");
+        let alias_status = state
+            .recovery_status(&alias_id)
+            .await
+            .expect("the Codex rekey alias resolves to the same recovery facts");
+        assert_eq!(alias_status.operation_id, canonical_status.operation_id);
+        assert_eq!(canonical_status.failed_launches, 1);
+        assert_eq!(alias_status.failed_launches, 1);
+
+        let operations = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(
+            operations
+                .lines()
+                .filter(|line| line.contains("\"thread/resume\""))
+                .count(),
+            1,
+            "both provider callers share one native Codex resume: {operations}"
+        );
+        assert!(
+            operations.contains(canonical_id),
+            "the shared recovery keeps the provider's canonical native thread id: {operations}"
+        );
+        assert!(
+            !operations.contains(&alias_id),
+            "the provisional ownership alias is never sent to Codex: {operations}"
+        );
     }
 
     // -- TERM-25: wrong-thread resume rejection --
