@@ -22,27 +22,31 @@ pub const RECOVERY_RETRY_FLOOR: Duration = Duration::from_secs(1);
 type SharedResult<T, E> = Arc<Result<T, RecoveryFailure<E>>>;
 
 /// A failure reported by an admitted provider operation. Only failures with
-/// `counts_as_failed_launch` consume the per-conversation recovery budget.
+/// a launch classification consume the per-conversation recovery budget.
 pub struct RecoveryAttemptFailure<E> {
     pub error: E,
-    pub counts_as_failed_launch: bool,
-    apply_retry_floor: bool,
+    kind: RecoveryFailureKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecoveryFailureKind {
+    Launch,
+    Refusal,
+    Superseded,
 }
 
 impl<E> RecoveryAttemptFailure<E> {
     pub fn launch(error: E) -> Self {
         Self {
             error,
-            counts_as_failed_launch: true,
-            apply_retry_floor: true,
+            kind: RecoveryFailureKind::Launch,
         }
     }
 
     pub fn refusal(error: E) -> Self {
         Self {
             error,
-            counts_as_failed_launch: false,
-            apply_retry_floor: true,
+            kind: RecoveryFailureKind::Refusal,
         }
     }
 
@@ -51,8 +55,7 @@ impl<E> RecoveryAttemptFailure<E> {
     pub fn superseded(error: E) -> Self {
         Self {
             error,
-            counts_as_failed_launch: false,
-            apply_retry_floor: false,
+            kind: RecoveryFailureKind::Superseded,
         }
     }
 }
@@ -103,6 +106,7 @@ struct RecoveryEntryState<T, E> {
     failed_launches: u32,
     retry_until: Option<Instant>,
     exhausted: bool,
+    superseded: bool,
     waiters: usize,
     result: Option<SharedResult<T, E>>,
     current: Option<Arc<RecoveryOperation<T, E>>>,
@@ -286,6 +290,7 @@ impl<T, E> SessionRecoveryMap<T, E> {
                             failed_launches: 0,
                             retry_until: None,
                             exhausted: false,
+                            superseded: false,
                             waiters: 0,
                             result: None,
                             current: None,
@@ -342,9 +347,21 @@ impl<T, E> SessionRecoveryMap<T, E> {
                     entry: entry.clone(),
                 }
             } else if state.waiters > 0
-                && (state.result.as_ref().is_some_and(|result| result.is_ok())
-                    || state.retry_until.is_none())
+                && (state.result.as_ref().is_some_and(|result| result.is_ok()) || state.superseded)
             {
+                if let Some(error) = preflight() {
+                    tracing::info!(target: "freshell_freshagent::session_recovery",
+                        event = "freshagent.recovery_admission_refused", canonical_key = %key,
+                        operation_id = %state.operation_id,
+                        request_id = request_id.as_deref().unwrap_or(""), admission = "settled_cohort",
+                        "current ownership prevented a late join of the settled recovery cohort");
+                    return RecoveryAnswer {
+                        operation_id: state.operation_id.clone(),
+                        result: Arc::new(Err(RecoveryFailure::Attempt(error))),
+                        status: recovery_status(&state),
+                        joined_existing: true,
+                    };
+                }
                 // Keep the result stable while its cohort consumes a success
                 // or a no-delay refusal. A later operation starts only after
                 // those waiters finish; no retry timer is needed for supersession.
@@ -387,6 +404,7 @@ impl<T, E> SessionRecoveryMap<T, E> {
                 state.in_flight = true;
                 state.retry_until = None;
                 state.exhausted = false;
+                state.superseded = false;
                 state.waiters = 1;
                 state.result = None;
                 state.current = Some(operation.clone());
@@ -483,25 +501,24 @@ impl<T, E> SessionRecoveryMap<T, E> {
                 let operation_tx = operation.result_tx.clone();
                 tokio::spawn(async move {
                     let settled = AssertUnwindSafe(start()).catch_unwind().await;
-                    let (outcome, failed_launch, apply_retry_floor): (
-                        SharedResult<T, E>,
-                        bool,
-                        bool,
-                    ) = match settled {
-                        Ok(Ok(value)) => (Arc::new(Ok(value)), false, false),
-                        Ok(Err(failure)) => (
-                            Arc::new(Err(RecoveryFailure::Attempt(failure.error))),
-                            failure.counts_as_failed_launch,
-                            failure.apply_retry_floor,
-                        ),
-                        Err(_) => {
-                            tracing::error!(target: "freshell_freshagent::session_recovery",
+                    let (outcome, failure_kind): (SharedResult<T, E>, Option<RecoveryFailureKind>) =
+                        match settled {
+                            Ok(Ok(value)) => (Arc::new(Ok(value)), None),
+                            Ok(Err(failure)) => (
+                                Arc::new(Err(RecoveryFailure::Attempt(failure.error))),
+                                Some(failure.kind),
+                            ),
+                            Err(_) => {
+                                tracing::error!(target: "freshell_freshagent::session_recovery",
                                 event = "freshagent.recovery_operation_panicked",
                                 operation_id = %operation_id,
                                 "the shared recovery operation panicked before settling");
-                            (Arc::new(Err(RecoveryFailure::Panicked)), false, true)
-                        }
-                    };
+                                (
+                                    Arc::new(Err(RecoveryFailure::Panicked)),
+                                    Some(RecoveryFailureKind::Refusal),
+                                )
+                            }
+                        };
                     let mut current = state
                         .state
                         .lock()
@@ -509,13 +526,16 @@ impl<T, E> SessionRecoveryMap<T, E> {
                     if current.operation_id == operation_id {
                         current.in_flight = false;
                         current.result = Some(outcome.clone());
+                        current.superseded = failure_kind == Some(RecoveryFailureKind::Superseded);
                         match outcome.as_ref() {
                             Ok(_) => {
                                 current.failed_launches = 0;
                                 current.retry_until = None;
                                 current.exhausted = false;
                             }
-                            Err(RecoveryFailure::Attempt(_)) if failed_launch => {
+                            Err(RecoveryFailure::Attempt(_))
+                                if failure_kind == Some(RecoveryFailureKind::Launch) =>
+                            {
                                 current.failed_launches = current.failed_launches.saturating_add(1);
                                 current.retry_until = Some(Instant::now() + retry_floor);
                                 current.exhausted =
@@ -523,7 +543,7 @@ impl<T, E> SessionRecoveryMap<T, E> {
                             }
                             Err(_) => {
                                 current.retry_until =
-                                    apply_retry_floor.then(|| Instant::now() + retry_floor);
+                                    (!current.superseded).then(|| Instant::now() + retry_floor);
                                 current.exhausted =
                                     current.failed_launches >= maximum_failed_launches;
                             }
@@ -604,8 +624,25 @@ impl<T, E> SessionRecoveryMap<T, E> {
                 .unwrap_or_else(|error| error.into_inner());
             let now = Instant::now();
             if state.in_flight
-                || (state.result.as_ref().is_some_and(|result| result.is_ok()) && state.waiters > 0)
+                || ((state.result.as_ref().is_some_and(|result| result.is_ok())
+                    || state.superseded)
+                    && state.waiters > 0)
             {
+                if !state.in_flight {
+                    if let Some(error) = preflight() {
+                        tracing::info!(target: "freshell_freshagent::session_recovery",
+                            event = "freshagent.recovery_admission_refused", canonical_key = %key,
+                            operation_id = %state.operation_id,
+                            request_id = request_id.as_deref().unwrap_or(""), admission = "settled_existing_cohort",
+                            "current ownership prevented a late join of the settled recovery cohort");
+                        return Some(RecoveryAnswer {
+                            operation_id: state.operation_id.clone(),
+                            result: Arc::new(Err(RecoveryFailure::Attempt(error))),
+                            status: recovery_status(&state),
+                            joined_existing: true,
+                        });
+                    }
+                }
                 let operation = state
                     .current
                     .as_ref()
@@ -1022,6 +1059,69 @@ mod tests {
             .await;
         assert_ne!(next.operation_id, first.operation_id);
         assert_eq!(next.result.as_ref().as_ref().unwrap(), "next lifecycle");
+    }
+
+    #[tokio::test]
+    async fn settled_cohort_join_checks_current_owner_in_both_admission_paths() {
+        for succeeded in [true, false] {
+            for existing_only in [false, true] {
+                let recovery = TestRecovery::new();
+                let mut first = Box::pin(recovery.run("settled-owner", move || async move {
+                    if succeeded {
+                        Ok("original owner".into())
+                    } else {
+                        Err(RecoveryAttemptFailure::superseded("original supersession"))
+                    }
+                }));
+                assert!(futures_util::poll!(&mut first).is_pending());
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while recovery.status("settled-owner").await.unwrap().in_flight {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let late = if existing_only {
+                    recovery
+                        .join_existing_with_requester_preflight(
+                            "settled-owner",
+                            Some("late".into()),
+                            || Some("terminal owns the key"),
+                        )
+                        .await
+                        .expect("the settled cohort remains discoverable")
+                } else {
+                    recovery
+                        .run_with_requester_preflight(
+                            "settled-owner",
+                            Some("late".into()),
+                            || Some("terminal owns the key"),
+                            || async { panic!("the late requester must not start a provider") },
+                        )
+                        .await
+                };
+                assert!(
+                    matches!(
+                        late.result.as_ref(),
+                        Err(RecoveryFailure::Attempt("terminal owns the key"))
+                    ),
+                    "succeeded={succeeded}, existing_only={existing_only}: {:?}",
+                    late.result
+                );
+                let original = first.await;
+                assert_eq!(original.operation_id, late.operation_id);
+                assert_eq!(original.status.failed_launches, 0);
+                assert!(original.status.retry_after_ms.is_none());
+                if succeeded {
+                    assert_eq!(original.result.as_ref().as_ref().unwrap(), "original owner");
+                } else {
+                    assert!(matches!(
+                        original.result.as_ref(),
+                        Err(RecoveryFailure::Attempt("original supersession"))
+                    ));
+                }
+            }
+        }
     }
 
     #[tokio::test]

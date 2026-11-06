@@ -664,6 +664,28 @@ impl FreshClaudeState {
         outcome
     }
 
+    /// Observe supersession before cleanup can release this operation's own
+    /// claim or restore a tombstone. A provider/I/O error alone is not proof.
+    fn establishment_supersession(
+        &self,
+        claim: Option<&DurableClaim>,
+        write_claim: Option<&crate::identity_sink::BindingClaim>,
+    ) -> Option<EstablishError> {
+        if claim
+            .is_some_and(|claim| self.claim_dead_state_advanced(&claim.durable, claim.dead_state))
+        {
+            Some(EstablishError::ClosedInFlight)
+        } else if write_claim.is_some_and(|claim| {
+            self.ownership
+                .as_ref()
+                .is_some_and(|registry| !claim.is_current(registry))
+        }) {
+            Some(EstablishError::OwnershipChanged)
+        } else {
+            None
+        }
+    }
+
     async fn establish(
         &self,
         plan: EstablishPlan<'_>,
@@ -686,6 +708,15 @@ impl FreshClaudeState {
             genesis,
             retry,
         } = plan;
+        let write_claim = own_ticket
+            .as_ref()
+            .and_then(|ticket| {
+                crate::identity_sink::BindingClaim::from_ticket(
+                    ticket,
+                    crate::identity_sink::BindingClaimKind::Starting,
+                )
+            })
+            .or_else(|| binding_claim.clone());
         let start = StartWatch {
             pid_slot: start_pid_slot,
             partial_runtime_key: partial_runtime_key.as_deref(),
@@ -693,7 +724,11 @@ impl FreshClaudeState {
         };
         let mut booted = self
             .boot_sidecar(&spec, lease_guard.as_mut(), Some(start))
-            .await;
+            .await
+            .map_err(|error| {
+                self.establishment_supersession(claim.as_ref(), write_claim.as_ref())
+                    .unwrap_or(error)
+            });
         // Design §4.2: a typed refusal the store can explain is retried once,
         // decided again from a fresh look at the store.
         if let (Err(EstablishError::Boot(failure)), Some(retry)) = (&booted, retry.as_ref()) {
@@ -706,7 +741,11 @@ impl FreshClaudeState {
                 };
                 booted = self
                     .boot_sidecar(&spec, lease_guard.as_mut(), Some(start))
-                    .await;
+                    .await
+                    .map_err(|error| {
+                        self.establishment_supersession(claim.as_ref(), write_claim.as_ref())
+                            .unwrap_or(error)
+                    });
             }
         }
         let booted = match booted {
@@ -719,15 +758,6 @@ impl FreshClaudeState {
                 return Err(error);
             }
         };
-        let write_claim = own_ticket
-            .as_ref()
-            .and_then(|ticket| {
-                crate::identity_sink::BindingClaim::from_ticket(
-                    ticket,
-                    crate::identity_sink::BindingClaimKind::Starting,
-                )
-            })
-            .or_else(|| binding_claim.clone());
         let mut binding_write_guard = Some(self.registered_binding_guard(
             own_ticket.take(),
             write_claim.clone(),
@@ -753,20 +783,27 @@ impl FreshClaudeState {
         // A close that landed while this resume booted invalidates its
         // captured fence. Refuse it before starting the consumer.
         if let Some(claim) = claim.as_ref() {
-            if !self
-                .commit_session_claim(
+            let refusal = match self
+                .commit_session_claim_outcome(
                     &claim.durable,
                     claim.dead_state,
                     std::slice::from_ref(&map_key),
                 )
                 .await
             {
+                Ok(crate::identity_sink::ClaimCommit::Committed) => None,
+                Ok(crate::identity_sink::ClaimCommit::RefusedStale) => {
+                    Some(EstablishError::ClosedInFlight)
+                }
+                Err(error) => Some(EstablishError::Binding(error.to_string())),
+            };
+            if let Some(error) = refusal {
                 let _ = child.start_kill();
                 reap_owned_claude_sidecars(&ownership_id);
                 if let Some(mut guard) = lease_guard.take() {
                     guard.fail();
                 }
-                return Err(EstablishError::ClosedInFlight);
+                return Err(error);
             }
         }
 
@@ -916,6 +953,8 @@ impl FreshClaudeState {
                 )
                 .await
             {
+                let superseded =
+                    self.establishment_supersession(claim.as_ref(), write_claim.as_ref());
                 if let Some(claim) = claim.as_ref().filter(|claim| claim.dead_state.is_some()) {
                     self.rollback_session_claim(&claim.durable).await;
                 }
@@ -929,7 +968,9 @@ impl FreshClaudeState {
                 } else {
                     drop(binding_write_guard.take());
                 }
-                return Err(EstablishError::Binding(error.to_string()));
+                return Err(
+                    superseded.unwrap_or_else(|| EstablishError::Binding(error.to_string()))
+                );
             }
         }
         if let Some(claim) = claim.as_ref() {

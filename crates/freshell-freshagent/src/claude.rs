@@ -586,7 +586,8 @@ impl FreshClaudeState {
                         recovery::RuntimeResumeError::Closed => {
                             "Claude session was closed".to_string()
                         }
-                        recovery::RuntimeResumeError::Unavailable { message, .. } => message,
+                        recovery::RuntimeResumeError::Unavailable { message, .. }
+                        | recovery::RuntimeResumeError::Superseded { message, .. } => message,
                     })?;
                 if self.has_live_session(session_id).await {
                     return Ok(());
@@ -1577,7 +1578,7 @@ impl FreshClaudeState {
                 "claude transcript not found for this session".to_string(),
                 session_id.to_string(),
             )),
-            Err(ResumeClaudeError::Transient(detail)) => {
+            Err(ResumeClaudeError::Transient(detail) | ResumeClaudeError::Superseded(detail)) => {
                 Err(("claude resume failed".to_string(), detail))
             }
         }
@@ -2313,7 +2314,9 @@ impl FreshClaudeState {
                         &format!("No conversation found with session ID: {sid}"),
                     );
                 }
-                Err(ResumeClaudeError::Transient(detail)) => {
+                Err(
+                    ResumeClaudeError::Transient(detail) | ResumeClaudeError::Superseded(detail),
+                ) => {
                     return self.answer_create_failure(
                         &request_id,
                         view_id.as_deref(),
@@ -2553,6 +2556,11 @@ impl FreshClaudeState {
             ),
             Err(crate::session_recovery::RecoveryFailure::Attempt(
                 recovery::RuntimeResumeError::Unavailable {
+                    code,
+                    message,
+                    owner,
+                }
+                | recovery::RuntimeResumeError::Superseded {
                     code,
                     message,
                     owner,
@@ -4031,8 +4039,27 @@ impl FreshClaudeState {
         expect_killed_at_ms: Option<i64>,
         through_placeholders: &[String],
     ) -> bool {
+        matches!(
+            self.commit_session_claim_outcome(
+                durable_id,
+                expect_killed_at_ms,
+                through_placeholders
+            )
+            .await,
+            Ok(crate::identity_sink::ClaimCommit::Committed)
+        )
+    }
+
+    /// Preserve stale-close refusals separately from persistence failures for
+    /// recovery accounting; callers that only need admission keep the bool facade.
+    async fn commit_session_claim_outcome(
+        &self,
+        durable_id: &str,
+        expect_killed_at_ms: Option<i64>,
+        through_placeholders: &[String],
+    ) -> std::io::Result<crate::identity_sink::ClaimCommit> {
         let Some(sink) = self.identity_sink() else {
-            return true;
+            return Ok(crate::identity_sink::ClaimCommit::Committed);
         };
         // A create registers directly under its durable UUID. That key's
         // existing close is compared with the captured claim snapshot below;
@@ -4051,7 +4078,7 @@ impl FreshClaudeState {
             )
             .await
         {
-            Ok(crate::identity_sink::ClaimCommit::Committed) => true,
+            Ok(crate::identity_sink::ClaimCommit::Committed) => {}
             Ok(crate::identity_sink::ClaimCommit::RefusedStale) => {
                 tracing::info!(target: "freshell_freshagent::claude",
                     durable = %durable_id,
@@ -4059,13 +4086,13 @@ impl FreshClaudeState {
                      this resume was in flight (or under the one-shot seat it rides); the \
                      claim commits nothing and the lane tears down"
                 );
-                return false;
+                return Ok(crate::identity_sink::ClaimCommit::RefusedStale);
             }
             Err(e) => {
                 tracing::warn!(error = %e, session = %durable_id,
                     "freshagent.claude.claim_commit_failed: the durable close left the claim \
                      undecidable; the lane tears down and leaves the close standing");
-                return false;
+                return Err(e);
             }
         };
         let mut cleared_aliases = Vec::new();
@@ -4102,7 +4129,7 @@ impl FreshClaudeState {
                 tracing::warn!(error = %e, session = %alias, "freshagent.claude.alias_kill_tombstone_clear_failed");
             }
         }
-        true
+        Ok(crate::identity_sink::ClaimCommit::Committed)
     }
 
     /// Retire-on-kill round 5 (focused-ep5-r4 Finding 1): the claim's
@@ -5746,7 +5773,18 @@ impl FreshClaudeState {
             own_ticket,
         )
         .await
-        .map_err(|error| ResumeClaudeError::Transient(error.resume_detail()))?;
+        .map_err(|error| {
+            if matches!(
+                error,
+                establish::EstablishError::ClosedInFlight
+                    | establish::EstablishError::LeaseRevoked
+                    | establish::EstablishError::OwnershipChanged
+            ) {
+                ResumeClaudeError::Superseded(error.resume_detail())
+            } else {
+                ResumeClaudeError::Transient(error.resume_detail())
+            }
+        })?;
         Ok(())
     }
 
@@ -6815,6 +6853,8 @@ enum ResumeClaudeError {
     /// Spawn/pipe/`created` failure -- the session may be perfectly resumable;
     /// NEVER declared lost (opencode_ws.rs discipline).
     Transient(String),
+    /// A successful native start was closed or superseded before publication.
+    Superseded(String),
 }
 
 /// A request the session's turn lock serializes (design §3.3). Each one that
@@ -14026,6 +14066,12 @@ pub(crate) mod tests {
         );
 
         attach.await.expect("the attach task completed");
+        let recovery = state.recovery_status(DURABLE).await.unwrap();
+        assert_eq!(
+            recovery.failed_launches, 0,
+            "a stale close refusal is not a failed provider launch"
+        );
+        assert!(recovery.retry_after_ms.is_none());
         std::env::remove_var("CLAUDE_CONFIG_DIR");
 
         // The lane answered with the attach-resume failure (never a silent
@@ -14381,6 +14427,12 @@ pub(crate) mod tests {
             .await
             .expect("the attach resolves")
             .expect("attach task completed");
+        let recovery = state.recovery_status(DURABLE).await.unwrap();
+        assert_eq!(
+            recovery.failed_launches, 0,
+            "a post-commit close is not a failed provider launch"
+        );
+        assert!(recovery.retry_after_ms.is_none());
         std::env::remove_var("CLAUDE_CONFIG_DIR");
 
         let mut saw_resume_failed = false;

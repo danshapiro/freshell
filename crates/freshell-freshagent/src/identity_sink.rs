@@ -212,6 +212,47 @@ pub struct BindingClaim {
 }
 
 impl BindingClaim {
+    /// Re-observe the immutable claim before classifying a refused write.
+    /// A displaced owner is supersession; an error under the same claim is
+    /// still a genuine persistence failure. Call before cleanup changes state.
+    pub fn is_current(&self, registry: &freshell_ownership::RuntimeOwnershipRegistry) -> bool {
+        use freshell_ownership::{OwnershipState, RuntimeOwnerKind};
+        let snapshot = registry.observe(&self.provider, &self.session_id);
+        snapshot.epoch == self.epoch
+            && match (self.kind, &snapshot.state) {
+                (
+                    BindingClaimKind::Starting,
+                    OwnershipState::Starting {
+                        kind: RuntimeOwnerKind::FreshAgent,
+                        operation_id,
+                        generation,
+                        ..
+                    },
+                )
+                | (
+                    BindingClaimKind::Handoff,
+                    OwnershipState::Handoff {
+                        to_kind: RuntimeOwnerKind::FreshAgent,
+                        operation_id,
+                        generation,
+                        ..
+                    },
+                ) => operation_id == &self.operation_id && *generation == self.generation,
+                (
+                    BindingClaimKind::LiveFreshAgent,
+                    OwnershipState::Live {
+                        owner, generation, ..
+                    },
+                ) => {
+                    owner.kind == RuntimeOwnerKind::FreshAgent
+                        && owner.ownership_id.as_deref() == Some(self.operation_id.as_str())
+                        && owner.live_session_key.as_deref() == Some(self.session_id.as_str())
+                        && *generation == self.generation
+                }
+                _ => false,
+            }
+    }
+
     /// Capture the immutable identity of a current fresh-agent start or
     /// handoff ticket. The durable sink still revalidates it at execution
     /// time, so holding this value never grants ongoing authority by itself.

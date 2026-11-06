@@ -172,7 +172,8 @@ impl FreshClaudeState {
                 return None;
             }
             Err(crate::session_recovery::RecoveryFailure::Attempt(
-                recovery::RuntimeResumeError::Unavailable { code, message, .. },
+                recovery::RuntimeResumeError::Unavailable { code, message, .. }
+                | recovery::RuntimeResumeError::Superseded { code, message, .. },
             )) => {
                 attach_error(&reply, &msg, &previous, code, message);
                 return None;

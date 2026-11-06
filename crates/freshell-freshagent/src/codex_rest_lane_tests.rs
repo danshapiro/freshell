@@ -941,7 +941,7 @@ async fn recovery_claim_refusal_preserves_owner_for_native_requester_and_rest_cr
     use freshell_ownership::{
         BeginOutcome, CommitOutcome, OwnerIdentity, RuntimeOwnerKind, RuntimeOwnershipRegistry,
     };
-    for is_send in [false, true] {
+    for (is_send, terminal_live) in [(false, false), (true, false), (false, true), (true, true)] {
         let id = if is_send {
             "claim-owner-send"
         } else {
@@ -963,6 +963,9 @@ async fn recovery_claim_refusal_preserves_owner_for_native_requester_and_rest_cr
         };
         let registry = Arc::new(RuntimeOwnershipRegistry::with_epoch(191));
         state.set_ownership(registry.clone());
+        let liveness = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = liveness.clone();
+        state.set_terminal_liveness(Arc::new(move |_, _| probe.load(Ordering::SeqCst)));
         let mut bus = state.broadcast_tx.subscribe();
         // Admit recovery while vacant, then hold its actual claim behind the
         // provider-operation lock. The refusal must come from the claim, not
@@ -1041,6 +1044,7 @@ async fn recovery_claim_refusal_preserves_owner_for_native_requester_and_rest_cr
             ),
             CommitOutcome::Committed
         );
+        liveness.store(terminal_live, Ordering::SeqCst);
         drop(held);
         let native = tokio::time::timeout(Duration::from_secs(5), native)
             .await
@@ -1113,6 +1117,102 @@ async fn recovery_claim_refusal_preserves_owner_for_native_requester_and_rest_cr
         );
         state.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn create_operation_terminal_liveness_refusal_names_the_owner() {
+    use freshell_ownership::{
+        BeginOutcome, CommitOutcome, OwnerIdentity, RuntimeOwnerKind, RuntimeOwnershipRegistry,
+    };
+    let (mut state, mut bus) = super::tests::state_with_bus();
+    let registry = Arc::new(RuntimeOwnershipRegistry::with_epoch(291));
+    let id = "live-terminal-create-refusal";
+    let BeginOutcome::Granted { generation } = registry.begin_start(
+        PROVIDER,
+        id,
+        RuntimeOwnerKind::Terminal,
+        "terminal-op",
+        None,
+        "fixture",
+        1,
+    ) else {
+        panic!("fixture owner granted")
+    };
+    assert_eq!(
+        registry.commit_live(
+            PROVIDER,
+            id,
+            "terminal-op",
+            generation,
+            OwnerIdentity {
+                kind: RuntimeOwnerKind::Terminal,
+                terminal_id: Some("terminal".into()),
+                live_session_key: None,
+                pid: None,
+                ownership_id: None,
+            }
+        ),
+        CommitOutcome::Committed
+    );
+    state.set_ownership(registry);
+    state.set_terminal_liveness(Arc::new(|_, _| true));
+    let outcome =
+        super::tests::create_resume_operation_for_test(&state, "live-terminal-request", id).await;
+    let CodexCreateOutcome::Failed { code, owner, .. } = outcome else {
+        panic!("terminal owner refuses create")
+    };
+    assert_eq!(code, "SESSION_RESERVED");
+    assert_eq!(
+        owner,
+        Some(crate::ownership_lane::TerminalOwnerFields {
+            owner_kind: "terminal",
+            owner_epoch: 291,
+            owner_generation: generation,
+        })
+    );
+    let frame: Value = serde_json::from_str(&bus.try_recv().unwrap()).unwrap();
+    assert_eq!(frame["requestId"], "live-terminal-request");
+    assert_eq!(
+        json!([
+            frame["ownerKind"],
+            frame["ownerEpoch"],
+            frame["ownerGeneration"]
+        ]),
+        json!(["terminal", 291, generation])
+    );
+    assert!(state.sessions.lock().await.is_empty());
+    state.session_recovery =
+        crate::session_recovery::SessionRecoveryMap::with_policy(1, Duration::ZERO);
+    state
+        .session_recovery
+        .run(state.recovery_map_key(id), || async {
+            Err(crate::session_recovery::RecoveryAttemptFailure::launch(
+                CodexRecoveryFailure::CrashRecovery("previous real failure".into()),
+            ))
+        })
+        .await;
+    let Err(EnsureAliveError::Reserved(owner)) = state
+        .ensure_session_alive(id, None, DeadThreadCachePolicy::Respect)
+        .await
+    else {
+        panic!("current terminal refusal takes precedence over the exhausted launch budget")
+    };
+    assert_eq!(owner.unwrap().owner_epoch, 291);
+    let Err(ResumeSessionError::Reserved(owner)) =
+        state.ensure_session_resumable(id, None, None, None).await
+    else {
+        panic!("historical resume preserves its current terminal refusal despite exhaustion")
+    };
+    assert_eq!(owner.unwrap().owner_epoch, 291);
+    assert_eq!(
+        state
+            .session_recovery
+            .status(&state.recovery_map_key(id))
+            .await
+            .unwrap()
+            .failed_launches,
+        1
+    );
 }
 
 #[tokio::test]
