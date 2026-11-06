@@ -8,6 +8,8 @@ import {
 } from '../helpers/fresh-agent-attach-rounds.js'
 import {
   fetchFreshAgentSnapshot,
+  holdNextFreshAgentSnapshotResponse,
+  sendComposerText,
   FORK_PARENT_CONTINUATION_PROMPT,
   withTwoDeviceSession,
   type FreshAgentMultipleDeviceMode,
@@ -311,6 +313,18 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
         .toBe(nativeSessionId)
       await native.releaseTurn()
       await expect(mobileNewView.page.locator('[data-context="fresh-agent"]').last()).toContainText(response, { timeout: 45_000 })
+      await expect.poll(async () => {
+        const currentSnapshot = await fetchFreshAgentSnapshot(native.info, targetSession)
+        return {
+          userRows: countTranscriptRowsWithSummary(currentSnapshot.turns, 'user', heldPrompt)
+            - countTranscriptRowsWithSummary(beforeSnapshot.turns, 'user', heldPrompt),
+          assistantRows: countTranscriptRowsWithSummary(currentSnapshot.turns, 'assistant', response)
+            - countTranscriptRowsWithSummary(beforeSnapshot.turns, 'assistant', response),
+        }
+      }, {
+        timeout: 30_000,
+        message: 'the shared transcript snapshot commits the completed native turn after it is rendered',
+      }).toEqual({ userRows: 1, assistantRows: 1 })
       const afterSnapshot = await fetchFreshAgentSnapshot(native.info, targetSession)
       expect(countTranscriptRowsWithSummary(afterSnapshot.turns, 'user', heldPrompt)
         - countTranscriptRowsWithSummary(beforeSnapshot.turns, 'user', heldPrompt)).toBe(1)
@@ -798,8 +812,12 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
                 && frame.observedEpoch === currentOwner.epoch
                 && frame.observedGeneration === currentOwner.generation
                 && typeof frame.capturedAtMs === 'number'
-                && Number(frame.capturedAtMs) > Number(currentOwner.capturedAtMs))
+                && Number(frame.capturedAtMs) > Number(currentReady.capturedAtMs))
               if (currentAttach) {
+                // A recovery_in_progress reconcile may authorize its fenced
+                // attach while the owner handoff is still starting. Require
+                // both facts in this ready window and on the same fence, but
+                // allow the commit and attach to arrive in either order.
                 committedOwner = currentOwner
                 forcedSnapshot409FirstAttachAtMs = Number(currentAttach.capturedAtMs)
                 break
@@ -1072,9 +1090,10 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
           const recoveryRounds = analysis.rounds.filter((round) => round.authorizationFrameIndex >= baselineFrameCount
             && (endFrameCount === undefined || round.authorizationFrameIndex < endFrameCount))
           const readyRounds = recoveryRounds.filter((round) => round.kind === 'ready')
-          const positiveReconcileRounds = recoveryRounds.filter((round) => round.kind === 'reconcile')
-          const bindingReconcileRounds = positiveReconcileRounds.filter((round) =>
-            round.targetVerdict === 'attach' || round.targetVerdict === 'respawn')
+          const reconcileRounds = recoveryRounds.filter((round) => round.kind === 'reconcile')
+          const bindingReconcileRounds = reconcileRounds.filter((round) =>
+            round.targetVerdict === 'attach' || round.targetVerdict === 'respawn'
+              || round.targetVerdict === 'recovery_in_progress')
           const duplicateAttachments = recoveryRounds.flatMap((round) => round.duplicateAttachments)
           const recoveryAttachments = recoveryRounds.flatMap((round) => round.attachments)
           const authoritativeByRound = bindingReconcileRounds.map((round) => ({
@@ -1183,7 +1202,7 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
           })
           if (
             readyRounds.length > 0
-            && positiveReconcileRounds.length > 0
+            && reconcileRounds.length > 0
             && authoritativeCount > 0
             && bindingReconcileRounds.length > 0
             && duplicateAttachments.length === 0
@@ -1202,6 +1221,8 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
                       id: round.id,
                       verdict: round.targetVerdict,
                       authorizationFrameIndex: round.authorizationFrameIndex,
+                      recoveryJoinFence: round.recoveryJoinFence,
+                      recoveryJoinCommittedOwnerFrames: round.recoveryJoinCommittedOwnerFrames,
                       respawnCreateRequestId: round.respawnCreateRequestId,
                       respawnCreatedFrameIndex: round.respawnCreatedFrameIndex,
                       respawnCommittedOwnerFence: round.respawnCommittedOwnerFence,
@@ -1220,7 +1241,7 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
             device: deviceName,
             intendedView: { viewId: device.viewId, tabId: device.tabId, paneId: device.paneId },
             expectedBaselineFence: { observedEpoch: 1, observedGeneration: 1 },
-            expectedRecovery: `attach verdict => exactly one non-retry (${expectedRecoveryFence.epoch},${expectedRecoveryFence.generation}) attach; respawn verdict => exact target create acknowledgment plus current committed owner fence (${expectedRecoveryFence.epoch},${expectedRecoveryFence.generation}) with optional single follow-up attach; duplicate same-fence sends require SESSION_RESERVED`,
+            expectedRecovery: `attach verdict => exactly one non-retry (${expectedRecoveryFence.epoch},${expectedRecoveryFence.generation}) attach; recovery_in_progress => matching handoff-started fence, one matching attach, then matching commit; respawn verdict => exact target create acknowledgment plus current committed owner fence (${expectedRecoveryFence.epoch},${expectedRecoveryFence.generation}) with optional single follow-up attach; duplicate same-fence sends require SESSION_RESERVED`,
             observedRecoveryCounts: { bootstrapCount, authoritativeCount },
             authoritativeByRound,
             bootstrapByRound,
@@ -1251,6 +1272,8 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
               reconcileId: round.reconcileId,
               targetVerdict: round.targetVerdict,
               authorizationFrameIndex: round.authorizationFrameIndex,
+              recoveryJoinFence: round.recoveryJoinFence,
+              recoveryJoinCommittedOwnerFrames: round.recoveryJoinCommittedOwnerFrames,
               respawnCreateRequestId: round.respawnCreateRequestId,
               respawnNullBootstrapFrameIndex: round.respawnNullBootstrapFrameIndex,
               respawnCreatedFrameIndex: round.respawnCreatedFrameIndex,
@@ -1755,6 +1778,682 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
     expect(Math.max(...admittedAt) - Math.min(...admittedAt)).toBeLessThan(safeWindowMs)
     expect(Math.max(...admittedAt) - nativeAttemptAt).toBeLessThan(safeWindowMs)
     return cohort
+  }
+
+  for (const mode of MODES) {
+    test(`stage2 bounded refresh ${mode}: reconnect and retry settle while the peer streams`, withTwoDeviceSession(mode, async ({
+      desktop,
+      mobile,
+      native,
+      session,
+    }) => {
+      const snapshotPath = `/api/fresh-agent/threads/${encodeURIComponent(session.sessionType)}/${encodeURIComponent(session.provider)}/${encodeURIComponent(session.sessionId)}`
+      let mobileSnapshotRequests = 0
+      const mobileSnapshotResponses: Array<Record<string, unknown>> = []
+      const mobileBrowserErrors: Array<Record<string, unknown>> = []
+      const onMobilePageError = (error: Error) => {
+        mobileBrowserErrors.push({ kind: 'pageerror', message: error.message })
+      }
+      const onMobileConsoleError = (message: import('@playwright/test').ConsoleMessage) => {
+        if (message.type() !== 'error') return
+        mobileBrowserErrors.push({
+          kind: 'console',
+          message: message.text(),
+          location: message.location(),
+        })
+      }
+      mobile.page.on('pageerror', onMobilePageError)
+      mobile.page.on('console', onMobileConsoleError)
+      mobile.page.on('request', (request) => {
+        const url = new URL(request.url())
+        if (request.method() === 'GET' && url.pathname === snapshotPath) mobileSnapshotRequests += 1
+      })
+      mobile.page.on('response', (response) => {
+        const url = new URL(response.url())
+        if (response.request().method() !== 'GET' || url.pathname !== snapshotPath) return
+        void response.json().then((raw: unknown) => {
+          const snapshot = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {}
+          const extensions = snapshot.extensions && typeof snapshot.extensions === 'object'
+            ? snapshot.extensions as Record<string, unknown>
+            : {}
+          const providerState = extensions[session.provider] && typeof extensions[session.provider] === 'object'
+            ? extensions[session.provider] as Record<string, unknown>
+            : {}
+          mobileSnapshotResponses.push({
+            trigger: url.searchParams.get('trigger'),
+            status: response.status(),
+            revision: typeof snapshot.revision === 'number' ? snapshot.revision : null,
+            ownerKind: typeof providerState.ownerKind === 'string' ? providerState.ownerKind : null,
+            statusFromLiveState: typeof providerState.statusFromLiveState === 'boolean' ? providerState.statusFromLiveState : null,
+            nativeHistoryAvailable: typeof providerState.nativeHistoryAvailable === 'boolean' ? providerState.nativeHistoryAvailable : null,
+            turnCount: Array.isArray(snapshot.turns) ? snapshot.turns.length : null,
+          })
+        }).catch(() => {
+          mobileSnapshotResponses.push({ trigger: url.searchParams.get('trigger'), status: response.status(), bodyReadError: true })
+        })
+      })
+      const snapshotDiagnostics = async () => {
+        const audit = await mobile.page.evaluate(() => {
+          const events = window.__FRESHELL_TEST_HARNESS__?.getPerfAuditSnapshot()?.perfEvents ?? []
+          return events.filter((event) => event.event === 'fresh_agent.snapshot_request').map((event) => ({
+            stage: event.stage,
+            view: event.view,
+            tabId: event.tabId,
+            paneId: event.paneId,
+            activeTabId: event.activeTabId,
+            activePaneId: event.activePaneId,
+            isActivePane: event.isActivePane,
+            trigger: event.trigger,
+            requestSource: event.requestSource,
+            requestSerial: event.requestSerial,
+            refreshSerial: event.refreshSerial,
+            reason: event.reason,
+            force: event.force,
+            hidden: event.hidden,
+            outcome: event.outcome,
+            revision: event.revision,
+            snapshotRevision: event.snapshotRevision,
+            dirty: event.dirty,
+            dirtyVersion: event.dirtyVersion,
+            dirtyBaseRevision: event.dirtyBaseRevision,
+            requiresRevisionAdvance: event.requiresRevisionAdvance,
+            revealVersion: event.revealVersion,
+            attemptRequestId: event.attemptRequestId,
+            attemptState: event.attemptState,
+            attemptIdentity: event.attemptIdentity,
+            deadlineAt: event.deadlineAt,
+            errorVisible: event.errorVisible,
+            revealRefreshIsCurrent: event.revealRefreshIsCurrent,
+            revealRevisionIsFresh: event.revealRevisionIsFresh,
+            projectionNeedsResnapshot: event.projectionNeedsResnapshot,
+            projectionRevisionIsFresh: event.projectionRevisionIsFresh,
+          }))
+        })
+        return { requests: mobileSnapshotRequests, responses: mobileSnapshotResponses, audit }
+      }
+      const beforeReconnect = await fetchFreshAgentSnapshot(native.info, session)
+      expect(beforeReconnect.turns.length).toBeGreaterThan(0)
+      const desktopTranscriptView = desktop.page.locator('[data-context="fresh-agent-transcript"]').last()
+      await expect.poll(() => desktopTranscriptView.locator('article[data-turn-index]').count(), {
+        timeout: 20_000,
+        message: 'desktop renders the turns already present in the unchanged server snapshot',
+      }).toBeGreaterThanOrEqual(beforeReconnect.turns.length)
+      const requestsBeforeReconnect = mobileSnapshotRequests
+      const responsesBeforeReconnect = mobileSnapshotResponses.length
+      const firstReadyAt = await mobile.harness.getLastReadyAt()
+
+      await mobile.harness.forceDisconnect()
+      await mobile.context.setOffline(true)
+      await mobile.page.waitForTimeout(1_500)
+      await mobile.context.setOffline(false)
+      await mobile.harness.waitForConnectionAfter(firstReadyAt, 60_000)
+      await expect.poll(() => mobileSnapshotRequests, {
+        timeout: 30_000,
+        message: 'mobile performs a real snapshot read after reconnect',
+      }).toBeGreaterThan(requestsBeforeReconnect)
+      await expect.poll(() => mobileSnapshotResponses.length, {
+        timeout: 20_000,
+        message: 'the reconnect snapshot response is received and recorded',
+      }).toBeGreaterThan(responsesBeforeReconnect)
+      await expect(mobile.page.locator('[aria-label="Refreshing conversation"]')).toHaveCount(0, { timeout: 20_000 })
+      const mobileTranscriptView = mobile.page.locator('[data-context="fresh-agent-transcript"]').last()
+      await expect.poll(() => mobileTranscriptView.locator('article[data-turn-index]').count(), {
+        timeout: 20_000,
+        message: 'mobile renders all turns from the unchanged server snapshot',
+      }).toBeGreaterThanOrEqual(beforeReconnect.turns.length)
+      await expect(mobileTranscriptView).toContainText('stage1 warm session for multiple devices')
+      const reconnectResponse = mobileSnapshotResponses.slice(responsesBeforeReconnect)
+        .find((response) => response.trigger === 'reconnect')
+      expect(reconnectResponse, `reconnect response diagnostics: ${JSON.stringify(await snapshotDiagnostics())}`)
+        .toMatchObject({
+          trigger: 'reconnect',
+          status: 200,
+          revision: beforeReconnect.revision,
+          turnCount: beforeReconnect.turns.length,
+        })
+      expect((await fetchFreshAgentSnapshot(native.info, session)).turns).toEqual(beforeReconnect.turns)
+
+      // Keep the mobile view hidden while it is suspended and the desktop
+      // starts a real turn. Reconnecting a hidden view records that its
+      // transcript needs checking; revealing it below starts the visible,
+      // bounded refresh that this scenario holds.
+      const mobileTabCountBeforeBackground = await mobile.harness.getTabCount()
+      const backgroundTabId = `task7-refresh-background-${randomUUID()}`
+      await mobile.page.evaluate((id) => {
+        const harness = window.__FRESHELL_TEST_HARNESS__
+        if (!harness) throw new Error('Test harness not installed')
+        harness.dispatch({ type: 'tabs/addTab', payload: { id, title: 'Refresh background', mode: 'shell' } })
+      }, backgroundTabId)
+      await expect.poll(() => mobile.harness.getTabCount(), {
+        timeout: 10_000,
+        message: 'mobile creates a second real tab to hide the suspended Fresh Agent view',
+      }).toBe(mobileTabCountBeforeBackground + 1)
+      await expect.poll(() => mobile.harness.getActiveTabId(), {
+        timeout: 10_000,
+        message: 'the newly created background tab becomes active on mobile',
+      }).toBe(backgroundTabId)
+      expect(backgroundTabId).not.toBe(mobile.tabId)
+
+      const heldSnapshot = await holdNextFreshAgentSnapshotResponse(mobile.page, session)
+      try {
+        const secondReadyAt = await mobile.harness.getLastReadyAt()
+        const desktopReadyAt = await desktop.harness.getLastReadyAt()
+        await mobile.harness.forceDisconnect()
+        await mobile.context.setOffline(true)
+        await mobile.page.waitForTimeout(1_500)
+
+        const snapshotBeforeHeldTurn = await fetchFreshAgentSnapshot(native.info, session)
+        expect(typeof snapshotBeforeHeldTurn.revision).toBe('number')
+        const firstHeldPrompt = `stage2 bounded refresh held prompt committed ${mode}`
+        await native.holdNextTurn(session.sessionId)
+        await sendComposerText(desktop, firstHeldPrompt)
+        await native.waitForHeldTurn(firstHeldPrompt, session.sessionId)
+        await waitForPaneStatus(desktop, /^running$/)
+        expect(native.bootCount(session.sessionId)).toBe(1)
+
+        // Finish one real native turn while mobile is offline so its saved
+        // transcript revision advances beyond the mobile pane's cached base.
+        // A second held turn keeps desktop streaming while mobile times out
+        // and retries against that committed revision.
+        await native.releaseTurn()
+        await waitForPaneStatus(desktop, /^idle$/)
+        await expect.poll(async () => JSON.stringify((await fetchFreshAgentSnapshot(native.info, session)).turns), {
+          timeout: 30_000,
+          message: 'the first native turn is committed to provider history before the Retry scenario',
+        }).toContain(firstHeldPrompt)
+        const snapshotAfterCommittedTurn = await fetchFreshAgentSnapshot(native.info, session)
+        expect(snapshotAfterCommittedTurn.revision).toBeGreaterThan(snapshotBeforeHeldTurn.revision)
+        expect(snapshotAfterCommittedTurn.turns.length).toBeGreaterThan(snapshotBeforeHeldTurn.turns.length)
+
+        const secondHeldPrompt = `stage2 bounded refresh held prompt live ${mode}`
+        await native.holdNextTurn(session.sessionId)
+        await sendComposerText(desktop, secondHeldPrompt)
+        await native.waitForHeldTurn(secondHeldPrompt, session.sessionId)
+        await waitForPaneStatus(desktop, /^running$/)
+        expect(await desktop.harness.getConnectionStatus()).toBe('ready')
+        expect(await desktop.harness.getLastReadyAt()).toBe(desktopReadyAt)
+
+        const requestsBeforeReveal = mobileSnapshotRequests
+        await mobile.context.setOffline(false)
+        await mobile.harness.waitForConnectionAfter(secondReadyAt, 60_000)
+        expect(await mobile.harness.getActiveTabId()).toBe(backgroundTabId)
+        expect(mobileSnapshotRequests).toBe(requestsBeforeReveal)
+
+        await mobile.page.evaluate((tabId) => {
+          const harness = window.__FRESHELL_TEST_HARNESS__
+          if (!harness) throw new Error('Test harness not installed')
+          harness.dispatch({ type: 'tabs/setActiveTab', payload: tabId })
+        }, mobile.tabId)
+        await expect.poll(() => mobile.harness.getActiveTabId(), {
+          timeout: 10_000,
+          message: 'mobile reveals the suspended Fresh Agent view',
+        }).toBe(mobile.tabId)
+        await expect.poll(() => heldSnapshot.isFetched(), {
+          timeout: 30_000,
+          message: 'revealing the suspended view made a real snapshot read with trigger=reveal',
+        }).toBe(true)
+        expect(heldSnapshot.requestTrigger()).toBe('reveal')
+        await expect(mobile.page.getByRole('status', { name: 'Refreshing conversation' })).toBeVisible()
+
+        const refreshFailure = mobile.page.getByRole('alert', {
+          name: 'The conversation could not be refreshed.',
+        })
+        await expect(refreshFailure).toBeVisible({ timeout: 25_000 })
+        await expect(refreshFailure).toContainText('Try again.')
+        await expect(mobile.page.getByTestId('fresh-agent-stale-transcript')).toHaveAttribute('aria-hidden', 'true')
+        await expect.poll(async () => {
+          const layout = await desktop.harness.getPaneLayout(desktop.tabId)
+          return findFreshAgentLeaf(layout)?.content?.status ?? null
+        }, {
+          timeout: 10_000,
+          message: 'desktop remains in the second held streaming turn while mobile refresh is bounded',
+        }).toBe('running')
+        expect(native.bootCount(session.sessionId)).toBe(1)
+
+        const requestsBeforeRetry = mobileSnapshotRequests
+        const responsesBeforeRetry = mobileSnapshotResponses.length
+        const diagnosticsBeforeRetry = await snapshotDiagnostics()
+        const evaluationsBeforeRetry = diagnosticsBeforeRetry.audit
+          .filter((event) => event.stage === 'reveal_refresh_evaluated').length
+        const retryButton = refreshFailure.getByRole('button', { name: 'Retry' })
+        await expect(refreshFailure).toBeVisible()
+        await expect(retryButton).toBeVisible()
+        await expect(retryButton).toBeEnabled()
+        const retryUiBeforeClick = {
+          activeTabId: await mobile.harness.getActiveTabId(),
+          buttonVisible: await retryButton.isVisible(),
+          buttonEnabled: await retryButton.isEnabled(),
+          alertVisible: await refreshFailure.isVisible(),
+          requestCount: mobileSnapshotRequests,
+        }
+        expect(retryUiBeforeClick.activeTabId).toBe(mobile.tabId)
+        const auditCountBeforeClick = (await snapshotDiagnostics()).audit.length
+        const browserErrorCountBeforeClick = mobileBrowserErrors.length
+        const retryClickProbe = await mobile.page.evaluate(() => {
+          const pageWindow = window as any
+          pageWindow.__TASK7_RETRY_CLICK_DISPATCH__ = null
+          pageWindow.__TASK7_RETRY_CLICK_EVENT__ = null
+          pageWindow.__TASK7_DOCUMENT_CAPTURE_EVENTS__ = []
+          pageWindow.__TASK7_DOCUMENT_BUBBLE_EVENTS__ = []
+          pageWindow.__TASK7_EVENT_PROPAGATION_TRAIL__ = []
+          pageWindow.__TASK7_EVENT_METHOD_CALLS__ = []
+          pageWindow.__TASK7_RETRY_ONCLICK_ENTRIES__ = []
+          pageWindow.__TASK7_RETRY_EVENT_LISTENERS__ = []
+          pageWindow.__TASK7_RETRY_EVENT_METHOD_RESTORERS__ = []
+          pageWindow.__TASK7_RETRY_REACT_PROP_PATCH__ = null
+          const describeElement = (element: Element) => {
+            const ownNames = Object.getOwnPropertyNames(element)
+            const propsKey = ownNames.find((key) => key.startsWith('__reactProps$'))
+            const props = propsKey ? (element as any)[propsKey] as Record<string, unknown> : null
+            const onClickSource = typeof props?.onClick === 'function'
+              ? String(props.onClick).replace(/\s+/g, ' ').slice(0, 480)
+              : null
+            return {
+              tagName: element.tagName,
+              id: element.id || null,
+              role: element.getAttribute('role'),
+              testId: element.getAttribute('data-testid'),
+              hasReactProps: Boolean(propsKey),
+              reactEventProps: props
+                ? Object.keys(props).filter((key) => key === 'onClick' || key === 'onClickCapture')
+                : [],
+              onClickType: typeof props?.onClick,
+              onClickName: typeof props?.onClick === 'function' ? props.onClick.name || null : null,
+              onClickSource,
+              onClickContainsRetryAuditMarker: onClickSource?.includes('reveal_retry_clicked') ?? false,
+              onClickCaptureType: typeof props?.onClickCapture,
+              hasReactFiber: ownNames.some((key) => key.startsWith('__reactFiber$')),
+              hasReactContainer: ownNames.some((key) => key.startsWith('__reactContainer$')),
+            }
+          }
+          const describePathNode = (node: EventTarget) => {
+            if (node === window) return 'window'
+            if (node === document) return 'document'
+            if (node instanceof Element) {
+              const role = node.getAttribute('role')
+              return `${node.tagName.toLowerCase()}${node.id ? `#${node.id}` : ''}${role ? `[role=${role}]` : ''}`
+            }
+            return node instanceof Node ? node.nodeName : typeof node
+          }
+          const readPerfAuditState = () => {
+            const snapshot = pageWindow.__FRESHELL_TEST_HARNESS__?.getPerfAuditSnapshot?.() ?? null
+            const events = snapshot?.perfEvents ?? []
+            const latest = events.at(-1) as Record<string, unknown> | undefined
+            return {
+              snapshotAvailable: snapshot !== null,
+              perfEventCount: events.length,
+              latestEvent: latest
+                ? { event: latest.event, stage: latest.stage, trigger: latest.trigger, refreshSerial: latest.refreshSerial }
+                : null,
+            }
+          }
+          const describeEvent = (event: MouseEvent) => ({
+            isTrusted: event.isTrusted,
+            bubbles: event.bubbles,
+            cancelable: event.cancelable,
+            composed: event.composed,
+            eventPhase: event.eventPhase,
+            cancelBubble: event.cancelBubble,
+            defaultPrevented: event.defaultPrevented,
+            target: event.target ? describePathNode(event.target) : null,
+            composedPath: event.composedPath().slice(0, 24).map(describePathNode),
+            perfAudit: readPerfAuditState(),
+          })
+          const alert = document.querySelector('[role="alert"][aria-label="The conversation could not be refreshed."]')
+          const button = alert?.querySelector('button') as HTMLButtonElement | null
+          const root = document.getElementById('root')
+          const buttonOwnNames = button ? Object.getOwnPropertyNames(button) : []
+          const buttonPropsKey = buttonOwnNames.find((key) => key.startsWith('__reactProps$'))
+          const buttonProps = buttonPropsKey && button ? (button as any)[buttonPropsKey] as Record<string, unknown> : null
+          const originalOnClick = buttonProps?.onClick
+          let reactOnClickWrapped = false
+          let reactOnClickPatchError: string | null = null
+          if (buttonProps && typeof originalOnClick === 'function') {
+            const wrappedOnClick = function (this: unknown, ...args: unknown[]) {
+              const syntheticEvent = args[0] as { nativeEvent?: Event; defaultPrevented?: boolean } | undefined
+              const entry: Record<string, unknown> = {
+                eventIsSavedNativeEvent: syntheticEvent?.nativeEvent === pageWindow.__TASK7_RETRY_CLICK_EVENT__,
+                syntheticDefaultPreventedAtEntry: syntheticEvent?.defaultPrevented ?? null,
+                auditAtEntry: readPerfAuditState(),
+              }
+              pageWindow.__TASK7_RETRY_ONCLICK_ENTRIES__.push(entry)
+              try {
+                const result = (originalOnClick as (...args: unknown[]) => unknown).apply(this, args)
+                entry.auditAfterHandler = readPerfAuditState()
+                return result
+              } catch (error) {
+                entry.handlerError = error instanceof Error ? error.message : String(error)
+                entry.auditAfterHandler = readPerfAuditState()
+                throw error
+              }
+            }
+            try {
+              buttonProps.onClick = wrappedOnClick
+              reactOnClickWrapped = buttonProps.onClick === wrappedOnClick
+              pageWindow.__TASK7_RETRY_REACT_PROP_PATCH__ = { buttonProps, originalOnClick, wrappedOnClick }
+            } catch (error) {
+              reactOnClickPatchError = error instanceof Error ? error.message : String(error)
+            }
+          }
+          const isRetryButtonEvent = (event: MouseEvent) => Boolean(button && event.composedPath().includes(button))
+          const rememberEventMethod = (event: MouseEvent, method: 'preventDefault' | 'stopPropagation' | 'stopImmediatePropagation') => {
+            const originalDescriptor = Object.getOwnPropertyDescriptor(event, method)
+            const originalMethod = (event as any)[method] as (...args: unknown[]) => unknown
+            try {
+              Object.defineProperty(event, method, {
+                configurable: true,
+                writable: true,
+                value: function (...args: unknown[]) {
+                  pageWindow.__TASK7_EVENT_METHOD_CALLS__.push({
+                    method,
+                    stack: new Error(`Retry click ${method}`).stack?.split('\n').slice(0, 8).join('\n').slice(0, 1400) ?? null,
+                    cancelBubbleBefore: event.cancelBubble,
+                    defaultPreventedBefore: event.defaultPrevented,
+                  })
+                  return originalMethod.apply(event, args)
+                },
+              })
+              pageWindow.__TASK7_RETRY_EVENT_METHOD_RESTORERS__ ??= []
+              pageWindow.__TASK7_RETRY_EVENT_METHOD_RESTORERS__.push({ event, method, originalDescriptor })
+            } catch (error) {
+              pageWindow.__TASK7_EVENT_METHOD_CALLS__.push({
+                method,
+                patchError: error instanceof Error ? error.message : String(error),
+              })
+            }
+          }
+          const captureListener = (event: MouseEvent) => {
+            const matchesRetryButton = isRetryButtonEvent(event)
+            const target = event.target instanceof Element ? event.target.closest('button') : null
+            const alertAtCapture = target?.closest('[role="alert"]') ?? null
+            pageWindow.__TASK7_DOCUMENT_CAPTURE_EVENTS__.push({
+              count: pageWindow.__TASK7_DOCUMENT_CAPTURE_EVENTS__.length + 1,
+              matchesRetryButton,
+              alertLabel: alertAtCapture?.getAttribute('aria-label') ?? null,
+              event: describeEvent(event),
+            })
+            if (!matchesRetryButton) return
+            pageWindow.__TASK7_RETRY_CLICK_EVENT__ = event
+            for (const method of ['preventDefault', 'stopPropagation', 'stopImmediatePropagation'] as const) {
+              rememberEventMethod(event, method)
+            }
+            const ancestry: Array<Record<string, unknown>> = []
+            let current: Element | null = target
+            while (current && ancestry.length < 64) {
+              ancestry.push(describeElement(current))
+              if (current === root) break
+              current = current.parentElement
+            }
+            const dispatch: Record<string, unknown> = {
+              dispatched: true,
+              event: describeEvent(event),
+              targetConnected: button?.isConnected ?? false,
+              targetDisabled: button?.disabled ?? null,
+              targetMatchesAlert: alertAtCapture?.getAttribute('aria-label') === 'The conversation could not be refreshed.',
+              activeTabId: pageWindow.__FRESHELL_TEST_HARNESS__?.getState()?.tabs?.activeTabId ?? null,
+              documentBubbleSeen: false,
+              ancestry,
+            }
+            pageWindow.__TASK7_RETRY_CLICK_DISPATCH__ = dispatch
+          }
+          const bubbleListener = (event: MouseEvent) => {
+            const matchesSavedEvent = event === pageWindow.__TASK7_RETRY_CLICK_EVENT__
+            const dispatch = pageWindow.__TASK7_RETRY_CLICK_DISPATCH__
+            pageWindow.__TASK7_DOCUMENT_BUBBLE_EVENTS__.push({
+              count: pageWindow.__TASK7_DOCUMENT_BUBBLE_EVENTS__.length + 1,
+              matchesSavedEvent,
+              event: describeEvent(event),
+            })
+            if (!matchesSavedEvent || !dispatch) return
+            dispatch.documentBubbleSeen = true
+            dispatch.eventAtDocumentBubble = describeEvent(event)
+          }
+          const addPropagationProbe = (node: EventTarget | null, nodeLabel: string, capture: boolean) => {
+            if (!node) return
+            const listener = (event: Event) => {
+              if (event !== pageWindow.__TASK7_RETRY_CLICK_EVENT__) return
+              pageWindow.__TASK7_EVENT_PROPAGATION_TRAIL__.push({
+                node: nodeLabel,
+                phase: capture ? 'capture' : 'bubble',
+                event: describeEvent(event as MouseEvent),
+              })
+            }
+            node.addEventListener('click', listener, capture)
+            pageWindow.__TASK7_RETRY_EVENT_LISTENERS__.push({ node, listener, capture })
+          }
+          pageWindow.__TASK7_RETRY_CAPTURE_LISTENER__ = captureListener
+          pageWindow.__TASK7_RETRY_BUBBLE_LISTENER__ = bubbleListener
+          addPropagationProbe(button, 'retry-button', true)
+          addPropagationProbe(button, 'retry-button', false)
+          addPropagationProbe(root, '#root', true)
+          addPropagationProbe(root, '#root', false)
+          document.addEventListener('click', captureListener, true)
+          addPropagationProbe(document, 'document-capture', true)
+          document.addEventListener('click', bubbleListener)
+          addPropagationProbe(document, 'document-bubble', false)
+          return {
+            alertFound: Boolean(alert),
+            buttonFound: Boolean(button),
+            buttonConnected: button?.isConnected ?? false,
+            buttonDisabled: (button as HTMLButtonElement | null)?.disabled ?? null,
+            buttonReact: button ? describeElement(button) : null,
+            rootReact: document.getElementById('root') ? describeElement(document.getElementById('root')!) : null,
+            reactOnClickWrapped,
+            reactOnClickPatchError,
+            perfAuditAtListenerInstall: readPerfAuditState(),
+          }
+        })
+        const collectRetryUiAfterClick = () => mobile.page.evaluate(() => {
+          const pageWindow = window as any
+          const alerts = Array.from(document.querySelectorAll('[role="alert"]'))
+            .map((alert) => ({ label: alert.getAttribute('aria-label'), text: alert.textContent?.trim() ?? '' }))
+          const retryAlert = document.querySelector('[role="alert"][aria-label="The conversation could not be refreshed."]')
+          const button = retryAlert?.querySelector('button')
+          const clickEvent = pageWindow.__TASK7_RETRY_CLICK_EVENT__ as MouseEvent | null
+          const clickDispatch = pageWindow.__TASK7_RETRY_CLICK_DISPATCH__ ?? null
+          const eventAfterDispatch = clickEvent ? {
+            bubbles: clickEvent.bubbles,
+            cancelable: clickEvent.cancelable,
+            composed: clickEvent.composed,
+            cancelBubble: clickEvent.cancelBubble,
+            defaultPrevented: clickEvent.defaultPrevented,
+            eventPhase: clickEvent.eventPhase,
+          } : null
+          const documentCaptureEvents = [...(pageWindow.__TASK7_DOCUMENT_CAPTURE_EVENTS__ ?? [])]
+          const documentBubbleEvents = [...(pageWindow.__TASK7_DOCUMENT_BUBBLE_EVENTS__ ?? [])]
+          const propagationTrail = [...(pageWindow.__TASK7_EVENT_PROPAGATION_TRAIL__ ?? [])]
+          const eventMethodCalls = [...(pageWindow.__TASK7_EVENT_METHOD_CALLS__ ?? [])]
+          const onClickEntries = [...(pageWindow.__TASK7_RETRY_ONCLICK_ENTRIES__ ?? [])]
+          const auditBridgeAtRead = (() => {
+            const snapshot = pageWindow.__FRESHELL_TEST_HARNESS__?.getPerfAuditSnapshot?.() ?? null
+            const events = snapshot?.perfEvents ?? []
+            const latest = events.at(-1) as Record<string, unknown> | undefined
+            return {
+              snapshotAvailable: snapshot !== null,
+              perfEventCount: events.length,
+              latestEvent: latest
+                ? { event: latest.event, stage: latest.stage, trigger: latest.trigger, refreshSerial: latest.refreshSerial }
+                : null,
+            }
+          })()
+          const propPatch = pageWindow.__TASK7_RETRY_REACT_PROP_PATCH__
+          let reactOnClickRestored = false
+          const cleanupErrors: string[] = []
+          try {
+            if (propPatch?.buttonProps?.onClick === propPatch.wrappedOnClick) {
+              propPatch.buttonProps.onClick = propPatch.originalOnClick
+              reactOnClickRestored = propPatch.buttonProps.onClick === propPatch.originalOnClick
+            }
+          } catch (error) {
+            cleanupErrors.push(error instanceof Error ? error.message : String(error))
+          }
+          const methodRestorers = pageWindow.__TASK7_RETRY_EVENT_METHOD_RESTORERS__ ?? []
+          for (const restorer of methodRestorers) {
+            try {
+              if (restorer.originalDescriptor) {
+                Object.defineProperty(restorer.event, restorer.method, restorer.originalDescriptor)
+              } else {
+                delete restorer.event[restorer.method]
+              }
+            } catch (error) {
+              cleanupErrors.push(error instanceof Error ? error.message : String(error))
+            }
+          }
+          const captureListener = pageWindow.__TASK7_RETRY_CAPTURE_LISTENER__
+          const bubbleListener = pageWindow.__TASK7_RETRY_BUBBLE_LISTENER__
+          if (typeof captureListener === 'function') {
+            document.removeEventListener('click', captureListener, true)
+          }
+          if (typeof bubbleListener === 'function') document.removeEventListener('click', bubbleListener)
+          for (const registration of pageWindow.__TASK7_RETRY_EVENT_LISTENERS__ ?? []) {
+            try {
+              registration.node.removeEventListener('click', registration.listener, registration.capture)
+            } catch (error) {
+              cleanupErrors.push(error instanceof Error ? error.message : String(error))
+            }
+          }
+          pageWindow.__TASK7_RETRY_CAPTURE_LISTENER__ = null
+          pageWindow.__TASK7_RETRY_BUBBLE_LISTENER__ = null
+          pageWindow.__TASK7_RETRY_CLICK_EVENT__ = null
+          return {
+            clickDispatch,
+            eventAfterDispatch,
+            documentCaptureEvents,
+            documentBubbleEvents,
+            propagationTrail,
+            eventMethodCalls,
+            onClickEntries,
+            auditBridgeAtRead,
+            reactOnClickRestored,
+            cleanupErrors,
+            activeTabId: pageWindow.__FRESHELL_TEST_HARNESS__?.getState()?.tabs?.activeTabId ?? null,
+            retryAlertPresent: Boolean(retryAlert),
+            retryAlertText: retryAlert?.textContent?.trim() ?? null,
+            retryButtonVisible: Boolean(button && button.getClientRects().length > 0),
+            retryButtonEnabled: Boolean(button && !(button as HTMLButtonElement).disabled),
+            alerts,
+          }
+        })
+        let retryUiAfterClick: Awaited<ReturnType<typeof collectRetryUiAfterClick>> | null = null
+        let retryClickFailure: unknown = null
+        try {
+          await retryButton.tap()
+        } catch (error) {
+          retryClickFailure = error
+        } finally {
+          try {
+            retryUiAfterClick = await collectRetryUiAfterClick()
+          } catch (error) {
+            retryClickFailure ??= error
+          }
+        }
+        if (retryClickFailure) {
+          throw new Error(`Retry click/cleanup failed: ${String(retryClickFailure)}; aftermath=${JSON.stringify(retryUiAfterClick)}`)
+        }
+        if (!retryUiAfterClick) throw new Error('Retry click aftermath snapshot was not captured')
+        const immediatePostClick = await snapshotDiagnostics()
+        const postClickAudit = immediatePostClick.audit.slice(auditCountBeforeClick)
+        const retryClickAudit = [...postClickAudit].reverse()
+          .find((event) => event.stage === 'reveal_retry_clicked')
+        const retryRefreshRequestAudit = [...postClickAudit].reverse()
+          .find((event) => event.stage === 'refresh_requested' && event.trigger === 'reveal'
+            && typeof event.refreshSerial === 'number'
+            && event.refreshSerial > Number(retryClickAudit?.attemptRequestId))
+        const suppressedAudit = [...postClickAudit].reverse()
+          .find((event) => event.stage === 'reveal_refresh_suppressed')
+        console.info(JSON.stringify({
+          event: 'task7_browser_refresh_post_click',
+          mode,
+          retryUiBeforeClick,
+          retryClickProbe,
+          retryUiAfterClick,
+          requestsBeforeRetry,
+          requestsImmediatelyAfterClick: immediatePostClick.requests,
+          auditCountBeforeClick,
+          postClickAudit,
+          browserErrors: mobileBrowserErrors,
+          browserErrorsAfterClick: mobileBrowserErrors.slice(browserErrorCountBeforeClick),
+          retryClickAudit,
+          retryRefreshRequestAudit,
+          suppressedAudit,
+        }))
+        mobile.page.off('pageerror', onMobilePageError)
+        mobile.page.off('console', onMobileConsoleError)
+        expect(retryClickAudit, `Retry handler audit: ${JSON.stringify(immediatePostClick)}`).toBeDefined()
+        expect(retryClickAudit).toMatchObject({
+          tabId: mobile.tabId,
+          paneId: mobile.paneId,
+          activeTabId: mobile.tabId,
+          activePaneId: mobile.paneId,
+          isActivePane: true,
+          hidden: false,
+          dirty: true,
+          errorVisible: true,
+          attemptState: 'timed-out',
+        })
+        expect(retryRefreshRequestAudit, `Retry request audit: ${JSON.stringify(immediatePostClick)}`).toBeDefined()
+        try {
+          await expect.poll(() => mobileSnapshotRequests, {
+            timeout: 25_000,
+            message: 'Retry issues a new real snapshot request after click-handler execution',
+          }).toBeGreaterThan(requestsBeforeRetry)
+        } catch (error) {
+          throw new Error(`${String(error)}\nPost-click diagnostics: ${JSON.stringify(await snapshotDiagnostics())}`)
+        }
+        await expect.poll(() => mobileSnapshotResponses.length, {
+          timeout: 25_000,
+          message: 'Retry receives a snapshot response',
+        }).toBeGreaterThan(responsesBeforeRetry)
+        await expect.poll(async () => (await snapshotDiagnostics()).audit
+          .filter((event) => event.stage === 'reveal_refresh_evaluated').length, {
+          timeout: 25_000,
+          message: 'Retry response is evaluated against the current revision and freshness requirements',
+        }).toBeGreaterThan(evaluationsBeforeRetry)
+        const retryDiagnostics = await snapshotDiagnostics()
+        const retryEvaluation = [...retryDiagnostics.audit].reverse().find((event) => event.stage === 'reveal_refresh_evaluated'
+          && event.trigger === 'reveal' && event.refreshSerial === retryRefreshRequestAudit?.refreshSerial)
+        const retryResponse = retryDiagnostics.responses.slice(responsesBeforeRetry)
+          .find((response) => response.trigger === 'reveal')
+        console.info(JSON.stringify({
+          event: 'task7_browser_refresh_retry_diagnostic',
+          mode,
+          requestsBeforeRetry,
+          requestsAfterRetry: retryDiagnostics.requests,
+          response: retryResponse,
+          evaluation: retryEvaluation,
+        }))
+        await expect(refreshFailure, `Retry response diagnostics: ${JSON.stringify(retryDiagnostics)}`)
+          .toHaveCount(0, { timeout: 25_000 })
+        expect(retryEvaluation).toMatchObject({
+          trigger: 'reveal',
+          requestSource: 'native',
+          dirty: true,
+          revealRefreshIsCurrent: true,
+          revealRevisionIsFresh: true,
+        })
+        expect(retryResponse).toMatchObject({ status: 200 })
+        expect(typeof retryResponse?.revision).toBe('number')
+        expect(retryResponse?.revision as number).toBeGreaterThan(snapshotBeforeHeldTurn.revision)
+        expect(retryEvaluation?.snapshotRevision).toBe(retryResponse?.revision)
+        expect(retryEvaluation?.dirtyBaseRevision).toBe(snapshotBeforeHeldTurn.revision)
+        await expect(mobile.page.getByTestId('fresh-agent-stale-transcript')).toHaveCount(0)
+        await waitForPaneStatus(desktop, /^running$/)
+        expect(await desktop.harness.getConnectionStatus()).toBe('ready')
+        expect(await desktop.harness.getLastReadyAt()).toBe(desktopReadyAt)
+        expect(native.bootCount(session.sessionId)).toBe(1)
+
+        // Complete the older held response only after the current retry has
+        // settled. Its request belongs to the timed-out attempt and cannot
+        // replace the successful retry's verified transcript.
+        heldSnapshot.release()
+        await heldSnapshot.finished
+        await expect(refreshFailure).toHaveCount(0)
+        await expect(mobile.page.getByTestId('fresh-agent-stale-transcript')).toHaveCount(0)
+      } finally {
+        heldSnapshot.release()
+        await native.releaseTurn().catch(() => {})
+      }
+    }, { perfAudit: true }))
   }
 
   for (const mode of MODES) {

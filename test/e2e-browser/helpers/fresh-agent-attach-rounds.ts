@@ -27,6 +27,8 @@ export type FreshAgentAttachRound = {
   bootId?: string
   reconcileId?: string
   targetVerdict?: string
+  recoveryJoinFence?: OwnerFence
+  recoveryJoinCommittedOwnerFrames?: Array<{ frameIndex: number; fence: OwnerFence }>
   respawnCreateRequestId?: string
   respawnNullBootstrapFrameIndex?: number
   respawnCreatedFrameIndex?: number
@@ -227,7 +229,10 @@ function validTargetReconcileVerdict(
   const targetPaneKey = target.tabId + ':' + target.paneId
   if (pending.targetPaneKey !== targetPaneKey) return null
   const verdict = verdicts.find((candidate) => isRow(candidate) && candidate.paneKey === targetPaneKey)
-  if (!isRow(verdict) || !isPositiveVerdict(verdict.verdict)) return null
+  if (!isRow(verdict)) return null
+  if (verdict.verdict === 'error' && verdict.reason === 'recovery_in_progress'
+    && matchesSessionIdentity(verdict, target)) return 'recovery_in_progress'
+  if (!isPositiveVerdict(verdict.verdict)) return null
   // A missing attach identity is skipped by the actual fresh-agent fold; a
   // corrected foreign identity authorizes that conversation, not this target.
   if (verdict.verdict !== 'fresh' && !matchesSessionIdentity(verdict, target)) return null
@@ -261,6 +266,7 @@ export function analyzeFreshAgentAttachRounds(
   let startingOwner: OwnerFence | null = null
   let liveUpgradeFence: OwnerFence | null = null
   let currentFreshAgentOwnerFence: OwnerFence | null = null
+  let currentHandoffStartedOwnerFence: OwnerFence | null = null
 
   const makeRound = (round: Omit<
     MutableRound,
@@ -323,6 +329,7 @@ export function analyzeFreshAgentAttachRounds(
       startingOwner = null
       liveUpgradeFence = null
       currentFreshAgentOwnerFence = null
+      currentHandoffStartedOwnerFence = null
       const bootId = nonEmptyString(frame.bootId)
       const serverInstanceId = nonEmptyString(frame.serverInstanceId)
       if (!bootId || !serverInstanceId) {
@@ -340,6 +347,13 @@ export function analyzeFreshAgentAttachRounds(
         && owner.state !== 'stopping')
       currentFreshAgentOwnerFence = matchingReadyOwners.length === 1
         ? ownerFence(matchingReadyOwners[0])
+        : null
+      const recoveringReadyOwners = readyOwners.filter((owner) => owner.provider === target.provider
+        && owner.sessionId === target.sessionId
+        && owner.ownerKind === 'fresh-agent'
+        && (owner.state === 'starting' || owner.state === 'handoff' || owner.state === 'stopping'))
+      currentHandoffStartedOwnerFence = recoveringReadyOwners.length === 1
+        ? ownerFence(recoveringReadyOwners[0])
         : null
       nextRoundNumber += 1
       startRound({
@@ -359,6 +373,23 @@ export function analyzeFreshAgentAttachRounds(
       currentFreshAgentOwnerFence = frame.transition === 'handoff-committed'
         && frame.ownerKind === 'fresh-agent'
         && fence
+        && frame.fenced !== true
+        ? fence
+        : null
+      if (frame.transition === 'handoff-committed'
+        && currentRound.kind === 'reconcile'
+        && currentRound.targetVerdict === 'recovery_in_progress'
+        && currentRound.recoveryJoinFence
+        && fence
+        && fence.epoch === currentRound.recoveryJoinFence.epoch
+        && fence.generation === currentRound.recoveryJoinFence.generation
+        && frame.ownerKind === 'fresh-agent'
+        && frame.fenced !== true
+        && nonEmptyString(frame.operationId)) {
+        currentRound.recoveryJoinCommittedOwnerFrames?.push({ frameIndex, fence })
+      }
+      currentHandoffStartedOwnerFence = frame.transition === 'handoff-started'
+        && frame.ownerKind === 'fresh-agent'
         && frame.fenced !== true
         ? fence
         : null
@@ -462,12 +493,19 @@ export function analyzeFreshAgentAttachRounds(
         rollbackPendingRound(pending)
         continue
       }
+      const recoveryJoinFence = verdict === 'recovery_in_progress' ? currentHandoffStartedOwnerFence : null
+      if (verdict === 'recovery_in_progress' && !recoveryJoinFence) {
+        rollbackPendingRound(pending)
+        continue
+      }
       const provisionalId = pending.round.id
       nextRoundNumber += 1
       const id = 'reconcile:' + nextRoundNumber + ':' + reconcileId
       pending.round.id = id
       pending.round.authorizationFrameIndex = frameIndex
       pending.round.targetVerdict = verdict
+      if (recoveryJoinFence) pending.round.recoveryJoinFence = recoveryJoinFence
+      if (verdict === 'recovery_in_progress') pending.round.recoveryJoinCommittedOwnerFrames = []
       for (const attachment of pending.round.attachments) attachment.roundId = id
       if (verdict === 'respawn') {
         pending.round.respawnCreateRequestId = pending.targetCreateRequestId
@@ -652,11 +690,13 @@ export function analyzeFreshAgentAttachRounds(
 }
 
 /**
- * Check the authoritative action for one positive reconcile result. An
- * `attach` verdict must produce exactly one current-fence attach. A `respawn`
- * verdict completes either through the exact pane create acknowledgment plus
- * a current committed owner, or through one exact target attach sent after a
- * matching current owner commits in that same reconcile round.
+ * Check the authoritative action for one reconcile recovery result. An
+ * `attach` verdict needs exactly one current-fence attach. A
+ * `recovery_in_progress` verdict needs its matching handoff-started fence,
+ * one attach under that fence, and the matching commit afterward. A
+ * `respawn` verdict completes through the exact pane create acknowledgment
+ * plus a current committed owner, or through one exact target attach sent
+ * after a matching current owner commits in that same reconcile round.
  */
 export function hasAuthoritativeFreshAgentRecoveryAction(
   round: FreshAgentAttachRound,
@@ -670,6 +710,19 @@ export function hasAuthoritativeFreshAgentRecoveryAction(
       && attachment.observedEpoch === expectedFence.epoch
       && attachment.observedGeneration === expectedFence.generation)
     return authoritativeAttaches.length === 1
+  }
+  if (round.targetVerdict === 'recovery_in_progress') {
+    const joinFence = round.recoveryJoinFence
+    if (!joinFence || !sameFence(joinFence, expectedFence)) return false
+    const authoritativeAttaches = round.attachments.filter((attachment) =>
+      !attachment.retryAfterSessionReserved
+      && !attachment.retryAfterRestoreUnavailable
+      && attachment.observedEpoch === expectedFence.epoch
+      && attachment.observedGeneration === expectedFence.generation)
+    if (authoritativeAttaches.length !== 1) return false
+    const attachFrameIndex = authoritativeAttaches[0].frameIndex
+    return round.recoveryJoinCommittedOwnerFrames?.some((owner) =>
+      owner.frameIndex > attachFrameIndex && sameFence(owner.fence, expectedFence)) ?? false
   }
   if (round.targetVerdict !== 'respawn') return false
   const matchingOwnerFrames = round.respawnCommittedOwnerFrames?.filter((owner) =>

@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
@@ -8,6 +8,7 @@ import freshAgentReducer, { applyRuntimeOwner } from '@/store/freshAgentSlice'
 import tabsReducer from '@/store/tabsSlice'
 import connectionReducer, { setBootId, setStatus } from '@/store/connectionSlice'
 import { FreshAgentView } from '@/components/fresh-agent/FreshAgentView'
+import { ApiError } from '@/lib/api'
 import { getRebindQueue, resetRebindQueueForTests } from '@/lib/rebind-queue'
 import { resetSnapshotSchedulerForTests } from '@/lib/fresh-agent-snapshot-scheduler'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
@@ -380,6 +381,7 @@ describe('FreshAgentView hidden-pane rebind (F8)', () => {
     const { rerender } = renderView({ paneContent, hidden: true })
 
     await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
     emitWsMessage({
       type: 'freshAgent.event',
       sessionId: SESS_3,
@@ -398,6 +400,140 @@ describe('FreshAgentView hidden-pane rebind (F8)', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(500) })
     expect(screen.getByText('recovered transcript')).toBeInTheDocument()
     expect(screen.queryByTestId('fresh-agent-stale-transcript')).not.toBeInTheDocument()
+  })
+
+  it('times out a hung visible refresh with saved content and Retry, then ignores the late old response', async () => {
+    let releaseOldRequest!: (value: ReturnType<typeof snapshotWithText>) => void
+    const oldRequest = new Promise<ReturnType<typeof snapshotWithText>>((resolve) => { releaseOldRequest = resolve })
+    let oldRequestSettled = false
+    void oldRequest.then(() => { oldRequestSettled = true })
+    apiMock.getFreshAgentThreadSnapshot
+      .mockResolvedValueOnce(snapshotWithText('saved transcript', 5))
+      .mockImplementationOnce(() => oldRequest)
+      .mockResolvedValueOnce(snapshotWithText('recovered transcript', 6))
+    const paneContent = { ...basePaneContent, sessionId: SESS_1, status: 'idle' as const }
+    const { rerender } = renderView({ paneContent, hidden: true })
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+    emitWsMessage({
+      type: 'freshAgent.event',
+      sessionId: SESS_1,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      event: { type: 'freshAgent.session.changed', sessionId: SESS_1 },
+    })
+    rerenderView(rerender, { paneContent, hidden: false })
+    expect(screen.getByRole('status', { name: 'Refreshing conversation' })).toBeInTheDocument()
+    await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+    expect(apiMock.getFreshAgentThreadSnapshot.mock.results[1]?.value).toBe(oldRequest)
+    expect(oldRequestSettled).toBe(false)
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(15_000) })
+    const refreshAlert = screen.getByRole('alert', { name: 'The conversation could not be refreshed.' })
+    expect(refreshAlert).toHaveTextContent('Try again.')
+    expect(screen.getByText('saved transcript')).toBeInTheDocument()
+    expect(screen.getByTestId('fresh-agent-stale-transcript')).toHaveAttribute('aria-hidden', 'true')
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(screen.getByRole('status', { name: 'Refreshing conversation' })).toBeInTheDocument()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500)
+      for (let index = 0; index < 5; index++) await Promise.resolve()
+    })
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(3)
+    expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[2][3]).toMatchObject({ trigger: 'reveal' })
+    expect(screen.getByText('recovered transcript')).toBeInTheDocument()
+    expect(screen.queryByTestId('fresh-agent-stale-transcript')).not.toBeInTheDocument()
+
+    await act(async () => {
+      releaseOldRequest(snapshotWithText('late old transcript', 7))
+      for (let index = 0; index < 5; index++) await Promise.resolve()
+    })
+    expect(screen.getByText('recovered transcript')).toBeInTheDocument()
+    expect(screen.queryByText('late old transcript')).not.toBeInTheDocument()
+  })
+
+  it('keeps the timeout and Retry surface when a response arrives before the shared scheduler deadline', async () => {
+    let releaseLateResponse!: (value: ReturnType<typeof snapshotWithText>) => void
+    const lateResponse = new Promise<ReturnType<typeof snapshotWithText>>((resolve) => { releaseLateResponse = resolve })
+    apiMock.getFreshAgentThreadSnapshot
+      .mockResolvedValueOnce(snapshotWithText('saved transcript', 5))
+      .mockImplementationOnce(() => lateResponse)
+      .mockResolvedValueOnce(snapshotWithText('retried transcript', 7))
+    const paneContent = { ...basePaneContent, sessionId: SESS_1, status: 'idle' as const }
+    const { rerender } = renderView({ paneContent, hidden: true })
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+    emitWsMessage({
+      type: 'freshAgent.event',
+      sessionId: SESS_1,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      event: { type: 'freshAgent.session.changed', sessionId: SESS_1 },
+    })
+    rerenderView(rerender, { paneContent, hidden: false })
+    await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+    expect(screen.getByRole('status', { name: 'Refreshing conversation' })).toBeInTheDocument()
+    const schedulerSignal = apiMock.getFreshAgentThreadSnapshot.mock.calls[1]?.[3]?.signal as AbortSignal | undefined
+    expect(schedulerSignal).toBeDefined()
+
+    // The visible attempt starts its 15s deadline before the 250ms reveal debounce.
+    // This test is already 500ms past reveal start, so 14,600ms reaches 100ms
+    // after its view deadline while staying before the scheduler's own deadline.
+    await act(async () => { await vi.advanceTimersByTimeAsync(14_600) })
+    expect(schedulerSignal?.aborted).toBe(false)
+    expect(screen.getByRole('alert', { name: 'The conversation could not be refreshed.' })).toHaveTextContent('Try again.')
+    await act(async () => {
+      releaseLateResponse(snapshotWithText('late timed-out transcript', 6))
+      for (let index = 0; index < 5; index++) await Promise.resolve()
+    })
+
+    expect(screen.getByText('saved transcript')).toBeInTheDocument()
+    expect(screen.queryByText('late timed-out transcript')).not.toBeInTheDocument()
+    expect(screen.getByRole('alert', { name: 'The conversation could not be refreshed.' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500)
+      for (let index = 0; index < 5; index++) await Promise.resolve()
+    })
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(3)
+    expect(screen.getByText('retried transcript')).toBeInTheDocument()
+    expect(screen.queryByRole('alert', { name: 'The conversation could not be refreshed.' })).not.toBeInTheDocument()
+  })
+
+  it('keeps a timed-out reveal visible instead of restarting after a long 429 backoff', async () => {
+    apiMock.getFreshAgentThreadSnapshot
+      .mockResolvedValueOnce(snapshotWithText('saved transcript', 5))
+      .mockRejectedValueOnce(new ApiError(429, 'Too many requests', undefined, 15_050))
+    const paneContent = { ...basePaneContent, sessionId: SESS_1, status: 'idle' as const }
+    const { rerender } = renderView({ paneContent, hidden: true })
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+    emitWsMessage({
+      type: 'freshAgent.event',
+      sessionId: SESS_1,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      event: { type: 'freshAgent.session.changed', sessionId: SESS_1 },
+    })
+    rerenderView(rerender, { paneContent, hidden: false })
+    await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+    expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[1][3]).toMatchObject({ trigger: 'reveal' })
+    expect(screen.getByRole('status', { name: 'Refreshing conversation' })).toBeInTheDocument()
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(15_500) })
+    expect(screen.getByRole('alert', { name: 'The conversation could not be refreshed.' })).toHaveTextContent('Try again.')
+    expect(screen.getByText('saved transcript')).toBeInTheDocument()
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000) })
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+    expect(screen.getByRole('alert', { name: 'The conversation could not be refreshed.' })).toBeInTheDocument()
   })
 
   it('keeps the spinner up when the first reveal snapshot has not caught up yet', async () => {
@@ -492,15 +628,26 @@ describe('FreshAgentView hidden-pane rebind (F8)', () => {
       expect(screen.queryByRole('status', { name: 'Refreshing conversation' })).not.toBeInTheDocument()
       await act(async () => { await vi.advanceTimersByTimeAsync(500) })
 
+      const refreshTriggers = apiMock.getFreshAgentThreadSnapshot.mock.calls
+        .slice(callsBeforeRequest)
+        .map(([, , , options]) => (options as { trigger?: string } | undefined)?.trigger ?? null)
+      expect(refreshTriggers, 'revealing an approval-only change should make one non-blocking surface read')
+        .toEqual(['reveal-surface'])
       expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBe(callsBeforeRequest + 1)
       expect(screen.getByRole('alert', { name: 'Permission request for Bash' })).toBeInTheDocument()
       expect(screen.queryByRole('status', { name: 'Refreshing conversation' })).not.toBeInTheDocument()
       expect(screen.queryByTestId('fresh-agent-stale-transcript')).not.toBeInTheDocument()
+      const callsAfterFirstReveal = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
 
       // The owed refresh is consumed: hiding and revealing again fetches nothing.
       rerenderView(rerender, { paneContent, hidden: true })
       rerenderView(rerender, { paneContent, hidden: false })
       await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+      const repeatedRevealTriggers = apiMock.getFreshAgentThreadSnapshot.mock.calls
+        .slice(callsAfterFirstReveal)
+        .map(([, , , options]) => (options as { trigger?: string } | undefined)?.trigger ?? null)
+      expect(repeatedRevealTriggers, 'the same approval surface refresh must not be re-armed by a later reveal')
+        .toEqual([])
       expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBe(callsBeforeRequest + 1)
     })
 

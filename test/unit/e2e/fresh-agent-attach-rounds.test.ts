@@ -75,6 +75,29 @@ const committedOwner = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 })
 
+const recoveryInProgressResult = (overrides: Record<string, unknown> = {}) => result('reconcile-one', 'error', {
+  verdicts: [{
+    paneKey: `${target.tabId}:${target.paneId}`,
+    verdict: 'error',
+    reason: 'recovery_in_progress',
+    sessionRef: { provider: target.provider, sessionId: target.sessionId },
+  }],
+  ...overrides,
+})
+
+const readyWithRecoveringOwner = (overrides: Record<string, unknown> = {}) => ({
+  ...ready(),
+  runtimeOwners: [{
+    provider: target.provider,
+    sessionId: target.sessionId,
+    epoch: 2,
+    generation: 1,
+    ownerKind: 'fresh-agent',
+    state: 'starting',
+  }],
+  ...overrides,
+})
+
 const snapshotRequest = (requestId = 'snapshot-request', overrides: Record<string, unknown> = {}) => ({
   direction: 'http-request',
   type: 'freshAgent.snapshot.request',
@@ -220,6 +243,68 @@ function analyzeOpenCodeRespawn(options: {
 }
 
 describe('analyzeFreshAgentAttachRounds', () => {
+  it('accepts one recovery-in-progress join only under the current owner fence and its matching commit', () => {
+    const exactJoin = analyzeFreshAgentAttachRounds([
+      readyWithRecoveringOwner(),
+      request(),
+      recoveryInProgressResult(),
+      attach(2, 1),
+      committedOwner(),
+    ], target)
+    const missingFence = analyzeFreshAgentAttachRounds([
+      ready(),
+      request(),
+      recoveryInProgressResult(),
+      attach(2, 1),
+      committedOwner(),
+    ], target)
+    const mismatchedFence = analyzeFreshAgentAttachRounds([
+      readyWithRecoveringOwner({
+        runtimeOwners: [{
+          provider: target.provider,
+          sessionId: target.sessionId,
+          epoch: 2,
+          generation: 2,
+          ownerKind: 'fresh-agent',
+          state: 'starting',
+        }],
+      }),
+      request(),
+      recoveryInProgressResult(),
+      attach(2, 1),
+      committedOwner(),
+    ], target)
+    const missingCommit = analyzeFreshAgentAttachRounds([
+      readyWithRecoveringOwner(),
+      request(),
+      recoveryInProgressResult(),
+      attach(2, 1),
+    ], target)
+    const duplicateAttach = analyzeFreshAgentAttachRounds([
+      readyWithRecoveringOwner(),
+      request(),
+      recoveryInProgressResult(),
+      attach(2, 1),
+      attach(2, 1),
+      committedOwner(),
+    ], target)
+
+    expect(exactJoin.validReconcileRoundIds).toEqual(['reconcile-one'])
+    expect(exactJoin.rounds[1]).toMatchObject({
+      kind: 'reconcile',
+      targetVerdict: 'recovery_in_progress',
+      recoveryJoinFence: { epoch: 2, generation: 1 },
+      attachments: [{ observedEpoch: 2, observedGeneration: 1 }],
+      duplicateAttachments: [],
+    })
+    expect(hasAuthoritativeFreshAgentRecoveryAction(exactJoin.rounds[1], { epoch: 2, generation: 1 })).toBe(true)
+
+    for (const analysis of [missingFence, mismatchedFence, missingCommit, duplicateAttach]) {
+      const round = analysis.rounds.find((candidate) => candidate.targetVerdict === 'recovery_in_progress')
+      expect(Boolean(round && hasAuthoritativeFreshAgentRecoveryAction(round, { epoch: 2, generation: 1 }))).toBe(false)
+    }
+  })
+
   it('accepts an exact respawn create and current committed owner without requiring a later attach', () => {
     const completedRespawn = analyzeFreshAgentAttachRounds([
       ready(),

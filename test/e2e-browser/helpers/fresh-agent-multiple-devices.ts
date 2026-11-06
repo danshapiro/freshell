@@ -214,10 +214,16 @@ async function createFreshAgentPane(page: Page, mode: FreshAgentMultipleDeviceMo
   await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible({ timeout: 15_000 })
 }
 
-async function sendComposerText(page: Page, text: string): Promise<void> {
-  const pane = page.locator('[data-context="fresh-agent"]').last()
-  await pane.getByRole('textbox', { name: 'Chat message input' }).fill(text)
-  await pane.getByRole('button', { name: 'Send', exact: true }).click()
+export async function sendComposerText(device: { page: Page; paneId: string }, text: string): Promise<void> {
+  const pane = device.page.locator(
+    `[data-pane-id="${device.paneId}"] [data-context="fresh-agent"], [data-pane-id="${device.paneId}"][data-context="fresh-agent"]`,
+  ).first()
+  const composer = pane.getByRole('textbox', { name: 'Chat message input' })
+  await expect(composer).toBeEnabled({ timeout: 30_000 })
+  await composer.fill(text)
+  const send = pane.getByRole('button', { name: 'Send', exact: true })
+  await expect(send).toBeEnabled({ timeout: 30_000 })
+  await send.click()
 }
 
 async function newDeviceContext(browser: Browser, mobile: boolean): Promise<BrowserContext> {
@@ -299,9 +305,14 @@ async function openDevicePage(
   frames: JsonRow[],
   createdReplies: CreatedReplyGate,
   attachRequests: AttachRequestGate,
+  options: { perfAudit?: boolean } = {},
 ): Promise<DevicePage> {
   const page = await context.newPage()
-  await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+  const pageUrl = new URL(info.baseUrl)
+  pageUrl.searchParams.set('token', info.token)
+  pageUrl.searchParams.set('e2e', '1')
+  if (options.perfAudit) pageUrl.searchParams.set('perfAudit', '1')
+  await page.goto(pageUrl.toString())
   const machineChooser = page.getByRole('dialog', { name: 'Choose a machine' })
   await page.waitForFunction(() => Boolean(
     document.querySelector('[data-testid="sidebar-session-list"]')
@@ -874,6 +885,7 @@ function nativeFixture(input: {
 async function startTwoDeviceSession(
   browser: Browser,
   mode: FreshAgentMultipleDeviceMode,
+  options: { perfAudit?: boolean } = {},
 ): Promise<FreshAgentMultipleDeviceSession> {
   if (!FRESH_AGENT_MODE.test(mode)) throw new Error(`unsupported Fresh Agent provider mode: ${mode}`)
   const provider = PROVIDER_BY_MODE[mode]
@@ -957,6 +969,7 @@ async function startTwoDeviceSession(
         liveTranscriptPrompts: [
           'stage1 warm session for multiple devices',
           'stage1 shared held prompt',
+          'stage2 bounded refresh held prompt',
           FORK_PARENT_CONTINUATION_PROMPT,
           'stage1 terminate held prompt',
         ],
@@ -1018,10 +1031,10 @@ async function startTwoDeviceSession(
     await installCreatedReplyGate(desktopContext, info, desktopFrames, desktopCreatedReplyGate, desktopAttachRequestGate)
     await installCreatedReplyGate(mobileContext, info, mobileFrames, mobileCreatedReplyGate, mobileAttachRequestGate)
     desktopOpen = await openDevicePage(
-      desktopContext, info, desktopFrames, desktopCreatedReplyGate.gate, desktopAttachRequestGate.gate,
+      desktopContext, info, desktopFrames, desktopCreatedReplyGate.gate, desktopAttachRequestGate.gate, options,
     )
     mobileOpen = await openDevicePage(
-      mobileContext, info, mobileFrames, mobileCreatedReplyGate.gate, mobileAttachRequestGate.gate,
+      mobileContext, info, mobileFrames, mobileCreatedReplyGate.gate, mobileAttachRequestGate.gate, options,
     )
 
     const desktopDeviceId = await desktopOpen.page.evaluate(() => localStorage.getItem('freshell.device-id.v2'))
@@ -1049,7 +1062,7 @@ async function startTwoDeviceSession(
       viewId: desktopViewId,
     }
     await waitForPaneStatus(desktop, /^(connected|idle)$/)
-    await sendComposerText(desktop.page, 'stage1 warm session for multiple devices')
+    await sendComposerText(desktop, 'stage1 warm session for multiple devices')
     await waitForPaneStatus(desktop, 'idle')
     const sessionId = await waitForFreshAgentSessionId(desktop)
     if (mode === 'freshcodex') {
@@ -1139,9 +1152,10 @@ async function startTwoDeviceSession(
 export function withTwoDeviceSession(
   mode: FreshAgentMultipleDeviceMode,
   body: (session: FreshAgentMultipleDeviceSession) => Promise<void>,
+  options: { perfAudit?: boolean } = {},
 ): (fixtures: TestFixtures) => Promise<void> {
   return async ({ browser }) => {
-    const session = await startTwoDeviceSession(browser, mode)
+    const session = await startTwoDeviceSession(browser, mode, options)
     try {
       await body(session)
     } finally {
@@ -1155,4 +1169,54 @@ export async function fetchFreshAgentSnapshot(
   session: FreshAgentMultipleDeviceSession['session'],
 ): Promise<any> {
   return fetchSnapshot(info, session)
+}
+
+export interface HeldFreshAgentSnapshotResponse {
+  fetched: Promise<void>
+  finished: Promise<void>
+  isFetched: () => boolean
+  requestTrigger: () => string | null
+  release: () => void
+}
+
+/** Hold one real server snapshot response before the browser receives it. */
+export async function holdNextFreshAgentSnapshotResponse(
+  page: Page,
+  session: FreshAgentMultipleDeviceSession['session'],
+): Promise<HeldFreshAgentSnapshotResponse> {
+  const expectedPath = `/api/fresh-agent/threads/${encodeURIComponent(session.sessionType)}/${encodeURIComponent(session.provider)}/${encodeURIComponent(session.sessionId)}`
+  let holdNext = true
+  let signalFetched!: () => void
+  let signalFinished!: () => void
+  let releaseResponse!: () => void
+  let didFetch = false
+  let heldTrigger: string | null = null
+  const fetched = new Promise<void>((resolve) => { signalFetched = resolve })
+  const finished = new Promise<void>((resolve) => { signalFinished = resolve })
+  const responseGate = new Promise<void>((resolve) => { releaseResponse = resolve })
+  await page.route('**/api/fresh-agent/threads/**', async (route) => {
+    const request = route.request()
+    const url = new URL(request.url())
+    if (!holdNext || request.method() !== 'GET' || url.pathname !== expectedPath
+      || url.searchParams.get('trigger') !== 'reveal') {
+      await route.continue()
+      return
+    }
+    holdNext = false
+    heldTrigger = url.searchParams.get('trigger')
+    try {
+      const response = await route.fetch()
+      didFetch = true
+      signalFetched()
+      await responseGate
+      try {
+        await route.fulfill({ response })
+      } catch {
+        // The client may have canceled this held request at its own deadline.
+      }
+    } finally {
+      signalFinished()
+    }
+  })
+  return { fetched, finished, isFetched: () => didFetch, requestTrigger: () => heldTrigger, release: releaseResponse }
 }
