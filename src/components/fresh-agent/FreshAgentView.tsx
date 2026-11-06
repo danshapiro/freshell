@@ -725,8 +725,13 @@ function codexPaneRetryIdentity(
   tabId: string,
   paneId: string,
 ): string {
+  // Reconciliation can add an explicit ref for the existing session. That
+  // does not change the retry's source; a different ref still fences it.
+  const sessionRef = pane.sessionRef
+    ? [pane.sessionRef.provider, pane.sessionRef.sessionId]
+    : pane.sessionId ? [pane.provider, pane.sessionId] : null
   return JSON.stringify([
-    tabId, paneId, key, revision, pane.createRequestId, pane.sessionId, pane.sessionRef,
+    tabId, paneId, key, revision, pane.createRequestId, pane.sessionId, sessionRef,
     pane.soulId, pane.soulIntentRevision, pane.incarnationId,
     state.connection.bootId, selectPaneOwnerFence(state, pane), isFreshAgentLifecycleBlocked(pane),
   ])
