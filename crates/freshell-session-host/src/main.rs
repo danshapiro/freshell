@@ -1385,12 +1385,17 @@ async fn dispatch_with_effects(
                             "accepted Codex send lacks its typed native identity receipt",
                         ));
                     }
-                    commit_fresh_native_transition(
-                        state,
-                        &actor,
-                        before.native_session_id.as_deref(),
-                    )
-                    .await?;
+                    if should_commit_fresh_native_transition(
+                        &after.provider,
+                        &dispatch_result.state,
+                    ) {
+                        commit_fresh_native_transition(
+                            state,
+                            &actor,
+                            before.native_session_id.as_deref(),
+                        )
+                        .await?;
+                    }
                     let native_session_id = after.native_session_id.clone();
                     let native_identity = dispatch_result.native_identity.or_else(|| {
                         (after.provider == freshell_runtime_protocol::FreshProvider::Codex)
@@ -3393,6 +3398,18 @@ async fn retained_codex_recovery_source(
     )
 }
 
+fn should_commit_fresh_native_transition(
+    provider: &freshell_runtime_protocol::FreshProvider,
+    command_state: &freshell_runtime_protocol::CommandState,
+) -> bool {
+    *provider == freshell_runtime_protocol::FreshProvider::Codex
+        && matches!(
+            command_state,
+            freshell_runtime_protocol::CommandState::ProviderAcked
+                | freshell_runtime_protocol::CommandState::Completed
+        )
+}
+
 async fn commit_fresh_native_transition(
     state: &HostState,
     actor: &Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>,
@@ -3440,8 +3457,8 @@ async fn commit_fresh_native_transition(
         return Err(refuse());
     }
     if launch.requested_native_session_id.as_deref() == Some(child.as_str()) {
-        // A host can persist this transition before its reply reaches the
-        // supervisor. Receipt-only retries must not advance the launch twice.
+        // The observed root already matches the persisted launch, so this
+        // repeated transition is a no-op.
         return Ok(());
     }
     if matches!(

@@ -14,6 +14,44 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 const ORIGINAL: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const RECOVERED: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
+#[test]
+fn only_accepted_codex_sends_commit_native_root_transitions() {
+    use freshell_runtime_protocol::{CommandState, FreshProvider};
+
+    assert!(super::should_commit_fresh_native_transition(
+        &FreshProvider::Codex,
+        &CommandState::ProviderAcked,
+    ));
+    assert!(super::should_commit_fresh_native_transition(
+        &FreshProvider::Codex,
+        &CommandState::Completed,
+    ));
+    for provider in [FreshProvider::Claude, FreshProvider::Opencode] {
+        for state in [
+            CommandState::ProviderAcked,
+            CommandState::Completed,
+            CommandState::Queued,
+            CommandState::Dispatching,
+            CommandState::Ambiguous,
+        ] {
+            assert!(
+                !super::should_commit_fresh_native_transition(&provider, &state),
+                "{provider:?}/{state:?} must not commit a Codex root transition"
+            );
+        }
+    }
+    for state in [
+        CommandState::Queued,
+        CommandState::Dispatching,
+        CommandState::Ambiguous,
+    ] {
+        assert!(
+            !super::should_commit_fresh_native_transition(&FreshProvider::Codex, &state),
+            "{state:?} Codex sends have not yet been accepted"
+        );
+    }
+}
+
 struct NativeRecoveryTransport {
     evidence: std::sync::Mutex<serde_json::Value>,
     live: AtomicBool,
