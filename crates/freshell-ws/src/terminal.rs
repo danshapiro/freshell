@@ -1219,6 +1219,15 @@ async fn handle_client_text(
     {
         // This message is a receipt-only operation. Older or unnegotiated
         // connections must not turn it into a legacy provider send.
+        if let ClientMessage::FreshAgentSendReconcile(send) = &message {
+            tracing::warn!(
+                event = "freshagent.send_reconcile.unnegotiated",
+                provider = agent_provider_wire(send.provider),
+                session_id = %send.session_id,
+                request_id = ?send.request_id,
+                "receipt-only message ignored because the connection did not negotiate support"
+            );
+        }
         return true;
     }
     // Explicit managed fresh-agent rollout: every fresh-agent operation is
@@ -14038,6 +14047,64 @@ mod pane_reconcile_gate_tests {
             }
             other => panic!("expected a text frame, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn unnegotiated_receipt_reconcile_drop_is_logged_with_request_identity() {
+        let events = crate::invariants::capture::capture();
+        let (mut ws_tx, _client) = loopback_sink_and_client().await;
+        let state = state();
+        let conn_sink: FrameSink = std::sync::Arc::new(|_| {});
+        let (interactive_create_tx, _interactive_create_rx) =
+            mpsc::channel::<interactive_creates::Job>(1);
+        let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
+        let mut host_stats_last_refresh_at = None;
+        let mut conn_identity = ConnectionIdentity::default();
+
+        let keep_open = handle_client_text(
+            r#"{"type":"freshAgent.send.reconcile","provider":"codex","sessionId":"old-route","sessionType":"freshcodex","requestId":"unnegotiated-receipt-7","text":"original input"}"#,
+            &mut ws_tx,
+            &state,
+            701,
+            &conn_sink,
+            false,
+            false,
+            false,
+            false,
+            &interactive_create_tx,
+            &create_cancel_rx,
+            &mut host_stats_last_refresh_at,
+            &mut conn_identity,
+            &mut Default::default(),
+            &None,
+        )
+        .await;
+
+        assert!(keep_open);
+        let hits: Vec<crate::invariants::capture::CapturedEvent> = {
+            let events = events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            events
+                .iter()
+                .filter(|event| {
+                    event.fields.get("event").map(String::as_str)
+                        == Some("freshagent.send_reconcile.unnegotiated")
+                        && event.fields.get("request_id").map(String::as_str)
+                            == Some("Some(\"unnegotiated-receipt-7\")")
+                })
+                .cloned()
+                .collect()
+        };
+        let warning = hits.first().expect("unnegotiated receipt drop is logged");
+        assert_eq!(
+            warning.fields.get("provider").map(String::as_str),
+            Some("codex")
+        );
+        assert_eq!(
+            warning.fields.get("session_id").map(String::as_str),
+            Some("old-route")
+        );
     }
 
     pub(super) fn state() -> WsState {

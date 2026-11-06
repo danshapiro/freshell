@@ -1,5 +1,7 @@
 use super::*;
-use freshell_runtime_protocol::{CommandState, RuntimeError};
+use freshell_runtime_protocol::{
+    CommandState, FreshAgentSendDiagnostic, FreshAgentSendDiagnosticOutcome, RuntimeError,
+};
 
 include!("fresh_agent_send_replay_tests.rs");
 
@@ -139,7 +141,7 @@ async fn receipt_reconcile_bypasses_checkpoint_barrier_and_stale_admission() {
 }
 
 #[tokio::test]
-async fn codex_receipt_reconcile_publishes_correlated_error_without_a_receipt() {
+async fn codex_receipt_reconcile_keeps_old_supervisor_protocol_error_ambiguous() {
     use std::time::Duration;
 
     let root = tempfile::tempdir().unwrap();
@@ -184,9 +186,10 @@ async fn codex_receipt_reconcile_publishes_correlated_error_without_a_receipt() 
             &mut reconcile_stream,
             &AdminReply {
                 request_id: reconcile.request_id,
-                result: Ok(AdminResult::FreshAgentCommand {
-                    state: CommandState::Ambiguous,
-                }),
+                result: Err(RuntimeError::new(
+                    RuntimeErrorCode::InvalidRequest,
+                    "unsupported fresh_agent_send_reconcile command",
+                )),
             },
         )
         .await
@@ -227,6 +230,38 @@ async fn codex_receipt_reconcile_publishes_correlated_error_without_a_receipt() 
         .as_str()
         .unwrap()
         .starts_with("CODEX_DELIVERY_AMBIGUOUS:"));
+}
+
+#[test]
+fn receipt_reconcile_classifier_requires_a_typed_refusal() {
+    use freshell_runtime_client::ClientError;
+
+    let ambiguous =
+        classify_hosted_send_reconcile(AgentProvider::Codex, Ok(CommandState::Ambiguous));
+    assert!(matches!(
+        ambiguous,
+        HostedSendOutcome::Ambiguous(message)
+            if message.starts_with("CODEX_DELIVERY_AMBIGUOUS:")
+    ));
+
+    let refused = classify_hosted_send_reconcile(
+        AgentProvider::Codex,
+        Err(ClientError::Runtime {
+            code: RuntimeErrorCode::HostUnreachable,
+            message: "hosted fresh-agent command failed".into(),
+            diagnostic_code: None,
+            fresh_agent_provider_start_diagnostic: None,
+            fresh_agent_send_diagnostic: Some(FreshAgentSendDiagnostic {
+                outcome: FreshAgentSendDiagnosticOutcome::Refused,
+                message: Some("the journal confirms this request was refused".into()),
+            }),
+        }),
+    );
+    assert!(matches!(
+        refused,
+        HostedSendOutcome::Refused(message)
+            if message == "the journal confirms this request was refused"
+    ));
 }
 
 /// Exercise the real proxy and its runtime client over the control socket.

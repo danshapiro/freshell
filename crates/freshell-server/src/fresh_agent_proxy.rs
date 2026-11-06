@@ -305,7 +305,7 @@ impl HostedFreshAgentProxy {
                         checkpoint_logical_attempt_id,
                     )
                     .await;
-                classify_hosted_send(provider, result)
+                classify_hosted_send_reconcile(provider, result)
             }
             None => HostedSendOutcome::Ambiguous(hosted_send_uncertain_reason(provider)),
         };
@@ -2322,6 +2322,34 @@ fn classify_hosted_send(
             "The hosted session is not ready to receive this message.".into(),
         ),
         Err(_) => HostedSendOutcome::Ambiguous(ambiguous()),
+    }
+}
+
+/// A receipt lookup can claim refusal only when the supervisor returns the
+/// typed journal diagnostic that proves this exact input was refused. Other
+/// errors, including `InvalidRequest` from an older supervisor that does not
+/// understand the lookup command, do not establish whether the original send
+/// reached the provider.
+fn classify_hosted_send_reconcile(
+    provider: AgentProvider,
+    result: Result<CommandState, freshell_runtime_client::ClientError>,
+) -> HostedSendOutcome {
+    use freshell_runtime_client::ClientError;
+    use freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome;
+
+    match result {
+        Ok(CommandState::ProviderAcked | CommandState::Completed) => HostedSendOutcome::Accepted,
+        Err(ClientError::Runtime {
+            fresh_agent_send_diagnostic:
+                Some(freshell_runtime_protocol::FreshAgentSendDiagnostic {
+                    outcome: FreshAgentSendDiagnosticOutcome::Refused,
+                    message,
+                }),
+            ..
+        }) => HostedSendOutcome::Refused(
+            message.unwrap_or_else(|| "The provider did not accept this message.".to_string()),
+        ),
+        _ => HostedSendOutcome::Ambiguous(hosted_send_uncertain_reason(provider)),
     }
 }
 
