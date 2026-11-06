@@ -289,6 +289,10 @@ impl Supervisor {
         for view in self.registry.inventory().await.map_err(map_registry)? {
             latest.insert(view.soul_id.clone(), view);
         }
+        self.retained_codex_observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|soul_id, _| latest.contains_key(soul_id));
         let mut tasks = JoinSet::new();
         let semaphore = Arc::new(Semaphore::new(startup_concurrency_limit()));
         for handle in self
@@ -352,37 +356,31 @@ impl Supervisor {
                     .await
                     .map_err(map_registry)?;
                 let inspection = supervisor.backend.inspect(&handle).await;
-                let lifecycle = supervisor.lifecycle_lock(&view.soul_id).await;
-                // Host Status and its classification share SEND/Compact's
-                // ACK/commit lock; backend inspection must not delay controls.
-                let Ok(lifecycle_guard) = lifecycle.try_lock() else {
-                    return Ok(());
-                };
-                let current = supervisor.registry.recovery_context(view.soul_id.clone())
-                    .await.map_err(map_registry)?;
-                if current.desired_state != DesiredState::Running
-                    || current.intent_revision != view.intent_revision
-                    || current.recovery_state != RecoveryState::Live
-                    || current.prior_handle.incarnation_id() != &view.incarnation_id
-                    || current.prior_handle.incarnation_id() != handle.incarnation_id()
-                    || current.prior_handle.launch_nonce() != handle.launch_nonce()
+                // Backend inspection can outlive the ownership snapshot from
+                // inventory. Re-read it before contacting the host so an
+                // observation of a revoked incarnation cannot authenticate
+                // against that old runtime.
+                let observed = supervisor
+                    .registry
+                    .recovery_context(view.soul_id.clone())
+                    .await
+                    .map_err(map_registry)?;
+                if observed.desired_state != DesiredState::Running
+                    || observed.intent_revision != view.intent_revision
+                    || observed.recovery_state != RecoveryState::Live
+                    || observed.prior_handle.incarnation_id() != &view.incarnation_id
+                    || observed.prior_handle.incarnation_id() != handle.incarnation_id()
+                    || observed.prior_handle.launch_nonce() != handle.launch_nonce()
                 {
                     return Ok(());
                 }
-                let mut retained_source = None;
-                let trigger = match inspection {
-                    Ok(inspection)
-                        if matches!(
-                            inspection.state,
-                            BackendRuntimeState::Missing
-                                | BackendRuntimeState::Exited
-                                | BackendRuntimeState::Dead
-                        ) =>
-                    {
-                        Some(RecoveryTrigger::ProviderExit)
-                    }
+                // Authenticate and query the host before taking the lifecycle
+                // lock. A stalled host must not block SEND or Compact. The
+                // snapshot is revalidated under the lock before it can drive
+                // any registry mutation or recovery decision.
+                let host_observation = match &inspection {
                     Ok(inspection) if inspection.state == BackendRuntimeState::Running => {
-                        match supervisor
+                        Some(match supervisor
                             .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
                             .await
                         {
@@ -394,30 +392,103 @@ impl Supervisor {
                                 )
                                 .await
                             {
-                                Ok(status) if status.exited => {
-                                    let current = supervisor.registry.recovery_context(view.soul_id.clone())
-                                        .await.map_err(map_registry)?;
-                                    if supervisor.retained_codex_host_eligible(&current, &host, &status).await? {
-                                        retained_source = status.fresh_agent_recovery_source.clone();
-                                        None
-                                    } else {
-                                        Some(RecoveryTrigger::ProviderExit)
-                                    }
+                                Ok(status) => Ok((host, status)),
+                                Err(error) => {
+                                    append_event(
+                                        &supervisor.config.lifecycle_log,
+                                        "supervisor.runtime_observer.host_status_failed",
+                                        serde_json::json!({"soulId":view.soul_id,"errorCode":error.code,"message":error.message}),
+                                    );
+                                    Err(RecoveryTrigger::HostUnreachable)
                                 }
-                                Ok(status) if host.is_retained_v1() => {
-                                    match supervisor.verify_retained_terminal_owner_status(&handle, &host, &status).await {
-                                        Ok(()) => None,
+                            },
+                            Err(error) => {
+                                append_event(
+                                    &supervisor.config.lifecycle_log,
+                                    "supervisor.runtime_observer.authenticate_failed",
+                                    serde_json::json!({"soulId":view.soul_id,"errorCode":error.code,"message":error.message}),
+                                );
+                                Err(RecoveryTrigger::HostUnreachable)
+                            }
+                        })
+                    }
+                    _ => None,
+                };
+                let lifecycle = supervisor.lifecycle_lock(&view.soul_id).await;
+                let Ok(lifecycle_guard) = lifecycle.try_lock() else {
+                    return Ok(());
+                };
+                let current = supervisor.registry.recovery_context(view.soul_id.clone())
+                    .await.map_err(map_registry)?;
+                if current.desired_state != DesiredState::Running
+                    || current.intent_revision != view.intent_revision
+                    || current.recovery_state != RecoveryState::Live
+                    || current.prior_handle.incarnation_id() != &view.incarnation_id
+                    || current.prior_handle.incarnation_id() != handle.incarnation_id()
+                    || current.prior_handle.launch_nonce() != handle.launch_nonce()
+                    || current.prior_handle.incarnation_id() != observed.prior_handle.incarnation_id()
+                    || current.prior_handle.launch_nonce() != observed.prior_handle.launch_nonce()
+                    || current.native_identity_launch != observed.native_identity_launch
+                    || current.native_session_id != observed.native_session_id
+                    || current.evidence_revision != observed.evidence_revision
+                    || current.identity_revision != observed.identity_revision
+                    || current.accepted_command_count != observed.accepted_command_count
+                    || current.completed_command_count != observed.completed_command_count
+                    || current.dispatched_command_count != observed.dispatched_command_count
+                {
+                    return Ok(());
+                }
+                let mut retained_source = None;
+                let trigger = match (inspection, host_observation) {
+                    (Ok(inspection), _)
+                        if matches!(
+                            inspection.state,
+                            BackendRuntimeState::Missing
+                                | BackendRuntimeState::Exited
+                                | BackendRuntimeState::Dead
+                        ) =>
+                    {
+                        Some(RecoveryTrigger::ProviderExit)
+                    }
+                    (Ok(inspection), Some(host_observation))
+                        if inspection.state == BackendRuntimeState::Running =>
+                    {
+                        match host_observation {
+                            Ok((host, status)) => {
+                                let retained_owner_valid = if host.is_retained_v1() {
+                                    match supervisor
+                                        .verify_retained_terminal_owner_status(
+                                            &handle, &host, &status,
+                                        )
+                                        .await
+                                    {
+                                        Ok(()) => true,
                                         Err(error) => {
                                             append_event(
                                                 &supervisor.config.lifecycle_log,
                                                 "supervisor.runtime_observer.retained_owner_changed",
                                                 serde_json::json!({"severity":"warning","soulId":view.soul_id,"errorCode":error.code,"message":error.message}),
                                             );
-                                            Some(RecoveryTrigger::HostUnreachable)
+                                            false
                                         }
                                     }
-                                }
-                                Ok(_) => {
+                                } else {
+                                    true
+                                };
+                                if !retained_owner_valid {
+                                    Some(RecoveryTrigger::HostUnreachable)
+                                } else if status.exited {
+                                    if supervisor
+                                        .retained_codex_host_eligible(&current, &host, &status)
+                                        .await?
+                                    {
+                                        retained_source =
+                                            status.fresh_agent_recovery_source.clone();
+                                        None
+                                    } else {
+                                        Some(RecoveryTrigger::ProviderExit)
+                                    }
+                                } else {
                                     if view.provider.as_deref() != Some("shell")
                                         && !matches!(
                                             view.durability_state,
@@ -433,27 +504,12 @@ impl Supervisor {
                                     }
                                     None
                                 }
-                                Err(error) => {
-                                    append_event(
-                                        &supervisor.config.lifecycle_log,
-                                        "supervisor.runtime_observer.host_status_failed",
-                                        serde_json::json!({"soulId":view.soul_id,"errorCode":error.code,"message":error.message}),
-                                    );
-                                    Some(RecoveryTrigger::HostUnreachable)
-                                }
-                            },
-                            Err(error) => {
-                                append_event(
-                                    &supervisor.config.lifecycle_log,
-                                    "supervisor.runtime_observer.authenticate_failed",
-                                    serde_json::json!({"soulId":view.soul_id,"errorCode":error.code,"message":error.message}),
-                                );
-                                Some(RecoveryTrigger::HostUnreachable)
                             }
+                            Err(trigger) => Some(trigger),
                         }
                     }
-                    Ok(_) => None,
-                    Err(error) => {
+                    (Ok(_), _) => None,
+                    (Err(error), _) => {
                         append_event(
                             &supervisor.config.lifecycle_log,
                             "supervisor.runtime_observer.inspect_failed",
@@ -578,7 +634,7 @@ mod tests {
     };
     use rusqlite::{params, Connection};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
-    use tokio::{net::UnixListener, task::JoinHandle};
+    use tokio::{net::UnixListener, sync::Notify, task::JoinHandle};
 
     struct ObserverFixture {
         root: Arc<tempfile::TempDir>,
@@ -588,6 +644,9 @@ mod tests {
         stale_observation: Arc<AtomicBool>,
         probe_unavailable: Arc<AtomicBool>,
         stop_during_probe: Arc<AtomicBool>,
+        hold_status: Arc<AtomicBool>,
+        status_started: Arc<Notify>,
+        release_status: Arc<Notify>,
         peer: JoinHandle<()>,
     }
 
@@ -668,12 +727,18 @@ mod tests {
             let stale_observation = Arc::new(AtomicBool::new(false));
             let probe_unavailable = Arc::new(AtomicBool::new(false));
             let stop_during_probe = Arc::new(AtomicBool::new(false));
+            let hold_status = Arc::new(AtomicBool::new(false));
+            let status_started = Arc::new(Notify::new());
+            let release_status = Arc::new(Notify::new());
             let peer = {
                 let listener = UnixListener::bind(runtime.join("host.sock")).unwrap();
                 let probes = Arc::clone(&probes);
                 let stale_observation = Arc::clone(&stale_observation);
                 let probe_unavailable = Arc::clone(&probe_unavailable);
                 let stop_during_probe = Arc::clone(&stop_during_probe);
+                let hold_status = Arc::clone(&hold_status);
+                let status_started = Arc::clone(&status_started);
+                let release_status = Arc::clone(&release_status);
                 let soul = soul.clone();
                 tokio::spawn(async move {
                     let boot = HostBootId::new();
@@ -706,6 +771,10 @@ mod tests {
                                 })
                             }
                             HostCommand::Status { incarnation_id } => {
+                                if hold_status.swap(false, Ordering::SeqCst) {
+                                    status_started.notify_one();
+                                    release_status.notified().await;
+                                }
                                 assert_eq!(incarnation_id, launch.incarnation_id);
                                 Ok(HostResult::Status { fresh_agent_recovery_source: None,
                                     host_boot_id: boot.clone(), worker_pid: Some(42), worker_launch_count: 1,
@@ -770,6 +839,9 @@ mod tests {
                 stale_observation,
                 probe_unavailable,
                 stop_during_probe,
+                hold_status,
+                status_started,
+                release_status,
                 peer,
             }
         }
@@ -896,5 +968,62 @@ mod tests {
             "a verified read cannot publish after durable Stop"
         );
         assert_ne!(context.durability_state, DurabilityState::ResumeCaptured);
+    }
+
+    #[tokio::test]
+    async fn observer_does_not_hold_lifecycle_lock_while_waiting_for_host_status() {
+        let fixture = ObserverFixture::new(false).await;
+        fixture.hold_status.store(true, Ordering::SeqCst);
+        let supervisor = fixture.supervisor.clone();
+        let observer = tokio::spawn(async move { supervisor.observe_once().await });
+
+        tokio::time::timeout(Duration::from_secs(5), fixture.status_started.notified())
+            .await
+            .expect("observer should reach the held host Status call");
+        let lifecycle = fixture.supervisor.lifecycle_lock(&fixture.soul).await;
+        let lifecycle_lock_available = lifecycle.try_lock().is_ok();
+
+        fixture.release_status.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), observer)
+            .await
+            .expect("observer should settle after host Status is released")
+            .expect("observer task should not panic")
+            .expect("observer pass should succeed");
+        assert!(
+            lifecycle_lock_available,
+            "a slow host Status request must not block SEND/Compact's lifecycle lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn observer_drops_retained_observations_for_deleted_souls() {
+        let fixture = ObserverFixture::new(false).await;
+        let deleted_soul = SoulId::new();
+        let context = fixture.context().await;
+        fixture
+            .supervisor
+            .retained_codex_observations
+            .lock()
+            .unwrap()
+            .insert(
+                deleted_soul.clone(),
+                NativeIdentityObservation {
+                    native_session_id: "deleted-root".into(),
+                    incarnation_id: context.prior_handle.incarnation_id().clone(),
+                    launch_nonce: context.prior_handle.launch_nonce().as_str().into(),
+                    evidence_revision: context.evidence_revision,
+                    source: NativeIdentitySource::CodexAppServer,
+                    evidence_digest: "c".repeat(64),
+                },
+            );
+
+        fixture.observe().await;
+
+        assert!(!fixture
+            .supervisor
+            .retained_codex_observations
+            .lock()
+            .unwrap()
+            .contains_key(&deleted_soul));
     }
 }

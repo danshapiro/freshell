@@ -2816,7 +2816,7 @@ impl Supervisor {
                             .record_codex_dispatch_recovery_identity(source.clone(), identity)
                             .await
                             .map_err(map_registry)?;
-                    } else if update == FreshAgentNativeIdentityUpdate::Transition {
+                    } else {
                         self.registry
                             .record_fresh_agent_dispatch_identity(
                                 soul_id.clone(),
