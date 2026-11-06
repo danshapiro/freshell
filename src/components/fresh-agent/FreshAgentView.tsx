@@ -2309,8 +2309,22 @@ export function FreshAgentView({
       return
     }
     const version = snapshotDirtyVersionRef.current
-    if (!force && revealRefreshVersionRef.current === version) {
-      const attempt = revealRefreshAttemptRef.current
+    const content = paneContentRef.current
+    const currentState = appStore.getState()
+    const identity = JSON.stringify({
+      createRequestId: content.createRequestId,
+      sessionType: content.sessionType,
+      provider: content.provider,
+      threadId: snapshotThreadIdRef.current,
+      soulId: content.soulId ?? null,
+      soulIntentRevision: content.soulIntentRevision ?? null,
+      bootId: currentState.connection.bootId ?? null,
+      ownerFence: selectPaneOwnerFence(currentState, content),
+    })
+    const previousAttempt = revealRefreshAttemptRef.current
+    if (!force && revealRefreshVersionRef.current === version
+      && previousAttempt?.state === 'pending' && previousAttempt.identity === identity) {
+      const attempt = previousAttempt
       recordSnapshotAudit('reveal_refresh_suppressed', () => ({
         reason: 'already-requested',
         force,
@@ -2331,19 +2345,6 @@ export function FreshAgentView({
       return
     }
     revealRefreshVersionRef.current = version
-    const content = paneContentRef.current
-    const currentState = appStore.getState()
-    const identity = JSON.stringify({
-      createRequestId: content.createRequestId,
-      sessionType: content.sessionType,
-      provider: content.provider,
-      threadId: snapshotThreadIdRef.current,
-      soulId: content.soulId ?? null,
-      soulIntentRevision: content.soulIntentRevision ?? null,
-      bootId: currentState.connection.bootId ?? null,
-      ownerFence: selectPaneOwnerFence(currentState, content),
-    })
-    const previousAttempt = revealRefreshAttemptRef.current
     const requestId = String(snapshotRefreshSerialRef.current + 1)
     const nextAttempt = beginRefresh({
       identity,
@@ -4407,7 +4408,11 @@ export function FreshAgentView({
       if (messageBelongsToPane && !hiddenRef.current && transcriptChanged && snapshotDirtyRef.current) {
         requestRevealRefresh(true)
       } else if (messageBelongsToPane && (isSnapshotInvalidatingFreshAgentEvent(message) || unattributedCodexDiagnosticChanged || pendingCodexDiagnosticChanged)) {
-        if (!hiddenRef.current) requestSnapshotRefresh('event')
+        if (!hiddenRef.current) {
+          const revealAttempt = revealRefreshAttemptRef.current
+          if (snapshotDirtyRef.current && revealAttempt?.state === 'pending') requestRevealRefresh(true)
+          else requestSnapshotRefresh('event')
+        }
         else if (eventClass === 'surface' || unattributedCodexDiagnosticChanged || pendingCodexDiagnosticChanged) {
           surfaceRefreshOwedRef.current = true
         }

@@ -251,6 +251,13 @@ describe('analyzeFreshAgentAttachRounds', () => {
       attach(2, 1),
       committedOwner(),
     ], target)
+    const commitBeforeAttach = analyzeFreshAgentAttachRounds([
+      readyWithRecoveringOwner(),
+      request(),
+      recoveryInProgressResult(),
+      committedOwner(),
+      attach(2, 1),
+    ], target)
     const missingFence = analyzeFreshAgentAttachRounds([
       ready(),
       request(),
@@ -288,8 +295,30 @@ describe('analyzeFreshAgentAttachRounds', () => {
       attach(2, 1),
       committedOwner(),
     ], target)
+    const commitBeforeResult = analyzeFreshAgentAttachRounds([
+      readyWithRecoveringOwner(),
+      request(),
+      committedOwner(),
+      recoveryInProgressResult(),
+      attach(2, 1),
+    ], target)
+    const attachBeforeResult = analyzeFreshAgentAttachRounds([
+      readyWithRecoveringOwner(),
+      request(),
+      attach(2, 1),
+      recoveryInProgressResult(),
+      committedOwner(),
+    ], target)
+    const mismatchedCommit = analyzeFreshAgentAttachRounds([
+      readyWithRecoveringOwner(),
+      request(),
+      recoveryInProgressResult(),
+      attach(2, 1),
+      committedOwner({ generation: 2 }),
+    ], target)
 
     expect(exactJoin.validReconcileRoundIds).toEqual(['reconcile-one'])
+    expect(commitBeforeAttach.validReconcileRoundIds).toEqual(['reconcile-one'])
     expect(exactJoin.rounds[1]).toMatchObject({
       kind: 'reconcile',
       targetVerdict: 'recovery_in_progress',
@@ -298,8 +327,17 @@ describe('analyzeFreshAgentAttachRounds', () => {
       duplicateAttachments: [],
     })
     expect(hasAuthoritativeFreshAgentRecoveryAction(exactJoin.rounds[1], { epoch: 2, generation: 1 })).toBe(true)
+    expect(hasAuthoritativeFreshAgentRecoveryAction(commitBeforeAttach.rounds[1], { epoch: 2, generation: 1 })).toBe(true)
 
-    for (const analysis of [missingFence, mismatchedFence, missingCommit, duplicateAttach]) {
+    for (const analysis of [
+      missingFence,
+      mismatchedFence,
+      missingCommit,
+      duplicateAttach,
+      commitBeforeResult,
+      attachBeforeResult,
+      mismatchedCommit,
+    ]) {
       const round = analysis.rounds.find((candidate) => candidate.targetVerdict === 'recovery_in_progress')
       expect(Boolean(round && hasAuthoritativeFreshAgentRecoveryAction(round, { epoch: 2, generation: 1 }))).toBe(false)
     }
