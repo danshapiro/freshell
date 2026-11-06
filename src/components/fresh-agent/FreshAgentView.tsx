@@ -1413,6 +1413,7 @@ export function FreshAgentView({
   const [snapshotRefreshNonce, setSnapshotRefreshNonce] = useState(0)
   const snapshotRefreshTriggerRef = useRef<SnapshotTrigger>('identity')
   const snapshotRequestAuthorityRef = useRef({ next: 0, applied: 0, generation: 0, readOnlySource: false })
+  const snapshotObserversRef = useRef(new Set<AbortController>())
   const snapshotAuditViewRef = useRef<number | null>(null)
   const snapshotAuditInputsRef = useRef<Record<string, unknown> | null>(null)
   // Independent of log levels. Construct diagnostic data only while the opt-in bridge exists.
@@ -2232,8 +2233,11 @@ export function FreshAgentView({
 
   useEffect(() => {
     isMountedRef.current = true
+    const snapshotObservers = snapshotObserversRef.current
     return () => {
       isMountedRef.current = false
+      for (const observer of snapshotObservers) observer.abort()
+      snapshotObservers.clear()
       // Free any slot held by an un-acked create so the shared queue does
       // not wait out the 10s backstop for a pane that no longer exists.
       releasePendingRebind()
@@ -5042,8 +5046,8 @@ export function FreshAgentView({
       }))
     }
     const handleSnapshotError = (error: unknown) => {
-      // AbortError swallow kept as harmless dead armor: scheduler-path
-      // fetches carry no signal (A2), so this can no longer fire.
+      // Shared read deadlines are reported as SnapshotRunTimeoutError; an
+      // independently aborted fetch must not become a session failure.
       if (error instanceof Error && error.name === 'AbortError') return
       if (isStaleSnapshotRequest('error-fold')) return
       // A history refusal must not initiate an attach/resume or clear the
@@ -5217,6 +5221,7 @@ export function FreshAgentView({
       + `:read-generation:${requestReadGeneration}:boot:${requestBootId ?? ''}:owner:${requestOwnerFence?.epoch ?? ''}:${requestOwnerFence?.generation ?? ''}`
     let ran = false
     const observerController = new AbortController()
+    snapshotObserversRef.current.add(observerController)
     auditRequest('request_queued')
     void getSnapshotScheduler().schedule(key, trigger, async (signal) => {
       ran = true
@@ -5243,7 +5248,9 @@ export function FreshAgentView({
       auditRequest('soul_started', () => ({ source: 'fallback' }))
       return getFreshAgentThreadSnapshot(requestSessionType, provider, sessionId, { ...options, soulId: requestPaneSoulId })
     }, { signal: observerController.signal }).then((outcome) => {
+      snapshotObserversRef.current.delete(observerController)
       auditRequest('outcome_received', () => ({ outcome: outcome.status, ran }))
+      if (observerController.signal.aborted) return
       if (isStaleSnapshotRequest('outcome')) return
       if (outcome.status === 'ok') {
         applySnapshot(outcome.value as FreshAgentSnapshot)
@@ -5271,7 +5278,9 @@ export function FreshAgentView({
       if (outcome.status === 'coalesced') return
       handleSnapshotError(outcome.error)
     })
-    return () => observerController.abort()
+    // Effect reruns can leave an older history read eligible to display while
+    // a current live read waits. Keep its observer until settlement or unmount;
+    // the currentness fences above decide whether the response may apply.
     // Identity changes and newer status activity during managed lost recovery
     // load a current snapshot. Ordinary status updates stay outside this effect.
     // This effect dispatches updatePaneContent to persist its resolved resumeSessionId/

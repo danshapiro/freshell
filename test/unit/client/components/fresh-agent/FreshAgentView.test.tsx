@@ -5909,8 +5909,12 @@ describe('FreshAgentView', () => {
       target: { value: 'after materialized' },
     })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
-    expect(sentFreshAgentMessages('freshAgent.send').at(-1)).toMatchObject({
-      sessionId: 'ses_real_materialized_1',
+    await waitFor(() => {
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
+      expect(sentFreshAgentMessages('freshAgent.send').at(-1)).toMatchObject({
+        sessionId: 'ses_real_materialized_1',
+        text: 'after materialized',
+      })
     })
   })
 
@@ -13578,8 +13582,8 @@ describe('FreshAgentView', () => {
     const attachB = attachFor('view-b')
     expect(attachA.requestId).not.toBe(attachB.requestId)
 
-    // Default providers emit SESSION_RESERVED through freshAgent.error without
-    // a retryable flag; the correlated attach result keeps that wire shape.
+    // A correlated reservation without owner authority refreshes only the
+    // requesting pane's verdict; it cannot authorize a blind attach retry.
     act(() => {
       for (const listener of [...freshAgentMessageListeners]) {
         listener({
@@ -13598,7 +13602,11 @@ describe('FreshAgentView', () => {
     await new Promise((resolve) => setTimeout(resolve, 1_050))
     const afterCurrentFailure = sentFreshAgentMessages('freshAgent.attach')
     expect(afterCurrentFailure.filter((message) => message.viewId === 'view-a')).toHaveLength(1)
-    expect(afterCurrentFailure.filter((message) => message.viewId === 'view-b')).toHaveLength(2)
+    expect(afterCurrentFailure.filter((message) => message.viewId === 'view-b')).toHaveLength(1)
+    expect(sentFreshAgentMessages('pane.reconcile.request')).toEqual([
+      expect.objectContaining({ panes: [expect.objectContaining({ paneKey: 'tab-2:pane-b' })] }),
+    ])
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
 
     const newerDecisionCount = afterCurrentFailure.length
     act(() => store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-a' })))
@@ -13622,6 +13630,8 @@ describe('FreshAgentView', () => {
     })
     await new Promise((resolve) => setTimeout(resolve, 1_050))
     expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(newerDecisionCount + 1)
+    expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(1)
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
 
     const currentAttachB = sentFreshAgentMessages('freshAgent.attach').filter((message) => message.viewId === 'view-b').at(-1)!
     act(() => {
@@ -13663,6 +13673,8 @@ describe('FreshAgentView', () => {
     })
     await new Promise((resolve) => setTimeout(resolve, 1_050))
     expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(newerDecisionCount + 1)
+    expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(1)
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
   })
 
   it('refreshes freshopencode on session.changed without reopening the bouncer', async () => {
@@ -16567,7 +16579,8 @@ describe('FreshAgentView', () => {
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: expect.stringMatching(/^freshAgent\.|^pane\.reconcile/) }))
     respondToViewDetach(false)
     fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
-    expect(await screen.findByRole('status')).toHaveTextContent('The view could not be detached.')
+    expect(await within(screen.getByTestId('managed-runtime-recovery-card'))
+      .findByRole('status')).toHaveTextContent('The view could not be detached.')
     expectFreshAgentPaneContentToEqual(store, content)
     expect(screen.getByText('Conversation retained before starting new')).toBeInTheDocument()
     expect(screen.getByText('Close failed: Previous close was not confirmed')).toBeInTheDocument()
@@ -16627,7 +16640,8 @@ describe('FreshAgentView', () => {
       wsMock.send.mockClear()
       respondToViewDetach(false)
       fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
-      expect(await screen.findByRole('status')).toHaveTextContent('The view could not be detached.')
+      expect(await within(screen.getByTestId('managed-runtime-recovery-card'))
+        .findByRole('status')).toHaveTextContent('The view could not be detached.')
       expect(getFreshAgentPaneContent(store)).toMatchObject(retained)
       expect(screen.getByText('Close failed: Previous close was not confirmed')).toBeInTheDocument()
       expect(screen.getByText('Conversation retained before starting new')).toBeInTheDocument()
@@ -16724,6 +16738,9 @@ describe('FreshAgentView', () => {
         .toBe('exited')
       expect(getFreshAgentPaneContent(store).sessionRef?.sessionId).toBe('thread-parent')
     })
+    const endedSummary = screen.getByRole('alert', { name: 'Session ended' })
+    expect(endedSummary).toBeVisible()
+    fireEvent.click(endedSummary)
     expect(screen.getByText(/This session has ended/)).toBeVisible()
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.detach' }))
@@ -17220,11 +17237,17 @@ describe('FreshAgentView', () => {
     })
     expect(screen.queryByText(/failed to parse url/i)).not.toBeInTheDocument()
 
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(2))
+    const currentAttach = sentFreshAgentMessages('freshAgent.attach').at(-1)!
+    expect(currentAttach.requestId).not.toBe(attach.requestId)
+    expect(currentAttach).toMatchObject({ sessionRef: { provider: 'claude', sessionId: durableSessionId } })
+
     const lostMessage = {
       type: 'freshAgent.attach.failed',
       requestId: attach.requestId,
       viewId: attach.viewId,
       sessionId: 'dead-session-id',
+      sessionRef: currentAttach.sessionRef,
       sessionType: 'freshclaude',
       provider: 'claude',
       status: 'failed',
@@ -17234,6 +17257,14 @@ describe('FreshAgentView', () => {
     act(() => {
       handleFreshAgentMessage(store.dispatch, lostMessage)
       onMessage(lostMessage)
+    })
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+    expect(store.getState().freshAgent.sessions['freshclaude:claude:dead-session-id']?.lost).not.toBe(true)
+
+    act(() => {
+      const currentLostMessage = { ...lostMessage, requestId: currentAttach.requestId, viewId: currentAttach.viewId }
+      handleFreshAgentMessage(store.dispatch, currentLostMessage)
+      onMessage(currentLostMessage)
     })
 
     await waitFor(() => {
@@ -18178,10 +18209,10 @@ describe('snapshot scheduler integration (zrrj)', () => {
    * collapses.
    */
   function captureWsBroadcast() {
-    const handlers: Array<(message: unknown) => void> = []
+    const handlers = new Set<(message: unknown) => void>()
     wsMock.onMessage.mockImplementation((handler) => {
-      handlers.push(handler)
-      return () => {}
+      handlers.add(handler)
+      return () => { handlers.delete(handler) }
     })
     return (message: unknown) => {
       act(() => {
@@ -18320,20 +18351,48 @@ describe('snapshot scheduler integration (zrrj)', () => {
     expect(apiMock.getFreshAgentThreadSnapshot).not.toHaveBeenCalled()
   })
 
-  it('scheduler-path fetches carry no abort signal (shared runs must survive one pane unmounting)', async () => {
-    const store = createStore()
-    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(freshopencodeSnapshot('done', 10))
-
-    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: schedulerPaneContent('req-sched-signal') }))
-    render(
-      <Provider store={store}>
+  it('scheduler-path fetches keep their shared read alive when one view unmounts', async () => {
+    vi.useFakeTimers()
+    try {
+      const store = createStore()
+      const broadcast = captureWsBroadcast()
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(freshopencodeSnapshot('before shared refresh', 10))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: schedulerPaneContent('req-sched-a') }))
+      store.dispatch(initLayout({ tabId: 'tab-2', paneId: 'pane-2', content: schedulerPaneContent('req-sched-b') }))
+      const departing = render(<Provider store={store}>
         <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
-      </Provider>,
-    )
-    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
-    // 4th positional arg is the query/options bag ({ revision?, cwd?, signal? }).
-    const options = apiMock.getFreshAgentThreadSnapshot.mock.calls[0][3]
-    expect(options?.signal).toBeUndefined()
+      </Provider>)
+      const surviving = render(<Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-2" paneId="pane-2" />
+      </Provider>)
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+        await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS)
+      })
+      expect(within(departing.container).getByText('before shared refresh')).toBeVisible()
+      expect(within(surviving.container).getByText('before shared refresh')).toBeVisible()
+
+      const sharedRead = createDeferred<unknown>()
+      apiMock.getFreshAgentThreadSnapshot.mockClear().mockReturnValue(sharedRead.promise)
+      broadcast(sessionChanged())
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+      const signal = apiMock.getFreshAgentThreadSnapshot.mock.calls[0][3]?.signal as AbortSignal
+      expect(signal).toBeInstanceOf(AbortSignal)
+
+      departing.unmount()
+      expect(signal.aborted).toBe(false)
+      await act(async () => { sharedRead.resolve(freshopencodeSnapshot('shared refresh completed', 11)) })
+      expect(within(surviving.container).getByText('shared refresh completed')).toBeVisible()
+      expect(departing.container).toBeEmptyDOMElement()
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+      expect(signal.aborted).toBe(false)
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      vi.useRealTimers()
+    }
   })
 })
 
@@ -21833,7 +21892,9 @@ describe('Fresh Agent view switches preserve a shared parent view', () => {
         />
       </Provider>,
     )
-    await screen.findByRole('alert')
+    const stuckSummary = await screen.findByText('Agent appears stuck', { exact: true })
+    expect(stuckSummary).toBeVisible()
+    fireEvent.click(stuckSummary)
     wsMock.send.mockClear()
 
     fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))

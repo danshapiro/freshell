@@ -951,6 +951,9 @@ describe('FreshAgentView obsolete attach authority retry', () => {
       await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS + 20)
     })
 
+    const summary = screen.getByRole('alert', { name: 'Session opened elsewhere' })
+    expect(summary).toBeVisible()
+    fireEvent.click(summary)
     expect(screen.getByRole('alert', { name: 'Session open as a terminal on another device' })).toBeVisible()
     expect(sentOfType('freshAgent.attach')).toHaveLength(1)
     expect(sentOfType('freshAgent.create')).toHaveLength(0)
