@@ -2928,27 +2928,6 @@ impl Supervisor {
             Ok(status) => status,
             Err(_) => return Err(readiness_error),
         };
-        if status.native_readiness_receipt.is_some() {
-            // Retry the durable handoff once while its original ownership
-            // and intent fence are still current.
-            let supervisor = self.clone();
-            let soul_id = soul_id.clone();
-            let prior_handle = before_retry.prior_handle.clone();
-            tokio::spawn(async move {
-                supervisor
-                    .authenticate_current_codex_recovery_host(&soul_id, &prior_handle)
-                    .await
-            })
-            .await
-            .map_err(|_| {
-                RuntimeError::new(
-                    RuntimeErrorCode::RecoveryBlocked,
-                    "Codex readiness receipt reconciliation task did not complete",
-                )
-            })??;
-            return Ok(());
-        }
-
         let current = self
             .registry
             .recovery_context(soul_id.clone())
@@ -2960,30 +2939,53 @@ impl Supervisor {
         {
             return Err(readiness_error);
         }
-        let next_revision = self
-            .registry
-            .rearm_recovery_retry(soul_id.clone(), current.intent_revision)
-            .await
-            .map_err(map_registry)?;
-        crate::service::append_event(
-            &self.config.lifecycle_log,
-            "supervisor.recovery_retry.cancelled",
-            serde_json::json!({
-                "severity":"info",
-                "soulId":soul_id,
-                "incarnationId":current.prior_handle.incarnation_id(),
-                "attemptId":current.recovery_attempt_id,
-                "intentRevision":current.intent_revision,
-                "nextIntentRevision":next_revision,
-                "controlEpoch":self.registry.control_epoch(),
-                "reason":"manual_rearm_after_readiness_failure",
-                "readinessErrorCode":format!("{:?}", readiness_error.code),
-                "nativeReadinessReceiptPending":false,
-            }),
-        );
-        // The scheduled retry now owns the next classification. Report the
-        // failed readiness check instead of entering another recovery path.
-        Err(readiness_error)
+
+        if let Some(receipt) = status.native_readiness_receipt.as_ref() {
+            let pending = receipt.is_valid()
+                && receipt
+                    .source_fence
+                    .is_covered_by(&before_retry.write_fence().native_readiness_fence())
+                && before_retry.native_identity_launch.as_ref() == Some(&receipt.source_launch)
+                && before_retry.native_session_id.as_deref()
+                    == Some(receipt.identity.previous_native_session_id.as_str());
+            let already_committed = receipt.is_valid()
+                && current.native_identity_launch.as_ref() == Some(&receipt.next_launch)
+                && current.native_session_id.as_deref()
+                    == Some(receipt.identity.native_session_id.as_str());
+            if !pending && !already_committed {
+                // A stale or otherwise mismatched receipt cannot be treated as
+                // proof that the provider transition is either pending or
+                // committed. Keep the current fence and let a later retry
+                // reconcile it once ownership can be established.
+                return Err(readiness_error);
+            }
+            if pending {
+                // Retry the durable handoff once while its original ownership
+                // and intent fence are still current.
+                let supervisor = self.clone();
+                let soul_id = soul_id.clone();
+                let prior_handle = before_retry.prior_handle.clone();
+                let task = tokio::spawn(async move {
+                    supervisor
+                        .authenticate_current_codex_recovery_host(&soul_id, &prior_handle)
+                        .await
+                });
+                let _abort_on_drop = AbortTaskOnDrop(task.abort_handle());
+                task.await.map_err(|_| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::RecoveryBlocked,
+                        "Codex readiness receipt reconciliation task did not complete",
+                    )
+                })??;
+                return Ok(());
+            }
+        }
+        // With no pending receipt (or an already-committed receipt), the
+        // ordinary ManualRetry path below can safely advance intent and run
+        // its normal classification. Returning the readiness error here
+        // stranded Blocked souls because rearming alone does not schedule a
+        // retry for the new intent.
+        Ok(())
     }
 
     pub(crate) async fn recover(
@@ -3135,13 +3137,13 @@ impl Supervisor {
         {
             // A successful readiness check can advance registry evidence.
             // Reconcile it before ManualRetry advances user intent.
-            if let Err(readiness_error) = self
+            let readiness_result = self
                 .authenticate_current_codex_recovery_host(
                     &request.soul_id,
                     &before_retry.prior_handle,
                 )
-                .await
-            {
+                .await;
+            if let Err(readiness_error) = readiness_result {
                 Box::pin(self.reconcile_failed_manual_retry_readiness(
                     &request.soul_id,
                     &before_retry,

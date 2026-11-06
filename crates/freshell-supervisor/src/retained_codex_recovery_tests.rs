@@ -388,7 +388,7 @@ impl ControlledCodex {
                                         ),
                                     }
                                 } else if let Some(receipt) =
-                                    readiness_receipt.lock().unwrap().take()
+                                    readiness_receipt.lock().unwrap().clone()
                                 {
                                     exited.store(false, Ordering::SeqCst);
                                     HostResult::FreshAgentCommand {
@@ -1071,12 +1071,24 @@ async fn manual_retry_prepares_retained_codex_before_marking_it_live() {
 }
 
 #[tokio::test]
-async fn manual_retry_rearms_when_readiness_fails_without_a_pending_receipt() {
+async fn manual_retry_classifies_blocked_codex_when_readiness_fails_without_a_pending_receipt() {
     let fixture = ControlledCodex::new().await;
     let before = fixture
         .supervisor
         .registry
         .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    fixture
+        .supervisor
+        .registry
+        .mark_recovery_blocked(
+            fixture.soul.clone(),
+            None,
+            freshell_runtime_protocol::RecoveryBlockReason::RetryBudget,
+            vec!["automatic retry budget exhausted".into()],
+            before.write_fence(),
+        )
         .await
         .unwrap();
     fixture.native_prepare_refuse.store(true, Ordering::SeqCst);
@@ -1089,7 +1101,8 @@ async fn manual_retry_rearms_when_readiness_fails_without_a_pending_receipt() {
             expected_intent_revision: Some(before.intent_revision),
             expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
         })
-        .await;
+        .await
+        .expect("a failed readiness check without a pending receipt must enter normal recovery");
 
     let after = fixture
         .supervisor
@@ -1099,10 +1112,65 @@ async fn manual_retry_rearms_when_readiness_fails_without_a_pending_receipt() {
         .unwrap();
     assert_eq!(after.intent_revision, before.intent_revision + 1);
     assert_eq!(fixture.native_prepares.load(Ordering::SeqCst), 1);
+    assert_eq!(after.recovery_state, RecoveryState::Live, "{result:?}");
+    assert_eq!(result.outcome, RecoveryOutcome::Reattached, "{result:?}");
+    assert_eq!(fixture.recovery_probes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn manual_retry_preserves_fence_when_host_receipt_state_is_unavailable() {
+    let fixture = ControlledCodex::new().await;
+    let before = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    fixture
+        .supervisor
+        .registry
+        .mark_recovery_blocked(
+            fixture.soul.clone(),
+            None,
+            freshell_runtime_protocol::RecoveryBlockReason::RetryBudget,
+            vec!["automatic retry budget exhausted".into()],
+            before.write_fence(),
+        )
+        .await
+        .unwrap();
+    let blocked = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    fixture.peer.abort();
+
+    let result = fixture
+        .supervisor
+        .recover(RecoverRequest {
+            soul_id: fixture.soul.clone(),
+            trigger: RecoveryTrigger::ManualRetry,
+            expected_intent_revision: Some(blocked.intent_revision),
+            expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
+        })
+        .await;
     assert!(
         result.is_err(),
-        "the request should report its failed readiness check after safely rearming"
+        "unknown receipt state must not advance intent"
     );
+
+    let after = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    assert_eq!(after.intent_revision, blocked.intent_revision);
+    assert_eq!(after.recovery_state, RecoveryState::Blocked);
+    assert_eq!(after.recovery_attempt_id, blocked.recovery_attempt_id);
+    assert_eq!(after.native_identity_launch, blocked.native_identity_launch);
+    assert_eq!(after.native_session_id, blocked.native_session_id);
 }
 
 #[tokio::test]
@@ -1137,7 +1205,7 @@ async fn manual_retry_reconciles_pending_readiness_receipt_before_rearming() {
         source.evidence_revision = next_launch.evidence_revision;
     }
     fixture.exited.store(false, Ordering::SeqCst);
-    *fixture.readiness_receipt.lock().unwrap() = Some(receipt);
+    *fixture.readiness_receipt.lock().unwrap() = Some(receipt.clone());
     fixture.native_prepare_refuse.store(true, Ordering::SeqCst);
 
     let result = fixture
@@ -1169,7 +1237,42 @@ async fn manual_retry_reconciles_pending_readiness_receipt_before_rearming() {
         "the receipt's provider launch is committed before ManualRetry changes intent"
     );
     assert_eq!(after.intent_revision, before.intent_revision + 1);
-    assert!(fixture.readiness_receipt.lock().unwrap().is_none());
+    assert_eq!(
+        fixture.readiness_receipt.lock().unwrap().as_ref(),
+        Some(&receipt),
+        "the host keeps the committed receipt in durable status"
+    );
+
+    // A later failed readiness probe sees the same durable receipt after it
+    // has already been committed. Presence alone must not make ManualRetry
+    // try to commit it under the stale source fence.
+    fixture.native_prepare_refuse.store(true, Ordering::SeqCst);
+    let next = fixture
+        .supervisor
+        .recover(RecoverRequest {
+            soul_id: fixture.soul.clone(),
+            trigger: RecoveryTrigger::ManualRetry,
+            expected_intent_revision: Some(after.intent_revision),
+            expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
+        })
+        .await
+        .expect("a previously committed persistent receipt is not pending work");
+    let final_state = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    assert_eq!(next.outcome, RecoveryOutcome::Reattached, "{next:?}");
+    assert_eq!(final_state.intent_revision, after.intent_revision + 1);
+    assert_eq!(
+        final_state.native_session_id.as_deref(),
+        Some("native-readiness-child")
+    );
+    assert_eq!(
+        fixture.readiness_receipt.lock().unwrap().as_ref(),
+        Some(&receipt)
+    );
 }
 
 #[tokio::test]

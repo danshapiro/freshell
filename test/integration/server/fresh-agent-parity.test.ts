@@ -1832,9 +1832,10 @@ tool_timeout_sec = 120
     expect(rig.runtime.isContainerRunning(providerContainerId)).toBe(true)
     const priorHostTraffic = await model.readTraffic()
     retainedModelTraffic = [...retainedModelTraffic, ...priorHostTraffic]
-    // The actor is paused, so a provider-exit observer cannot complete an
-    // in-place readiness change. Retire its exact container before waiting
-    // for the observer, forcing recovery to open a new actor process.
+    // Retire the exact runtime after pausing its host. Depending on whether
+    // the observer sees the backend exit before the host socket failure, the
+    // trigger is provider_exit or host_unreachable; either must recover into
+    // a new actor process and commit its readiness receipt.
     expect(stoppedSessionHostPid).toBeGreaterThan(1)
     rig.runtime.killOwnedRuntimeExact(providerContainerId)
     pausedSessionHost = undefined
@@ -1846,7 +1847,7 @@ tool_timeout_sec = 120
         const trigger = rows.find(row => row.sequence > supervisorSequenceBeforeHostPause
           && row.event === 'supervisor.runtime_observer.recovery_scheduled'
           && row.data?.soulId === beforeCrash.view!.soulId
-          && row.data?.trigger === 'provider_exit')
+          && ['provider_exit', 'host_unreachable'].includes(row.data?.trigger))
         if (!trigger) return undefined
         const settlements = rows.filter(row => row.sequence > trigger.sequence
           && row.data?.soulId === beforeCrash.view!.soulId
@@ -1875,7 +1876,7 @@ tool_timeout_sec = 120
     }
     const coldRecoveryDiagnostic = coldRecoveryDiagnostics()
     rig.runtime.writeIncident('freshcodex-managed-native-cold-recovery-settlement', coldRecoveryDiagnostic)
-    expect(coldRecovery.trigger.data.trigger).toBe('provider_exit')
+    expect(['provider_exit', 'host_unreachable']).toContain(coldRecovery.trigger.data.trigger)
     expect(coldRecovery.settled.event).toBe('supervisor.recovery_retry.settled')
     expect(coldRecovery.settled.data.reason).toBe('recovered')
     expect(coldRecovery.settled.data.incarnationId).not.toBe(beforeCrash.view!.incarnationId)

@@ -2781,16 +2781,14 @@ impl Supervisor {
                         prior_native,
                         native_session_id.as_deref(),
                     )?;
-                    if update == FreshAgentNativeIdentityUpdate::Transition {
-                        self.registry
-                            .record_fresh_agent_dispatch_identity(
-                                soul_id.clone(),
-                                handle.incarnation_id().clone(),
-                                identity,
-                            )
-                            .await
-                            .map_err(map_registry)?;
-                    }
+                    self.registry
+                        .record_fresh_agent_dispatch_identity(
+                            soul_id.clone(),
+                            handle.incarnation_id().clone(),
+                            identity,
+                        )
+                        .await
+                        .map_err(map_registry)?;
                     tracing::info!(soul_id=%soul_id,incarnation_id=%handle.incarnation_id(),previous_native_session_id=prior_native,native_session_id=native_session_id.as_deref(),native_identity_update=?update,"freshagent.native_dispatch_identity_committed");
                 } else if let Some(native_session_id) = native_session_id {
                     self.registry
