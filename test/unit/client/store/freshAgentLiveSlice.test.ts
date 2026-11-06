@@ -15,6 +15,8 @@ import freshAgentLiveReducer, {
   liveTailCleared,
   liveTailViewerAdded,
   liveTailViewerRemoved,
+  nativeProjectionRetired,
+  nativeSourceAnnounced,
   streamOpsApplied,
   transcriptAnnounced,
   transcriptExpectationsDropped,
@@ -80,6 +82,50 @@ describe('freshAgentLive slice (transcript-live D3)', () => {
     store.dispatch(transcriptProjectionSnapshotReceived({ ...codexLocator, snapshot: codexSnapshot(99) }))
     expect(tail(store, codexKey).projection?.needsResnapshot).not.toBe(true)
     expect(tail(store, codexKey).projection?.turns[0].items).toEqual([{ id: 'a', kind: 'text', text: 'Hel' }])
+  })
+
+  it('tracks uncertain coverage without retaining patch bodies until a matching snapshot covers it', () => {
+    const store = createStore()
+    const send = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event', ...codexLocator, event: { sessionId: codexLocator.sessionId, ...event },
+    })
+    send({ type: 'freshAgent.session.init', projectionId: 'p', historyGeneration: 0 })
+    store.dispatch(nativeProjectionRetired({ ...codexLocator, awaitingNativeSessionId: 'native-b' }))
+    store.dispatch(nativeSourceAnnounced({ ...codexLocator, nativeSessionId: 'native-b' }))
+    for (let revision = 3; revision < 100; revision++) send({ type: 'freshAgent.transcript.patch', projectionId: 'p', historyGeneration: 0,
+      ops: [{ op: 'appendItem', nativeTurnId: 't', rowId: 't', itemId: 'a', field: 'text', text: `unverified-${revision}-${'x'.repeat(2048)}`, revision }] })
+    const bufferedState = JSON.stringify(tail(store, codexKey))
+    expect(bufferedState).not.toContain('unverified-')
+    expect(bufferedState.length).toBeLessThan(16 * 1024)
+    const snapshot = (revision: number) => ({ ...codexSnapshot(revision), threadId: 'native-b' })
+    store.dispatch(transcriptProjectionSnapshotReceived({ ...codexLocator,
+      snapshot: { ...snapshot(2), threadId: 'native-a' }, nativeSessionId: 'native-a' }))
+    expect(tail(store, codexKey).projection).toBeUndefined()
+    store.dispatch(transcriptProjectionSnapshotReceived({ ...codexLocator, snapshot: snapshot(2), nativeSessionId: 'native-b' }))
+    expect(tail(store, codexKey).projection).toMatchObject({ needsResnapshot: true, eventRevision: 99 })
+    store.dispatch(transcriptProjectionSnapshotReceived({ ...codexLocator, snapshot: snapshot(99), nativeSessionId: 'native-b' }))
+    expect(tail(store, codexKey).projection?.needsResnapshot).not.toBe(true)
+    expect(tail(store, codexKey).projection?.turns[0].items).toEqual([{ id: 'a', kind: 'text', text: 'Hel' }])
+  })
+
+  it('requires recovery coverage of a newer history generation, even if an older snapshot has a higher revision', () => {
+    const store = createStore()
+    const send = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event', ...codexLocator, event: { sessionId: codexLocator.sessionId, ...event },
+    })
+    send({ type: 'freshAgent.session.init', projectionId: 'p', historyGeneration: 0 })
+    store.dispatch(nativeProjectionRetired({ ...codexLocator, awaitingNativeSessionId: 'native-b' }))
+    store.dispatch(nativeSourceAnnounced({ ...codexLocator, nativeSessionId: 'native-b' }))
+    send({ type: 'freshAgent.transcript.patch', projectionId: 'p', historyGeneration: 1,
+      ops: [{ op: 'appendItem', nativeTurnId: 't', rowId: 't', itemId: 'a', field: 'text', text: 'unverified newer generation', revision: 5 }] })
+    const older = { ...codexSnapshot(100), threadId: 'native-b' }
+    store.dispatch(transcriptProjectionSnapshotReceived({ ...codexLocator, snapshot: older, nativeSessionId: 'native-b' }))
+    expect(tail(store, codexKey).projection).toMatchObject({ historyGeneration: 1, eventRevision: 5, needsResnapshot: true })
+    const current = FreshAgentSnapshotSchema.parse({ ...older, extensions: { codex: { projection: {
+      ...(older.extensions?.codex?.projection as Record<string, unknown>), historyGeneration: 1, eventRevision: 5,
+    } } } })
+    store.dispatch(transcriptProjectionSnapshotReceived({ ...codexLocator, snapshot: current, nativeSessionId: 'native-b' }))
+    expect(tail(store, codexKey).projection?.needsResnapshot).not.toBe(true)
   })
 
   it('host loss preserves a prior failure and freezes completed output as unconfirmed rather than changing it to an interruption', () => {

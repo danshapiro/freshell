@@ -69,7 +69,7 @@ function retireLiveProjection(session: FreshAgentLiveSession, nextNativeSessionI
     if (!sameSource) {
       const retired = session.retiredProjectionIds ??= {}
       retired[session.projection.id] = true
-      if (uncertain) (session.uncertainProjectionIds ??= {})[session.projection.id] = true
+      if (uncertain) (session.uncertainProjectionIds ??= {})[session.projection.id] ??= {}
     }
   }
   if (sameSource) {
@@ -148,6 +148,25 @@ function isCurrentNativeAnnouncement(
   const key = makeFreshAgentSessionKey(locator)
   return Boolean(nativeSessionId && !state.bySession[key]?.awaitingNativeSessionId
     && state.announcedNativeBySession[key] === nativeSessionId)
+}
+
+/** An uncertain ID still cannot render event bodies. Record only the newest
+ * observed coverage for its announced source so a proving snapshot cannot
+ * silently omit an event that arrived while that snapshot was in flight. */
+function observeUncertainProjection(
+  session: FreshAgentLiveSession,
+  patch: FreshAgentTranscriptPatch,
+  nativeSessionId?: string,
+): void {
+  const uncertain = session.uncertainProjectionIds?.[patch.projectionId]
+  if (!uncertain || !nativeSessionId || session.awaitingNativeSessionId || !patch.ops.length) return
+  const revision = patch.ops.reduce((maximum, op) => Math.max(maximum, op.revision), 0)
+  const observed = uncertain.observed
+  if (!observed || observed.nativeSessionId !== nativeSessionId || patch.historyGeneration > observed.historyGeneration) {
+    uncertain.observed = { nativeSessionId, historyGeneration: patch.historyGeneration, revision }
+  } else if (patch.historyGeneration === observed.historyGeneration) {
+    observed.revision = Math.max(observed.revision, revision)
+  }
 }
 
 /** A source-identified snapshot can resolve an unknown projection only after
@@ -295,7 +314,12 @@ const freshAgentLiveSlice = createSlice({
     transcriptPatchApplied(state, action: PayloadAction<FreshAgentSessionLocator & { patch: FreshAgentTranscriptPatch }>) {
       const { patch, ...locator } = action.payload
       const session = sessionFor(state, locator)
-      if (session.retiredProjectionIds?.[patch.projectionId] || session.uncertainProjectionIds?.[patch.projectionId]) return
+      const uncertain = session.uncertainProjectionIds?.[patch.projectionId]
+      if (uncertain) {
+        observeUncertainProjection(session, patch, state.announcedNativeBySession[makeFreshAgentSessionKey(locator)])
+        return
+      }
+      if (session.retiredProjectionIds?.[patch.projectionId]) return
       if (session.projection?.id === patch.projectionId) session.projection = applyFreshAgentTranscriptPatch(session.projection, patch)
       else {
         // Buffer a bounded reconnect race without adopting its source. The
@@ -315,6 +339,8 @@ const freshAgentLiveSlice = createSlice({
       if (!metadata) return
       if (!acceptsTranscriptProjectionSnapshot(state, locator, metadata.id, nativeSessionId)) return
       const session = sessionFor(state, locator)
+      const sameProjection = session.projection?.id === metadata.id
+      const observed = session.uncertainProjectionIds?.[metadata.id]?.observed
       if (retainedSourceKey) {
         const uncertain = session.uncertainRetainedSourceKeys?.[retainedSourceKey]
         if (session.retiredRetainedSourceKeys?.[retainedSourceKey] && !uncertain) return
@@ -345,9 +371,20 @@ const freshAgentLiveSlice = createSlice({
       }
       if (locator.provider === 'codex') {
         if (nativeSessionId) session.projectionNativeSessionId = nativeSessionId
-        else delete session.projectionNativeSessionId
+        else if (!sameProjection) delete session.projectionNativeSessionId
       }
       session.projection = hydrateTranscriptProjection(session.projection, snapshot)
+      // Only the identified matching source can discharge its observed
+      // coverage. Ask for a covering snapshot instead of replaying a body
+      // whose source was not established when it arrived.
+      if (observed && observed.nativeSessionId === nativeSessionId && (observed.historyGeneration > metadata.historyGeneration
+        || observed.historyGeneration === metadata.historyGeneration && observed.revision > metadata.eventRevision)) {
+        if (observed.historyGeneration > session.projection.historyGeneration) {
+          session.projection = bindTranscriptProjection(session.projection, metadata.id, observed.historyGeneration)
+        }
+        session.projection.needsResnapshot = true
+        session.projection.eventRevision = Math.max(session.projection.eventRevision, observed.revision)
+      }
       for (const patch of session.unboundTranscriptPatches ?? []) {
         if (patch.projectionId === metadata.id) session.projection = applyFreshAgentTranscriptPatch(session.projection, patch)
       }

@@ -96,7 +96,10 @@ export type FreshAgentLiveSession = {
   retiredProjectionIds?: Record<string, true>
   /** Unidentified sources are fenced until a current, identified snapshot proves them. */
   uncertainRetainedSourceKeys?: Record<string, true>
-  uncertainProjectionIds?: Record<string, true>
+  uncertainProjectionIds?: Record<string, {
+    /** Coverage observed after an announcement; never stores an unverified body. */
+    observed?: { nativeSessionId: string; historyGeneration: number; revision: number }
+  }>
   projection?: TranscriptProjection
   /** Native source of the shared projection, independently of pane references and connection state. */
   projectionNativeSessionId?: string
