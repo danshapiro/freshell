@@ -1946,7 +1946,7 @@ fn fake_host_with_boot(
     change_boot: bool,
     boot: HostBootId,
 ) -> (Arc<StdMutex<Vec<HostCommand>>>, tokio::task::JoinHandle<()>) {
-    fake_host_with_native_behavior(runtime_dir, change_boot, boot, None, false)
+    fake_host_with_native_behavior(runtime_dir, change_boot, boot, None, false, None)
 }
 
 fn fake_host_with_native_behavior(
@@ -1955,6 +1955,7 @@ fn fake_host_with_native_behavior(
     boot: HostBootId,
     auth_gate: Option<Arc<tokio::sync::Notify>>,
     host_busy: bool,
+    read_events_gate: Option<Arc<tokio::sync::Notify>>,
 ) -> (Arc<StdMutex<Vec<HostCommand>>>, tokio::task::JoinHandle<()>) {
     let secret = b"synthetic-host-secret";
     std::fs::write(runtime_dir.join("secret"), secret).unwrap();
@@ -2019,6 +2020,18 @@ fn fake_host_with_native_behavior(
                                 FreshAgentNativeNameReply::Renamed
                             }
                         }
+                    })
+                }
+                HostCommand::FreshAgentReadEvents { .. } => {
+                    if let Some(gate) = &read_events_gate {
+                        gate.notified().await;
+                    }
+                    HostResult::FreshAgentEvents(AgentEventBatch {
+                        retained_state: None,
+                        retained_from: 1,
+                        head: 0,
+                        reset_required: false,
+                        events: Vec::new(),
                     })
                 }
                 HostCommand::FreshAgentConfigure { .. } => HostResult::FreshAgentCommand {
@@ -2481,42 +2494,68 @@ async fn native_name_lifecycle_contention_is_undispatched_and_fresh_retry_succee
 }
 
 #[tokio::test]
-async fn native_name_transient_lifecycle_admission_preserves_the_current_request() {
+async fn native_name_waits_for_event_poll_lifecycle_lock_and_preserves_the_current_request() {
     let fixture = running_fresh_provider_with_name(FreshProvider::Codex, None, "name-native").await;
     let request = native_name_request(&fixture).await;
-    let (received, host) = fake_host_with_boot(
+    let read_events_gate = Arc::new(tokio::sync::Notify::new());
+    let (received, host) = fake_host_with_native_behavior(
         &fixture.runtime_dir,
         false,
         request.source.host_boot_id.clone(),
+        None,
+        false,
+        Some(read_events_gate.clone()),
     );
-    let lifecycle = fixture.supervisor.lifecycle_lock(&fixture.soul).await;
-    let held = lifecycle.lock().await;
+    let poll_supervisor = fixture.supervisor.clone();
+    let poll_soul = fixture.soul.clone();
+    let poll = tokio::spawn(async move {
+        poll_supervisor
+            .fresh_agent_read_events(poll_soul, 0, 128)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if received
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|command| matches!(command, HostCommand::FreshAgentReadEvents { .. }))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the event poll should reach the fake host and hold lifecycle ownership");
+
     let mut operation = Box::pin(fixture.supervisor.fresh_agent_native_name(request));
     let first_poll = std::future::poll_fn(|cx| {
         std::task::Poll::Ready(std::future::Future::poll(operation.as_mut(), cx))
     })
     .await;
-    let std::task::Poll::Ready(reply) = first_poll else {
-        panic!("lifecycle contention must refuse immediately rather than queue native work");
-    };
-    assert_eq!(
-        reply.unwrap(),
-        FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::LifecycleBusy)
+    assert!(
+        matches!(first_poll, std::task::Poll::Pending),
+        "name sync should wait briefly for the active event read instead of immediately refusing"
     );
     assert!(
-        received.lock().unwrap().is_empty(),
-        "refused admission performs no host/native work"
+        !received
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|command| matches!(command, HostCommand::FreshAgentNativeName { .. })),
+        "name sync must not dispatch before the event read releases lifecycle ownership"
     );
-    drop(operation);
-    drop(held);
-    // Only a new request with freshly observed authority may use the released
-    // lock. The refused future must never resume or spend a native attempt.
-    let fresh = native_name_request(&fixture).await;
-    let reply = fixture
-        .supervisor
-        .fresh_agent_native_name(fresh)
+    read_events_gate.notify_one();
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(2), operation.as_mut())
         .await
-        .unwrap();
+        .expect("name sync should get its fair turn after the event poll")
+        .expect("the native-name supervisor request should succeed");
+    let event_batch = tokio::time::timeout(std::time::Duration::from_secs(2), poll)
+        .await
+        .expect("the event poll should complete after its host reply")
+        .expect("the event poll task should not panic");
+    assert!(event_batch.is_ok());
     host.abort();
     let _ = host.await;
     assert_eq!(reply, FreshAgentNativeNameReply::Renamed);
@@ -2527,7 +2566,8 @@ async fn native_name_transient_lifecycle_admission_preserves_the_current_request
             .iter()
             .filter(|command| matches!(command, HostCommand::FreshAgentNativeName { .. }))
             .count(),
-        1
+        1,
+        "the held event read and one accepted native-name operation are dispatched"
     );
 }
 #[tokio::test]
@@ -2934,24 +2974,20 @@ async fn native_name_queued_stop_cancellation_and_deadline_never_dispatch_late()
             request.source.host_boot_id.clone(),
         );
         let lifecycle = fixture.supervisor.lifecycle_lock(&fixture.soul).await;
-        let held = lifecycle.lock().await;
+        let mut held = Some(lifecycle.lock().await);
         let mut operation = Box::pin(fixture.supervisor.fresh_agent_native_name(request.clone()));
         let first_poll = std::future::poll_fn(|cx| {
             std::task::Poll::Ready(std::future::Future::poll(operation.as_mut(), cx))
         })
         .await;
-        let std::task::Poll::Ready(reply) = first_poll else {
-            panic!("{case}: lifecycle contention must not leave a queued request");
-        };
-        assert_eq!(
-            reply.unwrap(),
-            FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::LifecycleBusy)
+        assert!(
+            matches!(first_poll, std::task::Poll::Pending),
+            "{case}: bounded lifecycle admission should wait while the lock is held"
         );
         assert!(
             received.lock().unwrap().is_empty(),
-            "{case}: typed refusal must precede every host/native operation"
+            "{case}: a queued admission must not dispatch before acquiring the lock"
         );
-        drop(operation);
         match case {
             "stop" => {
                 fixture
@@ -2960,39 +2996,47 @@ async fn native_name_queued_stop_cancellation_and_deadline_never_dispatch_late()
                     .begin_stop_expected(fixture.soul.clone(), None)
                     .await
                     .unwrap();
+                drop(held.take());
+                match operation.await {
+                    Err(error) => assert_eq!(error.code, RuntimeErrorCode::UnknownSoul),
+                    Ok(FreshAgentNativeNameReply::Failed(
+                        FreshAgentNativeNameError::Unavailable { .. },
+                    )) => {}
+                    other => {
+                        panic!("stop must invalidate queued name work before dispatch: {other:?}")
+                    }
+                }
             }
             "deadline" => {
-                // Even after the refused request's old deadline and lock
-                // release, no detached queue entry may survive its caller.
+                // A queued request whose deadline expires must settle without
+                // native dispatch and without retaining a detached lock waiter.
                 tokio::time::pause();
                 tokio::time::advance(std::time::Duration::from_millis(5_001)).await;
+                assert!(matches!(
+                    operation.await.unwrap(),
+                    FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Timeout { .. })
+                ));
                 tokio::time::resume();
+                drop(held.take());
             }
             "epoch" => {
+                drop(operation);
                 request.expected_control_epoch =
                     Some(fixture.supervisor.registry.control_epoch() + 1)
             }
-            "cancel" => {}
+            "cancel" => {
+                drop(operation);
+            }
             _ => unreachable!(),
         }
-        drop(held);
-        if matches!(case, "stop" | "epoch") {
+        if case == "epoch" {
+            drop(held.take());
             // A fresh attempt must reject the stopped source or stale epoch
             // before authenticating, rather than revive the old refusal.
             let reply = fixture.supervisor.fresh_agent_native_name(request).await;
-            if case == "epoch" {
-                assert_eq!(reply.unwrap_err().code, RuntimeErrorCode::StaleControlEpoch);
-            } else {
-                assert!(
-                    reply.is_err()
-                        || matches!(
-                            reply.unwrap(),
-                            FreshAgentNativeNameReply::Failed(
-                                FreshAgentNativeNameError::Unavailable { .. }
-                            )
-                        )
-                );
-            }
+            assert_eq!(reply.unwrap_err().code, RuntimeErrorCode::StaleControlEpoch);
+        } else if matches!(case, "cancel") {
+            drop(held.take());
         }
         tokio::task::yield_now().await;
         assert!(
@@ -3020,6 +3064,7 @@ async fn native_name_rechecks_stop_and_deadline_after_delayed_authentication() {
             request.source.host_boot_id.clone(),
             Some(gate.clone()),
             false,
+            None,
         );
         let mut operation = Box::pin(fixture.supervisor.fresh_agent_native_name(request));
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -3088,6 +3133,7 @@ async fn native_name_host_reply_cannot_forge_undispatched_admission_proof() {
         request.source.host_boot_id.clone(),
         None,
         true,
+        None,
     );
     assert!(matches!(
         fixture

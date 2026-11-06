@@ -8,6 +8,7 @@ const nativeNameOperations = new Set(['probe', 'read', 'write', 'confirm_read'])
 const nativeWriteStatuses = new Set(['pending', 'synced', 'unsynced', 'unsupported'])
 const nativeUnsyncedReasons = new Map<string, string>([
   ['native name synchronization stopped after repeated lifecycle lock contention', 'lifecycle_busy_exhausted'],
+  ['native name synchronization is waiting to retry after repeated lifecycle lock contention', 'lifecycle_busy_cooldown'],
   ['the native target holds no title at the attempted location', 'native_title_missing'],
   ['divergent native title at the attempted location', 'native_title_diverged'],
   ['native route changed; the previous title confirmation is no longer current', 'route_changed'],
@@ -29,7 +30,7 @@ export type NativeSyncDiagnosticSample = {
 }
 
 export type NativeNameWorkerEvent = {
-  event: 'deferred' | 'exhausted' | 'stale'
+  event: 'deferred' | 'exhausted' | 'cooldown_scheduled' | 'stale'
   atMs?: number
   severity?: 'trace' | 'debug' | 'info' | 'warn' | 'warning' | 'error'
   revision?: number
@@ -225,6 +226,7 @@ export function summarizeNativeNameWorkerLogs(output: string | readonly string[]
   const eventNames = new Map<string, NativeNameWorkerEvent['event']>([
     ['session_names.native_cycle_deferred', 'deferred'],
     ['session_names.native_cycle_deferrals_exhausted', 'exhausted'],
+    ['session_names.native_cycle_cooldown_scheduled', 'cooldown_scheduled'],
     ['session_names.native_cycle_deferral_stale', 'stale'],
   ])
   const records = tail.split('\n').flatMap(line => {

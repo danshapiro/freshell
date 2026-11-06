@@ -40,6 +40,8 @@ use tokio::{
     time::{sleep, Duration, Instant},
 };
 
+const NATIVE_NAME_LIFECYCLE_LOCK_WAIT: Duration = Duration::from_millis(250);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FreshNativeAdmission {
     Live,
@@ -4358,15 +4360,27 @@ impl Supervisor {
                 })
             };
             let lifecycle_lock = self.lifecycle_lock(&request.soul_id).await;
-            // Metadata discovery must not queue behind lifecycle work and then
-            // dispatch after the name worker's existing request budget expired.
-            let Ok(_guard) = lifecycle_lock.try_lock() else {
+            // Event reads also use this lock and can arrive every 50 ms. A
+            // short FIFO wait lets metadata work take its turn between reads
+            // without allowing it to queue ahead of SEND or Stop indefinitely.
+            let lock_wait_started = Instant::now();
+            let Ok(_guard) =
+                tokio::time::timeout(NATIVE_NAME_LIFECYCLE_LOCK_WAIT, lifecycle_lock.lock()).await
+            else {
+                if Instant::now() >= deadline {
+                    return Ok(FreshAgentNativeNameReply::Failed(
+                        FreshAgentNativeNameError::Timeout {
+                            timeout_ms: BUDGET_MS,
+                        },
+                    ));
+                }
                 append_event(
                     &self.config.lifecycle_log,
                     "freshagent.native_name_refused",
                     serde_json::json!({
                         "severity":"info",
                         "reason":"lifecycle_busy",
+                        "waitedMs":lock_wait_started.elapsed().as_millis(),
                         "soulId":request.soul_id,
                         "nativeSessionId":request.source.native_session_id,
                         "operation":match &request.operation {

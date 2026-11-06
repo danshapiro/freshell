@@ -68,8 +68,8 @@ describe('native-name timeout diagnostics', () => {
         [JSON.stringify(['session', 'codex', id])]: {
           status: 'unsynced', desiredRevision: 7, desiredName: 'private saved title',
           seriesEpoch: 7, cyclesConsumed: 1, readsConsumed: 0, lifecycleBusyDeferrals: 6,
-          settled: true, nextDue: null, confirmationPendingReceipt: null,
-          unsyncedReason: 'native name synchronization stopped after repeated lifecycle lock contention',
+          settled: false, nextDue: 1_799_999_999_999, confirmationPendingReceipt: null,
+          unsyncedReason: 'native name synchronization is waiting to retry after repeated lifecycle lock contention',
           attemptedLocation: { cwd: '/private/workspace' }, receiptId: 'private-receipt',
         },
       },
@@ -86,10 +86,10 @@ describe('native-name timeout diagnostics', () => {
       cyclesConsumed: 1,
       readsConsumed: 0,
       lifecycleBusyDeferrals: 6,
-      settled: true,
-      retryScheduled: false,
+      settled: false,
+      retryScheduled: true,
       confirmationPending: false,
-      reasonCategory: 'lifecycle_busy_exhausted',
+      reasonCategory: 'lifecycle_busy_cooldown',
     })
     expect(JSON.stringify(summary)).not.toContain(id)
     expect(JSON.stringify(summary)).not.toContain('private saved title')
@@ -193,6 +193,9 @@ describe('native-name timeout diagnostics', () => {
       JSON.stringify({ level: 'WARN', msg: 'session_names.native_cycle_deferrals_exhausted', revision: 7,
         series_epoch: 2, location_revision: 3, cycle: 1, operation: 'write', deferral_count: 6,
         name_ref: 'private-ref', error: 'private provider text' }),
+      JSON.stringify({ level: 'WARN', msg: 'session_names.native_cycle_cooldown_scheduled', revision: 8,
+        series_epoch: 3, location_revision: 4, cycle: 2, operation: 'probe', deferral_count: 6,
+        retry_in_ms: 60_000, name_ref: 'private-ref', error: 'private provider text' }),
     ].join('\n')
 
     const summary = summarizeNativeNameWorkerLogs(rows)
@@ -202,6 +205,8 @@ describe('native-name timeout diagnostics', () => {
         refundedCycle: true, refundedRead: false },
       { event: 'exhausted', severity: 'warn', revision: 7, seriesEpoch: 2, locationRevision: 3,
         cycle: 1, operation: 'write', deferralCount: 6 },
+      { event: 'cooldown_scheduled', severity: 'warn', revision: 8, seriesEpoch: 3, locationRevision: 4,
+        cycle: 2, operation: 'probe', deferralCount: 6, retryInMs: 60_000 },
     ])
     expect(JSON.stringify(summary)).not.toContain('private-ref')
     expect(JSON.stringify(summary)).not.toContain('private provider text')
@@ -214,7 +219,7 @@ describe('native-name timeout diagnostics', () => {
       operation: 'write', error: 'private historical payload',
     }))
     const recentRows = Array.from({ length: 40 }, (_, index) => JSON.stringify({
-      level: 'WARN', msg: 'session_names.native_cycle_deferrals_exhausted', revision: 100 + index,
+      level: 'WARN', msg: 'session_names.native_cycle_cooldown_scheduled', revision: 100 + index,
       operation: 'read', name_ref: 'private-ref',
     }))
     const chunks = [...oldSecretRows, ...recentRows]
@@ -223,7 +228,7 @@ describe('native-name timeout diagnostics', () => {
 
     expect(summary.lineCount).toBeLessThan(chunks.length)
     expect(summary.records).toHaveLength(32)
-    expect(summary.records[0]).toEqual({ event: 'exhausted', severity: 'warn', revision: 108, operation: 'read' })
+    expect(summary.records[0]).toEqual({ event: 'cooldown_scheduled', severity: 'warn', revision: 108, operation: 'read' })
     expect(summary.records.at(-1)?.revision).toBe(139)
     expect(JSON.stringify(summary)).not.toContain('private historical payload')
     expect(JSON.stringify(summary)).not.toContain('private-ref')
