@@ -5043,7 +5043,6 @@ mod sessions_sweep_tests {
             session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
             reconcile_deferral_budget_ms:
                 freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-            fresh_agent_respawn_counts: Default::default(),
             ownership: None,
         };
         (ws_state, identity, broadcast_rx)

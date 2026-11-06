@@ -550,7 +550,6 @@ async fn spawn_antigravity_server_with_probe(
         activity: Some(activity_hub.clone()),
         session_existence: probe,
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-        fresh_agent_respawn_counts: Default::default(),
         ownership: None,
     };
 
