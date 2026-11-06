@@ -63,8 +63,8 @@ try {
     throw error
   }
   const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'))
-  if (report.numTotalTests !== 2 || report.numPassedTests !== 2 || report.numFailedTests !== 0 || report.numPendingTests !== 0) {
-    throw new Error(`controlled client contract did not pass exactly two tests: ${JSON.stringify({
+  if (report.numTotalTests !== 4 || report.numPassedTests !== 4 || report.numFailedTests !== 0 || report.numPendingTests !== 0) {
+    throw new Error(`controlled client contract did not pass exactly four tests: ${JSON.stringify({
       total: report.numTotalTests, passed: report.numPassedTests, failed: report.numFailedTests, pending: report.numPendingTests,
     })}`)
   }
@@ -74,6 +74,13 @@ try {
     throw new Error('controlled client request identity evidence is incomplete')
   }
   for (const identity of identities) process.stdout.write(`${JSON.stringify({ severity: 'info', event: 'controlled_codex_host_request', ...identity })}\n`)
+  const attaches = fs.readFileSync(path.join(temporary, 'attach-identities.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+  if (attaches.length !== 2 || new Set(attaches.map((row) => row.publicId)).size !== 2
+    || attaches.some((row) => row.publicId !== row.requestSessionId || row.frameCount < 5
+      || row.firstType !== 'freshAgent.session.materialized')) {
+    throw new Error('controlled unchanged attach evidence is incomplete')
+  }
+  for (const attach of attaches) process.stdout.write(`${JSON.stringify({ severity: 'info', event: 'controlled_codex_host_attach', ...attach })}\n`)
   process.stdout.write(`${JSON.stringify({ severity: 'info', event: 'controlled_codex_host_contract_passed', tests: report.numPassedTests })}\n`)
 } finally {
   fs.rmSync(temporary, { recursive: true, force: true })

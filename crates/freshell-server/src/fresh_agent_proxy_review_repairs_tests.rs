@@ -405,6 +405,353 @@ async fn collect_until(
 }
 
 #[tokio::test]
+async fn unchanged_codex_attach_announces_before_output() {
+    let mut failures = Vec::new();
+    for public in ["managed-public", "native-b"] {
+        for empty in [false, true] {
+            for targeted_replay in [false, true] {
+                for with_reference in [false, true] {
+                    let mut batch = journal_batch();
+                    batch.accepted_native_dispatch = None;
+                    batch.events[0].event = status("native-b", "current-status");
+                    if empty {
+                        batch.events.clear();
+                        batch.head = 0;
+                    }
+                    let mut fixture = JournalFixture::new("native-b", public, batch).await;
+                    let scenario = std::panic::AssertUnwindSafe(async {
+                        let command = || {
+                            let mut value = serde_json::json!({
+                                "provider":"codex", "sessionType":"freshcodex", "sessionId":public
+                            });
+                            if with_reference {
+                                value["sessionRef"] =
+                                    serde_json::json!({"provider":"codex", "sessionId":"native-b"});
+                            }
+                            HostedFreshAgentCommand::Attach(serde_json::from_value(value).unwrap())
+                        };
+                        if targeted_replay {
+                            fixture.proxy.clone().handle(command()).await;
+                            assert!(fixture.proxy.pollers.lock().await.contains(&fixture.soul));
+                            if !empty {
+                                let mut first = Vec::new();
+                                assert!(
+                                    collect_until(&mut fixture.frames, &mut first, |frames| frames
+                                        .iter()
+                                        .any(|frame| frame["event"]["status"] == "current-status"))
+                                    .await,
+                                    "first attach did not receive its journal: {first:?}"
+                                );
+                            }
+                            while fixture.frames.try_recv().is_ok() {}
+                        }
+                        fixture.proxy.clone().handle(command()).await;
+                        assert!(fixture.proxy.pollers.lock().await.contains(&fixture.soul));
+                        let mut frames = Vec::new();
+                        if empty {
+                            while let Ok(frame) = fixture.frames.try_recv() {
+                                frames.push(
+                                    serde_json::from_str::<serde_json::Value>(&frame).unwrap(),
+                                );
+                            }
+                        } else {
+                            assert!(
+                                collect_until(&mut fixture.frames, &mut frames, |frames| frames
+                                    .iter()
+                                    .any(|frame| frame["event"]["status"] == "current-status"))
+                                .await,
+                                "attach did not receive its journal: {frames:?}"
+                            );
+                        }
+                        let announced = frames.iter().position(|frame| {
+                            frame["type"] == "freshAgent.session.materialized"
+                                && frame["previousSessionId"] == public
+                                && frame["sessionId"] == public
+                                && frame["sessionRef"]["provider"] == "codex"
+                                && frame["sessionRef"]["sessionId"] == "native-b"
+                        });
+                        let output = frames
+                            .iter()
+                            .position(|frame| frame["event"]["status"] == "current-status");
+                        if announced.is_none()
+                            || (!empty && !announced.zip(output).is_some_and(|(a, b)| a < b))
+                        {
+                            failures.push((public, empty, targeted_replay, with_reference, frames));
+                        }
+                    })
+                    .catch_unwind()
+                    .await;
+                    fixture.shutdown().await;
+                    if let Err(panic) = scenario {
+                        std::panic::resume_unwind(panic);
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "successful unchanged attaches must announce their source before replay: {failures:?}"
+    );
+}
+
+#[tokio::test]
+async fn unchanged_codex_attach_client_frames() {
+    let request = std::env::var("FRESHELL_TEST_CONTROLLED_ATTACH").unwrap_or_else(|_| serde_json::json!({
+        "type":"freshAgent.attach", "provider":"codex", "sessionType":"freshcodex", "sessionId":"managed-public",
+        "sessionRef":{"provider":"codex", "sessionId":"native-b"}
+    }).to_string());
+    let request: freshell_protocol::FreshAgentAttach = serde_json::from_str(&request).unwrap();
+    assert_eq!(request.provider, AgentProvider::Codex);
+    assert_eq!(request.session_type, SessionType::Freshcodex);
+    assert!(matches!(
+        request.session_id.as_str(),
+        "managed-public" | "native-b"
+    ));
+    assert_eq!(
+        request
+            .session_ref
+            .as_ref()
+            .map(|reference| reference.session_id.as_str()),
+        Some("native-b")
+    );
+    let public = request.session_id.clone();
+    let provider_event = |event: serde_json::Value| AgentEvent::Provider {
+        payload: serde_json::json!({
+            "type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex", "sessionId":"native-b", "event":event
+        }),
+    };
+    let mut batch = journal_batch();
+    batch.accepted_native_dispatch = None;
+    batch.head = 4;
+    batch.events = vec![
+        AgentJournalEvent {
+            sequence: 1,
+            event: status("native-b", "running"),
+        },
+        AgentJournalEvent {
+            sequence: 2,
+            event: provider_event(serde_json::json!({
+                "type":"freshAgent.session.init", "sessionId":"native-b", "projectionId":"current-projection", "historyGeneration":0
+            })),
+        },
+        AgentJournalEvent {
+            sequence: 3,
+            event: provider_event(serde_json::json!({
+                "type":"freshAgent.transcript.patch", "sessionId":"native-b", "projectionId":"current-projection", "historyGeneration":0,
+                "ops":[{"op":"resetTurn", "nativeTurnId":"turn", "revision":1, "turns":[{"id":"turn", "turnId":"turn",
+                    "role":"assistant", "summary":"", "items":[{"id":"answer", "kind":"text", "text":"Current gateway answer"}]}]}]
+            })),
+        },
+        AgentJournalEvent {
+            sequence: 4,
+            event: AgentEvent::PermissionRequested {
+                decision_id: "current-control".into(),
+                payload: serde_json::json!({"type":"freshAgent.permission.request", "sessionId":"native-b", "requestId":"current-control",
+                "tool":{"name":"current-tool"}}),
+            },
+        },
+    ];
+    let mut fixture = JournalFixture::new("native-b", &public, batch).await;
+    let scenario =
+        std::panic::AssertUnwindSafe(async {
+            fixture
+                .proxy
+                .clone()
+                .handle(HostedFreshAgentCommand::Attach(request))
+                .await;
+            let mut frames = Vec::new();
+            assert!(
+                collect_until(&mut fixture.frames, &mut frames, |frames| frames
+                    .iter()
+                    .any(|frame| frame["event"]["requestId"] == "current-control"))
+                .await,
+                "the attach must replay the current control: {frames:?}"
+            );
+            for event_type in [
+                "freshAgent.status",
+                "freshAgent.session.init",
+                "freshAgent.transcript.patch",
+                "freshAgent.permission.request",
+            ] {
+                assert!(
+                    frames.iter().any(|frame| frame["sessionId"] == public
+                        && frame["event"]["type"] == event_type),
+                    "the attach must replay {event_type}: {frames:?}"
+                );
+            }
+            println!(
+                "FRESHELL_UNCHANGED_CODEX_ATTACH_FRAMES={}",
+                serde_json::to_string(&frames).unwrap()
+            );
+        })
+        .catch_unwind()
+        .await;
+    fixture.shutdown().await;
+    if let Err(panic) = scenario {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn unchanged_codex_attach_fences_captured_old_delivery() {
+    let mut batch = journal_batch();
+    batch.accepted_native_dispatch = None;
+    batch.events.clear();
+    batch.head = 0;
+    let mut fixture = JournalFixture::new("native-a", "managed-public", batch).await;
+    let scenario = std::panic::AssertUnwindSafe(async {
+        let mut route = PresentationRoute::initial("managed-public");
+        route.known_native = Some("native-a".into());
+        route.materialized = true;
+        fixture
+            .proxy
+            .presentation_routes
+            .lock()
+            .await
+            .insert(fixture.soul.clone(), route);
+        let old_source = fixture.proxy.current_source(&fixture.soul).await.unwrap();
+        let old_generation = fixture.proxy.route_generation(&fixture.soul).await;
+        fixture.state.lock().unwrap().native = "native-b".into();
+        fixture
+            .proxy
+            .clone()
+            .handle(attach("managed-public", "codex", "native-b"))
+            .await;
+        let mut frames = Vec::new();
+        while let Ok(frame) = fixture.frames.try_recv() {
+            frames.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
+        }
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame["type"] == "freshAgent.session.materialized"
+                    && frame["sessionRef"]["sessionId"] == "native-b"),
+            "validated B must be announced: {frames:?}"
+        );
+        let old_delivery = PolledDelivery {
+            soul: &fixture.soul,
+            route_generation: old_generation,
+            provider: "codex",
+            fallback_presentation_id: "managed-public",
+            session_type: "freshcodex",
+            attention_since: Some(0),
+            source: Some(&old_source),
+            native_dispatch_in_flight: false,
+            force_materialization: false,
+            replay_session_id: Some("managed-public"),
+        };
+        assert!(
+            !fixture
+                .proxy
+                .deliver_polled_event(status("native-a", "old-status"), &old_delivery)
+                .await
+        );
+        assert!(
+            fixture.frames.try_recv().is_err(),
+            "captured old delivery must not follow B"
+        );
+    })
+    .catch_unwind()
+    .await;
+    fixture.shutdown().await;
+    if let Err(panic) = scenario {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn unchanged_codex_attach_fences_old_delivery_after_unannounced_current_event() {
+    let mut batch = journal_batch();
+    batch.accepted_native_dispatch = None;
+    batch.events.clear();
+    batch.head = 0;
+    let mut fixture = JournalFixture::new("native-a", "managed-public", batch).await;
+    let scenario = std::panic::AssertUnwindSafe(async {
+        let mut route = PresentationRoute::initial("managed-public");
+        route.known_native = Some("native-a".into());
+        route
+            .announced_native
+            .insert("managed-public".into(), "native-a".into());
+        route.materialized = true;
+        fixture
+            .proxy
+            .presentation_routes
+            .lock()
+            .await
+            .insert(fixture.soul.clone(), route);
+        let old_source = fixture.proxy.current_source(&fixture.soul).await.unwrap();
+        let generation = fixture.proxy.route_generation(&fixture.soul).await;
+        fixture.state.lock().unwrap().native = "native-b".into();
+        let new_source = fixture.proxy.current_source(&fixture.soul).await.unwrap();
+        let old_delivery = PolledDelivery {
+            soul: &fixture.soul,
+            route_generation: generation,
+            provider: "codex",
+            fallback_presentation_id: "managed-public",
+            session_type: "freshcodex",
+            attention_since: Some(0),
+            source: Some(&old_source),
+            native_dispatch_in_flight: false,
+            force_materialization: false,
+            replay_session_id: Some("managed-public"),
+        };
+        let current_delivery = PolledDelivery {
+            source: Some(&new_source),
+            ..old_delivery
+        };
+        assert!(
+            fixture
+                .proxy
+                .deliver_polled_event(status("native-b", "early-current"), &current_delivery)
+                .await
+        );
+        let earlier: serde_json::Value =
+            serde_json::from_str(&fixture.frames.try_recv().unwrap()).unwrap();
+        assert_eq!(earlier["event"]["status"], "early-current");
+        assert_eq!(
+            fixture.proxy.route_generation(&fixture.soul).await,
+            generation
+        );
+        assert_eq!(
+            fixture.proxy.presentation_routes.lock().await[&fixture.soul]
+                .known_native
+                .as_deref(),
+            Some("native-b")
+        );
+
+        fixture
+            .proxy
+            .clone()
+            .handle(attach("managed-public", "codex", "native-b"))
+            .await;
+        let announcement: serde_json::Value = serde_json::from_str(
+            &fixture
+                .frames
+                .try_recv()
+                .expect("the validated attach must announce B before returning"),
+        )
+        .unwrap();
+        assert_eq!(announcement["type"], "freshAgent.session.materialized");
+        assert_eq!(announcement["sessionRef"]["sessionId"], "native-b");
+        assert!(
+            !fixture
+                .proxy
+                .deliver_polled_event(status("native-a", "old-status"), &old_delivery)
+                .await,
+            "an unannounced B event must not let captured A output pass the later B announcement"
+        );
+        assert!(fixture.frames.try_recv().is_err());
+    })
+    .catch_unwind()
+    .await;
+    fixture.shutdown().await;
+    if let Err(panic) = scenario {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
 async fn gateway_failures_identify_attach_source_and_operation_request() {
     let mut fixture = JournalFixture::new("native-b", "managed-public", journal_batch()).await;
     fixture.state.lock().unwrap().fail_inventory_reads = 2;

@@ -128,6 +128,21 @@ async function controlledFrames(request: Record<string, unknown>, outcome: 'refu
   return { match, different }
 }
 
+async function unchangedAttachFrames(request: Record<string, unknown>) {
+  const server = process.env.FRESHELL_TEST_CONTROLLED_GATEWAY_BINARY
+  if (process.env.FRESHELL_SANDBOX_MODE !== 'runtime-suite' || !server || !process.env.TMPDIR) {
+    throw new Error('unchanged attach contract requires the runtime-suite sandbox and gateway test binary')
+  }
+  const result = await execFileAsync(server, [
+    '--exact', 'fresh_agent_proxy::tests::review_repairs::unchanged_codex_attach_client_frames', '--nocapture', '--test-threads=1',
+  ], { env: { ...process.env, FRESHELL_TEST_CONTROLLED_ATTACH: JSON.stringify(request) }, maxBuffer: 4 * 1024 * 1024 })
+  expect(result.stdout).toMatch(/test result: ok\. 1 passed;/)
+  const marker = 'FRESHELL_UNCHANGED_CODEX_ATTACH_FRAMES='
+  const lines = result.stdout.split('\n').filter((line) => line.includes(marker))
+  if (lines.length !== 1) throw new Error(`expected one real gateway frame sequence, got ${lines.length}`)
+  return JSON.parse(lines[0].slice(lines[0].indexOf(marker) + marker.length)) as Record<string, unknown>[]
+}
+
 beforeEach(() => {
   resetSnapshotSchedulerForTests()
   resetRebindQueueForTests()
@@ -187,5 +202,57 @@ describe('controlled production-host send contract', () => {
     fs.appendFileSync(path.join(process.env.TMPDIR!, 'request-identities.jsonl'), `${JSON.stringify({ outcome,
       requestId: request.requestId, responseRequestId: (frames.match.event as Record<string, unknown>).requestId,
       differentRequestId: (frames.different.event as Record<string, unknown>).requestId })}\n`)
+  })
+})
+
+describe('controlled unchanged Codex attach contract', () => {
+  it.each(['managed-public', 'native-b'])('replays the unchanged source to the mounted public-only pane %s', async (publicId) => {
+    const { WsClient } = await vi.importActual<typeof import('@/lib/ws-client')>('@/lib/ws-client')
+    const client = new WsClient('ws://controlled-unchanged-attach.test/ws')
+    const store = createStore()
+    const currentLocator = { ...locator, sessionId: publicId }
+    const currentInventory = ManagedRuntimeInventorySnapshotSchema.parse({ ...inventory,
+      souls: inventory.souls.map((soul) => ({ ...soul, freshAgentSessionId: publicId, nativeSessionId: 'native-b' })) })
+    client.onMessage((frame) => { handleFreshAgentMessage(store.dispatch, frame, client) })
+    wsMock.onMessage.mockImplementation((handler) => client.onMessage(handler))
+    store.dispatch(sessionInit(currentLocator))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: { kind: 'fresh-agent', ...currentLocator,
+      createRequestId: 'controlled-unchanged-attach', status: 'idle', soulId: 'soul-one', soulIntentRevision: 3, viewIntentId: 'view-one' } }))
+    let resolveSnapshot!: (value: unknown) => void
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValue(new Promise((resolve) => { resolveSnapshot = resolve }))
+    render(<Provider store={store}><MountedPane /></Provider>)
+    try {
+      act(() => applyManagedRuntimeMergePlan(store as any, buildManagedRuntimeMergePlan(currentInventory, store.getState() as any)))
+      const key = `freshcodex:codex:${publicId}`
+      expect(store.getState().freshAgentLive.bySession[key]?.awaitingNativeSessionId).toBe('native-b')
+      const receive = (frame: Record<string, unknown>) => client.receiveMessageForTest(frame as never)
+      act(() => {
+        receive({ type: 'freshAgent.session.materialized', ...currentLocator, previousSessionId: publicId,
+          sessionRef: { provider: 'codex', sessionId: 'native-a' } })
+        receive({ type: 'freshAgent.event', ...currentLocator,
+          event: { type: 'freshAgent.permission.request', sessionId: publicId, requestId: 'old-control', tool: { name: 'old-tool' } } })
+      })
+      expect(store.getState().freshAgent.sessions[key].pendingPermissions['old-control']).toBeUndefined()
+      let attach: Record<string, unknown> | undefined
+      await waitFor(() => {
+        attach = wsMock.send.mock.calls.map(([frame]) => frame).find((frame) => frame?.type === 'freshAgent.attach'
+          && frame.sessionId === publicId && frame.sessionRef?.sessionId === 'native-b')
+        expect(attach).toBeDefined()
+      })
+      const frames = await unchangedAttachFrames(attach!)
+      act(() => { for (const frame of frames) receive(frame) })
+      expect(await screen.findByText('Current gateway answer')).toBeInTheDocument()
+      expect(store.getState().freshAgent.sessions[key].status).toBe('running')
+      expect(store.getState().freshAgent.sessions[key].pendingPermissions['current-control']).toMatchObject({ toolName: 'current-tool' })
+      expect(store.getState().freshAgent.sessions[key].pendingPermissions['old-control']).toBeUndefined()
+      expect(store.getState().freshAgentLive.bySession[key]?.awaitingNativeSessionId).toBeUndefined()
+      expect(frames[0]).toMatchObject({ type: 'freshAgent.session.materialized', previousSessionId: publicId,
+        sessionId: publicId, sessionRef: { provider: 'codex', sessionId: 'native-b' } })
+      fs.appendFileSync(path.join(process.env.TMPDIR!, 'attach-identities.jsonl'), `${JSON.stringify({ publicId,
+        requestSessionId: attach!.sessionId, frameCount: frames.length, firstType: frames[0].type })}\n`)
+    } finally {
+      cleanup()
+      resolveSnapshot({ ...hostedCodexNativeHistory, threadId: 'native-b' })
+    }
   })
 })
