@@ -54,6 +54,7 @@ enum NativeSessionTransitionEvidence {
     AcceptedDispatch {
         pending_naming_handle: Option<String>,
         recovery_source: Option<Arc<OwnedCodexDispatchRecovery>>,
+        recovery_input_request_id: Option<RequestId>,
     },
 }
 
@@ -2837,6 +2838,42 @@ impl Registry {
         .await
     }
 
+    /// Return the original owner for an exact input that is still unresolved.
+    /// This lets receipt recovery contact only the host that received the
+    /// original send, without admitting or dispatching the input again.
+    pub(crate) async fn ambiguous_input_incarnation(
+        &self,
+        soul_id: SoulId,
+        request_id: RequestId,
+        data: &[u8],
+        correlation: Option<&[u8]>,
+    ) -> Result<Option<IncarnationId>, RegistryError> {
+        let digest = input_payload_digest(data, correlation);
+        let payload = data.to_vec();
+        self.run_blocking(move |conn| {
+            let row: Option<(String, Vec<u8>, String, String)> = conn
+                .query_row(
+                    "SELECT payload_digest,protected_payload,state,incarnation_id FROM input_commands WHERE soul_id=?1 AND request_id=?2",
+                    params![soul_id.as_str(), request_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            let Some((stored_digest, stored_payload, state, incarnation)) = row else {
+                return Ok(None);
+            };
+            if stored_digest != digest || stored_payload != payload {
+                return Err(RegistryError::InputConflict);
+            }
+            if !matches!(state.as_str(), "dispatching" | "ambiguous") {
+                return Ok(None);
+            }
+            IncarnationId::parse(incarnation)
+                .map(Some)
+                .map_err(|_| RegistryError::Integrity("invalid input incarnation id".into()))
+        })
+        .await
+    }
+
     /// Record a refusal only when the blocked soul has no prior input for
     /// this request. The refusal is never queued or counted as admitted work.
     pub(crate) async fn refuse_blocked_unadmitted_input(
@@ -3233,6 +3270,7 @@ impl Registry {
             NativeSessionTransitionEvidence::AcceptedDispatch {
                 pending_naming_handle: identity.pending_naming_handle,
                 recovery_source: None,
+                recovery_input_request_id: None,
             },
         )
         .await
@@ -3243,14 +3281,8 @@ impl Registry {
         &self,
         source: Arc<OwnedCodexDispatchRecovery>,
         identity: NativeDispatchIdentity,
+        request_id: RequestId,
     ) -> Result<(), RegistryError> {
-        if identity.previous_native_session_id == identity.native_session_id
-            && identity.pending_naming_handle.is_none()
-        {
-            return self
-                .commit_codex_dispatch_recovery_same_root(source, identity)
-                .await;
-        }
         self.transition_native_session_evidenced_fenced(
             source.handle.soul_id().clone(),
             source.handle.incarnation_id().clone(),
@@ -3260,6 +3292,7 @@ impl Registry {
             NativeSessionTransitionEvidence::AcceptedDispatch {
                 pending_naming_handle: identity.pending_naming_handle,
                 recovery_source: Some(source),
+                recovery_input_request_id: Some(request_id),
             },
         )
         .await
@@ -3287,6 +3320,7 @@ impl Registry {
             NativeSessionTransitionEvidence::AcceptedDispatch {
                 pending_naming_handle: identity.pending_naming_handle,
                 recovery_source: None,
+                recovery_input_request_id: None,
             },
         )
         .await
@@ -3360,15 +3394,28 @@ impl Registry {
         fence: RecoveryWriteFence,
         evidence: NativeSessionTransitionEvidence,
     ) -> Result<RecoveryWriteFence, RegistryError> {
-        let (claude_fork, native_clear, pending_naming_handle, recovery_source) = match evidence {
-            NativeSessionTransitionEvidence::Operation(recipe) => (recipe, None, None, None),
+        let (
+            claude_fork,
+            native_clear,
+            pending_naming_handle,
+            recovery_source,
+            recovery_input_request_id,
+        ) = match evidence {
+            NativeSessionTransitionEvidence::Operation(recipe) => (recipe, None, None, None, None),
             NativeSessionTransitionEvidence::ClaudeClear(observation) => {
-                (None, Some(observation), None, None)
+                (None, Some(observation), None, None, None)
             }
             NativeSessionTransitionEvidence::AcceptedDispatch {
                 pending_naming_handle,
                 recovery_source,
-            } => (None, None, Some(pending_naming_handle), recovery_source),
+                recovery_input_request_id,
+            } => (
+                None,
+                None,
+                Some(pending_naming_handle),
+                recovery_source,
+                recovery_input_request_id,
+            ),
         };
         let preserve_presentation = pending_naming_handle.is_some();
         if let Some(recipe) = &claude_fork {
@@ -3489,6 +3536,14 @@ impl Registry {
                     if let Some(source) = recovery_source.as_ref() {
                         codex_dispatch_recovery::commit_dispatch_acceptance(&tx, source)?;
                     }
+                    if let Some(request_id) = recovery_input_request_id.as_ref() {
+                        complete_codex_recovery_input_in_tx(
+                            &tx,
+                            &soul_id,
+                            &incarnation_id,
+                            request_id,
+                        )?;
+                    }
                     let successor = load_recovery_write_fence(&tx, &soul_id)?;
                     tx.commit()?;
                     return Ok(successor);
@@ -3574,6 +3629,14 @@ impl Registry {
             }
             if let Some(source) = recovery_source.as_ref() {
                 codex_dispatch_recovery::commit_dispatch_acceptance(&tx, source)?;
+            }
+            if let Some(request_id) = recovery_input_request_id.as_ref() {
+                complete_codex_recovery_input_in_tx(
+                    &tx,
+                    &soul_id,
+                    &incarnation_id,
+                    request_id,
+                )?;
             }
             let successor = load_recovery_write_fence(&tx, &soul_id)?;
             tx.commit()?;
@@ -5949,6 +6012,24 @@ fn input_payload_digest(data: &[u8], correlation: Option<&[u8]>) -> String {
         digest.update(correlation);
     }
     format!("sha256:{:x}", digest.finalize())
+}
+
+fn complete_codex_recovery_input_in_tx(
+    tx: &Connection,
+    soul_id: &SoulId,
+    incarnation_id: &IncarnationId,
+    request_id: &RequestId,
+) -> Result<(), RegistryError> {
+    let changed = tx.execute(
+        "UPDATE input_commands SET state='completed',updated_at=?1 WHERE soul_id=?2 AND request_id=?3 AND incarnation_id=?4 AND state IN ('dispatching','ambiguous')",
+        params![now_millis(), soul_id.as_str(), request_id.as_str(), incarnation_id.as_str()],
+    )?;
+    if changed != 1 {
+        return Err(RegistryError::InvalidState(format!(
+            "Codex recovery input {request_id} is not unresolved for its original incarnation"
+        )));
+    }
+    Ok(())
 }
 
 fn reservation_totals(

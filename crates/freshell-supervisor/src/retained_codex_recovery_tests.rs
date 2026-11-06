@@ -4,9 +4,9 @@ use crate::backend::{
 };
 use crate::registry::OwnedRuntimeHandle;
 use freshell_runtime_protocol::{
-    FreshProvider, NativeDispatchIdentity, NativeIdentityLaunch, NativeIdentityObservation,
-    NativeIdentitySource, NativeReadinessReceipt, RecoverRequest, RecoveryOutcome, RecoveryState,
-    RecoveryTrigger,
+    FreshProvider, GrantId, NativeDispatchIdentity, NativeIdentityLaunch,
+    NativeIdentityObservation, NativeIdentitySource, NativeReadinessReceipt, RecoverRequest,
+    RecoveryOutcome, RecoveryState, RecoveryTrigger,
 };
 use rusqlite::{params, Connection};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -87,6 +87,8 @@ struct ControlledCodex {
     source: Arc<std::sync::Mutex<NativeIdentityObservation>>,
     exited: Arc<AtomicBool>,
     inputs: Arc<AtomicUsize>,
+    receipt_queries: Arc<AtomicUsize>,
+    lose_send_reply_once: Arc<AtomicBool>,
     native_prepares: Arc<AtomicUsize>,
     recovery_probes: Arc<AtomicUsize>,
     recovery_probe_blocked: Arc<AtomicBool>,
@@ -143,7 +145,7 @@ impl ControlledCodex {
             [soul.as_str()],
         )
         .unwrap();
-        conn.execute("UPDATE incarnations SET runtime_dir=?1,execution_generation=1,host_boot_id=?2,fresh_agent_spec=?3,fixture_kind=NULL WHERE incarnation_id=?4",params![runtime.to_string_lossy(),boot.as_str(),serde_json::to_string(&agent).unwrap(),prepared.incarnation_id.as_str()]).unwrap();
+        conn.execute("UPDATE incarnations SET runtime_dir=?1,execution_generation=1,host_boot_id=?2,grant_id=?3,fresh_agent_spec=?4,fixture_kind=NULL WHERE incarnation_id=?5",params![runtime.to_string_lossy(),boot.as_str(),GrantId::new().as_str(),serde_json::to_string(&agent).unwrap(),prepared.incarnation_id.as_str()]).unwrap();
         registry
             .record_native_session(
                 soul.clone(),
@@ -197,6 +199,11 @@ impl ControlledCodex {
         let source = Arc::new(std::sync::Mutex::new(parent));
         let exited = Arc::new(AtomicBool::new(true));
         let inputs = Arc::new(AtomicUsize::new(0));
+        let receipt_queries = Arc::new(AtomicUsize::new(0));
+        let lose_send_reply_once = Arc::new(AtomicBool::new(false));
+        let send_receipt = Arc::new(std::sync::Mutex::new(
+            None::<(RequestId, NativeDispatchIdentity)>,
+        ));
         let native_prepares = Arc::new(AtomicUsize::new(0));
         let recovery_probes = Arc::new(AtomicUsize::new(0));
         let recovery_probe_blocked = Arc::new(AtomicBool::new(false));
@@ -224,6 +231,9 @@ impl ControlledCodex {
             let source = source.clone();
             let exited = exited.clone();
             let inputs = inputs.clone();
+            let receipt_queries = receipt_queries.clone();
+            let lose_send_reply_once = lose_send_reply_once.clone();
+            let send_receipt = send_receipt.clone();
             let native_prepares = native_prepares.clone();
             let recovery_probes = recovery_probes.clone();
             let recovery_probe_blocked = recovery_probe_blocked.clone();
@@ -252,6 +262,9 @@ impl ControlledCodex {
                     let source = source.clone();
                     let exited = exited.clone();
                     let inputs = inputs.clone();
+                    let receipt_queries = receipt_queries.clone();
+                    let lose_send_reply_once = lose_send_reply_once.clone();
+                    let send_receipt = send_receipt.clone();
                     let native_prepares = native_prepares.clone();
                     let recovery_probes = recovery_probes.clone();
                     let recovery_probe_blocked = recovery_probe_blocked.clone();
@@ -289,6 +302,7 @@ impl ControlledCodex {
                                 ))
                             );
                         }
+                        let mut drop_reply = false;
                         let result = match request.body {
                             HostCommand::Hello {
                                 incarnation_id,
@@ -308,6 +322,7 @@ impl ControlledCodex {
                                         "native-identity-observation-v1".into(),
                                         "fresh-agent-codex-dispatch-recovery-v1".into(),
                                         HOST_CAPABILITY_NATIVE_READINESS_RECEIPT_V1.into(),
+                                        HOST_CAPABILITY_CODEX_SEND_RECEIPT_V1.into(),
                                     ];
                                     if capability.load(Ordering::SeqCst) {
                                         values.push("fresh-agent-codex-recovery-source-v1".into());
@@ -354,31 +369,54 @@ impl ControlledCodex {
                                     opencode_adoption: Default::default(),
                                 }
                             }
-                            HostCommand::FreshAgentSend { .. } => {
-                                inputs.fetch_add(1, Ordering::SeqCst);
-                                sending.notify_one();
-                                if hold_ack.load(Ordering::SeqCst) {
-                                    release.notified().await;
-                                }
-                                let previous = source.lock().unwrap().native_session_id.clone();
-                                let native_session_id =
-                                    if readiness_root_change.load(Ordering::SeqCst) {
-                                        previous.clone()
-                                    } else {
-                                        let mut observation = source.lock().unwrap();
-                                        observation.native_session_id = "native-child".into();
-                                        observation.evidence_revision = launch
-                                            .evidence_revision
-                                            .checked_add(1)
-                                            .expect("synthetic Codex identity revision has room");
-                                        "native-child".into()
-                                    };
-                                exited.store(false, Ordering::SeqCst);
-                                HostResult::FreshAgentCommand {
-                                    state: CommandState::ProviderAcked,
-                                    claude_fork: None,
-                                    native_session_id: Some(native_session_id.clone()),
-                                    native_identity: Some(NativeDispatchIdentity {
+                            HostCommand::FreshAgentSend {
+                                request_id,
+                                receipt_only,
+                                ..
+                            } => {
+                                if receipt_only {
+                                    receipt_queries.fetch_add(1, Ordering::SeqCst);
+                                    match send_receipt.lock().unwrap().clone() {
+                                        Some((recorded_request, identity))
+                                            if recorded_request == request_id =>
+                                        {
+                                            HostResult::FreshAgentCommand {
+                                                state: CommandState::ProviderAcked,
+                                                claude_fork: None,
+                                                native_session_id: Some(
+                                                    identity.native_session_id.clone(),
+                                                ),
+                                                native_identity: Some(identity),
+                                            }
+                                        }
+                                        _ => HostResult::FreshAgentCommand {
+                                            state: CommandState::Ambiguous,
+                                            claude_fork: None,
+                                            native_session_id: None,
+                                            native_identity: None,
+                                        },
+                                    }
+                                } else {
+                                    inputs.fetch_add(1, Ordering::SeqCst);
+                                    sending.notify_one();
+                                    if hold_ack.load(Ordering::SeqCst) {
+                                        release.notified().await;
+                                    }
+                                    let previous = source.lock().unwrap().native_session_id.clone();
+                                    let native_session_id =
+                                        if readiness_root_change.load(Ordering::SeqCst) {
+                                            previous.clone()
+                                        } else {
+                                            let mut observation = source.lock().unwrap();
+                                            observation.native_session_id = "native-child".into();
+                                            observation.evidence_revision =
+                                                launch.evidence_revision.checked_add(1).expect(
+                                                    "synthetic Codex identity revision has room",
+                                                );
+                                            "native-child".into()
+                                        };
+                                    exited.store(false, Ordering::SeqCst);
+                                    let identity = NativeDispatchIdentity {
                                         previous_native_session_id: if bad_ack
                                             .load(Ordering::SeqCst)
                                         {
@@ -388,7 +426,18 @@ impl ControlledCodex {
                                         },
                                         native_session_id,
                                         pending_naming_handle: None,
-                                    }),
+                                    };
+                                    *send_receipt.lock().unwrap() =
+                                        Some((request_id.clone(), identity.clone()));
+                                    if lose_send_reply_once.swap(false, Ordering::SeqCst) {
+                                        drop_reply = true;
+                                    }
+                                    HostResult::FreshAgentCommand {
+                                        state: CommandState::ProviderAcked,
+                                        claude_fork: None,
+                                        native_session_id: Some(identity.native_session_id.clone()),
+                                        native_identity: Some(identity),
+                                    }
                                 }
                             }
                             HostCommand::FreshAgentPrepareNative { .. } => {
@@ -532,15 +581,17 @@ impl ControlledCodex {
                             HostCommand::Stop { .. } => HostResult::Stopped,
                             other => panic!("unexpected controlled Codex command {other:?}"),
                         };
-                        write_frame(
-                            &mut socket,
-                            &HostReply {
-                                request_id: request.request_id,
-                                result: Ok(result),
-                            },
-                        )
-                        .await
-                        .unwrap();
+                        if !drop_reply {
+                            write_frame(
+                                &mut socket,
+                                &HostReply {
+                                    request_id: request.request_id,
+                                    result: Ok(result),
+                                },
+                            )
+                            .await
+                            .unwrap();
+                        }
                     });
                 }
             })
@@ -577,6 +628,8 @@ impl ControlledCodex {
             source,
             exited,
             inputs,
+            receipt_queries,
+            lose_send_reply_once,
             native_prepares,
             recovery_probes,
             recovery_probe_blocked,
@@ -1016,6 +1069,24 @@ async fn public_send_recovers_retained_codex_source_and_commits_before_second_in
             .unwrap(),
         "initial retained root should satisfy the exact SEND admission checks"
     );
+    assert!(
+        codex_dispatch_recovery_is_bound(&before, &active, &host, &status),
+        "initial retained source should also satisfy the stricter recovery-send binding"
+    );
+    let registry_source = fixture
+        .supervisor
+        .registry
+        .codex_dispatch_recovery_source(fixture.soul.clone())
+        .await
+        .unwrap()
+        .unwrap_or_else(|| {
+            panic!(
+                "the registry should mint an exact retained-send source; recovery state is {:?}",
+                before.recovery_state
+            )
+        });
+    assert!(registry_source.matches_context(&before));
+    assert!(registry_source.matches_host(&host.host_boot_id, status.max_execution_generation));
     let send = fixture.send(RequestId::new()).await;
     assert!(
         matches!(
@@ -1037,8 +1108,8 @@ async fn public_send_recovers_retained_codex_source_and_commits_before_second_in
     assert_eq!(context.native_session_id.as_deref(), Some("native-child"));
     assert_eq!(
         fixture.native_prepares.load(Ordering::SeqCst),
-        1,
-        "SEND must obtain and commit Codex readiness before journaling user input"
+        0,
+        "the retained host's guarded SEND owns native recovery; no separate prepare may run"
     );
     assert_eq!(
         fixture.source.lock().unwrap().evidence_revision,
@@ -1084,14 +1155,14 @@ async fn public_send_recovers_retained_codex_source_and_commits_before_second_in
     assert_eq!(fixture.inputs.load(Ordering::SeqCst), 2);
     assert_eq!(
         fixture.recovery_probes.load(Ordering::SeqCst),
-        2,
-        "explicit SEND readiness and the observer each make one bounded provider check"
+        1,
+        "the observer performs one bounded provider check after the retained SEND"
     );
     fixture.assert_retained().await;
 }
 
 #[tokio::test]
-async fn public_send_uses_refreshed_identity_after_codex_readiness_changes_root() {
+async fn public_send_uses_retained_codex_source_without_a_separate_prepare() {
     let fixture = ControlledCodex::new().await;
     fixture.readiness_root_change.store(true, Ordering::SeqCst);
     let request_id = RequestId::new();
@@ -1108,11 +1179,8 @@ async fn public_send_uses_refreshed_identity_after_codex_readiness_changes_root(
         .recovery_context(fixture.soul.clone())
         .await
         .unwrap();
-    assert_eq!(
-        context.native_session_id.as_deref(),
-        Some("native-readiness-child")
-    );
-    assert_eq!(fixture.native_prepares.load(Ordering::SeqCst), 1);
+    assert_eq!(context.native_session_id.as_deref(), Some("native-parent"));
+    assert_eq!(fixture.native_prepares.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.inputs.load(Ordering::SeqCst), 1);
 
     assert!(matches!(
@@ -1124,8 +1192,67 @@ async fn public_send_uses_refreshed_identity_after_codex_readiness_changes_root(
     assert_eq!(
         fixture.inputs.load(Ordering::SeqCst),
         1,
-        "a completed SEND is replayed from its journal after readiness changed the root"
+        "a completed SEND is replayed from its journal without repeating the provider input"
     );
+}
+
+#[tokio::test]
+async fn lost_retained_codex_send_reply_is_reconciled_from_host_receipt_without_resend() {
+    let fixture = ControlledCodex::new().await;
+    fixture.lose_send_reply_once.store(true, Ordering::SeqCst);
+    let request_id = RequestId::new();
+
+    let first_error = fixture
+        .send(request_id.clone())
+        .await
+        .expect_err("the first response is deliberately lost after the host accepts the input");
+    assert_eq!(
+        fixture.inputs.load(Ordering::SeqCst),
+        1,
+        "the request must reach the host before response loss: {first_error:?}; lifecycle: {}",
+        std::fs::read_to_string(fixture._root.path().join("lifecycle.jsonl")).unwrap_or_default()
+    );
+    assert_eq!(fixture.receipt_queries.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .supervisor
+            .registry
+            .recovery_context(fixture.soul.clone())
+            .await
+            .unwrap()
+            .native_session_id
+            .as_deref(),
+        Some("native-parent"),
+        "the registry must remain on the old root until the durable receipt is checked"
+    );
+
+    assert!(matches!(
+        fixture.send(request_id.clone()).await.unwrap(),
+        AdminResult::FreshAgentCommand {
+            state: CommandState::ProviderAcked
+        }
+    ));
+    assert_eq!(fixture.inputs.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.receipt_queries.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture
+            .supervisor
+            .registry
+            .recovery_context(fixture.soul.clone())
+            .await
+            .unwrap()
+            .native_session_id
+            .as_deref(),
+        Some("native-child")
+    );
+    assert!(matches!(
+        fixture.send(request_id).await.unwrap(),
+        AdminResult::FreshAgentCommand {
+            state: CommandState::Completed
+        }
+    ));
+    assert_eq!(fixture.inputs.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.receipt_queries.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

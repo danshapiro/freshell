@@ -78,29 +78,6 @@ impl Registry {
         })
         .await
     }
-
-    pub(crate) async fn commit_codex_dispatch_recovery_same_root(
-        &self,
-        source: Arc<OwnedCodexDispatchRecovery>,
-        identity: freshell_runtime_protocol::NativeDispatchIdentity,
-    ) -> Result<(), RegistryError> {
-        if identity.previous_native_session_id != source.original_native_session_id
-            || identity.native_session_id != source.original_native_session_id
-            || identity.pending_naming_handle.is_some()
-        {
-            return Err(RegistryError::NativeIdentityConflict);
-        }
-        let soul_id = source.handle.soul_id().clone();
-        self.run_blocking(move |mut conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            validate_recovery_write_fence(&tx, &soul_id, &source.fence)?;
-            validate_source(&tx, &source)?;
-            commit_dispatch_acceptance(&tx, &source)?;
-            tx.commit()?;
-            Ok(())
-        })
-        .await
-    }
 }
 
 fn load_source(

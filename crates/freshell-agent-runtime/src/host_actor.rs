@@ -1127,6 +1127,8 @@ struct PersistedCommand {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     native_identity: Option<NativeDispatchIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex_dispatch_recovery_source: Option<NativeIdentityObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     operation_failure: Option<OperationFailureKind>,
 }
 
@@ -2624,6 +2626,55 @@ impl FreshAgentHostActor {
         .map(|result| result.state)
     }
 
+    /// Return an already-persisted acknowledgement for an exact retained
+    /// Codex send. This path is read-only: an absent or unfinished record is
+    /// ambiguous and never enters the provider transport.
+    pub async fn codex_recovery_send_receipt(
+        &self,
+        request_id: RequestId,
+        text: &str,
+        settings: Option<FreshAgentTurnSettings>,
+        logical_attempt_id: Option<&str>,
+    ) -> Result<DispatchResult, ActorError> {
+        let _dispatch_guard = self.dispatch_lock.lock().await;
+        if self.native_identity_transition.load(Ordering::SeqCst)
+            || self.stopped.load(Ordering::SeqCst)
+        {
+            return Err(ActorError::AmbiguousDispatch);
+        }
+
+        let state = self.state.lock().await;
+        let Some(existing) = state.commands.get(request_id.as_str()) else {
+            return Err(ActorError::AmbiguousDispatch);
+        };
+        let Some(source) = existing.codex_dispatch_recovery_source.as_ref() else {
+            return Err(ActorError::AmbiguousDispatch);
+        };
+        let expected_digest =
+            fresh_agent_send_digest(text, &settings, logical_attempt_id, Some(source))?;
+        if existing.payload_digest != expected_digest {
+            return Err(ActorError::RequestConflict);
+        }
+        if !matches!(
+            existing.state,
+            CommandState::ProviderAcked | CommandState::Completed
+        ) {
+            return Err(ActorError::AmbiguousDispatch);
+        }
+        let native_identity = existing
+            .native_identity
+            .clone()
+            .filter(|identity| {
+                state.profile.native_session_id.as_deref()
+                    == Some(identity.native_session_id.as_str())
+            })
+            .ok_or(ActorError::AmbiguousDispatch)?;
+        Ok(DispatchResult {
+            state: existing.state,
+            native_identity: Some(native_identity),
+        })
+    }
+
     pub async fn dispatch_with_codex_recovery_source(
         &self,
         request_id: RequestId,
@@ -2643,29 +2694,19 @@ impl FreshAgentHostActor {
         }
         // Preserve the exact historical digest for legacy sends so a command
         // journal created before this field existed remains idempotent after
-        // upgrade. A modern checkpointed send additionally fences the logical
-        // attempt identity into durable request-ID conflict detection.
-        let command_material = match codex_dispatch_recovery_source.as_ref() {
-            Some(source) => serde_json::to_vec(&(
-                text.as_str(),
-                &settings,
-                logical_attempt_id.as_deref(),
-                source,
-            )),
-            None => match logical_attempt_id.as_deref() {
-                Some(logical_attempt_id) => {
-                    serde_json::to_vec(&(text.as_str(), &settings, logical_attempt_id))
-                }
-                None => serde_json::to_vec(&(text.as_str(), &settings)),
-            },
-        }
-        .map_err(persist)?;
-        let digest = digest(&command_material);
+        // upgrade. The retained source and logical attempt fence recovery
+        // sends into durable request-ID conflict detection.
+        let payload_digest = fresh_agent_send_digest(
+            &text,
+            &settings,
+            logical_attempt_id.as_deref(),
+            codex_dispatch_recovery_source.as_ref(),
+        )?;
         let dispatch_profile;
         {
             let mut state = self.state.lock().await;
             if let Some(existing) = state.commands.get(request_id.as_str()) {
-                if existing.payload_digest != digest {
+                if existing.payload_digest != payload_digest {
                     return Err(ActorError::RequestConflict);
                 }
                 return match existing.state {
@@ -2686,10 +2727,11 @@ impl FreshAgentHostActor {
             state.commands.insert(
                 request_id.as_str().to_string(),
                 PersistedCommand {
-                    payload_digest: digest,
+                    payload_digest,
                     state: CommandState::Queued,
                     provider_ack_id: None,
                     native_identity: None,
+                    codex_dispatch_recovery_source: codex_dispatch_recovery_source.clone(),
                     operation_failure: None,
                 },
             );
@@ -2877,6 +2919,7 @@ impl FreshAgentHostActor {
                     state: CommandState::Dispatching,
                     provider_ack_id: None,
                     native_identity: None,
+                    codex_dispatch_recovery_source: None,
                     operation_failure: None,
                 },
             );
@@ -3074,6 +3117,7 @@ impl FreshAgentHostActor {
                     },
                     provider_ack_id: None,
                     native_identity: None,
+                    codex_dispatch_recovery_source: None,
                     operation_failure: None,
                 },
             );
@@ -4104,6 +4148,25 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ActorError> {
 
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn fresh_agent_send_digest(
+    text: &str,
+    settings: &Option<FreshAgentTurnSettings>,
+    logical_attempt_id: Option<&str>,
+    codex_dispatch_recovery_source: Option<&NativeIdentityObservation>,
+) -> Result<String, ActorError> {
+    // Preserve the historical digest shape for legacy sends while including
+    // all authority and checkpoint identity on newer recovery sends.
+    let command_material = match codex_dispatch_recovery_source {
+        Some(source) => serde_json::to_vec(&(text, settings, logical_attempt_id, source)),
+        None => match logical_attempt_id {
+            Some(logical_attempt_id) => serde_json::to_vec(&(text, settings, logical_attempt_id)),
+            None => serde_json::to_vec(&(text, settings)),
+        },
+    }
+    .map_err(persist)?;
+    Ok(digest(&command_material))
 }
 
 fn persist(error: impl std::fmt::Display) -> ActorError {

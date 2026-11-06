@@ -1278,6 +1278,22 @@ impl FreshAgentTransport for FakeTransport {
             .push(logical_attempt_id.map(str::to_owned));
         self.dispatch(request_id, text, profile).await
     }
+    async fn dispatch_with_codex_recovery_source(
+        &self,
+        request_id: &RequestId,
+        text: &str,
+        profile: &FreshAgentProfile,
+        _settings: Option<&FreshAgentTurnSettings>,
+        logical_attempt_id: Option<&str>,
+        source: Option<&NativeIdentityObservation>,
+    ) -> Result<DispatchAck, DispatchFailure> {
+        if source.is_some() {
+            self.dispatch(request_id, text, profile).await
+        } else {
+            self.dispatch_with_checkpoint_identity(request_id, text, profile, logical_attempt_id)
+                .await
+        }
+    }
     async fn resolve_permission(
         &self,
         _decision_id: &str,
@@ -1833,6 +1849,112 @@ async fn accepted_dispatch_native_identity_requires_current_source_and_existing_
         }
         actor.stop().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn retained_codex_send_receipt_can_be_read_after_a_lost_reply_without_dispatching_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = FakeTransport::new("native-parent");
+    let mut initial_profile = profile(FreshProvider::Codex, "receipt-store", Some("native-parent"));
+    initial_profile.runtime_variant = "codex-app-server".into();
+    *transport.dispatch_identity.lock().unwrap() = Some(NativeDispatchIdentity {
+        previous_native_session_id: "native-parent".into(),
+        native_session_id: "native-child".into(),
+        pending_naming_handle: None,
+    });
+    let source = NativeIdentityObservation {
+        native_session_id: "native-parent".into(),
+        incarnation_id: freshell_runtime_protocol::IncarnationId::new(),
+        launch_nonce: "receipt-launch".into(),
+        evidence_revision: 7,
+        source: freshell_runtime_protocol::NativeIdentitySource::FreshProviderHandshake,
+        evidence_digest: "b".repeat(64),
+    };
+    let request_id = RequestId::parse("retained-send-receipt").unwrap();
+    let actor = FreshAgentHostActor::open(dir.path(), initial_profile, transport.clone())
+        .await
+        .unwrap();
+
+    let accepted = actor
+        .dispatch_with_codex_recovery_source(
+            request_id.clone(),
+            "the already accepted prompt".into(),
+            None,
+            Some("attempt-7".into()),
+            Some(source),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        accepted.native_identity.as_ref().unwrap().native_session_id,
+        "native-child"
+    );
+    assert_eq!(transport.dispatches.load(Ordering::SeqCst), 1);
+
+    let recovered = actor
+        .codex_recovery_send_receipt(
+            request_id.clone(),
+            "the already accepted prompt",
+            None,
+            Some("attempt-7"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered.state, CommandState::ProviderAcked);
+    assert_eq!(recovered.native_identity, accepted.native_identity);
+    assert_eq!(transport.dispatches.load(Ordering::SeqCst), 1);
+
+    assert_eq!(
+        actor
+            .codex_recovery_send_receipt(
+                request_id.clone(),
+                "different prompt",
+                None,
+                Some("attempt-7"),
+            )
+            .await
+            .unwrap_err(),
+        ActorError::RequestConflict,
+        "receipt lookup must still bind the request to its exact payload"
+    );
+    assert_eq!(
+        actor
+            .codex_recovery_send_receipt(
+                RequestId::parse("missing-retained-send-receipt").unwrap(),
+                "a prompt with no durable send record",
+                None,
+                None,
+            )
+            .await
+            .unwrap_err(),
+        ActorError::AmbiguousDispatch,
+        "an unknown or unfinished command has no receipt and must never be dispatched by lookup"
+    );
+    assert_eq!(transport.dispatches.load(Ordering::SeqCst), 1);
+
+    let persisted_profile = actor.profile().await;
+    actor.stop().await.unwrap();
+    let reopened = FreshAgentHostActor::open(
+        dir.path(),
+        persisted_profile,
+        FakeTransport::new("native-child"),
+    )
+    .await
+    .unwrap();
+    let recovered_after_restart = reopened
+        .codex_recovery_send_receipt(
+            request_id,
+            "the already accepted prompt",
+            None,
+            Some("attempt-7"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered_after_restart.state, CommandState::ProviderAcked);
+    assert_eq!(
+        recovered_after_restart.native_identity,
+        accepted.native_identity
+    );
 }
 
 #[tokio::test]

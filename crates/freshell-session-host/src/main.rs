@@ -25,8 +25,8 @@ use freshell_runtime_protocol::{
     OpenCodeAdoptionStatus, OpenCodeTransferDescriptor, OpenCodeTransferReadinessReceipt,
     OpenCodeVerifiedRootTail, ProviderBootstrapFile, RecoveryPath, RecoveryProbe, ResumeSpec,
     RuntimeDiagnosticCode, RuntimeError, RuntimeErrorCode, RuntimeLimits, RuntimeMetrics, SoulId,
-    TerminalLaunchSpec, CONTROL_PROTOCOL_VERSION, HOST_CAPABILITY_NATIVE_READINESS_RECEIPT_V1,
-    MAX_OPENCODE_TRANSFER_MANIFEST_BYTES,
+    TerminalLaunchSpec, CONTROL_PROTOCOL_VERSION, HOST_CAPABILITY_CODEX_SEND_RECEIPT_V1,
+    HOST_CAPABILITY_NATIVE_READINESS_RECEIPT_V1, MAX_OPENCODE_TRANSFER_MANIFEST_BYTES,
 };
 use pty::HostedPty;
 use serde::{Deserialize, Serialize};
@@ -895,6 +895,7 @@ async fn dispatch_with_effects(
                     "fresh-agent-codex-recovery-source-v1".into(),
                     "fresh-agent-codex-same-root-readiness-v1".into(),
                     HOST_CAPABILITY_NATIVE_READINESS_RECEIPT_V1.into(),
+                    HOST_CAPABILITY_CODEX_SEND_RECEIPT_V1.into(),
                     "grant-v1".into(),
                     "stop-v1".into(),
                     "security-probe-v1".into(),
@@ -1276,9 +1277,63 @@ async fn dispatch_with_effects(
                     settings,
                     checkpoint_logical_attempt_id,
                     codex_dispatch_recovery_source,
+                    receipt_only,
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
                     let _native_command = state.fresh_native_command.lock().await;
+                    if receipt_only {
+                        let actor = state
+                            .fresh_agent
+                            .lock()
+                            .await
+                            .clone()
+                            .ok_or_else(unsupported_fresh_agent)?;
+                        let before = actor.profile().await;
+                        if codex_dispatch_recovery_source.is_some()
+                            || before.provider != freshell_runtime_protocol::FreshProvider::Codex
+                        {
+                            return Err(RuntimeError::new(
+                                RuntimeErrorCode::InvalidRequest,
+                                "receipt lookup is only available for an exact Codex send",
+                            ));
+                        }
+                        let receipt = actor
+                            .codex_recovery_send_receipt(
+                                request_id,
+                                &text,
+                                settings,
+                                checkpoint_logical_attempt_id.as_deref(),
+                            )
+                            .await
+                            .map_err(map_actor_error)?;
+                        let after = actor.profile().await;
+                        let identity = receipt.native_identity.as_ref().ok_or_else(|| {
+                            RuntimeError::new(
+                                RuntimeErrorCode::CommandAmbiguous,
+                                "Codex send has no durable accepted identity receipt",
+                            )
+                        })?;
+                        if after.native_session_id.as_deref()
+                            != Some(identity.native_session_id.as_str())
+                        {
+                            return Err(RuntimeError::new(
+                                RuntimeErrorCode::OwnershipMismatch,
+                                "Codex send receipt does not match the host's current native root",
+                            ));
+                        }
+                        commit_fresh_native_transition(
+                            state,
+                            &actor,
+                            Some(&identity.previous_native_session_id),
+                        )
+                        .await?;
+                        return Ok(HostResult::FreshAgentCommand {
+                            state: receipt.state,
+                            claude_fork: actor.claude_fork_recipe().await,
+                            native_session_id: after.native_session_id,
+                            native_identity: receipt.native_identity,
+                        });
+                    }
                     ensure_fresh_native_send_authority(state).await?;
                     let actor = state
                         .fresh_agent
@@ -3375,6 +3430,11 @@ async fn commit_fresh_native_transition(
         || launch.execution_generation != persisted.max_execution_generation
     {
         return Err(refuse());
+    }
+    if launch.requested_native_session_id.as_deref() == Some(child.as_str()) {
+        // A host can persist this transition before its reply reaches the
+        // supervisor. Receipt-only retries must not advance the launch twice.
+        return Ok(());
     }
     if matches!(
         provider,
@@ -12418,6 +12478,7 @@ mod tests {
                     settings: None,
                     checkpoint_logical_attempt_id: None,
                     codex_dispatch_recovery_source: None,
+                    receipt_only: false,
                 },
             ),
             &state,
@@ -12833,6 +12894,7 @@ mod tests {
                             text: "child input".into(),
                             settings: None,
                             codex_dispatch_recovery_source: None,
+                            receipt_only: false,
                         },
                     ),
                     &state,
@@ -13217,6 +13279,7 @@ mod tests {
                     text: "must not reach native input".into(),
                     settings: None,
                     codex_dispatch_recovery_source: None,
+                    receipt_only: false,
                 },
             ),
             &state,
@@ -13333,6 +13396,7 @@ mod tests {
                     settings: None,
                     checkpoint_logical_attempt_id: Some("managed-attempt-rpc-1".into()),
                     codex_dispatch_recovery_source: None,
+                    receipt_only: false,
                 },
             ),
             &state,
@@ -15224,6 +15288,7 @@ mod tests {
                     settings: None,
                     checkpoint_logical_attempt_id: None,
                     codex_dispatch_recovery_source: None,
+                    receipt_only: false,
                 },
             ),
             &state,
@@ -15295,6 +15360,7 @@ mod tests {
                     settings: None,
                     checkpoint_logical_attempt_id: None,
                     codex_dispatch_recovery_source: None,
+                    receipt_only: false,
                 },
             ),
             &state,

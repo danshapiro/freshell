@@ -14,6 +14,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
 pub const HOST_CAPABILITY_NATIVE_READINESS_RECEIPT_V1: &str =
     "fresh-agent-native-readiness-receipt-v1";
+pub const HOST_CAPABILITY_CODEX_SEND_RECEIPT_V1: &str = "fresh-agent-codex-send-receipt-v1";
 pub const MAX_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_NATIVE_HISTORY_FRAME_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_OPENCODE_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
@@ -23,6 +24,10 @@ pub const MAX_OPENCODE_TRANSFER_MANIFEST_BYTES: usize = 512 * 1024;
 pub const OPENCODE_TRANSFER_DESTINATION_DB: &str = ".local/share/opencode/opencode.db";
 
 type HmacSha256 = Hmac<Sha256>;
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
 
 pub mod fresh_agent_ops;
 pub use fresh_agent_ops::*;
@@ -5385,6 +5390,10 @@ pub enum HostCommand {
         /// the host revalidates it before allowing native recovery on SEND.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         codex_dispatch_recovery_source: Option<NativeIdentityObservation>,
+        /// Read only an existing durable Codex send acknowledgement. Hosts
+        /// must never dispatch provider work when this is true.
+        #[serde(default, skip_serializing_if = "is_false")]
+        receipt_only: bool,
     },
     FreshAgentFork {
         incarnation_id: IncarnationId,
@@ -5790,6 +5799,7 @@ mod tests {
             HostCommand::FreshAgentSend {
                 checkpoint_logical_attempt_id: None,
                 codex_dispatch_recovery_source: None,
+                receipt_only: false,
                 ..
             }
         ));
@@ -5797,6 +5807,29 @@ mod tests {
         assert!(legacy_json["params"]
             .get("codex_dispatch_recovery_source")
             .is_none());
+        assert!(legacy_json["params"].get("receipt_only").is_none());
+
+        let receipt_query: HostCommand = serde_json::from_value(serde_json::json!({
+            "method": "fresh_agent_send",
+            "params": {
+                "incarnation_id": "incarnation-hosted",
+                "request_id": "request-hosted-receipt",
+                "text": "already accepted",
+                "receipt_only": true
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            &receipt_query,
+            HostCommand::FreshAgentSend {
+                receipt_only: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            serde_json::to_value(receipt_query).unwrap()["params"]["receipt_only"],
+            true
+        );
 
         let recovery_source = NativeIdentityObservation {
             native_session_id: "thread-hosted".into(),
@@ -5820,6 +5853,7 @@ mod tests {
             &source_host_command,
             HostCommand::FreshAgentSend {
                 codex_dispatch_recovery_source: Some(source),
+                receipt_only: false,
                 ..
             } if source.native_session_id == "thread-hosted"
                 && source.incarnation_id == recovery_source.incarnation_id

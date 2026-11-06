@@ -19,7 +19,7 @@ use freshell_runtime_protocol::{
     OpenCodeTransferResult, RecoveryProbe, RequestId, ResumeSpec, RuntimeError, RuntimeErrorCode,
     RuntimeLimits, RuntimeMetrics, RuntimeOutputBatch, RuntimeView, SoulId, StopOutcome,
     TerminalLaunchSpec, UpdateLimitsResult, CONTROL_PROTOCOL_VERSION,
-    HOST_CAPABILITY_NATIVE_READINESS_RECEIPT_V1,
+    HOST_CAPABILITY_CODEX_SEND_RECEIPT_V1, HOST_CAPABILITY_NATIVE_READINESS_RECEIPT_V1,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -2642,138 +2642,96 @@ impl Supervisor {
         }
     }
 
-    async fn fresh_agent_send(
+    async fn reconcile_ambiguous_codex_send_receipt(
         &self,
-        request_id: RequestId,
-        soul_id: SoulId,
-        text: String,
-        settings: Option<freshell_runtime_protocol::FreshAgentTurnSettings>,
-        checkpoint_logical_attempt_id: Option<String>,
-    ) -> Result<CommandState, RuntimeError> {
-        if text.len() > freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES / 2 {
-            return Err(RuntimeError::new(
-                RuntimeErrorCode::InvalidRequest,
-                "fresh-agent input exceeds control-frame budget",
-            ));
-        }
-        let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
-        let _lifecycle_guard = lifecycle_lock.lock().await;
-        let settings_correlation = match checkpoint_logical_attempt_id.as_deref() {
-            Some(logical_attempt_id) => {
-                serde_json::to_vec(&(settings.as_ref(), logical_attempt_id))
-            }
-            None => serde_json::to_vec(&settings),
-        }
-        .map_err(|_| {
-            RuntimeError::new(
-                RuntimeErrorCode::InvalidRequest,
-                "fresh-agent settings could not be correlated",
-            )
-        })?;
-        match self
+        soul_id: &SoulId,
+        request_id: &RequestId,
+        text: &str,
+        settings: Option<&freshell_runtime_protocol::FreshAgentTurnSettings>,
+        checkpoint_logical_attempt_id: Option<&str>,
+        settings_correlation: &[u8],
+    ) -> Result<bool, RuntimeError> {
+        let Some(recorded_incarnation) = self
             .registry
-            .recorded_input_outcome(
+            .ambiguous_input_incarnation(
                 soul_id.clone(),
                 request_id.clone(),
                 text.as_bytes(),
-                Some(&settings_correlation),
+                Some(settings_correlation),
             )
             .await
             .map_err(map_registry)?
-        {
-            Some(InputJournalDisposition::Completed) => return Ok(CommandState::Completed),
-            Some(InputJournalDisposition::Ambiguous) => return Ok(CommandState::Ambiguous),
-            Some(InputJournalDisposition::Refused(diagnostic)) => {
-                return Err(fresh_send_refusal_error(diagnostic))
-            }
-            Some(InputJournalDisposition::Dispatch) | None => {}
-        }
-        let active = match self.registry.active_handle_for_soul(soul_id.clone()).await {
-            Ok(active) => active,
-            Err(error @ RegistryError::UnknownSoul(_)) => {
-                if let Some(source) = self
-                    .registry
-                    .codex_dispatch_recovery_source(soul_id.clone())
-                    .await
-                    .map_err(map_registry)?
-                {
-                    source.handle().clone()
-                } else {
-                    let blocked = self
-                        .registry
-                        .refuse_blocked_unadmitted_input(
-                            soul_id.clone(),
-                            request_id.clone(),
-                            text.as_bytes(),
-                            &settings_correlation,
-                        )
-                        .await
-                        .map_err(map_registry)?;
-                    if let Some(diagnostic) = blocked {
-                        return Err(fresh_send_refusal_error(diagnostic));
-                    }
-                    return Err(map_registry(error));
-                }
-            }
-            Err(error) => return Err(map_registry(error)),
+        else {
+            return Ok(false);
         };
-        if active.fresh_agent().is_none() {
-            return Err(RuntimeError::new(
-                RuntimeErrorCode::UnsupportedWorkload,
-                "soul is not a hosted fresh-agent",
-            ));
+        let Some(source) = self
+            .registry
+            .codex_dispatch_recovery_source(soul_id.clone())
+            .await
+            .map_err(map_registry)?
+        else {
+            return Ok(false);
+        };
+        if source.handle().incarnation_id() != &recorded_incarnation {
+            return Ok(false);
         }
-        let authenticated = self
-            .authenticate_fresh_host(&soul_id, &active, FreshNativeAdmission::CodexSendRecovery)
-            .await?;
-        let host = authenticated.host;
-        let recovery_source = authenticated.dispatch_recovery;
-        let codex_dispatch_recovery_source = authenticated.codex_dispatch_recovery_source;
-        let (disposition, incarnation_id) = if let Some(source) = recovery_source.as_ref() {
-            self.registry
-                .begin_codex_dispatch_recovery_input(
-                    source.clone(),
-                    request_id.clone(),
-                    text.as_bytes(),
-                    &settings_correlation,
-                    settings.clone(),
-                )
-                .await
-        } else {
-            self.registry
-                .begin_fresh_input(
-                    soul_id.clone(),
-                    request_id.clone(),
-                    text.as_bytes(),
-                    &settings_correlation,
-                    settings.clone(),
-                )
-                .await
+        let context = self
+            .registry
+            .recovery_context(soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        if !source.matches_context(&context) {
+            return Ok(false);
         }
-        .map_err(map_registry)?;
-        match disposition {
-            InputJournalDisposition::Completed => return Ok(CommandState::Completed),
-            InputJournalDisposition::Ambiguous => return Ok(CommandState::Ambiguous),
-            InputJournalDisposition::Refused(diagnostic) => {
-                return Err(fresh_send_refusal_error(diagnostic))
+
+        let handle = source.handle();
+        let host = match self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await
+        {
+            Ok(host) => host,
+            Err(error) => {
+                tracing::warn!(
+                    event = "fresh_agent.codex_send_receipt_authentication_failed",
+                    soul_id = %soul_id,
+                    incarnation_id = %recorded_incarnation,
+                    error_code = ?error.code,
+                    "cannot safely reconcile the ambiguous send receipt"
+                );
+                return Ok(false);
             }
-            InputJournalDisposition::Dispatch => {}
+        };
+        if !host
+            .capabilities
+            .iter()
+            .any(|capability| capability == HOST_CAPABILITY_CODEX_SEND_RECEIPT_V1)
+        {
+            return Ok(false);
         }
-        let handle = self
-            .registry
-            .owned_handle(incarnation_id)
+        let status = match self
+            .host_status(handle.incarnation_id().clone(), handle.runtime_dir(), &host)
             .await
-            .map_err(map_registry)?;
-        self.registry
-            .mark_input_dispatching(soul_id.clone(), request_id.clone())
-            .await
-            .map_err(map_registry)?;
-        let fence = self
-            .registry
-            .recovery_write_fence(soul_id.clone())
-            .await
-            .map_err(map_registry)?;
-        let response = self
+        {
+            Ok(status) => status,
+            Err(error) => {
+                tracing::warn!(
+                    event = "fresh_agent.codex_send_receipt_status_failed",
+                    soul_id = %soul_id,
+                    incarnation_id = %recorded_incarnation,
+                    error_code = ?error.code,
+                    "cannot safely reconcile the ambiguous send receipt"
+                );
+                return Ok(false);
+            }
+        };
+        if status.host_boot_id != host.host_boot_id
+            || !source.matches_host(&status.host_boot_id, status.max_execution_generation)
+            || status.worker_pid.is_none()
+        {
+            return Ok(false);
+        }
+
+        let receipt = self
             .send_authenticated_host_command(
                 handle.incarnation_id().clone(),
                 handle.runtime_dir(),
@@ -2781,45 +2739,251 @@ impl Supervisor {
                 HostCommand::FreshAgentSend {
                     incarnation_id: handle.incarnation_id().clone(),
                     request_id: request_id.clone(),
-                    text,
-                    settings,
-                    checkpoint_logical_attempt_id,
-                    codex_dispatch_recovery_source,
+                    text: text.to_string(),
+                    settings: settings.cloned(),
+                    checkpoint_logical_attempt_id: checkpoint_logical_attempt_id
+                        .map(str::to_string),
+                    codex_dispatch_recovery_source: None,
+                    receipt_only: true,
                 },
             )
             .await;
-        match response {
+        let identity = match receipt {
             Ok(HostResult::FreshAgentCommand {
                 state: CommandState::ProviderAcked | CommandState::Completed,
-                native_session_id,
-                native_identity,
+                native_session_id: Some(native_session_id),
+                native_identity: Some(identity),
                 ..
-            }) => {
-                if let Some(identity) = native_identity {
-                    let prior_native = handle
-                        .fresh_agent()
-                        .and_then(|spec| spec.native_session_id.as_deref());
-                    if handle.fresh_agent().is_none_or(|spec| {
-                        spec.provider != freshell_runtime_protocol::FreshProvider::Codex
-                    }) || prior_native != Some(identity.previous_native_session_id.as_str())
-                        || native_session_id.as_deref() != Some(identity.native_session_id.as_str())
+            }) if context.native_session_id.as_deref()
+                == Some(identity.previous_native_session_id.as_str())
+                && native_session_id == identity.native_session_id =>
+            {
+                identity
+            }
+            Ok(HostResult::FreshAgentCommand { .. }) => return Ok(false),
+            Ok(_) => return Ok(false),
+            Err(error) if error.code == RuntimeErrorCode::CommandAmbiguous => return Ok(false),
+            Err(error) => {
+                tracing::warn!(
+                    event = "fresh_agent.codex_send_receipt_lookup_failed",
+                    soul_id = %soul_id,
+                    incarnation_id = %recorded_incarnation,
+                    error_code = ?error.code,
+                    "host did not return a durable accepted-send receipt"
+                );
+                return Ok(false);
+            }
+        };
+
+        self.registry
+            .record_codex_dispatch_recovery_identity(source, identity, request_id.clone())
+            .await
+            .map_err(map_registry)?;
+        tracing::info!(
+            event = "fresh_agent.codex_send_receipt_reconciled",
+            soul_id = %soul_id,
+            incarnation_id = %recorded_incarnation,
+            request_id = %request_id,
+            "committed the host's existing Codex send receipt without dispatching again"
+        );
+        Ok(true)
+    }
+
+    fn fresh_agent_send<'a>(
+        &'a self,
+        request_id: RequestId,
+        soul_id: SoulId,
+        text: String,
+        settings: Option<freshell_runtime_protocol::FreshAgentTurnSettings>,
+        checkpoint_logical_attempt_id: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<CommandState, RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            if text.len() > freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES / 2 {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::InvalidRequest,
+                    "fresh-agent input exceeds control-frame budget",
+                ));
+            }
+            let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
+            let _lifecycle_guard = lifecycle_lock.lock().await;
+            let settings_correlation = match checkpoint_logical_attempt_id.as_deref() {
+                Some(logical_attempt_id) => {
+                    serde_json::to_vec(&(settings.as_ref(), logical_attempt_id))
+                }
+                None => serde_json::to_vec(&settings),
+            }
+            .map_err(|_| {
+                RuntimeError::new(
+                    RuntimeErrorCode::InvalidRequest,
+                    "fresh-agent settings could not be correlated",
+                )
+            })?;
+            match self
+                .registry
+                .recorded_input_outcome(
+                    soul_id.clone(),
+                    request_id.clone(),
+                    text.as_bytes(),
+                    Some(&settings_correlation),
+                )
+                .await
+                .map_err(map_registry)?
+            {
+                Some(InputJournalDisposition::Completed) => return Ok(CommandState::Completed),
+                Some(InputJournalDisposition::Ambiguous) => {
+                    if Box::pin(self.reconcile_ambiguous_codex_send_receipt(
+                        &soul_id,
+                        &request_id,
+                        &text,
+                        settings.as_ref(),
+                        checkpoint_logical_attempt_id.as_deref(),
+                        &settings_correlation,
+                    ))
+                    .await?
                     {
-                        return Err(RuntimeError::new(
+                        return Ok(CommandState::ProviderAcked);
+                    }
+                    return Ok(CommandState::Ambiguous);
+                }
+                Some(InputJournalDisposition::Refused(diagnostic)) => {
+                    return Err(fresh_send_refusal_error(diagnostic))
+                }
+                Some(InputJournalDisposition::Dispatch) | None => {}
+            }
+            let active = match self.registry.active_handle_for_soul(soul_id.clone()).await {
+                Ok(active) => active,
+                Err(error @ RegistryError::UnknownSoul(_)) => {
+                    if let Some(source) = self
+                        .registry
+                        .codex_dispatch_recovery_source(soul_id.clone())
+                        .await
+                        .map_err(map_registry)?
+                    {
+                        source.handle().clone()
+                    } else {
+                        let blocked = self
+                            .registry
+                            .refuse_blocked_unadmitted_input(
+                                soul_id.clone(),
+                                request_id.clone(),
+                                text.as_bytes(),
+                                &settings_correlation,
+                            )
+                            .await
+                            .map_err(map_registry)?;
+                        if let Some(diagnostic) = blocked {
+                            return Err(fresh_send_refusal_error(diagnostic));
+                        }
+                        return Err(map_registry(error));
+                    }
+                }
+                Err(error) => return Err(map_registry(error)),
+            };
+            if active.fresh_agent().is_none() {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::UnsupportedWorkload,
+                    "soul is not a hosted fresh-agent",
+                ));
+            }
+            let authenticated = self
+                .authenticate_fresh_host(&soul_id, &active, FreshNativeAdmission::CodexSendRecovery)
+                .await?;
+            let host = authenticated.host;
+            let recovery_source = authenticated.dispatch_recovery;
+            let codex_dispatch_recovery_source = authenticated.codex_dispatch_recovery_source;
+            let (disposition, incarnation_id) = if let Some(source) = recovery_source.as_ref() {
+                self.registry
+                    .begin_codex_dispatch_recovery_input(
+                        source.clone(),
+                        request_id.clone(),
+                        text.as_bytes(),
+                        &settings_correlation,
+                        settings.clone(),
+                    )
+                    .await
+            } else {
+                self.registry
+                    .begin_fresh_input(
+                        soul_id.clone(),
+                        request_id.clone(),
+                        text.as_bytes(),
+                        &settings_correlation,
+                        settings.clone(),
+                    )
+                    .await
+            }
+            .map_err(map_registry)?;
+            match disposition {
+                InputJournalDisposition::Completed => return Ok(CommandState::Completed),
+                InputJournalDisposition::Ambiguous => return Ok(CommandState::Ambiguous),
+                InputJournalDisposition::Refused(diagnostic) => {
+                    return Err(fresh_send_refusal_error(diagnostic))
+                }
+                InputJournalDisposition::Dispatch => {}
+            }
+            let handle = self
+                .registry
+                .owned_handle(incarnation_id)
+                .await
+                .map_err(map_registry)?;
+            self.registry
+                .mark_input_dispatching(soul_id.clone(), request_id.clone())
+                .await
+                .map_err(map_registry)?;
+            let fence = self
+                .registry
+                .recovery_write_fence(soul_id.clone())
+                .await
+                .map_err(map_registry)?;
+            let response = self
+                .send_authenticated_host_command(
+                    handle.incarnation_id().clone(),
+                    handle.runtime_dir(),
+                    &host,
+                    HostCommand::FreshAgentSend {
+                        incarnation_id: handle.incarnation_id().clone(),
+                        request_id: request_id.clone(),
+                        text,
+                        settings,
+                        checkpoint_logical_attempt_id,
+                        codex_dispatch_recovery_source,
+                        receipt_only: false,
+                    },
+                )
+                .await;
+            match response {
+                Ok(HostResult::FreshAgentCommand {
+                    state: CommandState::ProviderAcked | CommandState::Completed,
+                    native_session_id,
+                    native_identity,
+                    ..
+                }) => {
+                    if let Some(identity) = native_identity {
+                        let prior_native = handle
+                            .fresh_agent()
+                            .and_then(|spec| spec.native_session_id.as_deref());
+                        if handle.fresh_agent().is_none_or(|spec| {
+                            spec.provider != freshell_runtime_protocol::FreshProvider::Codex
+                        }) || prior_native != Some(identity.previous_native_session_id.as_str())
+                            || native_session_id.as_deref()
+                                != Some(identity.native_session_id.as_str())
+                        {
+                            return Err(RuntimeError::new(
                             RuntimeErrorCode::OwnershipMismatch,
                             "accepted native identity does not match its captured command source",
                         ));
-                    }
-                    let update = classify_fresh_agent_operation_identity(
-                        prior_native,
-                        native_session_id.as_deref(),
-                    )?;
-                    if update != FreshAgentNativeIdentityUpdate::Unchanged
-                        || identity.pending_naming_handle.is_some()
-                        || recovery_source.is_some()
-                    {
+                        }
+                        let update = classify_fresh_agent_operation_identity(
+                            prior_native,
+                            native_session_id.as_deref(),
+                        )?;
                         if let Some(source) = recovery_source.as_ref() {
                             self.registry
-                                .record_codex_dispatch_recovery_identity(source.clone(), identity)
+                                .record_codex_dispatch_recovery_identity(
+                                    source.clone(),
+                                    identity,
+                                    request_id.clone(),
+                                )
                                 .await
                                 .map_err(map_registry)?;
                         } else {
@@ -2832,39 +2996,40 @@ impl Supervisor {
                                 .await
                                 .map_err(map_registry)?;
                         }
+                        tracing::info!(soul_id=%soul_id,incarnation_id=%handle.incarnation_id(),previous_native_session_id=prior_native,native_session_id=native_session_id.as_deref(),native_identity_update=?update,"freshagent.native_dispatch_identity_committed");
+                    } else if recovery_source.is_some() {
+                        self.registry
+                            .mark_input_ambiguous(soul_id, request_id)
+                            .await
+                            .map_err(map_registry)?;
+                        return Err(RuntimeError::new(
+                            RuntimeErrorCode::OwnershipMismatch,
+                            "native recovery input lacks its typed source receipt",
+                        ));
+                    } else if let Some(native_session_id) = native_session_id {
+                        self.registry
+                            .record_native_session_fenced(
+                                soul_id.clone(),
+                                handle.incarnation_id().clone(),
+                                native_session_id,
+                                fence,
+                            )
+                            .await
+                            .map_err(map_registry)?;
                     }
-                    tracing::info!(soul_id=%soul_id,incarnation_id=%handle.incarnation_id(),previous_native_session_id=prior_native,native_session_id=native_session_id.as_deref(),native_identity_update=?update,"freshagent.native_dispatch_identity_committed");
-                } else if recovery_source.is_some() {
-                    self.registry
-                        .mark_input_ambiguous(soul_id, request_id)
-                        .await
-                        .map_err(map_registry)?;
-                    return Err(RuntimeError::new(
-                        RuntimeErrorCode::OwnershipMismatch,
-                        "native recovery input lacks its typed source receipt",
-                    ));
-                } else if let Some(native_session_id) = native_session_id {
-                    self.registry
-                        .record_native_session_fenced(
-                            soul_id.clone(),
-                            handle.incarnation_id().clone(),
-                            native_session_id,
-                            fence,
-                        )
-                        .await
-                        .map_err(map_registry)?;
+                    if recovery_source.is_none() {
+                        self.registry
+                            .mark_input_completed(soul_id, request_id)
+                            .await
+                            .map_err(map_registry)?;
+                    }
+                    Ok(CommandState::ProviderAcked)
                 }
-                self.registry
-                    .mark_input_completed(soul_id, request_id)
-                    .await
-                    .map_err(map_registry)?;
-                Ok(CommandState::ProviderAcked)
-            }
-            Ok(HostResult::FreshAgentCommand {
-                state: CommandState::Cancelled,
-                ..
-            }) => {
-                self.registry
+                Ok(HostResult::FreshAgentCommand {
+                    state: CommandState::Cancelled,
+                    ..
+                }) => {
+                    self.registry
                     .mark_fresh_input_refused(
                         soul_id,
                         request_id,
@@ -2876,44 +3041,45 @@ impl Supervisor {
                     )
                     .await
                     .map_err(map_registry)?;
-                Ok(CommandState::Cancelled)
-            }
-            Ok(HostResult::FreshAgentCommand { state, .. }) => {
-                self.registry
-                    .mark_input_ambiguous(soul_id, request_id)
-                    .await
-                    .map_err(map_registry)?;
-                Ok(state)
-            }
-            Ok(_) => {
-                self.registry
-                    .mark_input_ambiguous(soul_id, request_id)
-                    .await
-                    .map_err(map_registry)?;
-                Err(RuntimeError::new(
-                    RuntimeErrorCode::HostAuthenticationFailed,
-                    "unexpected fresh-agent command reply",
-                ))
-            }
-            Err(error) => {
-                let refusal = error.fresh_agent_send_diagnostic.as_ref().filter(|diagnostic| {
-                    error.code != RuntimeErrorCode::CommandAmbiguous
-                        && diagnostic.outcome == freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused
-                });
-                if let Some(diagnostic) = refusal {
-                    self.registry
-                        .mark_fresh_input_refused(soul_id, request_id, diagnostic.clone())
-                        .await
-                        .map_err(map_registry)?;
-                } else {
+                    Ok(CommandState::Cancelled)
+                }
+                Ok(HostResult::FreshAgentCommand { state, .. }) => {
                     self.registry
                         .mark_input_ambiguous(soul_id, request_id)
                         .await
                         .map_err(map_registry)?;
+                    Ok(state)
                 }
-                Err(error)
+                Ok(_) => {
+                    self.registry
+                        .mark_input_ambiguous(soul_id, request_id)
+                        .await
+                        .map_err(map_registry)?;
+                    Err(RuntimeError::new(
+                        RuntimeErrorCode::HostAuthenticationFailed,
+                        "unexpected fresh-agent command reply",
+                    ))
+                }
+                Err(error) => {
+                    let refusal = error.fresh_agent_send_diagnostic.as_ref().filter(|diagnostic| {
+                    error.code != RuntimeErrorCode::CommandAmbiguous
+                        && diagnostic.outcome == freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused
+                });
+                    if let Some(diagnostic) = refusal {
+                        self.registry
+                            .mark_fresh_input_refused(soul_id, request_id, diagnostic.clone())
+                            .await
+                            .map_err(map_registry)?;
+                    } else {
+                        self.registry
+                            .mark_input_ambiguous(soul_id, request_id)
+                            .await
+                            .map_err(map_registry)?;
+                    }
+                    Err(error)
+                }
             }
-        }
+        })
     }
 
     pub(crate) async fn authenticate_current_fresh_host(
@@ -3218,8 +3384,8 @@ impl Supervisor {
             })
         {
             // This exact-store path serves Codex readiness when live proof is
-            // incomplete or a validated retained SEND is being recovered. It
-            // commits any resulting root transition before the operation runs.
+            // incomplete. Retained SEND recovery stays inside the host's
+            // retained input dispatch, which binds the accepted source itself.
             let before_probe = current.write_fence();
             let (probe, probed_context) = self
                 .probe_codex_native_readiness_locked(&current, &host)
@@ -10661,6 +10827,7 @@ mod host_command_budget_tests {
             settings: None,
             checkpoint_logical_attempt_id: None,
             codex_dispatch_recovery_source: None,
+            receipt_only: false,
         })
         .await
         .expect_err("a silent host times out");

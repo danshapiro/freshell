@@ -3908,6 +3908,7 @@ mod tests {
                     settings: None,
                     checkpoint_logical_attempt_id: None,
                     codex_dispatch_recovery_source: None,
+                    receipt_only: false,
                 },
             ),
         )
@@ -6701,6 +6702,7 @@ await import(parameters.source)
                         settings: None,
                         checkpoint_logical_attempt_id: None,
                         codex_dispatch_recovery_source,
+                        receipt_only: false,
                     },
                 ),
                 host,
