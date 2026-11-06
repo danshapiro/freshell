@@ -24,7 +24,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const SCHEMA_VERSION: u32 = 21;
+pub const SCHEMA_VERSION: u32 = 22;
 mod codex_dispatch_recovery;
 pub(crate) use codex_dispatch_recovery::OwnedCodexDispatchRecovery;
 mod input_reservation;
@@ -2651,7 +2651,7 @@ impl Registry {
         data: &[u8],
         correlation: Option<&[u8]>,
     ) -> Result<(InputJournalDisposition, IncarnationId), RegistryError> {
-        self.begin_input_with_settings(soul_id, request_id, data, correlation, None, None)
+        self.begin_input_with_settings(soul_id, request_id, data, correlation, None, false, None)
             .await
     }
 
@@ -2663,8 +2663,16 @@ impl Registry {
         correlation: &[u8],
         settings: Option<FreshAgentTurnSettings>,
     ) -> Result<(InputJournalDisposition, IncarnationId), RegistryError> {
-        self.begin_input_with_settings(soul_id, request_id, data, Some(correlation), settings, None)
-            .await
+        self.begin_input_with_settings(
+            soul_id,
+            request_id,
+            data,
+            Some(correlation),
+            settings,
+            false,
+            None,
+        )
+        .await
     }
 
     pub(crate) async fn begin_codex_dispatch_recovery_input(
@@ -2674,13 +2682,18 @@ impl Registry {
         data: &[u8],
         correlation: &[u8],
         settings: Option<FreshAgentTurnSettings>,
+        receipt_capable: bool,
     ) -> Result<(InputJournalDisposition, IncarnationId), RegistryError> {
+        if source.is_receipt_only() {
+            return Err(RegistryError::NativeIdentityConflict);
+        }
         self.begin_input_with_settings(
             source.handle.soul_id().clone(),
             request_id,
             data,
             Some(correlation),
             settings,
+            receipt_capable,
             Some(source),
         )
         .await
@@ -2693,6 +2706,7 @@ impl Registry {
         data: &[u8],
         correlation: Option<&[u8]>,
         settings: Option<FreshAgentTurnSettings>,
+        codex_dispatch_recovery_receipt: bool,
         recovery_source: Option<Arc<OwnedCodexDispatchRecovery>>,
     ) -> Result<(InputJournalDisposition, IncarnationId), RegistryError> {
         let payload_digest = input_payload_digest(data, correlation);
@@ -2787,17 +2801,33 @@ impl Registry {
             }
             let now = now_millis();
             let changed = tx.execute(
-                "UPDATE input_commands SET incarnation_id=?1,updated_at=?2 WHERE soul_id=?3 AND request_id=?4 AND state='queued'",
-                params![incarnation_id.as_str(), now, soul_id.as_str(), request_id.as_str()],
+                "UPDATE input_commands SET incarnation_id=?1,codex_dispatch_recovery_receipt=?2,updated_at=?3 WHERE soul_id=?4 AND request_id=?5 AND state='queued'",
+                params![incarnation_id.as_str(), codex_dispatch_recovery_receipt, now, soul_id.as_str(), request_id.as_str()],
             )?;
             if changed == 0 {
                 tx.execute(
-                    "INSERT INTO input_commands (soul_id,request_id,payload_digest,protected_payload,incarnation_id,state,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,'queued',?6,?6)",
-                    params![soul_id.as_str(), request_id.as_str(), payload_digest, protected_payload, incarnation_id.as_str(), now],
+                    "INSERT INTO input_commands (soul_id,request_id,payload_digest,protected_payload,incarnation_id,state,codex_dispatch_recovery_receipt,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,'queued',?6,?7,?7)",
+                    params![soul_id.as_str(), request_id.as_str(), payload_digest, protected_payload, incarnation_id.as_str(), codex_dispatch_recovery_receipt, now],
                 )?;
             }
             tx.commit()?;
             Ok((InputJournalDisposition::Dispatch, incarnation_id))
+        })
+        .await
+    }
+
+    pub(crate) async fn unresolved_codex_dispatch_recovery_receipt_count(
+        &self,
+        soul_id: SoulId,
+        incarnation_id: IncarnationId,
+    ) -> Result<u64, RegistryError> {
+        self.run_blocking(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM input_commands WHERE soul_id=?1 AND incarnation_id=?2 AND codex_dispatch_recovery_receipt=1 AND state IN ('dispatching','ambiguous')",
+                params![soul_id.as_str(), incarnation_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(RegistryError::from)
         })
         .await
     }
@@ -3059,6 +3089,11 @@ impl Registry {
                     "ambiguous input command {request_id} no longer matches its receipt"
                 )));
             }
+            clear_command_ambiguous_recovery_block_if_settled(
+                &tx,
+                &soul_id,
+                &incarnation_id,
+            )?;
             tx.commit()?;
             Ok(())
         })
@@ -3570,9 +3605,6 @@ impl Registry {
                         spec.naming_handle=pending.clone();
                         tx.execute("UPDATE incarnations SET fresh_agent_spec=?1,updated_at=?2 WHERE incarnation_id=?3",params![serde_json::to_string(spec)?,now_millis(),incarnation_id.as_str()])?;
                     }
-                    if let Some(source) = recovery_source.as_ref() {
-                        codex_dispatch_recovery::commit_dispatch_acceptance(&tx, source)?;
-                    }
                     if let Some(request_id) = recovery_input_request_id.as_ref() {
                         complete_codex_recovery_input_in_tx(
                             &tx,
@@ -3580,6 +3612,9 @@ impl Registry {
                             &incarnation_id,
                             request_id,
                         )?;
+                    }
+                    if let Some(source) = recovery_source.as_ref() {
+                        codex_dispatch_recovery::commit_dispatch_acceptance(&tx, source)?;
                     }
                     let successor = load_recovery_write_fence(&tx, &soul_id)?;
                     tx.commit()?;
@@ -3664,9 +3699,6 @@ impl Registry {
                 tx.execute("UPDATE incarnations SET native_identity_observation=?2 WHERE incarnation_id=?1",
                     params![incarnation_id.as_str(), serde_json::to_string(observation)?])?;
             }
-            if let Some(source) = recovery_source.as_ref() {
-                codex_dispatch_recovery::commit_dispatch_acceptance(&tx, source)?;
-            }
             if let Some(request_id) = recovery_input_request_id.as_ref() {
                 complete_codex_recovery_input_in_tx(
                     &tx,
@@ -3674,6 +3706,9 @@ impl Registry {
                     &incarnation_id,
                     request_id,
                 )?;
+            }
+            if let Some(source) = recovery_source.as_ref() {
+                codex_dispatch_recovery::commit_dispatch_acceptance(&tx, source)?;
             }
             let successor = load_recovery_write_fence(&tx, &soul_id)?;
             tx.commit()?;
@@ -6069,6 +6104,23 @@ fn complete_codex_recovery_input_in_tx(
     Ok(())
 }
 
+fn clear_command_ambiguous_recovery_block_if_settled(
+    conn: &Connection,
+    soul_id: &SoulId,
+    incarnation_id: &IncarnationId,
+) -> Result<(), RegistryError> {
+    conn.execute(
+        "UPDATE souls SET recovery_state='live',recovery_reason=NULL,updated_at=?1 WHERE soul_id=?2 AND desired_state='running' AND recovery_state='blocked' AND recovery_reason=?3 AND recovery_attempt_id IS NULL AND NOT EXISTS(SELECT 1 FROM input_commands c WHERE c.soul_id=?2 AND c.incarnation_id=?4 AND c.codex_dispatch_recovery_receipt=1 AND c.state IN ('dispatching','ambiguous'))",
+        params![
+            now_millis(),
+            soul_id.as_str(),
+            recovery_block_reason_name(RecoveryBlockReason::CommandAmbiguous),
+            incarnation_id.as_str(),
+        ],
+    )?;
+    Ok(())
+}
+
 fn reservation_totals(
     conn: &Connection,
     project_key: Option<&str>,
@@ -6650,6 +6702,7 @@ fn create_schema(
             protected_payload BLOB NOT NULL,
             incarnation_id TEXT NOT NULL REFERENCES incarnations(incarnation_id),
             state TEXT NOT NULL,
+            codex_dispatch_recovery_receipt INTEGER NOT NULL DEFAULT 0 CHECK (codex_dispatch_recovery_receipt IN (0,1)),
             fresh_agent_send_refusal TEXT,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
@@ -7372,6 +7425,17 @@ fn migrate_schema(conn: &mut Connection) -> Result<(), RegistryError> {
         tx.execute_batch("UPDATE installation SET schema_version=21,inventory_revision=inventory_revision+1 WHERE singleton=1;")?;
         tx.commit()?;
         schema = 21;
+    }
+    if schema == 21 {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !column_exists(&tx, "input_commands", "codex_dispatch_recovery_receipt")? {
+            tx.execute_batch(
+                "ALTER TABLE input_commands ADD COLUMN codex_dispatch_recovery_receipt INTEGER NOT NULL DEFAULT 0 CHECK (codex_dispatch_recovery_receipt IN (0,1));",
+            )?;
+        }
+        tx.execute_batch("UPDATE installation SET schema_version=22,inventory_revision=inventory_revision+1 WHERE singleton=1;")?;
+        tx.commit()?;
+        schema = 22;
     }
     if schema != SCHEMA_VERSION {
         return Err(RegistryError::Integrity(format!(

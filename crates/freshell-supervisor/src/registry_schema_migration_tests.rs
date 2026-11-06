@@ -28,9 +28,14 @@ fn assert_merged_schema_columns(connection: &Connection) {
         "input_commands",
         "fresh_agent_send_refusal"
     ));
+    assert!(has_column(
+        connection,
+        "input_commands",
+        "codex_dispatch_recovery_receipt"
+    ));
 }
 
-fn assert_schema_21(connection: &Connection) {
+fn assert_current_schema(connection: &Connection) {
     let version: u32 = connection
         .query_row(
             "SELECT schema_version FROM installation WHERE singleton=1",
@@ -38,8 +43,8 @@ fn assert_schema_21(connection: &Connection) {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(SCHEMA_VERSION, 21);
-    assert_eq!(version, 21);
+    assert_eq!(SCHEMA_VERSION, 22);
+    assert_eq!(version, SCHEMA_VERSION);
     assert_merged_schema_columns(connection);
 }
 
@@ -66,7 +71,7 @@ async fn schema_19_migrates_through_both_columns_without_losing_rows() {
     drop(registry);
 
     let connection = Connection::open(&database).unwrap();
-    assert_schema_21(&connection);
+    assert_current_schema(&connection);
     let installation_id: String = connection
         .query_row(
             "SELECT installation_id FROM installation WHERE singleton=1",
@@ -89,7 +94,7 @@ async fn schema_19_migrates_through_both_columns_without_losing_rows() {
     drop(reopened);
 
     let connection = Connection::open(&database).unwrap();
-    assert_schema_21(&connection);
+    assert_current_schema(&connection);
     let (persisted_installation_id, soul_count, incarnation_count, payload): (
         String,
         i64,
@@ -137,7 +142,7 @@ async fn schema_20_receipt_layout_migrates_without_losing_receipt_or_queued_inpu
     // A schema-20 database produced by the feature branch has the receipt
     // column but predates the refusal column.
     let connection = Connection::open(&database).unwrap();
-    assert_schema_21(&connection);
+    assert_current_schema(&connection);
     let installation_id: String = connection
         .query_row(
             "SELECT installation_id FROM installation WHERE singleton=1",
@@ -165,7 +170,7 @@ async fn schema_20_receipt_layout_migrates_without_losing_receipt_or_queued_inpu
     let reopened = Registry::open(&registry_path, None).unwrap();
     drop(reopened);
     let connection = Connection::open(&database).unwrap();
-    assert_schema_21(&connection);
+    assert_current_schema(&connection);
     let (version, persisted_installation_id): (u32, String) = connection
         .query_row(
             "SELECT schema_version,installation_id FROM installation WHERE singleton=1",
@@ -233,7 +238,7 @@ async fn schema_20_refusal_layout_migrates_without_losing_refusal_or_existing_ro
     // An upstream schema-20 database has the refusal column but predates the
     // native-readiness receipt column.
     let connection = Connection::open(&database).unwrap();
-    assert_schema_21(&connection);
+    assert_current_schema(&connection);
     let installation_id: String = connection
         .query_row(
             "SELECT installation_id FROM installation WHERE singleton=1",
@@ -301,7 +306,7 @@ async fn schema_20_refusal_layout_migrates_without_losing_refusal_or_existing_ro
     let reopened = Registry::open(&registry_path, None).unwrap();
     drop(reopened);
     let connection = Connection::open(&database).unwrap();
-    assert_schema_21(&connection);
+    assert_current_schema(&connection);
     let (version, persisted_installation_id): (u32, String) = connection
         .query_row(
             "SELECT schema_version,installation_id FROM installation WHERE singleton=1",
@@ -337,4 +342,74 @@ async fn schema_20_refusal_layout_migrates_without_losing_refusal_or_existing_ro
         incarnation_count, 1,
         "migration must preserve incarnation rows"
     );
+}
+
+#[tokio::test]
+async fn schema_21_adds_receipt_marker_without_reclassifying_existing_inputs() {
+    let root = tempfile::tempdir().unwrap();
+    let registry_path = root.path().join("registry");
+    let registry = Registry::open(&registry_path, None).unwrap();
+    let soul = SoulId::new();
+    let prepared = materialize_fresh_runtime(&registry, soul.clone(), root.path()).await;
+    let request = RequestId::parse("schema-21-receipt-marker").unwrap();
+    let (disposition, _) = registry
+        .begin_fresh_input(
+            soul.clone(),
+            request.clone(),
+            b"previously ambiguous ordinary input",
+            b"null",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(disposition, InputJournalDisposition::Dispatch);
+    registry
+        .mark_input_dispatching(soul.clone(), request.clone())
+        .await
+        .unwrap();
+    let database = registry.database_path().to_owned();
+    drop(registry);
+
+    // Schema 21 predates source-bound receipt tracking. Preserve the old
+    // ambiguous row, but default it to untracked so it cannot block recovery.
+    let connection = Connection::open(&database).unwrap();
+    assert_current_schema(&connection);
+    connection
+        .execute(
+            "UPDATE input_commands SET state='ambiguous' WHERE soul_id=?1 AND request_id=?2",
+            params![soul.as_str(), request.as_str()],
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE input_commands DROP COLUMN codex_dispatch_recovery_receipt;
+             UPDATE installation SET schema_version=21 WHERE singleton=1;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let migrated = Registry::open(&registry_path, None).unwrap();
+    assert_eq!(
+        migrated
+            .unresolved_codex_dispatch_recovery_receipt_count(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+            )
+            .await
+            .unwrap(),
+        0,
+        "preexisting ambiguous rows must not be treated as receipt-bearing sends"
+    );
+    drop(migrated);
+
+    let connection = Connection::open(&database).unwrap();
+    assert_current_schema(&connection);
+    let marker: i64 = connection
+        .query_row(
+            "SELECT codex_dispatch_recovery_receipt FROM input_commands WHERE soul_id=?1 AND request_id=?2",
+            params![soul.as_str(), request.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(marker, 0);
 }

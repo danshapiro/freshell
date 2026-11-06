@@ -16,6 +16,7 @@ pub(crate) struct OwnedCodexDispatchRecovery {
     original_native_session_id: String,
     native_launch: NativeIdentityLaunch,
     blocked_recovery: bool,
+    receipt_only: bool,
 }
 
 impl OwnedCodexDispatchRecovery {
@@ -29,6 +30,10 @@ impl OwnedCodexDispatchRecovery {
 
     pub(crate) fn is_blocked(&self) -> bool {
         self.blocked_recovery
+    }
+
+    pub(crate) fn is_receipt_only(&self) -> bool {
+        self.receipt_only
     }
 
     pub(crate) fn matches_context(&self, context: &RecoveryContext) -> bool {
@@ -60,6 +65,7 @@ impl OwnedCodexDispatchRecovery {
             && self.handle.host_binary_path == other.handle.host_binary_path
             && self.handle.provider_volume_name == other.handle.provider_volume_name
             && self.handle.immutable_config_digest == other.handle.immutable_config_digest
+            && self.receipt_only == other.receipt_only
     }
 }
 
@@ -72,7 +78,22 @@ impl Registry {
         let epoch = self.control_epoch();
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction()?;
-            let source = load_source(&tx, installation, &soul_id, epoch)?;
+            let source = load_source(&tx, installation, &soul_id, epoch, false)?;
+            tx.commit()?;
+            Ok(source.map(Arc::new))
+        })
+        .await
+    }
+
+    pub(crate) async fn codex_dispatch_recovery_receipt_source(
+        &self,
+        soul_id: SoulId,
+    ) -> Result<Option<Arc<OwnedCodexDispatchRecovery>>, RegistryError> {
+        let installation = self.installation_id().clone();
+        let epoch = self.control_epoch();
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction()?;
+            let source = load_source(&tx, installation, &soul_id, epoch, true)?;
             tx.commit()?;
             Ok(source.map(Arc::new))
         })
@@ -85,6 +106,7 @@ fn load_source(
     installation: InstallationId,
     soul: &SoulId,
     epoch: u64,
+    receipt_only: bool,
 ) -> Result<Option<OwnedCodexDispatchRecovery>, RegistryError> {
     type Custody = (String, String, u64, String, String);
     let row: Option<Custody> = conn.query_row(
@@ -93,12 +115,15 @@ fn load_source(
          WHERE s.soul_id=?1 AND s.provider='codex' AND s.desired_state='running'
            AND i.launch_state='running' AND i.cleanup_state='none'
            AND i.host_boot_id IS NOT NULL AND i.grant_id IS NOT NULL AND s.loss_incident_id IS NULL
-           AND (s.recovery_state='live' OR (s.recovery_state='blocked' AND s.recovery_reason IN (?2,?3) AND s.recovery_attempt_id IS NULL))
+           AND (s.recovery_state='live' OR (s.recovery_state='blocked' AND s.recovery_attempt_id IS NULL AND (s.recovery_reason IN (?2,?3) OR (?4 AND s.recovery_reason IN (?5,?6)))))
          ORDER BY i.created_at DESC LIMIT 1",
         params![
             soul.as_str(),
             recovery_block_reason_name(RecoveryBlockReason::StoreUnreadable),
             recovery_block_reason_name(RecoveryBlockReason::ImplementationUnavailable),
+            receipt_only,
+            recovery_block_reason_name(RecoveryBlockReason::CommandAmbiguous),
+            recovery_block_reason_name(RecoveryBlockReason::RetryBudget),
         ],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
     ).optional()?;
@@ -168,6 +193,7 @@ fn load_source(
         original_native_session_id,
         native_launch,
         blocked_recovery: state == "blocked",
+        receipt_only,
     }))
 }
 
@@ -180,6 +206,7 @@ pub(super) fn validate_source(
         source.handle.installation_id.clone(),
         source.handle.soul_id(),
         source.fence.control_epoch,
+        source.receipt_only,
     )?;
     if current
         .as_ref()
@@ -197,14 +224,29 @@ pub(super) fn commit_dispatch_acceptance(
     conn: &Connection,
     source: &OwnedCodexDispatchRecovery,
 ) -> Result<(), RegistryError> {
-    conn.execute(
-        "UPDATE souls SET recovery_state='live',recovery_reason=NULL,updated_at=?1 WHERE soul_id=?2 AND desired_state='running' AND recovery_state='blocked' AND recovery_reason IN (?3,?4)",
-        params![
-            now_millis(),
-            source.handle.soul_id().as_str(),
-            recovery_block_reason_name(RecoveryBlockReason::StoreUnreadable),
-            recovery_block_reason_name(RecoveryBlockReason::ImplementationUnavailable),
-        ],
-    )?;
+    if source.receipt_only {
+        conn.execute(
+            "UPDATE souls SET recovery_state='live',recovery_reason=NULL,updated_at=?1 WHERE soul_id=?2 AND desired_state='running' AND recovery_state='blocked' AND recovery_reason IN (?3,?4,?5,?6) AND NOT EXISTS(SELECT 1 FROM input_commands c WHERE c.soul_id=?2 AND c.incarnation_id=?7 AND c.codex_dispatch_recovery_receipt=1 AND c.state IN ('dispatching','ambiguous'))",
+            params![
+                now_millis(),
+                source.handle.soul_id().as_str(),
+                recovery_block_reason_name(RecoveryBlockReason::StoreUnreadable),
+                recovery_block_reason_name(RecoveryBlockReason::ImplementationUnavailable),
+                recovery_block_reason_name(RecoveryBlockReason::CommandAmbiguous),
+                recovery_block_reason_name(RecoveryBlockReason::RetryBudget),
+                source.handle.incarnation_id().as_str(),
+            ],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE souls SET recovery_state='live',recovery_reason=NULL,updated_at=?1 WHERE soul_id=?2 AND desired_state='running' AND recovery_state='blocked' AND recovery_reason IN (?3,?4)",
+            params![
+                now_millis(),
+                source.handle.soul_id().as_str(),
+                recovery_block_reason_name(RecoveryBlockReason::StoreUnreadable),
+                recovery_block_reason_name(RecoveryBlockReason::ImplementationUnavailable),
+            ],
+        )?;
+    }
     Ok(())
 }

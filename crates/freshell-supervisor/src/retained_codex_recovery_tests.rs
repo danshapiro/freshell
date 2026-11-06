@@ -1940,7 +1940,7 @@ async fn manual_retry_does_not_advance_intent_when_running_host_receipt_state_is
 }
 
 #[tokio::test]
-async fn replacement_is_blocked_while_a_codex_send_receipt_is_unresolved() {
+async fn receipt_reconcile_clears_a_codex_send_block() {
     let fixture = ControlledCodex::new().await;
     fixture.receipt_capability.store(false, Ordering::SeqCst);
     fixture.lose_send_reply_once.store(true, Ordering::SeqCst);
@@ -1954,7 +1954,11 @@ async fn replacement_is_blocked_while_a_codex_send_receipt_is_unresolved() {
     let settings_correlation =
         serde_json::to_vec(&(settings.as_ref(), logical_attempt_id.as_deref().unwrap())).unwrap();
     let send_error = fixture
-        .send_with_checkpoint(request_id.clone(), logical_attempt_id, settings)
+        .send_with_checkpoint(
+            request_id.clone(),
+            logical_attempt_id.clone(),
+            settings.clone(),
+        )
         .await
         .unwrap_err();
     assert_eq!(send_error.code, RuntimeErrorCode::HostUnreachable);
@@ -1973,32 +1977,52 @@ async fn replacement_is_blocked_while_a_codex_send_receipt_is_unresolved() {
         Some(InputJournalDisposition::Ambiguous)
     );
 
-    let before = fixture
+    let before_block = fixture
         .supervisor
         .registry
         .recovery_context(fixture.soul.clone())
         .await
         .unwrap();
-    fixture.backend.ended.store(true, Ordering::SeqCst);
-    fixture.peer.abort();
-    let result = fixture
+    fixture.receipt_capability.store(true, Ordering::SeqCst);
+    let blocked = fixture
         .supervisor
         .recover(RecoverRequest {
             soul_id: fixture.soul.clone(),
-            trigger: RecoveryTrigger::ProviderExit,
-            expected_intent_revision: Some(before.intent_revision),
+            trigger: RecoveryTrigger::ManualRetry,
+            expected_intent_revision: Some(before_block.intent_revision),
             expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
         })
         .await
-        .expect("unresolved receipt should return a typed blocked recovery result");
-
-    assert_eq!(result.outcome, RecoveryOutcome::Blocked, "{result:?}");
+        .expect("a live receipt-capable host must hold Manual Retry behind its receipt");
+    assert_eq!(blocked.outcome, RecoveryOutcome::Blocked, "{blocked:?}");
     assert!(matches!(
-        result.probe,
+        blocked.probe,
         Some(RecoveryProbe::Blocked {
             reason: freshell_runtime_protocol::RecoveryBlockReason::CommandAmbiguous,
             ..
         })
+    ));
+    let blocked_context = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    assert_eq!(blocked_context.recovery_state, RecoveryState::Blocked);
+    assert_eq!(
+        blocked_context.intent_revision,
+        before_block.intent_revision
+    );
+
+    let reconciled = fixture
+        .reconcile_send(request_id.clone(), logical_attempt_id, settings)
+        .await
+        .expect("a matching live-host receipt should settle the original send");
+    assert!(matches!(
+        reconciled,
+        AdminResult::FreshAgentCommand {
+            state: CommandState::Completed
+        }
     ));
     assert_eq!(fixture.backend.stops.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.backend.creates.load(Ordering::SeqCst), 0);
@@ -2008,8 +2032,8 @@ async fn replacement_is_blocked_while_a_codex_send_receipt_is_unresolved() {
         .recovery_context(fixture.soul.clone())
         .await
         .unwrap();
-    assert_eq!(after.intent_revision, before.intent_revision);
-    assert_eq!(after.recovery_state, RecoveryState::Blocked);
+    assert_eq!(after.intent_revision, before_block.intent_revision);
+    assert_eq!(after.recovery_state, RecoveryState::Live);
     assert_eq!(
         fixture
             .supervisor
@@ -2022,31 +2046,138 @@ async fn replacement_is_blocked_while_a_codex_send_receipt_is_unresolved() {
             )
             .await
             .unwrap(),
-        Some(InputJournalDisposition::Ambiguous)
+        Some(InputJournalDisposition::Completed)
     );
-    let manual_retry = fixture
-        .supervisor
-        .recover(RecoverRequest {
-            soul_id: fixture.soul.clone(),
-            trigger: RecoveryTrigger::ManualRetry,
-            expected_intent_revision: Some(after.intent_revision),
-            expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
-        })
+    fixture.peer.abort();
+}
+
+#[tokio::test]
+async fn verified_host_loss_does_not_permanently_block_an_unresolved_codex_receipt() {
+    let fixture = ControlledCodex::new().await;
+    fixture.receipt_capability.store(false, Ordering::SeqCst);
+    fixture.lose_send_reply_once.store(true, Ordering::SeqCst);
+    let request_id = RequestId::parse("receipt-host-loss-replacement").unwrap();
+    let logical_attempt_id = Some("receipt-host-loss-replacement-attempt".to_string());
+    let settings = Some(freshell_runtime_protocol::FreshAgentTurnSettings {
+        cwd: Some(fixture._root.path().to_string_lossy().into_owned()),
+        model: Some("gpt-5-codex".into()),
+        ..Default::default()
+    });
+    let send_error = fixture
+        .send_with_checkpoint(request_id.clone(), logical_attempt_id, settings)
         .await
-        .expect("Manual Retry with an unresolved receipt should return a typed block");
-    assert_eq!(
-        manual_retry.outcome,
-        RecoveryOutcome::Blocked,
-        "{manual_retry:?}"
-    );
-    let after_manual_retry = fixture
+        .unwrap_err();
+    assert_eq!(send_error.code, RuntimeErrorCode::HostUnreachable);
+
+    let before = fixture
         .supervisor
         .registry
         .recovery_context(fixture.soul.clone())
         .await
         .unwrap();
-    assert_eq!(after_manual_retry.intent_revision, after.intent_revision);
-    assert_eq!(fixture.backend.stops.load(Ordering::SeqCst), 0);
+    fixture.backend.ended.store(true, Ordering::SeqCst);
+    fixture.peer.abort();
+    let recovery = fixture
+        .supervisor
+        .recover(RecoverRequest {
+            soul_id: fixture.soul.clone(),
+            trigger: RecoveryTrigger::ProviderExit,
+            expected_intent_revision: Some(before.intent_revision),
+            expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
+        })
+        .await;
+
+    assert!(
+        fixture.backend.stops.load(Ordering::SeqCst) > 0
+            || fixture.backend.creates.load(Ordering::SeqCst) > 0,
+        "after the exact host is confirmed exited, recovery should proceed to cleanup or replacement; result: {recovery:?}"
+    );
+    if let Ok(result) = recovery {
+        assert!(!matches!(
+            result.probe,
+            Some(RecoveryProbe::Blocked {
+                reason: freshell_runtime_protocol::RecoveryBlockReason::CommandAmbiguous,
+                ..
+            })
+        ));
+    }
+    let manual_retry = fixture
+        .supervisor
+        .recover(RecoverRequest {
+            soul_id: fixture.soul.clone(),
+            trigger: RecoveryTrigger::ManualRetry,
+            expected_intent_revision: Some(before.intent_revision),
+            expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
+        })
+        .await;
+    assert_ne!(
+        manual_retry
+            .ok()
+            .and_then(|result| result.probe)
+            .and_then(|probe| match probe {
+                RecoveryProbe::Blocked { reason, .. } => Some(reason),
+                _ => None,
+            }),
+        Some(freshell_runtime_protocol::RecoveryBlockReason::CommandAmbiguous),
+        "Manual Retry after host loss must use the normal recovery classifier"
+    );
+}
+
+#[tokio::test]
+async fn ordinary_codex_send_ambiguity_does_not_block_verified_recovery() {
+    let fixture = ControlledCodex::new().await;
+    fixture.exited.store(false, Ordering::SeqCst);
+    fixture.receipt_capability.store(false, Ordering::SeqCst);
+    fixture.lose_send_reply_once.store(true, Ordering::SeqCst);
+    let request_id = RequestId::new();
+    let send_error = fixture.send(request_id).await.unwrap_err();
+    assert_eq!(send_error.code, RuntimeErrorCode::HostUnreachable);
+
+    let before = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .supervisor
+            .registry
+            .unresolved_codex_dispatch_recovery_receipt_count(
+                fixture.soul.clone(),
+                before.prior_handle.incarnation_id().clone(),
+            )
+            .await
+            .unwrap(),
+        0,
+        "ordinary live Codex sends do not carry a host receipt source"
+    );
+
+    fixture.backend.ended.store(true, Ordering::SeqCst);
+    fixture.peer.abort();
+    let recovery = fixture
+        .supervisor
+        .recover(RecoverRequest {
+            soul_id: fixture.soul.clone(),
+            trigger: RecoveryTrigger::ProviderExit,
+            expected_intent_revision: Some(before.intent_revision),
+            expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
+        })
+        .await;
+    assert!(
+        fixture.backend.stops.load(Ordering::SeqCst) > 0
+            || fixture.backend.creates.load(Ordering::SeqCst) > 0,
+        "receipt-less history must not block standard recovery; result: {recovery:?}"
+    );
+    if let Ok(result) = recovery {
+        assert!(!matches!(
+            result.probe,
+            Some(RecoveryProbe::Blocked {
+                reason: freshell_runtime_protocol::RecoveryBlockReason::CommandAmbiguous,
+                ..
+            })
+        ));
+    }
 }
 
 #[tokio::test]

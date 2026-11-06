@@ -311,16 +311,6 @@ fn pre_native_terminal(context: &RecoveryContext) -> bool {
         && context.native_identity_launch.is_none()
 }
 
-fn has_unresolved_retained_codex_input(context: &RecoveryContext) -> bool {
-    context.provider == "codex"
-        && context.fixture.is_none()
-        && context.fresh_agent.as_ref().is_some_and(|agent| {
-            agent.provider == freshell_runtime_protocol::FreshProvider::Codex
-                && agent.fixture_transport.is_none()
-        })
-        && context.dispatched_command_count > context.completed_command_count
-}
-
 fn retained_status_observed(
     context: &RecoveryContext,
     host: &crate::service::AuthenticatedHost,
@@ -3239,68 +3229,170 @@ impl Supervisor {
         Ok(())
     }
 
-    async fn manual_retry_unresolved_codex_input_block(
+    async fn unresolved_codex_receipt_count_with_live_host(
         &self,
         context: &RecoveryContext,
-    ) -> Result<Option<Box<RecoveryResult>>, RuntimeError> {
-        if !has_unresolved_retained_codex_input(context) {
+    ) -> Result<Option<u64>, RuntimeError> {
+        let pending_count = self
+            .registry
+            .unresolved_codex_dispatch_recovery_receipt_count(
+                context.soul_id.clone(),
+                context.prior_handle.incarnation_id().clone(),
+            )
+            .await
+            .map_err(map_registry)?;
+        if pending_count == 0 {
             return Ok(None);
         }
-        Ok(Some(Box::new(RecoveryResult {
-            outcome: RecoveryOutcome::Blocked,
-            view: self.view_for(context.prior_handle.incarnation_id()).await?,
-            probe: Some(blocked(
-                RecoveryPath::NativeResume,
-                RecoveryBlockReason::CommandAmbiguous,
-                "a previous Codex send still needs its original host receipt; recovery intent was left unchanged",
-                None,
-            )),
-            prior_incarnation_id: Some(context.prior_handle.incarnation_id().clone()),
-            attempt_id: None,
-            expected_native_session_id: context.native_session_id.clone(),
-            observed_native_session_id: None,
-            incident_id: None,
-        })))
+
+        let inspection = self
+            .backend
+            .inspect(&context.prior_handle)
+            .await
+            .map_err(map_backend)?;
+        match inspection.state {
+            BackendRuntimeState::Exited
+            | BackendRuntimeState::Dead
+            | BackendRuntimeState::Missing => {
+                return Ok(None);
+            }
+            BackendRuntimeState::Running => {}
+            BackendRuntimeState::Created
+            | BackendRuntimeState::Paused
+            | BackendRuntimeState::Restarting => {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::RecoveryBlocked,
+                    "Codex receipt host state is changing; recovery was deferred",
+                ));
+            }
+        }
+
+        let source = self
+            .registry
+            .codex_dispatch_recovery_receipt_source(context.soul_id.clone())
+            .await
+            .map_err(map_registry)?
+            .ok_or_else(|| {
+                RuntimeError::new(
+                    RuntimeErrorCode::RecoveryBlocked,
+                    "unresolved Codex receipt no longer has a current host source",
+                )
+            })?;
+        if !source.matches_context(context) {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::RecoveryBlocked,
+                "unresolved Codex receipt host source changed; recovery was deferred",
+            ));
+        }
+
+        let host = self
+            .authenticate_host(
+                context.prior_handle.incarnation_id(),
+                context.prior_handle.runtime_dir(),
+            )
+            .await?;
+        if !host.capabilities.iter().any(|capability| {
+            capability == freshell_runtime_protocol::HOST_CAPABILITY_CODEX_SEND_RECEIPT_V1
+        }) {
+            return Ok(None);
+        }
+        let status = self
+            .host_status(
+                context.prior_handle.incarnation_id().clone(),
+                context.prior_handle.runtime_dir(),
+                &host,
+            )
+            .await?;
+        if status.host_boot_id != host.host_boot_id
+            || !source.matches_host(&status.host_boot_id, status.max_execution_generation)
+            || status.worker_pid.is_none()
+        {
+            return Ok(None);
+        }
+        Ok(Some(pending_count))
     }
 
-    async fn replacement_unresolved_codex_input_block(
+    async fn block_recovery_for_live_codex_receipt(
         &self,
         soul_id: &SoulId,
         context: &RecoveryContext,
         path: RecoveryPath,
-        resume_spec: Option<&freshell_runtime_protocol::ResumeSpec>,
+        expected_native_session_id: Option<String>,
     ) -> Result<Option<Box<RecoveryResult>>, RuntimeError> {
-        if !has_unresolved_retained_codex_input(context) {
+        let Some(pending_count) =
+            Box::pin(self.unresolved_codex_receipt_count_with_live_host(context)).await?
+        else {
             return Ok(None);
-        }
+        };
         let reason = RecoveryBlockReason::CommandAmbiguous;
-        let message = "a previous Codex send still needs its original host receipt; preserving the saved conversation before replacement";
+        let message = "a previous Codex send still needs its original host receipt; recovery intent was left unchanged";
         self.registry
             .mark_recovery_blocked(
                 soul_id.clone(),
                 None,
                 reason,
-                vec![format!(
-                    "unresolvedCodexInputCount={}",
-                    context
-                        .dispatched_command_count
-                        .saturating_sub(context.completed_command_count)
-                )],
+                vec![format!("unresolvedCodexInputCount={pending_count}")],
                 context.write_fence(),
             )
             .await
             .map_err(map_registry)?;
+        crate::service::append_event(
+            &self.config.lifecycle_log,
+            "supervisor.codex_send_receipt_recovery_deferred",
+            serde_json::json!({
+                "severity":"warning",
+                "soulId":soul_id,
+                "incarnationId":context.prior_handle.incarnation_id(),
+                "unresolvedCodexInputCount":pending_count,
+                "reason":"current_host_can_answer_receipt",
+            }),
+        );
         Ok(Some(Box::new(RecoveryResult {
             outcome: RecoveryOutcome::Blocked,
             view: self.view_for(context.prior_handle.incarnation_id()).await?,
             probe: Some(blocked(path, reason, message, None)),
             prior_incarnation_id: Some(context.prior_handle.incarnation_id().clone()),
             attempt_id: None,
-            expected_native_session_id: resume_spec
-                .map(|spec| spec.provider_session.native_session_id.clone()),
+            expected_native_session_id,
             observed_native_session_id: None,
             incident_id: None,
         })))
+    }
+
+    async fn manual_retry_live_codex_receipt_block(
+        &self,
+        request: &RecoverRequest,
+    ) -> Result<Option<Box<RecoveryResult>>, RuntimeError> {
+        if request.trigger != RecoveryTrigger::ManualRetry {
+            return Ok(None);
+        }
+        self.registry
+            .assert_soul_intent_revision(request.soul_id.clone(), request.expected_intent_revision)
+            .await
+            .map_err(map_registry)?;
+        let context = self
+            .registry
+            .recovery_context(request.soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        if context.desired_state != DesiredState::Running
+            || context.recovery_state == freshell_runtime_protocol::RecoveryState::Lost
+            || context.provider != "codex"
+            || context.fixture.is_some()
+            || !context.fresh_agent.as_ref().is_some_and(|agent| {
+                agent.provider == freshell_runtime_protocol::FreshProvider::Codex
+                    && agent.fixture_transport.is_none()
+            })
+        {
+            return Ok(None);
+        }
+        self.block_recovery_for_live_codex_receipt(
+            &request.soul_id,
+            &context,
+            RecoveryPath::NativeResume,
+            context.native_session_id.clone(),
+        )
+        .await
     }
 
     pub(crate) async fn recover(
@@ -3327,13 +3419,71 @@ impl Supervisor {
     ) -> Result<RecoveryResult, RuntimeError> {
         let lifecycle_lock = self.lifecycle_lock(&request.soul_id).await;
         let recovery_guard = lifecycle_lock.lock_owned().await;
-        // Keep retry eligibility/reservation and the subsequent attempt in
-        // separate poll functions. Both phases have sizeable branch state;
-        // retaining the preflight branches while a replacement starts pushes
-        // the observer task close to Tokio's worker stack limit.
-        let plan =
-            Box::pin(self.prepare_scheduled_recovery(request, only_due_retry, recovery_guard))
-                .await?;
+        let (manual_retry_receipt_block, recovery_guard) = if request.trigger
+            == RecoveryTrigger::ManualRetry
+        {
+            let supervisor = self.clone();
+            let preflight_request = request.clone();
+            let task = tokio::spawn(async move {
+                let result = supervisor
+                    .manual_retry_live_codex_receipt_block(&preflight_request)
+                    .await;
+                (result, recovery_guard)
+            });
+            let _abort_on_drop = AbortTaskOnDrop(task.abort_handle());
+            match task.await {
+                Ok((result, recovery_guard)) => (result?, recovery_guard),
+                Err(error) => {
+                    crate::service::append_event(
+                        &self.config.lifecycle_log,
+                        "supervisor.recovery.manual_retry_receipt_preflight_failed",
+                        serde_json::json!({
+                            "severity":"error",
+                            "soulId":request.soul_id,
+                            "reason":if error.is_cancelled() { "cancelled" } else { "panicked" },
+                        }),
+                    );
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::RecoveryBlocked,
+                        "Manual Retry receipt preflight did not complete",
+                    ));
+                }
+            }
+        } else {
+            (None, recovery_guard)
+        };
+        if let Some(result) = manual_retry_receipt_block {
+            return Ok(*result);
+        }
+        // Retry eligibility/reservation has sizeable branch state. Poll it in
+        // its own task so receipt and readiness preflights do not accumulate
+        // on the caller's ordinary Tokio worker stack.
+        let soul_id = request.soul_id.clone();
+        let supervisor = self.clone();
+        let task = tokio::spawn(async move {
+            supervisor
+                .prepare_scheduled_recovery(request, only_due_retry, recovery_guard)
+                .await
+        });
+        let _abort_on_drop = AbortTaskOnDrop(task.abort_handle());
+        let plan = match task.await {
+            Ok(result) => result?,
+            Err(error) => {
+                crate::service::append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.recovery.preparation_task_failed",
+                    serde_json::json!({
+                        "severity":"error",
+                        "soulId":soul_id,
+                        "reason":if error.is_cancelled() { "cancelled" } else { "panicked" },
+                    }),
+                );
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::RecoveryBlocked,
+                    "scheduled recovery preparation did not complete",
+                ));
+            }
+        };
         match plan {
             ScheduledRecoveryPlan::Finished(result) => Ok(*result),
             ScheduledRecoveryPlan::Reserved(plan) => {
@@ -3493,16 +3643,6 @@ impl Supervisor {
                 "supervisor.stopped_data_repair_resume_requested",
                 serde_json::json!({"soulId":request.soul_id,"intentRevision":next_revision}),
             );
-        }
-        if request.trigger == RecoveryTrigger::ManualRetry
-            && before_retry.desired_state == DesiredState::Running
-            && before_retry.recovery_state != freshell_runtime_protocol::RecoveryState::Lost
-        {
-            if let Some(result) =
-                Box::pin(self.manual_retry_unresolved_codex_input_block(&before_retry)).await?
-            {
-                finish!(*result);
-            }
         }
         if request.trigger == RecoveryTrigger::ManualRetry
             && before_retry.desired_state == DesiredState::Running
@@ -4226,12 +4366,16 @@ impl Supervisor {
             .recovery_context(soul_id.clone())
             .await
             .map_err(map_registry)?;
-        if let Some(result) = Box::pin(self.replacement_unresolved_codex_input_block(
-            &soul_id,
-            &current,
-            path,
-            resume_spec.as_ref(),
-        ))
+        if let Some(result) = Box::pin(
+            self.block_recovery_for_live_codex_receipt(
+                &soul_id,
+                &current,
+                path,
+                resume_spec
+                    .as_ref()
+                    .map(|spec| spec.provider_session.native_session_id.clone()),
+            ),
+        )
         .await?
         {
             finish!(*result);

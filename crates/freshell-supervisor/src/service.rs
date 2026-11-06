@@ -2688,7 +2688,7 @@ impl Supervisor {
         };
         let Some(source) = self
             .registry
-            .codex_dispatch_recovery_source(soul_id.clone())
+            .codex_dispatch_recovery_receipt_source(soul_id.clone())
             .await
             .map_err(map_registry)?
         else {
@@ -3065,6 +3065,7 @@ impl Supervisor {
                         text.as_bytes(),
                         &settings_correlation,
                         settings.clone(),
+                        codex_dispatch_recovery_source.is_some(),
                     )
                     .await
             } else {
