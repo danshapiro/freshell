@@ -3436,7 +3436,7 @@ impl Supervisor {
         };
         if current.desired_state != freshell_runtime_protocol::DesiredState::Running
             || current.prior_handle.incarnation_id() != active.incarnation_id()
-            || status.exited
+            || (status.exited && dispatch_recovery.is_none())
             || (!observed && dispatch_recovery.is_none())
         {
             append_event(
