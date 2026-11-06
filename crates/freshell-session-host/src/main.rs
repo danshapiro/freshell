@@ -1275,6 +1275,7 @@ async fn dispatch_with_effects(
                     text,
                     settings,
                     checkpoint_logical_attempt_id,
+                    codex_dispatch_recovery_source,
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
                     let _native_command = state.fresh_native_command.lock().await;
@@ -1286,41 +1287,69 @@ async fn dispatch_with_effects(
                         .clone()
                         .ok_or_else(unsupported_fresh_agent)?;
                     let before = actor.profile().await;
-                    let command_state = actor
-                        .dispatch_with_checkpoint_identity(
+                    let codex_recovery_send = codex_dispatch_recovery_source.is_some();
+                    let expected_previous_native = codex_dispatch_recovery_source
+                        .as_ref()
+                        .map(|source| source.native_session_id.clone())
+                        .or_else(|| before.native_session_id.clone());
+                    let dispatch_result = actor
+                        .dispatch_with_codex_recovery_source(
                             request_id,
                             text,
                             settings,
                             checkpoint_logical_attempt_id,
+                            codex_dispatch_recovery_source,
                         )
                         .await
                         .map_err(map_actor_error)?;
+                    let after = actor.profile().await;
+                    if let Some(identity) = dispatch_result.native_identity.as_ref() {
+                        if expected_previous_native.as_deref()
+                            != Some(identity.previous_native_session_id.as_str())
+                            || after.native_session_id.as_deref()
+                                != Some(identity.native_session_id.as_str())
+                        {
+                            return Err(RuntimeError::new(
+                                RuntimeErrorCode::OwnershipMismatch,
+                                "accepted native identity does not match its send source",
+                            ));
+                        }
+                    } else if codex_recovery_send
+                        && after.provider == freshell_runtime_protocol::FreshProvider::Codex
+                    {
+                        return Err(RuntimeError::new(
+                            RuntimeErrorCode::OwnershipMismatch,
+                            "accepted Codex send lacks its typed native identity receipt",
+                        ));
+                    }
                     commit_fresh_native_transition(
                         state,
                         &actor,
                         before.native_session_id.as_deref(),
                     )
                     .await?;
-                    let after = actor.profile().await;
                     let native_session_id = after.native_session_id.clone();
-                    let native_identity =
-                        if after.provider == freshell_runtime_protocol::FreshProvider::Codex {
-                            before.native_session_id.zip(after.native_session_id).map(
-                                |(previous_native_session_id, native_session_id)| {
-                                    freshell_runtime_protocol::NativeDispatchIdentity {
-                                        previous_native_session_id,
-                                        native_session_id,
-                                        pending_naming_handle: after.naming_handle,
-                                    }
-                                },
-                            )
-                        } else {
-                            None
-                        };
+                    let native_identity = dispatch_result.native_identity.or_else(|| {
+                        (after.provider == freshell_runtime_protocol::FreshProvider::Codex)
+                            .then(|| {
+                                before
+                                    .native_session_id
+                                    .clone()
+                                    .zip(after.native_session_id.clone())
+                            })
+                            .flatten()
+                            .map(|(previous_native_session_id, native_session_id)| {
+                                freshell_runtime_protocol::NativeDispatchIdentity {
+                                    previous_native_session_id,
+                                    native_session_id,
+                                    pending_naming_handle: after.naming_handle.clone(),
+                                }
+                            })
+                    });
                     Ok(HostResult::FreshAgentCommand {
                         native_identity,
                         claude_fork: actor.claude_fork_recipe().await,
-                        state: command_state,
+                        state: dispatch_result.state,
                         native_session_id,
                     })
                 }
@@ -12388,6 +12417,7 @@ mod tests {
                     text: "forbidden unobserved input".into(),
                     settings: None,
                     checkpoint_logical_attempt_id: None,
+                    codex_dispatch_recovery_source: None,
                 },
             ),
             &state,
@@ -12802,6 +12832,7 @@ mod tests {
                             request_id: RequestId::new(),
                             text: "child input".into(),
                             settings: None,
+                            codex_dispatch_recovery_source: None,
                         },
                     ),
                     &state,
@@ -13185,6 +13216,7 @@ mod tests {
                     request_id: RequestId::parse("withdrawn-rpc-send").unwrap(),
                     text: "must not reach native input".into(),
                     settings: None,
+                    codex_dispatch_recovery_source: None,
                 },
             ),
             &state,
@@ -13300,6 +13332,7 @@ mod tests {
                     text: "perform fixture work".into(),
                     settings: None,
                     checkpoint_logical_attempt_id: Some("managed-attempt-rpc-1".into()),
+                    codex_dispatch_recovery_source: None,
                 },
             ),
             &state,
@@ -15190,6 +15223,7 @@ mod tests {
                     text: "must not reach the provider after a failed receipt commit".into(),
                     settings: None,
                     checkpoint_logical_attempt_id: None,
+                    codex_dispatch_recovery_source: None,
                 },
             ),
             &state,
@@ -15260,6 +15294,7 @@ mod tests {
                     text: "must not reach the provider after final state persistence failed".into(),
                     settings: None,
                     checkpoint_logical_attempt_id: None,
+                    codex_dispatch_recovery_source: None,
                 },
             ),
             &state,

@@ -5380,6 +5380,11 @@ pub enum HostCommand {
         settings: Option<FreshAgentTurnSettings>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         checkpoint_logical_attempt_id: Option<String>,
+        /// One-send permit for the exact native Codex source retained by this
+        /// actor after its native process exits. It does not assert liveness;
+        /// the host revalidates it before allowing native recovery on SEND.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codex_dispatch_recovery_source: Option<NativeIdentityObservation>,
     },
     FreshAgentFork {
         incarnation_id: IncarnationId,
@@ -5781,12 +5786,53 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(
-            legacy_host_command,
+            &legacy_host_command,
             HostCommand::FreshAgentSend {
                 checkpoint_logical_attempt_id: None,
+                codex_dispatch_recovery_source: None,
                 ..
             }
         ));
+        let legacy_json = serde_json::to_value(&legacy_host_command).unwrap();
+        assert!(legacy_json["params"]
+            .get("codex_dispatch_recovery_source")
+            .is_none());
+
+        let recovery_source = NativeIdentityObservation {
+            native_session_id: "thread-hosted".into(),
+            incarnation_id: IncarnationId::new(),
+            launch_nonce: "launch-hosted".into(),
+            evidence_revision: 4,
+            source: NativeIdentitySource::FreshProviderHandshake,
+            evidence_digest: "a".repeat(64),
+        };
+        let source_host_command: HostCommand = serde_json::from_value(serde_json::json!({
+            "method": "fresh_agent_send",
+            "params": {
+                "incarnation_id": "incarnation-hosted",
+                "request_id": "request-hosted-source",
+                "text": "recover",
+                "codex_dispatch_recovery_source": recovery_source.clone()
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            &source_host_command,
+            HostCommand::FreshAgentSend {
+                codex_dispatch_recovery_source: Some(source),
+                ..
+            } if source.native_session_id == "thread-hosted"
+                && source.incarnation_id == recovery_source.incarnation_id
+                && source.launch_nonce == recovery_source.launch_nonce
+                && source.evidence_revision == recovery_source.evidence_revision
+                && source.source == recovery_source.source
+                && source.evidence_digest == recovery_source.evidence_digest
+        ));
+        assert_eq!(
+            serde_json::to_value(&source_host_command).unwrap()["params"]
+                ["codex_dispatch_recovery_source"],
+            serde_json::to_value(recovery_source).unwrap()
+        );
     }
 
     #[test]

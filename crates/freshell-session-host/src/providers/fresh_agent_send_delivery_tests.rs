@@ -55,6 +55,7 @@ async fn hosted_send_delivery_refuses_only_the_new_send_when_an_earlier_delivery
                     text: text.into(),
                     settings: None,
                     checkpoint_logical_attempt_id: None,
+                    codex_dispatch_recovery_source: None,
                 },
             ),
         )

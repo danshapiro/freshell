@@ -27,8 +27,8 @@ use freshell_runtime_protocol::{
     AgentEvent, FreshAgentCapture, FreshAgentFixtureTransport, FreshAgentLaunchSpec,
     FreshAgentNativeNameError, FreshAgentNativeNameOperation, FreshAgentNativeNameReply,
     FreshAgentRollbackDirection, FreshAgentRollbackMode, FreshProvider, NativeIdentityLaunch,
-    NativeReadinessRecoveryAuthorization, ProviderLaunchContext, ProviderPreparation, RequestId,
-    ResumeSpec,
+    NativeIdentityObservation, NativeReadinessRecoveryAuthorization, ProviderLaunchContext,
+    ProviderPreparation, RequestId, ResumeSpec,
 };
 use serde_json::{json, Value};
 use std::{
@@ -1734,8 +1734,43 @@ impl FreshAgentTransport for HostedTransport {
         requested: Option<&freshell_runtime_protocol::FreshAgentTurnSettings>,
         logical_attempt_id: Option<&str>,
     ) -> Result<DispatchAck, DispatchFailure> {
+        self.dispatch_with_codex_recovery_source(
+            request_id,
+            text,
+            profile,
+            requested,
+            logical_attempt_id,
+            None,
+        )
+        .await
+    }
+
+    async fn dispatch_with_codex_recovery_source(
+        &self,
+        request_id: &RequestId,
+        text: &str,
+        profile: &FreshAgentProfile,
+        requested: Option<&freshell_runtime_protocol::FreshAgentTurnSettings>,
+        logical_attempt_id: Option<&str>,
+        codex_dispatch_recovery_source: Option<&NativeIdentityObservation>,
+    ) -> Result<DispatchAck, DispatchFailure> {
         #[cfg(test)]
         if let Some(delegate) = self.test_delegate.as_ref() {
+            if codex_dispatch_recovery_source.is_some() {
+                return Err(DispatchFailure {
+                    provider_diagnostic: Some(
+                        freshell_runtime_protocol::FreshAgentSendDiagnostic {
+                            outcome:
+                                freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused,
+                            message: Some(
+                                "Codex recovery source is not bound to this test transport".into(),
+                            ),
+                        },
+                    ),
+                    message: "Codex recovery source is not bound to this test transport".into(),
+                    acceptance_ambiguous: false,
+                });
+            }
             return delegate.dispatch(request_id, text, profile).await;
         }
         let session_id = self
@@ -1746,9 +1781,49 @@ impl FreshAgentTransport for HostedTransport {
                 message: "fresh-agent session is not started".into(),
                 acceptance_ambiguous: false,
             })?;
+        let profile = profile.clone();
+        if let Some(source) = codex_dispatch_recovery_source {
+            let bound_source = if self.provider == FreshProvider::Codex
+                && profile.provider == FreshProvider::Codex
+                && profile.runtime_variant == "codex-app-server"
+                && profile.native_session_id.as_deref() == Some(session_id.as_str())
+                && source.matches_provider("codex", true)
+            {
+                let identity = self.native_identity.lock().expect("native identity lock");
+                if identity.pending || identity.root.as_deref() != Some(session_id.as_str()) {
+                    false
+                } else if let (Some(launch), Some(evidence)) =
+                    (identity.launch.as_ref(), identity.evidence.as_ref())
+                {
+                    super::native_identity::bind_provider_observation(
+                        launch,
+                        &session_id,
+                        freshell_runtime_protocol::NativeIdentitySource::FreshProviderHandshake,
+                        evidence,
+                    )
+                    .as_ref()
+                        == Some(source)
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !bound_source {
+                return Err(DispatchFailure {
+                    provider_diagnostic: Some(
+                        freshell_runtime_protocol::FreshAgentSendDiagnostic {
+                            outcome: freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused,
+                            message: Some("Codex recovery source no longer matches the retained native identity".into()),
+                        },
+                    ),
+                    message: "Codex recovery source no longer matches the retained native identity".into(),
+                    acceptance_ambiguous: false,
+                });
+            }
+        }
         *self.profile.lock().expect("profile lock") = Some(profile.clone());
         let permission_mode = profile.effective_permission_mode().map(str::to_owned);
-        let profile = profile.clone();
         let settings = if self.provider == FreshProvider::Codex {
             requested.map(provider_send_settings)
         } else {
@@ -1787,7 +1862,12 @@ impl FreshAgentTransport for HostedTransport {
             }
             ProviderState::Codex(state) => {
                 use freshell_freshagent::codex::CodexSendOutcome;
-                return match state.handle_send_same_root(send).await {
+                let outcome = if codex_dispatch_recovery_source.is_some() {
+                    state.handle_send(send).await
+                } else {
+                    state.handle_send_same_root(send).await
+                };
+                return match outcome {
                     CodexSendOutcome::Accepted {
                         session_id: native,
                         submitted_turn_id,
@@ -3827,6 +3907,7 @@ mod tests {
                     text: "owned prompt".into(),
                     settings: None,
                     checkpoint_logical_attempt_id: None,
+                    codex_dispatch_recovery_source: None,
                 },
             ),
         )
@@ -4966,9 +5047,12 @@ try {{
             "exitProcessAfterMethodsOnce":["turn/start"],"exitProcessAfterMethodsOnceMarkerPath":marker,
             "overrides":{"thread/resume":{"error":{"code":-32600,"message":format!("no rollout found for thread id {original_id}")}}}
         })).await;
+        install_native_test_launch(&fixture, "task010-failed-resume-launch");
+        let mut profile = fixture.profile.clone();
+        profile.runtime_variant = "codex-app-server".into();
         let actor = FreshAgentHostActor::open(
             fixture.dir.path().join("owned-tree-actor"),
-            fixture.profile.clone(),
+            profile,
             fixture.transport.clone(),
         )
         .await
@@ -5022,12 +5106,15 @@ await import(parameters.source)
             std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         std::env::set_var("CODEX_CMD", wrapper);
+        let recovery_source = native_codex_recovery_source(&actor, &fixture, original_id).await;
         let recovery = tokio::time::timeout(
             Duration::from_secs(10),
-            actor.dispatch(
+            actor.dispatch_with_codex_recovery_source(
                 RequestId::parse("recover-after-missing-rollout").unwrap(),
                 "recovery native input".into(),
                 None,
+                None,
+                Some(recovery_source),
             ),
         )
         .await;
@@ -5066,9 +5153,12 @@ await import(parameters.source)
             "overrides":{"thread/resume":{"error":{"code":-32600,"message":"no rollout found for thread id thread-new-1"}}}
         });
         let fixture = native_codex_fixture(behavior.clone()).await;
+        install_native_test_launch(&fixture, "task010-unknown-cleanup-launch");
+        let mut profile = fixture.profile.clone();
+        profile.runtime_variant = "codex-app-server".into();
         let actor = FreshAgentHostActor::open(
             fixture.dir.path().join("unknown-cleanup-actor"),
-            fixture.profile.clone(),
+            profile,
             fixture.transport.clone(),
         )
         .await
@@ -5116,14 +5206,17 @@ await import(parameters.source)
         })
         .await
         .unwrap();
+        let recovery_source = native_codex_recovery_source(&actor, &fixture, "thread-new-1").await;
         behavior["threadStartThreadId"] = json!(uuid::Uuid::new_v4().to_string());
         std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR", behavior.to_string());
         let refused = tokio::time::timeout(
             Duration::from_secs(5),
-            actor.dispatch(
+            actor.dispatch_with_codex_recovery_source(
                 RequestId::parse("cleanup-refused-input").unwrap(),
                 "must never be replayed".into(),
                 None,
+                None,
+                Some(recovery_source.clone()),
             ),
         )
         .await
@@ -5176,11 +5269,14 @@ await import(parameters.source)
         })
         .await
         .expect("only positive exact-owned confirmation may release the claim");
+        let recovery_source = native_codex_recovery_source(&actor, &fixture, "thread-new-1").await;
         actor
-            .dispatch(
+            .dispatch_with_codex_recovery_source(
                 RequestId::parse("new-explicit-recovery-input").unwrap(),
                 "new explicit input after confirmation".into(),
                 None,
+                None,
+                Some(recovery_source),
             )
             .await
             .unwrap();
@@ -5562,11 +5658,7 @@ await import(parameters.source)
             execution_generation: 1,
             requested_native_session_id: None,
         };
-        {
-            let mut identity = fixture.transport.native_identity.lock().unwrap();
-            identity.launch = Some(launch.clone());
-            identity.producer_launch = Some(launch.clone());
-        }
+        bind_native_identity_launch(fixture, launch.clone());
         let mut persisted = host.persisted.lock().await;
         persisted.native_identity_launch = Some(launch);
         persisted.host_boot_id = Some(host.host_boot_id.clone());
@@ -5578,6 +5670,66 @@ await import(parameters.source)
         *host.control_fence.lock().unwrap() = crate::HostControlFence::from(&*persisted);
         drop(persisted);
         host
+    }
+
+    fn bind_native_identity_launch(
+        fixture: &NativeCodexFixture,
+        launch: freshell_runtime_protocol::NativeIdentityLaunch,
+    ) {
+        let mut identity = fixture.transport.native_identity.lock().unwrap();
+        identity.launch = Some(launch.clone());
+        identity.producer_launch = Some(launch);
+        if let (Some(root), Some(provider_evidence)) = (
+            identity.root.clone(),
+            identity
+                .evidence
+                .as_ref()
+                .and_then(|evidence| evidence.get("providerEvidence"))
+                .cloned(),
+        ) {
+            identity.evidence = Some(identity.bind_evidence(&root, provider_evidence));
+        }
+    }
+
+    fn install_native_test_launch(
+        fixture: &NativeCodexFixture,
+        launch_nonce: &str,
+    ) -> freshell_runtime_protocol::NativeIdentityLaunch {
+        let launch = freshell_runtime_protocol::NativeIdentityLaunch {
+            incarnation_id: freshell_runtime_protocol::IncarnationId::new(),
+            launch_nonce: launch_nonce.into(),
+            evidence_revision: 7,
+            execution_generation: 1,
+            requested_native_session_id: None,
+        };
+        bind_native_identity_launch(fixture, launch.clone());
+        launch
+    }
+
+    async fn native_codex_recovery_source(
+        actor: &FreshAgentHostActor,
+        fixture: &NativeCodexFixture,
+        native_session_id: &str,
+    ) -> NativeIdentityObservation {
+        let launch = fixture
+            .transport
+            .native_identity
+            .lock()
+            .unwrap()
+            .launch
+            .clone()
+            .expect("the test actor has a bound native launch");
+        let evidence = actor
+            .retained_codex_native_identity_evidence()
+            .await
+            .expect("the exited actor retains its exact Codex evidence");
+        crate::providers::native_identity::bind_provider_observation(
+            &launch,
+            native_session_id,
+            freshell_runtime_protocol::NativeIdentitySource::FreshProviderHandshake,
+            &evidence,
+        )
+        .expect("the retained Codex evidence binds to its current launch")
     }
 
     fn native_actor_start_failed(
@@ -6521,9 +6673,24 @@ await import(parameters.source)
         request: &str,
         text: &str,
     ) -> Result<freshell_runtime_protocol::CommandState, String> {
+        native_mint_input_with_recovery_source(actor, host, request, text, None).await
+    }
+
+    async fn native_mint_input_with_recovery_source(
+        actor: &Arc<FreshAgentHostActor>,
+        host: Option<&Arc<crate::HostState>>,
+        request: &str,
+        text: &str,
+        codex_dispatch_recovery_source: Option<
+            freshell_runtime_protocol::NativeIdentityObservation,
+        >,
+    ) -> Result<freshell_runtime_protocol::CommandState, String> {
         let request_id = RequestId::parse(request).unwrap();
         if let Some(host) = host {
-            let previous = actor.profile().await.native_session_id.unwrap();
+            let previous = match codex_dispatch_recovery_source.as_ref() {
+                Some(source) => source.native_session_id.clone(),
+                None => actor.profile().await.native_session_id.unwrap(),
+            };
             let result = crate::dispatch(
                 crate::tests::authenticated_host_envelope(
                     host,
@@ -6533,6 +6700,7 @@ await import(parameters.source)
                         text: text.into(),
                         settings: None,
                         checkpoint_logical_attempt_id: None,
+                        codex_dispatch_recovery_source,
                     },
                 ),
                 host,
@@ -6556,10 +6724,23 @@ await import(parameters.source)
             );
             Ok(state)
         } else {
-            actor
-                .dispatch(request_id, text.into(), None)
-                .await
-                .map_err(|error| error.to_string())
+            match codex_dispatch_recovery_source {
+                Some(source) => actor
+                    .dispatch_with_codex_recovery_source(
+                        request_id,
+                        text.into(),
+                        None,
+                        None,
+                        Some(source),
+                    )
+                    .await
+                    .map(|result| result.state)
+                    .map_err(|error| format!("{error:?}")),
+                None => actor
+                    .dispatch(request_id, text.into(), None)
+                    .await
+                    .map_err(|error| error.to_string()),
+            }
         }
     }
 
@@ -6604,6 +6785,7 @@ await import(parameters.source)
             None
         };
         let mut profile = fixture.profile.clone();
+        profile.runtime_variant = "codex-app-server".into();
         profile.naming_handle = pending.then(|| "pending-initial-recovery".into());
         profile.effort = Some("xhigh".into());
         profile.collaboration_mode = Some("plan".into());
@@ -6855,43 +7037,60 @@ await import(parameters.source)
             host.control_fence.lock().unwrap().stopped = false;
             assert_eq!(std::fs::read(&log).unwrap(), before);
         }
-        if let Some(host) = &host {
-            let launch = host
+        let source_launch = match host.as_ref() {
+            Some(host) => host
                 .persisted
                 .lock()
                 .await
                 .native_identity_launch
                 .clone()
-                .expect("the retained host owns the exact source launch");
-            let prepared = native_host_command(
-                host,
-                freshell_runtime_protocol::HostCommand::FreshAgentPrepareNative {
-                    incarnation_id: host.incarnation_id.clone(),
-                    expected_launch: Some(launch.clone()),
-                    source_fence: Some(crate::tests::native_readiness_fence_for_test(&launch)),
-                },
-            )
+                .unwrap(),
+            None => {
+                let launch = freshell_runtime_protocol::NativeIdentityLaunch {
+                    incarnation_id: freshell_runtime_protocol::IncarnationId::new(),
+                    launch_nonce: "direct-actor-recovery-launch".into(),
+                    evidence_revision: 7,
+                    execution_generation: 1,
+                    requested_native_session_id: Some(original.clone()),
+                };
+                bind_native_identity_launch(&fixture, launch.clone());
+                launch
+            }
+        };
+        let retained_evidence = actor
+            .retained_codex_native_identity_evidence()
             .await
-            .expect("receipt-backed readiness must finish before hosted SEND");
-            let freshell_runtime_protocol::HostResult::FreshAgentCommand {
-                native_identity: Some(identity),
-                ..
-            } = prepared
-            else {
-                panic!("native readiness must return its durable root transition")
-            };
-            assert_eq!(identity.previous_native_session_id, original);
-            assert_ne!(identity.native_session_id, original);
-            assert_eq!(
-                actor.profile().await.native_session_id.as_deref(),
-                Some(identity.native_session_id.as_str())
-            );
-        }
-        let recovery = native_mint_input(
+            .expect("the ended native producer's evidence remains retained by its host actor");
+        let recovery_source = crate::providers::native_identity::bind_provider_observation(
+            &source_launch,
+            &original,
+            freshell_runtime_protocol::NativeIdentitySource::FreshProviderHandshake,
+            &retained_evidence,
+        )
+        .expect("the exact original Codex evidence binds to the retained launch");
+        let before_wrong_source = std::fs::read(&log).unwrap();
+        let mut wrong_source = recovery_source.clone();
+        wrong_source.evidence_digest = "0".repeat(64);
+        assert!(native_mint_input_with_recovery_source(
+            &actor,
+            host.as_ref(),
+            "wrong-recovery-source",
+            "forbidden native input",
+            Some(wrong_source),
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            std::fs::read(&log).unwrap(),
+            before_wrong_source,
+            "a source with a different proof digest cannot reach the provider"
+        );
+        let recovery = native_mint_input_with_recovery_source(
             &actor,
             host.as_ref(),
             "recover-native",
             "recover native input",
+            Some(recovery_source.clone()),
         )
         .await;
         eprintln!(
@@ -6901,11 +7100,30 @@ await import(parameters.source)
             "evidence":cleanup.evidence()})
         );
         recovery.unwrap();
+        let after_recovery_requests = std::fs::read(&log).unwrap();
+        assert_eq!(
+            native_mint_input_with_recovery_source(
+                &actor,
+                host.as_ref(),
+                "recover-native",
+                "recover native input",
+                Some(recovery_source),
+            )
+            .await
+            .unwrap(),
+            freshell_runtime_protocol::CommandState::ProviderAcked,
+            "a retry after a lost host reply returns the accepted command"
+        );
+        assert_eq!(
+            std::fs::read(&log).unwrap(),
+            after_recovery_requests,
+            "replaying the accepted recovery request must not issue another native turn"
+        );
         let recovered = actor.profile().await;
         let native = recovered.native_session_id.clone().unwrap();
         assert_ne!(
             native, original,
-            "the typed successful mint-new result must update durable actor identity before dispatch returns"
+            "the source-bound native SEND must recover missing history before dispatch returns"
         );
         if let Some(host) = &host {
             let result = crate::dispatch(

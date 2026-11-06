@@ -577,6 +577,7 @@ fn native_send_reply(previous: &str, native: &str, pending: Option<String>) -> H
 enum NativeSendReadiness {
     Observed,
     Exited,
+    ExitedWithoutRecoverySource,
     ExitedWithoutRecoveryCapability,
     ExitedWithWrongGeneration,
     ExitedWithWrongBoot,
@@ -622,6 +623,7 @@ async fn native_send_host(
     let mut observation = view
         .native_identity_observation
         .expect("the current producer observation was published during fixture startup");
+    let retained_source = observation.clone();
     let control_epoch = fixture.supervisor.registry.control_epoch();
     let (shutdown, mut stop) = tokio::sync::oneshot::channel();
     let host = tokio::spawn(async move {
@@ -639,6 +641,7 @@ async fn native_send_host(
                         && initial_readiness != NativeSendReadiness::ExitedWithoutRecoveryCapability
                     {
                         capabilities.push("fresh-agent-codex-dispatch-recovery-v1".into());
+                        capabilities.push("fresh-agent-codex-recovery-source-v1".into());
                     }
                     HostResult::Hello {
                         host_boot_id:boot.clone(),proof:host_proof(secret,&challenge,&boot,&incarnation_id),capabilities,effective_limits:crate::checkpoints::tests::limits()
@@ -657,7 +660,10 @@ async fn native_send_host(
                         } else {
                             boot.clone()
                         },
-                        fresh_agent_recovery_source: None,
+                        fresh_agent_recovery_source: (exited
+                            && initial_readiness
+                                != NativeSendReadiness::ExitedWithoutRecoverySource)
+                            .then(|| retained_source.clone()),
                         worker_pid: Some(123),
                         worker_launch_count: 1,
                         max_control_epoch: control_epoch,
@@ -676,10 +682,22 @@ async fn native_send_host(
                         opencode_adoption: Default::default(),
                     }
                 },
-                HostCommand::FreshAgentSend {incarnation_id,..} => {
+                HostCommand::FreshAgentSend {incarnation_id,codex_dispatch_recovery_source,..} => {
                     assert_eq!(incarnation_id,incarnation);
                     assert_eq!(envelope.auth,Some(host_proof(secret,"command-auth",&boot,&incarnation)));
                     assert!(ready_for_send, "current native readiness must precede the original input");
+                    if sends == 0 && initial_readiness != NativeSendReadiness::Observed {
+                        assert_eq!(
+                            codex_dispatch_recovery_source.as_ref(),
+                            Some(&retained_source),
+                            "an exited hosted Codex send must carry the exact retained source"
+                        );
+                    } else {
+                        assert!(
+                            codex_dispatch_recovery_source.is_none(),
+                            "ordinary live sends do not carry recovery authority"
+                        );
+                    }
                     ready_for_send = false;
                     sends+=1;
                     if let Some((entered,release))=&gate {entered.notify_one();release.notified().await;}
@@ -804,6 +822,7 @@ async fn ended_codex_send_commits_the_typed_recovered_identity_once() {
 async fn ended_codex_send_requires_current_boot_generation_source_and_recovery_capability() {
     for readiness in [
         NativeSendReadiness::ExitedWithoutRecoveryCapability,
+        NativeSendReadiness::ExitedWithoutRecoverySource,
         NativeSendReadiness::ExitedWithWrongGeneration,
         NativeSendReadiness::ExitedWithWrongBoot,
         NativeSendReadiness::ExitedWithConflictingRoot,
@@ -874,63 +893,69 @@ async fn ended_codex_send_rejects_new_boot_reusing_old_grant() {
 }
 
 #[tokio::test]
-async fn ended_codex_send_recovers_after_observer_settles_store_unreadable() {
-    for recovered_root in ["native-recovered", "native-original"] {
-        let fixture =
-            running_fresh_provider_with_name(FreshProvider::Codex, None, "native-original").await;
-        let (shutdown, host) = native_send_host(
-            &fixture,
-            vec![native_send_reply("native-original", recovered_root, None)],
-            None,
-            NativeSendReadiness::Exited,
-        )
-        .await;
-        let fence = fixture
-            .supervisor
-            .registry
-            .recovery_write_fence(fixture.soul.clone())
-            .await
-            .unwrap();
-        fixture
-            .supervisor
-            .registry
-            .mark_recovery_blocked(
-                fixture.soul.clone(),
+async fn ended_codex_send_recovers_after_observer_settles_supported_block() {
+    for reason in [
+        RecoveryBlockReason::StoreUnreadable,
+        RecoveryBlockReason::ImplementationUnavailable,
+    ] {
+        for recovered_root in ["native-recovered", "native-original"] {
+            let fixture =
+                running_fresh_provider_with_name(FreshProvider::Codex, None, "native-original")
+                    .await;
+            let (shutdown, host) = native_send_host(
+                &fixture,
+                vec![native_send_reply("native-original", recovered_root, None)],
                 None,
-                RecoveryBlockReason::StoreUnreadable,
-                vec!["the observer inspected the archived original source".into()],
-                fence,
-            )
-            .await
-            .unwrap();
-        let result = fixture
-            .supervisor
-            .fresh_agent_send(
-                RequestId::new(),
-                fixture.soul.clone(),
-                "original recovery input".into(),
-                None,
-                None,
+                NativeSendReadiness::Exited,
             )
             .await;
-        shutdown.send(()).unwrap();
-        let sends = host.await.unwrap();
-        assert!(
-            matches!(result, Ok(CommandState::ProviderAcked)),
-            "the first send must not race observer settlement: {result:?}"
-        );
-        assert_eq!(sends, 1);
-        let view = fixture
-            .supervisor
-            .registry
-            .inventory()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|view| view.incarnation_id == fixture.incarnation)
-            .unwrap();
-        assert_eq!(view.recovery_state, RecoveryState::Live);
-        assert_eq!(view.native_session_id.as_deref(), Some(recovered_root));
+            let fence = fixture
+                .supervisor
+                .registry
+                .recovery_write_fence(fixture.soul.clone())
+                .await
+                .unwrap();
+            fixture
+                .supervisor
+                .registry
+                .mark_recovery_blocked(
+                    fixture.soul.clone(),
+                    None,
+                    reason,
+                    vec!["the observer inspected the archived original source".into()],
+                    fence,
+                )
+                .await
+                .unwrap();
+            let result = fixture
+                .supervisor
+                .fresh_agent_send(
+                    RequestId::new(),
+                    fixture.soul.clone(),
+                    "original recovery input".into(),
+                    None,
+                    None,
+                )
+                .await;
+            shutdown.send(()).unwrap();
+            let sends = host.await.unwrap();
+            assert!(
+                matches!(result, Ok(CommandState::ProviderAcked)),
+                "the first send must not race observer settlement: {result:?}"
+            );
+            assert_eq!(sends, 1);
+            let view = fixture
+                .supervisor
+                .registry
+                .inventory()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|view| view.incarnation_id == fixture.incarnation)
+                .unwrap();
+            assert_eq!(view.recovery_state, RecoveryState::Live);
+            assert_eq!(view.native_session_id.as_deref(), Some(recovered_root));
+        }
     }
 }
 #[tokio::test]

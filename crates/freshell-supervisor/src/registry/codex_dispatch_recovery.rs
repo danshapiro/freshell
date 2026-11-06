@@ -15,7 +15,7 @@ pub(crate) struct OwnedCodexDispatchRecovery {
     presentation_session_id: String,
     original_native_session_id: String,
     native_launch: NativeIdentityLaunch,
-    blocked_store: bool,
+    blocked_recovery: bool,
 }
 
 impl OwnedCodexDispatchRecovery {
@@ -27,8 +27,8 @@ impl OwnedCodexDispatchRecovery {
         &self.host_boot_id == boot && self.execution_generation == generation
     }
 
-    pub(crate) fn is_blocked_store(&self) -> bool {
-        self.blocked_store
+    pub(crate) fn is_blocked(&self) -> bool {
+        self.blocked_recovery
     }
 
     pub(crate) fn matches_context(&self, context: &RecoveryContext) -> bool {
@@ -78,6 +78,29 @@ impl Registry {
         })
         .await
     }
+
+    pub(crate) async fn commit_codex_dispatch_recovery_same_root(
+        &self,
+        source: Arc<OwnedCodexDispatchRecovery>,
+        identity: freshell_runtime_protocol::NativeDispatchIdentity,
+    ) -> Result<(), RegistryError> {
+        if identity.previous_native_session_id != source.original_native_session_id
+            || identity.native_session_id != source.original_native_session_id
+            || identity.pending_naming_handle.is_some()
+        {
+            return Err(RegistryError::NativeIdentityConflict);
+        }
+        let soul_id = source.handle.soul_id().clone();
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            validate_recovery_write_fence(&tx, &soul_id, &source.fence)?;
+            validate_source(&tx, &source)?;
+            commit_dispatch_acceptance(&tx, &source)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
 }
 
 fn load_source(
@@ -93,9 +116,13 @@ fn load_source(
          WHERE s.soul_id=?1 AND s.provider='codex' AND s.desired_state='running'
            AND i.launch_state='running' AND i.cleanup_state='none'
            AND i.host_boot_id IS NOT NULL AND i.grant_id IS NOT NULL AND s.loss_incident_id IS NULL
-           AND (s.recovery_state='live' OR (s.recovery_state='blocked' AND s.recovery_reason=?2 AND s.recovery_attempt_id IS NULL))
+           AND (s.recovery_state='live' OR (s.recovery_state='blocked' AND s.recovery_reason IN (?2,?3) AND s.recovery_attempt_id IS NULL))
          ORDER BY i.created_at DESC LIMIT 1",
-        params![soul.as_str(), recovery_block_reason_name(RecoveryBlockReason::StoreUnreadable)],
+        params![
+            soul.as_str(),
+            recovery_block_reason_name(RecoveryBlockReason::StoreUnreadable),
+            recovery_block_reason_name(RecoveryBlockReason::ImplementationUnavailable),
+        ],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
     ).optional()?;
     let Some((incarnation, boot, generation, grant, state)) = row else {
@@ -163,7 +190,7 @@ fn load_source(
         presentation_session_id,
         original_native_session_id,
         native_launch,
-        blocked_store: state == "blocked",
+        blocked_recovery: state == "blocked",
     }))
 }
 
@@ -194,8 +221,13 @@ pub(super) fn commit_dispatch_acceptance(
     source: &OwnedCodexDispatchRecovery,
 ) -> Result<(), RegistryError> {
     conn.execute(
-        "UPDATE souls SET recovery_state='live',recovery_reason=NULL,updated_at=?1 WHERE soul_id=?2 AND desired_state='running' AND recovery_state='blocked' AND recovery_reason=?3",
-        params![now_millis(), source.handle.soul_id().as_str(), recovery_block_reason_name(RecoveryBlockReason::StoreUnreadable)],
+        "UPDATE souls SET recovery_state='live',recovery_reason=NULL,updated_at=?1 WHERE soul_id=?2 AND desired_state='running' AND recovery_state='blocked' AND recovery_reason IN (?3,?4)",
+        params![
+            now_millis(),
+            source.handle.soul_id().as_str(),
+            recovery_block_reason_name(RecoveryBlockReason::StoreUnreadable),
+            recovery_block_reason_name(RecoveryBlockReason::ImplementationUnavailable),
+        ],
     )?;
     Ok(())
 }

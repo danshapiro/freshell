@@ -5961,6 +5961,7 @@ impl Supervisor {
                     text: command.data,
                     settings: Some(fresh_agent_replay_settings(agent)),
                     checkpoint_logical_attempt_id: None,
+                    codex_dispatch_recovery_source: None,
                 }
             } else {
                 HostCommand::TerminalInput {

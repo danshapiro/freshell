@@ -12,9 +12,10 @@ use freshell_runtime_protocol::{
     CommandState, EvidenceStoreState, FreshAgentCapture, FreshAgentNativeNameError,
     FreshAgentNativeNameOperation, FreshAgentNativeNameReply, FreshAgentRollbackDirection,
     FreshAgentRollbackMode, FreshAgentTurnSettings, NativeIdentityLaunch,
-    NativeReadinessAbsenceEvidence, NativeReadinessFence, NativeReadinessReceipt,
-    NativeReadinessRecoveryAuthorization, ProviderLaunchContext, ProviderModelSelection,
-    ProviderSecretReference, ProviderSessionReference, RecoveryBlockReason, RequestId, ResumeSpec,
+    NativeIdentityObservation, NativeReadinessAbsenceEvidence, NativeReadinessFence,
+    NativeReadinessReceipt, NativeReadinessRecoveryAuthorization, ProviderLaunchContext,
+    ProviderModelSelection, ProviderSecretReference, ProviderSessionReference, RecoveryBlockReason,
+    RequestId, ResumeSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -284,6 +285,14 @@ pub struct DispatchAck {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchResult {
+    pub state: CommandState,
+    /// The provider's exact correlated identity receipt. Persisted with the
+    /// command so a retry after a lost host reply returns the same transition.
+    pub native_identity: Option<NativeDispatchIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationAck {
     pub provider_ack_id: Option<String>,
     /// Some rollback implementations materialize a new provider-native
@@ -471,6 +480,30 @@ pub trait FreshAgentTransport: Send + Sync {
         logical_attempt_id: Option<&str>,
     ) -> Result<DispatchAck, DispatchFailure> {
         self.dispatch_with_checkpoint_identity(request_id, text, profile, logical_attempt_id)
+            .await
+    }
+    /// Dispatches the single Codex send authorized by an exact retained native
+    /// source. Other transports refuse this capability by default.
+    async fn dispatch_with_codex_recovery_source(
+        &self,
+        request_id: &RequestId,
+        text: &str,
+        profile: &FreshAgentProfile,
+        settings: Option<&FreshAgentTurnSettings>,
+        logical_attempt_id: Option<&str>,
+        source: Option<&NativeIdentityObservation>,
+    ) -> Result<DispatchAck, DispatchFailure> {
+        if source.is_some() {
+            return Err(DispatchFailure {
+                provider_diagnostic: Some(freshell_runtime_protocol::FreshAgentSendDiagnostic {
+                    outcome: freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused,
+                    message: Some("Codex recovery send is unsupported by this transport".into()),
+                }),
+                message: "Codex recovery send is unsupported by this transport".into(),
+                acceptance_ambiguous: false,
+            });
+        }
+        self.dispatch_with_turn_settings(request_id, text, profile, settings, logical_attempt_id)
             .await
     }
     async fn resolve_permission(
@@ -1091,6 +1124,8 @@ struct PersistedCommand {
     payload_digest: String,
     state: CommandState,
     provider_ack_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_identity: Option<NativeDispatchIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     operation_failure: Option<OperationFailureKind>,
 }
@@ -2578,6 +2613,25 @@ impl FreshAgentHostActor {
         settings: Option<FreshAgentTurnSettings>,
         logical_attempt_id: Option<String>,
     ) -> Result<CommandState, ActorError> {
+        self.dispatch_with_codex_recovery_source(
+            request_id,
+            text,
+            settings,
+            logical_attempt_id,
+            None,
+        )
+        .await
+        .map(|result| result.state)
+    }
+
+    pub async fn dispatch_with_codex_recovery_source(
+        &self,
+        request_id: RequestId,
+        text: String,
+        settings: Option<FreshAgentTurnSettings>,
+        logical_attempt_id: Option<String>,
+        codex_dispatch_recovery_source: Option<NativeIdentityObservation>,
+    ) -> Result<DispatchResult, ActorError> {
         // One provider conversation has one ordered input lane. Keep the
         // durability transition and provider acceptance boundary within the
         // same fence so concurrent gateways cannot become double writers.
@@ -2591,11 +2645,19 @@ impl FreshAgentHostActor {
         // journal created before this field existed remains idempotent after
         // upgrade. A modern checkpointed send additionally fences the logical
         // attempt identity into durable request-ID conflict detection.
-        let command_material = match logical_attempt_id.as_deref() {
-            Some(logical_attempt_id) => {
-                serde_json::to_vec(&(text.as_str(), &settings, logical_attempt_id))
-            }
-            None => serde_json::to_vec(&(text.as_str(), &settings)),
+        let command_material = match codex_dispatch_recovery_source.as_ref() {
+            Some(source) => serde_json::to_vec(&(
+                text.as_str(),
+                &settings,
+                logical_attempt_id.as_deref(),
+                source,
+            )),
+            None => match logical_attempt_id.as_deref() {
+                Some(logical_attempt_id) => {
+                    serde_json::to_vec(&(text.as_str(), &settings, logical_attempt_id))
+                }
+                None => serde_json::to_vec(&(text.as_str(), &settings)),
+            },
         }
         .map_err(persist)?;
         let digest = digest(&command_material);
@@ -2610,7 +2672,10 @@ impl FreshAgentHostActor {
                     CommandState::Ambiguous | CommandState::Dispatching | CommandState::Queued => {
                         Err(ActorError::AmbiguousDispatch)
                     }
-                    other => Ok(other),
+                    other => Ok(DispatchResult {
+                        state: other,
+                        native_identity: existing.native_identity.clone(),
+                    }),
                 };
             }
             if let Some(settings) = settings.as_ref() {
@@ -2624,6 +2689,7 @@ impl FreshAgentHostActor {
                     payload_digest: digest,
                     state: CommandState::Queued,
                     provider_ack_id: None,
+                    native_identity: None,
                     operation_failure: None,
                 },
             );
@@ -2639,12 +2705,13 @@ impl FreshAgentHostActor {
         }
         let result = self
             .transport
-            .dispatch_with_turn_settings(
+            .dispatch_with_codex_recovery_source(
                 &request_id,
                 &text,
                 &dispatch_profile,
                 settings.as_ref(),
                 logical_attempt_id.as_deref(),
+                codex_dispatch_recovery_source.as_ref(),
             )
             .await;
         let mut state = self.state.lock().await;
@@ -2709,6 +2776,7 @@ impl FreshAgentHostActor {
         match result {
             Ok(ack) => {
                 command.provider_ack_id = ack.provider_ack_id;
+                command.native_identity = ack.native_identity.clone();
                 command.state = CommandState::ProviderAcked;
                 push_event_bounded(
                     &mut state,
@@ -2720,7 +2788,10 @@ impl FreshAgentHostActor {
                     self.event_count_cap,
                 )?;
                 write_state(&self.state_dir, &state)?;
-                Ok(CommandState::ProviderAcked)
+                Ok(DispatchResult {
+                    state: CommandState::ProviderAcked,
+                    native_identity: ack.native_identity,
+                })
             }
             Err(failure) => {
                 command.state = if failure.acceptance_ambiguous {
@@ -2805,6 +2876,7 @@ impl FreshAgentHostActor {
                     payload_digest,
                     state: CommandState::Dispatching,
                     provider_ack_id: None,
+                    native_identity: None,
                     operation_failure: None,
                 },
             );
@@ -3001,6 +3073,7 @@ impl FreshAgentHostActor {
                         CommandState::Completed
                     },
                     provider_ack_id: None,
+                    native_identity: None,
                     operation_failure: None,
                 },
             );

@@ -134,7 +134,7 @@ impl ControlledCodex {
             .unwrap();
         agent.provider = FreshProvider::Codex;
         agent.session_type = "freshcodex".into();
-        agent.runtime_variant = "codex-app-server-v1".into();
+        agent.runtime_variant = "codex-app-server".into();
         agent.fixture_transport = None;
         let boot = HostBootId::new();
         let conn = Connection::open(registry.database_path()).unwrap();
@@ -306,6 +306,7 @@ impl ControlledCodex {
                                         "owned-provider-config-v1".into(),
                                         "provider-store-probe-v1".into(),
                                         "native-identity-observation-v1".into(),
+                                        "fresh-agent-codex-dispatch-recovery-v1".into(),
                                         HOST_CAPABILITY_NATIVE_READINESS_RECEIPT_V1.into(),
                                     ];
                                     if capability.load(Ordering::SeqCst) {

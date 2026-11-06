@@ -3244,6 +3244,13 @@ impl Registry {
         source: Arc<OwnedCodexDispatchRecovery>,
         identity: NativeDispatchIdentity,
     ) -> Result<(), RegistryError> {
+        if identity.previous_native_session_id == identity.native_session_id
+            && identity.pending_naming_handle.is_none()
+        {
+            return self
+                .commit_codex_dispatch_recovery_same_root(source, identity)
+                .await;
+        }
         self.transition_native_session_evidenced_fenced(
             source.handle.soul_id().clone(),
             source.handle.incarnation_id().clone(),
