@@ -3125,7 +3125,25 @@ impl Supervisor {
             .await
         {
             Ok(host) => host,
-            Err(_) => return Err(readiness_error),
+            Err(error) => {
+                // The normal recovery classifier already handles an
+                // unavailable retained host by using the exact persisted
+                // resume candidate, then requiring verified-empty cleanup
+                // before replacement. A failed manual-retry preflight must
+                // not strand a Blocked soul before that path can run.
+                crate::service::append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.manual_retry_readiness_deferred",
+                    serde_json::json!({
+                        "severity": "warning",
+                        "soulId": soul_id,
+                        "incarnationId": before_retry.prior_handle.incarnation_id(),
+                        "stage": "host_authentication",
+                        "errorCode": error.code,
+                    }),
+                );
+                return Ok(());
+            }
         };
         let status = match self
             .host_status(
@@ -3136,7 +3154,20 @@ impl Supervisor {
             .await
         {
             Ok(status) => status,
-            Err(_) => return Err(readiness_error),
+            Err(error) => {
+                crate::service::append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.manual_retry_readiness_deferred",
+                    serde_json::json!({
+                        "severity": "warning",
+                        "soulId": soul_id,
+                        "incarnationId": before_retry.prior_handle.incarnation_id(),
+                        "stage": "host_status",
+                        "errorCode": error.code,
+                    }),
+                );
+                return Ok(());
+            }
         };
         let current = self
             .registry

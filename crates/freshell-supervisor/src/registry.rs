@@ -3028,6 +3028,43 @@ impl Registry {
         }).await
     }
 
+    /// Settle an ambiguous input only when a receipt from its original host
+    /// proves that exact payload and incarnation were refused.
+    pub(crate) async fn mark_ambiguous_fresh_input_refused(
+        &self,
+        soul_id: SoulId,
+        request_id: RequestId,
+        incarnation_id: IncarnationId,
+        data: &[u8],
+        correlation: Option<&[u8]>,
+        diagnostic: freshell_runtime_protocol::FreshAgentSendDiagnostic,
+    ) -> Result<(), RegistryError> {
+        if diagnostic.outcome != freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused
+        {
+            return Err(RegistryError::InvalidState(
+                "a non-refusal cannot settle an ambiguous input".into(),
+            ));
+        }
+        let payload_digest = input_payload_digest(data, correlation);
+        let protected_payload = data.to_vec();
+        let encoded = serde_json::to_string(&diagnostic)?;
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = tx.execute(
+                "UPDATE input_commands SET state='refused',fresh_agent_send_refusal=?1,updated_at=?2 WHERE soul_id=?3 AND request_id=?4 AND payload_digest=?5 AND protected_payload=?6 AND incarnation_id=?7 AND state IN ('dispatching','ambiguous')",
+                params![encoded, now_millis(), soul_id.as_str(), request_id.as_str(), payload_digest, protected_payload, incarnation_id.as_str()],
+            )?;
+            if changed != 1 {
+                return Err(RegistryError::InvalidState(format!(
+                    "ambiguous input command {request_id} no longer matches its receipt"
+                )));
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Atomically moves one never-dispatched command onto the replacement
     /// incarnation. Dispatching/ambiguous commands are deliberately excluded:
     /// response loss can never cause an interrupted prompt to be replayed.

@@ -181,6 +181,7 @@ export const IDLE_INCOMPLETE_MAX_RETRIES = 5
 const IDLE_INCOMPLETE_RETRY_DELAY_MS = 1_000
 const REVEAL_REFRESH_MAX_WAIT_MS = 15_000
 export const FRESH_AGENT_CODEX_RECEIPT_RETRY_DELAY_MS = 30_000
+export const FRESH_AGENT_CODEX_RECEIPT_MAX_RETRIES = 5
 const log = createLogger('FreshAgentView')
 let nextSnapshotAuditView = 0
 
@@ -1475,6 +1476,7 @@ export function FreshAgentView({
   const localEchoSendBoundaryRef = useRef<{ requestId: string; turnKeys: ReadonlySet<string> } | null>(null)
   const pendingSendMetadataRef = useRef<Map<string, PendingSendMetadata>>(new Map())
   const codexSendReconcileTimersRef = useRef<Map<string, number>>(new Map())
+  const codexSendReconcileAttemptsRef = useRef<Map<string, number>>(new Map())
   // The pane's busy-epoch: advanced at every busy→idle edge of effectiveStatus
   // that SETTLES a turn. A composer send records the current epoch into its
   // pending send metadata at dispatch time, and `paneCaptureInFlight` only
@@ -2374,18 +2376,38 @@ export function FreshAgentView({
     codexSendReconcileTimersRef.current.delete(requestId)
   }, [])
 
+  const retireCodexSendReconcileRetry = useCallback((requestId: string) => {
+    clearCodexSendReconcileRetry(requestId)
+    codexSendReconcileAttemptsRef.current.delete(requestId)
+  }, [clearCodexSendReconcileRetry])
+
+  const sendCodexSendReceiptReconcile = useCallback((requestId: string, pending: PendingSendMetadata) => {
+    const sendFrame = pending.sendFrame
+    if (ws.state !== 'ready'
+      || !sendFrame
+      || sendFrame.type !== 'freshAgent.send'
+      || sendFrame.provider !== 'codex'
+      || sendFrame.requestId !== requestId) return false
+    const attempts = codexSendReconcileAttemptsRef.current.get(requestId) ?? 0
+    if (attempts >= FRESH_AGENT_CODEX_RECEIPT_MAX_RETRIES) return false
+    codexSendReconcileAttemptsRef.current.set(requestId, attempts + 1)
+    sendFreshAgentMessage({ ...sendFrame, type: 'freshAgent.send.reconcile' })
+    return true
+  }, [sendFreshAgentMessage, ws])
+
   const scheduleCodexSendReconcileRetry = useCallback((requestId: string) => {
     if (codexSendReconcileTimersRef.current.has(requestId)
-      || ws.getServerCapabilities().freshAgentSendReconcileV1 !== true) return
+      || ws.getServerCapabilities().freshAgentSendReconcileV1 !== true
+      || (codexSendReconcileAttemptsRef.current.get(requestId) ?? 0) >= FRESH_AGENT_CODEX_RECEIPT_MAX_RETRIES) return
 
     const scheduleNext = () => {
+      if ((codexSendReconcileAttemptsRef.current.get(requestId) ?? 0) >= FRESH_AGENT_CODEX_RECEIPT_MAX_RETRIES) return
       const timer = window.setTimeout(() => {
         codexSendReconcileTimersRef.current.delete(requestId)
         const current = paneContentRef.current
         const pending = pendingSendMetadataRef.current.get(requestId)
         const currentScope = paneSessionScope(current)
         if (!isMountedRef.current
-          || isFreshAgentLifecycleBlocked(current)
           || current.provider !== 'codex'
           || !current.sessionId
           || !pending?.deliveryAmbiguous
@@ -2396,22 +2418,31 @@ export function FreshAgentView({
           || pending.sendFrame.provider !== 'codex'
           || pending.sendFrame.requestId !== requestId
           || !scopeToPaneSession(pending, currentScope.sourceSessionKey, currentScope.sourceCanonicalSessionKey)) {
+          codexSendReconcileAttemptsRef.current.delete(requestId)
+          return
+        }
+        // A disconnect is handled by the existing reconnect listener. Do not
+        // put receipt frames into WsClient's offline queue, where they could
+        // displace user messages while the socket is down.
+        if (ws.state !== 'ready') return
+        if (isFreshAgentLifecycleBlocked(current)) {
+          scheduleNext()
           return
         }
         // Receipt reconciliation only reads the durable result; it never
-        // replays the provider input. Keep checking while the original
-        // outcome remains ambiguous and this pane still owns the send.
-        sendFreshAgentMessage({ ...pending.sendFrame, type: 'freshAgent.send.reconcile' })
-        scheduleNext()
+        // replays the provider input. Poll a bounded number of times while
+        // this pane still owns the send.
+        if (sendCodexSendReceiptReconcile(requestId, pending)) scheduleNext()
       }, FRESH_AGENT_CODEX_RECEIPT_RETRY_DELAY_MS)
       codexSendReconcileTimersRef.current.set(requestId, timer)
     }
     scheduleNext()
-  }, [sendFreshAgentMessage, ws])
+  }, [sendCodexSendReceiptReconcile, ws])
 
   useEffect(() => () => {
     for (const timer of codexSendReconcileTimersRef.current.values()) window.clearTimeout(timer)
     codexSendReconcileTimersRef.current.clear()
+    codexSendReconcileAttemptsRef.current.clear()
   }, [])
 
   const replayPendingCodexSendFrames = useCallback((current: FreshAgentPaneContent) => {
@@ -2425,16 +2456,21 @@ export function FreshAgentView({
         || !scopeToPaneSession(pending, currentScope.sourceSessionKey, currentScope.sourceCanonicalSessionKey)) {
         continue
       }
+      // A new ready WebSocket connection is a new opportunity for the
+      // supervisor to have recovered. Keep each connection's receipt-read
+      // burst bounded, but do not let an earlier exhausted burst disable a
+      // later reconnect.
+      clearCodexSendReconcileRetry(requestId)
+      codexSendReconcileAttemptsRef.current.delete(requestId)
       // Preserve the request ID and full original payload so the supervisor
       // can check its journal and durable host receipt. This route never
       // dispatches the provider input a second time.
-      if (pending.deliveryAmbiguous) {
-        clearCodexSendReconcileRetry(requestId)
-        scheduleCodexSendReconcileRetry(requestId)
+      if (!isFreshAgentLifecycleBlocked(current)) {
+        sendCodexSendReceiptReconcile(requestId, pending)
       }
-      sendFreshAgentMessage({ ...pending.sendFrame, type: 'freshAgent.send.reconcile' })
+      if (pending.deliveryAmbiguous) scheduleCodexSendReconcileRetry(requestId)
     }
-  }, [clearCodexSendReconcileRetry, scheduleCodexSendReconcileRetry, sendFreshAgentMessage, ws])
+  }, [clearCodexSendReconcileRetry, scheduleCodexSendReconcileRetry, sendCodexSendReceiptReconcile, ws])
 
   /** Task 10: re-issue a failed send under a fresh requestId with the
    * retained text + route cwd. The retry gets its own pending-metadata entry
@@ -3664,7 +3700,7 @@ export function FreshAgentView({
           || !locatorMatchesPane(message, current, freshOpenCodeRouteCwdRef.current, runtimeOwnersForLocator())) {
           return
         }
-        clearCodexSendReconcileRetry(message.requestId)
+        retireCodexSendReconcileRetry(message.requestId)
         if (pending && pending !== originalPending) {
           pendingSendMetadataRef.current.set(message.requestId, pending)
         } else if (!pending && persistedEchoMatches) {
@@ -3846,7 +3882,7 @@ export function FreshAgentView({
           scheduleCodexSendReconcileRetry(failedRequestId)
           requestSnapshotRefresh('poll')
         } else {
-          clearCodexSendReconcileRetry(failedRequestId)
+          retireCodexSendReconcileRetry(failedRequestId)
           pendingSendMetadataRef.current.delete(failedRequestId)
         }
         if (!ambiguous && outgoingTurnRef.current?.requestId === failedRequestId) {
@@ -4072,7 +4108,7 @@ export function FreshAgentView({
       }
     })
     return unsubscribe
-  }, [agentSession?.cwd, appStore, captureFreshAgentAttachmentAttempt, clearCodexSendReconcileRetry, clearReserveRedrive, commitSnapshot, descriptor?.label, dispatch, markSnapshotDirty, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, redriveAfterSessionReserved, releasePendingRebind, requestRevealRefresh, requestSnapshotRefresh, resendPendingMessage, scheduleCodexSendReconcileRetry, sendFencedFreshAgentAttach, sendFreshAgentMessage, setLocalEcho, setNotice, tabId, ws])
+  }, [agentSession?.cwd, appStore, captureFreshAgentAttachmentAttempt, clearCodexSendReconcileRetry, clearReserveRedrive, commitSnapshot, descriptor?.label, dispatch, markSnapshotDirty, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, redriveAfterSessionReserved, releasePendingRebind, requestRevealRefresh, requestSnapshotRefresh, resendPendingMessage, retireCodexSendReconcileRetry, scheduleCodexSendReconcileRetry, sendFencedFreshAgentAttach, sendFreshAgentMessage, setLocalEcho, setNotice, tabId, ws])
 
   useEffect(() => {
     const pendingRefusalFenceRefresh = pendingRefusalFenceRefreshRef.current

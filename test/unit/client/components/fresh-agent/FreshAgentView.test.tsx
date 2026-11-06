@@ -18,7 +18,7 @@ import { selectPaneOwnerFence } from '@/store/selectors/runtimeOwner'
 import tabsReducer, { closeTab, closePaneWithCleanup } from '@/store/tabsSlice'
 import connectionReducer, { setBootId } from '@/store/connectionSlice'
 import managedRuntimeReducer from '@/store/managedRuntimeSlice'
-import { FreshAgentView, FRESH_AGENT_CODEX_RECEIPT_RETRY_DELAY_MS, FRESH_AGENT_RESERVE_RETRY_FLOOR_MS, IDLE_INCOMPLETE_MAX_RETRIES, locatorMatchesPane } from '@/components/fresh-agent/FreshAgentView'
+import { FreshAgentView, FRESH_AGENT_CODEX_RECEIPT_MAX_RETRIES, FRESH_AGENT_CODEX_RECEIPT_RETRY_DELAY_MS, FRESH_AGENT_RESERVE_RETRY_FLOOR_MS, IDLE_INCOMPLETE_MAX_RETRIES, locatorMatchesPane } from '@/components/fresh-agent/FreshAgentView'
 import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSettingsButton'
 import {
   initLayout,
@@ -303,6 +303,7 @@ function seedStripUsage(
 const CLAUDE_RESTORE_THREAD_ID = '550e8400-e29b-41d4-a716-446655440001'
 
 const wsMock = vi.hoisted(() => ({
+  state: 'ready' as string,
   send: vi.fn(),
   onMessage: vi.fn(() => () => {}),
   onReconnect: vi.fn(() => () => {}),
@@ -576,6 +577,7 @@ beforeEach(() => {
   // A previous hidden pane can leave pacing timestamps in an advanced fake clock.
   resetRebindQueueForTests()
   wsMock.send.mockReset()
+  wsMock.state = 'ready'
   wsMock.onMessage.mockReset()
   wsMock.onReconnect.mockReset()
   wsMock.getServerCapabilities.mockReset()
@@ -22189,10 +22191,12 @@ describe('task6 hosted recovery in the mounted view', () => {
     expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(0)
   })
 
-  it('reconciles an ambiguous Codex send after supervisor restart without a WebSocket reconnect', async () => {
+  it('reconciles an ambiguous Codex send when connected, waits through recovery blocks, and bounds receipt reads', async () => {
     const store = createStore()
     const handlers = new Set<(message: unknown) => void>()
+    let reconnectHandler: (() => void) | undefined
     wsMock.onMessage.mockImplementation((handler) => { handlers.add(handler); return () => { handlers.delete(handler) } })
+    wsMock.onReconnect.mockImplementation((handler: () => void) => { reconnectHandler = handler; return () => { reconnectHandler = undefined } })
     wsMock.getServerCapabilities.mockReturnValue({ freshAgentSendReconcileV1: true })
     const locator = { sessionId: 'codex-open-socket-receipt', sessionType: 'freshcodex', provider: 'codex' }
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
@@ -22227,12 +22231,29 @@ describe('task6 hosted recovery in the mounted view', () => {
       })
       expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain')
 
+      wsMock.state = 'disconnected'
       await act(async () => { await vi.advanceTimersByTimeAsync(FRESH_AGENT_CODEX_RECEIPT_RETRY_DELAY_MS) })
+      expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(0)
+      wsMock.state = 'ready'
+      act(() => reconnectHandler?.())
       expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toEqual([{
         ...originalFrame,
         type: 'freshAgent.send.reconcile',
       }])
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+
+      const liveRecovery = getFreshAgentPaneContent(store).recoverySummary!
+      act(() => store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: {
+        recoverySummary: { ...liveRecovery, recoveryState: 'blocked' },
+      } })))
+      await act(async () => { await vi.advanceTimersByTimeAsync(FRESH_AGENT_CODEX_RECEIPT_RETRY_DELAY_MS) })
+      expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(1)
+      const blockedRecovery = getFreshAgentPaneContent(store).recoverySummary!
+      act(() => store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: {
+        recoverySummary: { ...blockedRecovery, recoveryState: 'live' },
+      } })))
+      await act(async () => { await vi.advanceTimersByTimeAsync(FRESH_AGENT_CODEX_RECEIPT_RETRY_DELAY_MS) })
+      expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(2)
 
       act(() => {
         for (const handler of [...handlers]) handler({
@@ -22241,8 +22262,28 @@ describe('task6 hosted recovery in the mounted view', () => {
         })
       })
       await act(async () => { await vi.advanceTimersByTimeAsync(FRESH_AGENT_CODEX_RECEIPT_RETRY_DELAY_MS) })
-      expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(2)
+      expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(3)
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(
+          FRESH_AGENT_CODEX_RECEIPT_RETRY_DELAY_MS * (FRESH_AGENT_CODEX_RECEIPT_MAX_RETRIES - 3),
+        )
+      })
+      expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(FRESH_AGENT_CODEX_RECEIPT_MAX_RETRIES)
+      await act(async () => { await vi.advanceTimersByTimeAsync(FRESH_AGENT_CODEX_RECEIPT_RETRY_DELAY_MS) })
+      expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(FRESH_AGENT_CODEX_RECEIPT_MAX_RETRIES)
+
+      act(() => reconnectHandler?.())
+      expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(FRESH_AGENT_CODEX_RECEIPT_MAX_RETRIES + 1)
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(
+          FRESH_AGENT_CODEX_RECEIPT_RETRY_DELAY_MS * FRESH_AGENT_CODEX_RECEIPT_MAX_RETRIES,
+        )
+      })
+      expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(FRESH_AGENT_CODEX_RECEIPT_MAX_RETRIES * 2)
+      await act(async () => { await vi.advanceTimersByTimeAsync(FRESH_AGENT_CODEX_RECEIPT_RETRY_DELAY_MS) })
+      expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(FRESH_AGENT_CODEX_RECEIPT_MAX_RETRIES * 2)
 
       const accepted = {
         type: 'freshAgent.send.accepted', ...locator,
@@ -22253,7 +22294,7 @@ describe('task6 hosted recovery in the mounted view', () => {
         for (const handler of [...handlers]) handler(accepted)
       })
       await act(async () => { await vi.advanceTimersByTimeAsync(FRESH_AGENT_CODEX_RECEIPT_RETRY_DELAY_MS) })
-      expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(2)
+      expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(FRESH_AGENT_CODEX_RECEIPT_MAX_RETRIES * 2)
     } finally {
       vi.useRealTimers()
     }
