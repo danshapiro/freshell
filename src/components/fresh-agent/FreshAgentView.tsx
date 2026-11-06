@@ -181,6 +181,7 @@ export const IDLE_INCOMPLETE_MAX_RETRIES = 5
 const IDLE_INCOMPLETE_RETRY_DELAY_MS = 1_000
 const NATIVE_CLAIM_MAX_RETRIES = 5
 const REVEAL_REFRESH_MAX_WAIT_MS = 15_000
+const RATE_LIMIT_RETRY_MARGIN_MS = 50
 const log = createLogger('FreshAgentView')
 let nextSnapshotAuditView = 0
 
@@ -1280,6 +1281,7 @@ export function FreshAgentView({
     pending: boolean
     exhausted: boolean
     identity: string
+    retryAtMs?: number
   } | null>(null)
   const nativeClaimRetryRef = useRef(nativeClaimRetry)
   nativeClaimRetryRef.current = nativeClaimRetry
@@ -1920,9 +1922,12 @@ export function FreshAgentView({
   const codexRetryIdentity = paneContent.provider === 'codex'
     ? codexPaneRetryIdentity(appStore.getState(), paneContent, codexSnapshotKey, codexSnapshotRevision) : undefined
   const previousCodexRetryIdentityRef = useRef(codexRetryIdentity)
+  // A pane may change away and then back to the same serialized identity.
+  const codexRetryGenerationRef = useRef(0)
   useEffect(() => {
     if (previousCodexRetryIdentityRef.current === codexRetryIdentity) return
     previousCodexRetryIdentityRef.current = codexRetryIdentity
+    codexRetryGenerationRef.current += 1
     clearIdleIncompleteRetry()
   }, [clearIdleIncompleteRetry, codexRetryIdentity])
   const previousManagedCodexNativeIdRef = useRef(managedCodexNativeId)
@@ -2115,7 +2120,7 @@ export function FreshAgentView({
       setNativeClaimRetry((current) => current === retry ? { ...retry, pending: false, attempts: retry.attempts + 1 } : current)
       if (snapshotDirtyRef.current) requestRevealRefresh(true)
       else requestSnapshotRefresh('idle-incomplete')
-    }, IDLE_INCOMPLETE_RETRY_DELAY_MS)
+    }, Math.max(IDLE_INCOMPLETE_RETRY_DELAY_MS, (retry.retryAtMs ?? 0) - Date.now() + RATE_LIMIT_RETRY_MARGIN_MS))
     return () => window.clearTimeout(timer)
   }, [codexRetryIdentity, codexSnapshotKey, codexSnapshotRevision, connectionStatus, hidden, lifecycleBlocked,
     nativeClaimRetry, nativeClaimRetryIsCurrent, ownerDivergence, paneContent.createRequestId, requestRevealRefresh, requestSnapshotRefresh])
@@ -3758,6 +3763,9 @@ export function FreshAgentView({
     // A missing soul uses the owned snapshot route, but remains a history-only
     // read: its status and errors cannot authorize runtime recovery.
     const requestReadOnly = snapshotReadOnly
+    const requestCodexRetryGeneration = codexRetryGenerationRef.current
+    const requestNativeClaim = provider === 'codex' && !requestReadOnly
+      ? appStore.getState().freshAgentLive?.bySession[projectionKey]?.nativeClaim : undefined
     const requestSoulId = requestReadOnly ? requestPaneSoulId : undefined
     const requestSerial = ++snapshotRequestAuthorityRef.current.next
     if (snapshotRequestAuthorityRef.current.readOnlySource !== requestReadOnly) {
@@ -4489,6 +4497,43 @@ export function FreshAgentView({
         return
       }
       if (outcome.status === 'rate-limited' || outcome.status === 'backoff') {
+        if (provider === 'codex' && codexRetryGenerationRef.current !== requestCodexRetryGeneration) return
+        // Claim recovery has its own pane-local, visible-only attempt budget.
+        // Route 429s through that budget too, including the first claim read,
+        // instead of creating an unbounded, visibility-blind retry timer.
+        if (!requestReadOnly && provider === 'codex' && codexSnapshotRevision !== undefined && codexRetryIdentity !== undefined) {
+          const liveSession = appStore.getState().freshAgentLive?.bySession[projectionKey]
+          const claimStillCurrent = requestNativeClaim && (liveSession?.nativeClaim
+            ? liveSession.nativeClaim.projectionId === requestNativeClaim.projectionId
+              && liveSession.nativeClaim.nativeSessionId === requestNativeClaim.nativeSessionId
+              && liveSession.nativeClaim.observationVersion === requestNativeClaim.observationVersion
+            : liveSession?.routeOnlyProjectionId === requestNativeClaim.projectionId
+              && liveSession.routeOnlyObservationVersion === requestNativeClaim.observationVersion)
+          const current = nativeClaimRetryRef.current
+          const matches = current?.key === projectionKey && current.revision === codexSnapshotRevision
+            && current.identity === codexRetryIdentity && current.createRequestId === requestCreateRequestId
+          if (requestClaimRetry && !matches) return
+          const retry = matches ? current : !current && claimStillCurrent ? {
+            key: projectionKey, revision: codexSnapshotRevision, projectionId: requestNativeClaim.projectionId,
+            nativeSessionId: requestNativeClaim.nativeSessionId, createRequestId: requestCreateRequestId,
+            hadStoredLayout, attempts: 0, pending: false, exhausted: false, identity: codexRetryIdentity,
+          } : null
+          if (retry && nativeClaimRetryIsCurrent(retry, false)) {
+            const exceedsRevealWait = trigger === 'reveal' && revealRefreshStartedAtRef.current !== null
+              && outcome.retryAtMs + RATE_LIMIT_RETRY_MARGIN_MS > revealRefreshStartedAtRef.current + REVEAL_REFRESH_MAX_WAIT_MS
+            const exhausted = retry.exhausted || retry.attempts >= NATIVE_CLAIM_MAX_RETRIES || exceedsRevealWait
+            const unchanged = matches && (retry.exhausted || (retry.pending && !exhausted && retry.retryAtMs === outcome.retryAtMs))
+            if (!unchanged) {
+              setNativeClaimRetry((latest) => latest === current
+                ? { ...retry, pending: !exhausted, exhausted, retryAtMs: outcome.retryAtMs } : latest)
+            }
+            if (exhausted && snapshotDirtyRef.current) {
+              revealRefreshStartedAtRef.current = null
+              setSnapshotRevealError('The conversation did not finish refreshing. Try again.')
+            }
+            return
+          }
+        }
         // Keep the last good snapshot visible; no error banner. Re-arm one
         // retry at expiry (dedupe: never arm a second timer alongside one
         // already counting down).
@@ -4507,12 +4552,14 @@ export function FreshAgentView({
           rateLimitRetryTimerRef.current = window.setTimeout(() => {
             rateLimitRetryTimerRef.current = null
             setRateLimitedUntil(null)
+            const retry = nativeClaimRetryRef.current
+            if (retry && nativeClaimRetryIsCurrent(retry, false)) return
             if (snapshotDirtyRef.current && !hiddenRef.current) {
               requestRevealRefresh(true)
             } else {
               requestSnapshotRefresh('manual')
             }
-          }, delay + 50)
+          }, delay + RATE_LIMIT_RETRY_MARGIN_MS)
         }
         return
       }
@@ -5618,7 +5665,7 @@ export function FreshAgentView({
                     onClick={() => {
                       const retry = nativeClaimRetryRef.current
                       if (!retry?.exhausted || !nativeClaimRetryIsCurrent(retry)) return
-                      setNativeClaimRetry({ ...retry, attempts: 0, pending: false, exhausted: false })
+                      setNativeClaimRetry({ ...retry, attempts: 0, pending: false, exhausted: false, retryAtMs: undefined })
                       requestSnapshotRefresh('manual')
                     }}>
                     Retry
@@ -5939,7 +5986,10 @@ export function FreshAgentView({
                           type="button"
                           className="shrink-0 rounded border border-border/70 px-2 py-1 text-xs"
                           onClick={() => {
-                            setNativeClaimRetry(null)
+                            const retry = nativeClaimRetryRef.current
+                            setNativeClaimRetry(retry && nativeClaimRetryIsCurrent(retry)
+                              ? { ...retry, attempts: 0, pending: false, exhausted: false, retryAtMs: undefined }
+                              : null)
                             requestRevealRefresh(true)
                           }}
                         >

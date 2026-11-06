@@ -3652,6 +3652,331 @@ describe('FreshAgentView', () => {
     },
   )
 
+  it.each(['pending', 'settled by sibling', 'settled by sibling while hidden'] as const)(
+    'bounds a rate-limited first claim read when the claim is %s', async (claimState) => {
+      const route = await mountProjectionReviewRoute(`claim-first-rate-limit-${claimState}`, false)
+      const secondInitial = createDeferred<unknown>()
+      const first = createDeferred<unknown>()
+      const sibling = createDeferred<unknown>()
+      const valid = createDeferred<unknown>()
+      try {
+        await prepareSiblingClaim(route, secondInitial, first, sibling)
+        vi.useFakeTimers()
+        if (claimState !== 'pending') {
+          await act(async () => sibling.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Sibling settled before limit', 2)))
+        }
+        if (claimState === 'settled by sibling while hidden') {
+          route.view.rerender(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden /></Provider>)
+        }
+        apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new ApiError(429, 'Too many requests', undefined, 1_000))
+        await act(async () => first.reject(new ApiError(429, 'Too many requests', undefined, 1_000)))
+        const reads = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+        if (claimState === 'settled by sibling while hidden') {
+          await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+          expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(reads)
+          route.view.rerender(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+        }
+        for (let attempt = 1; attempt <= 5; attempt++) {
+          await act(async () => { await vi.advanceTimersByTimeAsync(1_051 + SNAPSHOT_DEBOUNCE_MS) })
+          expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(reads + attempt)
+        }
+        await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+        expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(reads + 5)
+        const composer = within(route.view.container).getByRole('textbox', { name: 'Chat message input' })
+        expect(composer).toBeDisabled()
+        const alert = within(route.view.container).getByRole('alert', { name: 'Live conversation could not be refreshed' })
+        apiMock.getFreshAgentThreadSnapshot.mockReturnValue(valid.promise)
+        fireEvent.click(within(alert).getByRole('button', { name: 'Retry' }))
+        await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+        expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === valid.promise)).toBe(true)
+        await act(async () => valid.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Live after first rate limit', 3)))
+        expect(within(route.view.container).getByText('Live after first rate limit')).toBeInTheDocument()
+        expect(composer).toBeEnabled()
+      } finally {
+        cleanup()
+        resetSnapshotSchedulerForTests()
+        route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+        secondInitial.resolve(hostedCodexSnapshot('native-b', 'Second initial'))
+        first.resolve(hostedCodexSnapshot('native-b', 'First'))
+        sibling.resolve(hostedCodexSnapshot('native-b', 'Sibling'))
+        valid.resolve(hostedCodexSnapshot('native-b', 'Valid'))
+        vi.useRealTimers()
+      }
+    },
+  )
+
+  it('keeps dirty-reveal retries bounded after a sibling settles the claim', async () => {
+    const route = await mountProjectionReviewRoute('claim-rate-limited-dirty-reveal', false)
+    const secondInitial = createDeferred<unknown>()
+    const first = createDeferred<unknown>()
+    const sibling = createDeferred<unknown>()
+    const reveal = createDeferred<unknown>()
+    const manual = createDeferred<unknown>()
+    const valid = createDeferred<unknown>()
+    try {
+      await prepareSiblingClaim(route, secondInitial, first, sibling)
+      vi.useFakeTimers()
+      await act(async () => first.resolve(transientClaimHistory()))
+      await act(async () => sibling.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Sibling before dirty reveal', 2)))
+      route.view.rerender(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden /></Provider>)
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Sibling still live', 2))
+      const readsWhileHidden = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+      act(() => route.event({ type: 'freshAgent.session.changed', reason: 'codex-thread' }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.slice(readsWhileHidden).every((call) => call[3]?.cwd === '/sibling-retry-pane')).toBe(true)
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(reveal.promise)
+      route.view.rerender(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      const revealCall = apiMock.getFreshAgentThreadSnapshot.mock.results.findIndex((result) => result.value === reveal.promise)
+      expect(revealCall).toBeGreaterThanOrEqual(0)
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[revealCall]).toMatchObject(['freshcodex', 'codex', 'native-b', { trigger: 'reveal' }])
+      apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new ApiError(429, 'Too many requests', undefined, 1_000))
+      await act(async () => reveal.reject(new ApiError(429, 'Too many requests', undefined, 1_000)))
+      const reads = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        await act(async () => { await vi.advanceTimersByTimeAsync(1_051) })
+        await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+        expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(reads + attempt)
+      }
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(reads + 5)
+      const alert = () => within(route.view.container).getByRole('alert', { name: 'The conversation could not be refreshed.' })
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(manual.promise)
+      fireEvent.click(within(alert()).getByRole('button', { name: 'Retry' }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === manual.promise)).toBe(true)
+      apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new ApiError(429, 'Too many requests', undefined, 1_000))
+      await act(async () => manual.reject(new ApiError(429, 'Too many requests', undefined, 1_000)))
+      const readsAfterManual = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        await act(async () => { await vi.advanceTimersByTimeAsync(1_051) })
+        await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+        expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(readsAfterManual + attempt)
+      }
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(readsAfterManual + 5)
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(valid.promise)
+      fireEvent.click(within(alert()).getByRole('button', { name: 'Retry' }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === valid.promise)).toBe(true)
+      await act(async () => valid.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Live after dirty retry', 3)))
+      expect(within(route.view.container).getByText('Live after dirty retry')).toBeInTheDocument()
+      expect(within(route.view.container).getByRole('textbox', { name: 'Chat message input' })).toBeEnabled()
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      secondInitial.resolve(hostedCodexSnapshot('native-b', 'Second initial'))
+      first.resolve(hostedCodexSnapshot('native-b', 'First'))
+      sibling.resolve(hostedCodexSnapshot('native-b', 'Sibling'))
+      reveal.resolve(hostedCodexSnapshot('native-b', 'Reveal'))
+      manual.resolve(hostedCodexSnapshot('native-b', 'Manual'))
+      valid.resolve(hostedCodexSnapshot('native-b', 'Valid'))
+      vi.useRealTimers()
+    }
+  })
+
+  it('offers dirty-reveal Retry when rate-limit backoff exceeds the reveal wait', async () => {
+    const route = await mountProjectionReviewRoute('claim-rate-limited-long-reveal', false)
+    const secondInitial = createDeferred<unknown>()
+    const first = createDeferred<unknown>()
+    const sibling = createDeferred<unknown>()
+    const reveal = createDeferred<unknown>()
+    const valid = createDeferred<unknown>()
+    try {
+      await prepareSiblingClaim(route, secondInitial, first, sibling)
+      vi.useFakeTimers()
+      await act(async () => first.resolve(transientClaimHistory()))
+      await act(async () => sibling.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Sibling before long backoff', 2)))
+      route.view.rerender(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden /></Provider>)
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Sibling remains live', 2))
+      act(() => route.event({ type: 'freshAgent.session.changed', reason: 'codex-thread' }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(reveal.promise)
+      route.view.rerender(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === reveal.promise)).toBe(true)
+      await act(async () => reveal.reject(new ApiError(429, 'Too many requests', undefined, 60_000)))
+      const reads = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+      const alert = () => within(route.view.container).getByRole('alert', { name: 'The conversation could not be refreshed.' })
+      expect(alert()).toBeInTheDocument()
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(valid.promise)
+      fireEvent.click(within(alert()).getByRole('button', { name: 'Retry' }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(reads)
+      expect(alert()).toBeInTheDocument()
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(reads)
+      fireEvent.click(within(alert()).getByRole('button', { name: 'Retry' }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === valid.promise)).toBe(true)
+      await act(async () => valid.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Live after long backoff', 3)))
+      expect(within(route.view.container).getByText('Live after long backoff')).toBeInTheDocument()
+      expect(within(route.view.container).getByRole('textbox', { name: 'Chat message input' })).toBeEnabled()
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      secondInitial.resolve(hostedCodexSnapshot('native-b', 'Second initial'))
+      first.resolve(hostedCodexSnapshot('native-b', 'First'))
+      sibling.resolve(hostedCodexSnapshot('native-b', 'Sibling'))
+      reveal.resolve(hostedCodexSnapshot('native-b', 'Reveal'))
+      valid.resolve(hostedCodexSnapshot('native-b', 'Valid'))
+      vi.useRealTimers()
+    }
+  })
+
+  it.each(['automatic', 'manual', 'automatic while hidden'] as const)(
+    'keeps a bounded recovery action after a rate-limited %s live read', async (failure) => {
+      const route = await mountProjectionReviewRoute(`claim-rate-limited-${failure}`, false)
+      const secondInitial = createDeferred<unknown>()
+      const first = createDeferred<unknown>()
+      const sibling = createDeferred<unknown>()
+      const limited = createDeferred<unknown>()
+      const valid = createDeferred<unknown>()
+      const key = 'freshcodex:codex:native-b'
+      try {
+        const siblingView = await prepareSiblingClaim(route, secondInitial, first, sibling)
+        vi.useFakeTimers()
+        await act(async () => first.resolve(transientClaimHistory()))
+        await act(async () => sibling.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Sibling before rate limit', 2)))
+        const sourceRevision = route.store.getState().freshAgentLive.snapshotSourceRevisionBySession[key]
+        const shared = route.store.getState().freshAgent.sessions[key]
+        const composer = within(route.view.container).getByRole('textbox', { name: 'Chat message input' })
+        const reads = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+        if (failure === 'manual') {
+          apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(transientClaimHistory())
+          for (let attempt = 1; attempt <= 5; attempt++) {
+            await act(async () => { await vi.advanceTimersByTimeAsync(1_001 + SNAPSHOT_DEBOUNCE_MS) })
+            expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(reads + attempt)
+          }
+          const alert = within(route.view.container).getByRole('alert', { name: 'Live conversation could not be refreshed' })
+          apiMock.getFreshAgentThreadSnapshot.mockReturnValue(limited.promise)
+          fireEvent.click(within(alert).getByRole('button', { name: 'Retry' }))
+        } else {
+          apiMock.getFreshAgentThreadSnapshot.mockReturnValue(limited.promise)
+          await act(async () => { await vi.advanceTimersByTimeAsync(1_001 + SNAPSHOT_DEBOUNCE_MS) })
+        }
+        const limitedCall = apiMock.getFreshAgentThreadSnapshot.mock.results.findIndex((result) => result.value === limited.promise)
+        expect(limitedCall).toBeGreaterThanOrEqual(0)
+        expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[limitedCall]).toMatchObject([
+          'freshcodex', 'codex', 'native-b', { trigger: failure === 'manual' ? 'manual' : 'idle-incomplete' },
+        ])
+        if (failure === 'automatic while hidden') {
+          route.view.rerender(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden /></Provider>)
+        }
+        apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new ApiError(429, 'Too many requests', undefined, 1_000))
+        await act(async () => limited.reject(new ApiError(429, 'Too many requests', undefined, 5_000)))
+        const readsAfterLimit = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+        if (failure === 'automatic while hidden') {
+          await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+          expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(readsAfterLimit)
+          expect(within(route.view.container).queryByRole('alert', { name: 'Live conversation could not be refreshed' })).not.toBeInTheDocument()
+          route.view.rerender(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+        } else {
+          await act(async () => { await vi.advanceTimersByTimeAsync(4_999) })
+          expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(readsAfterLimit)
+        }
+        const remaining = failure === 'manual' ? 5 : 4
+        for (let attempt = 1; attempt <= remaining; attempt++) {
+          await act(async () => { await vi.advanceTimersByTimeAsync(1_051 + SNAPSHOT_DEBOUNCE_MS) })
+          expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(readsAfterLimit + attempt)
+        }
+        await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+        expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(readsAfterLimit + remaining)
+        expect(composer).toBeDisabled()
+        const alert = within(route.view.container).getByRole('alert', { name: 'Live conversation could not be refreshed' })
+        apiMock.getFreshAgentThreadSnapshot.mockReturnValue(valid.promise)
+        fireEvent.click(within(alert).getByRole('button', { name: 'Retry' }))
+        await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+        const validCall = apiMock.getFreshAgentThreadSnapshot.mock.results.findIndex((result) => result.value === valid.promise)
+        expect(validCall).toBeGreaterThanOrEqual(0)
+        expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[validCall]).toMatchObject(['freshcodex', 'codex', 'native-b', { trigger: 'manual' }])
+        await act(async () => valid.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Live after rate limit', 3)))
+        expect(within(route.view.container).getByText('Live after rate limit')).toBeInTheDocument()
+        expect(composer).toBeEnabled()
+        expect(within(siblingView.container).getByRole('textbox', { name: 'Chat message input' })).toBeEnabled()
+        expect(route.store.getState().freshAgentLive.snapshotSourceRevisionBySession[key]).toBe(sourceRevision)
+        expect(route.store.getState().freshAgent.sessions[key]?.status).toBe(shared.status)
+        expect(route.store.getState().freshAgent.sessions[key]?.statusVersion).toBe(shared.statusVersion)
+        expect(route.store.getState().freshAgent.sessions[key]?.lost).toBe(shared.lost)
+        expect(route.store.getState().freshAgent.sessions[key]?.lastError).toBe(shared.lastError)
+      } finally {
+        cleanup()
+        resetSnapshotSchedulerForTests()
+        route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+        secondInitial.resolve(hostedCodexSnapshot('native-b', 'Second initial'))
+        first.resolve(transientClaimHistory())
+        sibling.resolve(hostedCodexSnapshot('native-b', 'Sibling'))
+        limited.resolve(hostedCodexSnapshot('native-b', 'Limited'))
+        valid.resolve(hostedCodexSnapshot('native-b', 'Valid'))
+        vi.useRealTimers()
+      }
+    },
+  )
+
+  it.each(['source', 'pane', 'owner', 'lifecycle'] as const)(
+    'does not retry a rate-limited claim read after a %s change', async (change) => {
+      const route = await mountProjectionReviewRoute(`claim-rate-limit-fence-${change}`, false)
+      const secondInitial = createDeferred<unknown>()
+      const first = createDeferred<unknown>()
+      const sibling = createDeferred<unknown>()
+      const limited = createDeferred<unknown>()
+      const current = createDeferred<unknown>()
+      try {
+        await prepareSiblingClaim(route, secondInitial, first, sibling)
+        vi.useFakeTimers()
+        await act(async () => first.resolve(transientClaimHistory()))
+        await act(async () => sibling.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Sibling before rate-limit fence', 2)))
+        apiMock.getFreshAgentThreadSnapshot.mockReturnValue(limited.promise)
+        await act(async () => { await vi.advanceTimersByTimeAsync(1_001 + SNAPSHOT_DEBOUNCE_MS) })
+        expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === limited.promise)).toBe(true)
+        apiMock.getFreshAgentThreadSnapshot.mockReturnValue(current.promise)
+        const original = getFreshAgentPaneContent(route.store)
+        if (change === 'source') {
+          act(() => route.receive({ type: 'freshAgent.session.materialized', previousSessionId: 'native-b', sessionId: 'native-c',
+            sessionType: 'freshcodex', provider: 'codex', sessionRef: { provider: 'codex', sessionId: 'native-c' } }))
+        } else if (change === 'owner') {
+          act(() => route.store.dispatch(applyRuntimeOwner({ type: 'session.runtimeOwner', ...route.locator, epoch: 3, generation: 4,
+            ownerKind: 'fresh-agent', transition: 'handoff-committed', operationId: 'rate-limit-new-owner' })))
+        } else if (change === 'pane') {
+          act(() => route.store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: { ...original, createRequestId: 'replacement-rate-limit-pane' } })))
+          act(() => route.store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: original })))
+        } else {
+          act(() => route.store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: { ...original,
+            recoverySummary: { desiredState: 'stopped', recoveryState: 'stopped', durabilityState: 'resume_captured', allocationState: 'verified_durable' } } })))
+          act(() => route.store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: original })))
+        }
+        await act(async () => limited.reject(new ApiError(429, 'Too many requests', undefined, 1_000)))
+        await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+        const readsAfterChange = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+        await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+        if (change === 'pane') {
+          // The new identity's own read was queued behind the old in-flight
+          // request and received its 429. It may retry after backoff; hold it
+          // open and verify that no old claim retry is inherited alongside it.
+          expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.slice(readsAfterChange)).toHaveLength(1)
+          expect(apiMock.getFreshAgentThreadSnapshot.mock.results.at(-1)?.value).toBe(current.promise)
+          await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+          expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(readsAfterChange + 1)
+        } else {
+          expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.slice(readsAfterChange)).toEqual([])
+        }
+        expect(within(route.view.container).queryByRole('alert', { name: 'Live conversation could not be refreshed' })).not.toBeInTheDocument()
+      } finally {
+        cleanup()
+        resetSnapshotSchedulerForTests()
+        route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+        secondInitial.resolve(hostedCodexSnapshot('native-b', 'Second initial'))
+        first.resolve(hostedCodexSnapshot('native-b', 'First'))
+        sibling.resolve(hostedCodexSnapshot('native-b', 'Sibling'))
+        limited.resolve(hostedCodexSnapshot('native-b', 'Limited'))
+        current.resolve(hostedCodexSnapshot('native-b', 'Current'))
+        vi.useRealTimers()
+      }
+    },
+  )
+
   it.each(['visibility', 'source', 'lifecycle', 'owner'] as const)(
     'keeps an exhausted live-read action scoped to its %s', async (change) => {
       const route = await mountProjectionReviewRoute(`claim-exhausted-${change}`, false)
