@@ -1,6 +1,310 @@
 use super::*;
 use std::{future::Future, task::Poll};
 
+async fn assert_shared_resume_binding_outcome(cause: &str) {
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
+    for session_type in [SessionType::Freshclaude, SessionType::Kilroy] {
+        let _env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        write_fake_transcript(home.path(), &id);
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        let (mut state, _rx) = state_with_bus();
+        let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        sink.seed(
+            PROVIDER,
+            &id,
+            crate::identity_sink::FreshAgentSettings::default(),
+        );
+        state.set_identity_sink(sink.clone());
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        if !matches!(cause, "closed" | "closed_binding") {
+            state.set_ownership(registry.clone());
+        }
+        let gate = sink.arm_binding_stall_result(
+            PROVIDER,
+            &id,
+            matches!(cause, "binding_io" | "stale_binding" | "closed_binding"),
+        );
+        let mut msg = attach_msg(&id);
+        msg.session_type = session_type;
+        let operation = {
+            let state = state.clone();
+            let id = id.clone();
+            tokio::spawn(async move {
+                state
+                    .resume_shared(msg, id, None, true, "test/recovery-accounting")
+                    .await
+            })
+        };
+        gate.entered.recv_timeout(Duration::from_secs(15)).unwrap();
+        let pid = state.sessions.lock().await[&id].child.id().unwrap();
+        match cause {
+            "closed" | "closed_binding" => {
+                tokio::time::timeout(Duration::from_secs(5), state.handle_kill(kill_msg(&id)))
+                    .await
+                    .expect("closing the registered writer completes while its binding is parked");
+            }
+            "ownership" | "stale_binding" => {
+                let freshell_ownership::OwnershipState::Starting {
+                    operation_id,
+                    generation,
+                    ..
+                } = registry.observe(PROVIDER, &id).state
+                else {
+                    panic!("the parked provider launch owns the Starting claim");
+                };
+                registry.fail(PROVIDER, &id, &operation_id, generation, false);
+                let freshell_ownership::BeginOutcome::Granted { generation } = registry
+                    .begin_start(
+                        PROVIDER,
+                        &id,
+                        freshell_ownership::RuntimeOwnerKind::Terminal,
+                        "new-terminal-owner",
+                        None,
+                        "test",
+                        1,
+                    )
+                else {
+                    panic!("the superseding terminal claim succeeds");
+                };
+                assert_eq!(
+                    registry.commit_live(
+                        PROVIDER,
+                        &id,
+                        "new-terminal-owner",
+                        generation,
+                        freshell_ownership::OwnerIdentity {
+                            kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                            terminal_id: Some("new-terminal".into()),
+                            live_session_key: None,
+                            pid: None,
+                            ownership_id: None
+                        }
+                    ),
+                    freshell_ownership::CommitOutcome::Committed
+                );
+            }
+            "lease" => {
+                // Release the lease only after the actual writer has stopped,
+                // matching the native-death cleanup that can race registration.
+                let old = state.sessions.lock().await.remove(&id).unwrap();
+                assert!(matches!(
+                    state.teardown_removed_session_logged(old).await,
+                    LoggedTeardown::Confirmed
+                ));
+                assert!(crate::ownership_lane::partial_pid_confirmed_dead(pid));
+                state
+                    .leases
+                    .force_release_after_confirmed_kill(PROVIDER, &id);
+            }
+            "binding_io" => {}
+            _ => unreachable!(),
+        }
+        gate.release.send(()).unwrap();
+        let answer = tokio::time::timeout(Duration::from_secs(15), operation)
+            .await
+            .expect("the parked recovery settles")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !crate::ownership_lane::partial_pid_confirmed_dead(pid) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the uncommitted writer is torn down");
+        state.shutdown().await;
+        assert!(
+            answer.result.is_err(),
+            "the interrupted registration cannot succeed"
+        );
+        let genuine_failure = cause == "binding_io";
+        if !genuine_failure {
+            assert!(
+                matches!(
+                    answer.result.as_ref(),
+                    Err(crate::session_recovery::RecoveryFailure::Attempt(
+                        recovery::RuntimeResumeError::Superseded { .. }
+                    ))
+                ),
+                "{session_type:?}/{cause}: preserve the typed supersession cause: {:?}",
+                answer.result
+            );
+        }
+        assert_eq!(answer.status.failed_launches, u32::from(genuine_failure),
+            "{session_type:?}/{cause}: only genuine provider or persistence failures consume the budget: {:?}", answer.result);
+        assert_eq!(
+            answer.status.retry_after_ms.is_some(),
+            genuine_failure,
+            "{session_type:?}/{cause}: supersession must not impose a provider retry delay"
+        );
+        assert!(!answer.status.exhausted);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_claude_kilroy_closed_resume_preserves_launch_budget() {
+    assert_shared_resume_binding_outcome("closed").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_claude_kilroy_replaced_owner_preserves_launch_budget() {
+    assert_shared_resume_binding_outcome("ownership").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_claude_kilroy_revoked_lease_preserves_launch_budget() {
+    assert_shared_resume_binding_outcome("lease").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_claude_kilroy_binding_io_failure_spends_launch_budget() {
+    assert_shared_resume_binding_outcome("binding_io").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_claude_kilroy_stale_binding_preserves_launch_budget() {
+    assert_shared_resume_binding_outcome("stale_binding").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_claude_kilroy_closed_binding_preserves_launch_budget() {
+    assert_shared_resume_binding_outcome("closed_binding").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_claude_kilroy_claim_io_and_boot_failures_spend_launch_budget() {
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
+    for session_type in [SessionType::Freshclaude, SessionType::Kilroy] {
+        for boot_failure in [false, true] {
+            let _env = FakeClaudeSidecarEnv::install_with_knobs(None, boot_failure);
+            let home = tempfile::tempdir().unwrap();
+            let id = uuid::Uuid::new_v4().to_string();
+            write_fake_transcript(home.path(), &id);
+            std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+            let (state, _rx) = state_with_bus();
+            let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+            sink.seed(
+                PROVIDER,
+                &id,
+                crate::identity_sink::FreshAgentSettings::default(),
+            );
+            sink.set_fail_writes(!boot_failure);
+            state.set_identity_sink(sink);
+            let mut msg = attach_msg(&id);
+            msg.session_type = session_type;
+            let answer = tokio::time::timeout(
+                Duration::from_secs(15),
+                state.resume_shared(msg, id, None, true, "test/genuine-failure"),
+            )
+            .await
+            .expect("the failed launch settles");
+            state.shutdown().await;
+            assert!(matches!(answer.result.as_ref(), Err(crate::session_recovery::RecoveryFailure::Attempt(recovery::RuntimeResumeError::Unavailable { .. }))),
+                "{session_type:?}/boot_failure={boot_failure}: genuine failures keep their type: {:?}", answer.result);
+            assert_eq!(answer.status.failed_launches, 1);
+            assert!(answer.status.retry_after_ms.is_some());
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_claude_kilroy_superseded_boot_preserves_launch_budget() {
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
+    for session_type in [SessionType::Freshclaude, SessionType::Kilroy] {
+        let env = FakeClaudeSidecarEnv::install_with_knobs(Some(1_500), false);
+        let home = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        write_fake_transcript(home.path(), &id);
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        let (mut state, _rx) = state_with_bus();
+        let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(sink);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        state.set_ownership(registry.clone());
+        let mut msg = attach_msg(&id);
+        msg.session_type = session_type;
+        let operation = {
+            let state = state.clone();
+            let id = id.clone();
+            tokio::spawn(async move {
+                state
+                    .resume_shared(msg, id, None, true, "test/superseded-boot")
+                    .await
+            })
+        };
+        env.create_request().await;
+        let (pid, _) = state.leases.peek_kill_handle(PROVIDER, &id).unwrap();
+        let freshell_ownership::OwnershipState::Starting {
+            operation_id,
+            generation,
+            ..
+        } = registry.observe(PROVIDER, &id).state
+        else {
+            panic!("the native boot holds its Starting claim");
+        };
+        registry.fail(PROVIDER, &id, &operation_id, generation, false);
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
+            PROVIDER,
+            &id,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "new-boot-owner",
+            None,
+            "test",
+            1,
+        ) else {
+            panic!("the replacement lifecycle claims the key");
+        };
+        assert_eq!(
+            registry.commit_live(
+                PROVIDER,
+                &id,
+                "new-boot-owner",
+                generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("replacement-terminal".into()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None,
+                }
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        );
+        // Model cancellation of the superseded start's exact, recorded child.
+        assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0);
+        let answer = tokio::time::timeout(Duration::from_secs(15), operation)
+            .await
+            .unwrap()
+            .unwrap();
+        state.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !crate::ownership_lane::partial_pid_confirmed_dead(pid) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the canceled native boot's process is reaped");
+        assert!(
+            matches!(
+                answer.result.as_ref(),
+                Err(crate::session_recovery::RecoveryFailure::Attempt(
+                    recovery::RuntimeResumeError::Superseded { .. }
+                ))
+            ),
+            "the old boot's cancellation remains typed: {:?}",
+            answer.result
+        );
+        assert_eq!(answer.status.failed_launches, 0);
+        assert!(answer.status.retry_after_ms.is_none());
+        assert!(
+            matches!(registry.observe(PROVIDER, &id).state, freshell_ownership::OwnershipState::Live { owner, .. }
+            if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal)
+        );
+        assert!(crate::ownership_lane::partial_pid_confirmed_dead(pid));
+    }
+}
+
 #[tokio::test]
 async fn an_enabled_resume_waiter_survives_fast_owner_completion() {
     let state = state();

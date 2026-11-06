@@ -434,10 +434,19 @@ fn rollback_envelope(op: &RollbackRequest, live_session_id: &str, event: Value) 
 /// stamped from `op`. The `rollback:true` stamp routes the client to the
 /// notice channel, not the pane error surface.
 pub fn rollback_error_frame(op: &RollbackRequest, code: &str, message: &str) -> ServerMessage {
-    rollback_envelope(
-        op,
-        &op.session_id,
-        json!({
+    ServerMessage::FreshAgentEvent(rollback_error_event(op, code, message))
+}
+
+pub(crate) fn rollback_error_event(
+    op: &RollbackRequest,
+    code: &str,
+    message: &str,
+) -> FreshAgentEvent {
+    FreshAgentEvent {
+        provider: agent_provider_wire(op.provider).to_string(),
+        session_id: op.session_id.clone(),
+        session_type: session_type_wire(op.session_type).to_string(),
+        event: json!({
             "type": "freshAgent.error",
             "sessionId": op.session_id,
             "code": code,
@@ -445,7 +454,7 @@ pub fn rollback_error_frame(op: &RollbackRequest, code: &str, message: &str) -> 
             "requestId": op.request_id,
             "rollback": true,
         }),
-    )
+    }
 }
 
 /// Requesting-sink ack (only the initiating pane's connection):

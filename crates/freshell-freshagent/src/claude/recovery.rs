@@ -39,6 +39,12 @@ pub(super) enum RuntimeResumeError {
         message: String,
         owner: Option<crate::ownership_lane::TerminalOwnerFields>,
     },
+    /// The provider started, but a newer lifecycle invalidated publication.
+    Superseded {
+        code: &'static str,
+        message: String,
+        owner: Option<crate::ownership_lane::TerminalOwnerFields>,
+    },
 }
 
 impl RuntimeResumeError {
@@ -64,6 +70,7 @@ impl RuntimeResumeError {
         match self {
             Self::Lost => false,
             Self::Closed => false,
+            Self::Superseded { .. } => false,
             Self::Unavailable { code, .. } => {
                 *code != "SESSION_RESERVED" && *code != "SESSION_CLOSED"
             }
@@ -76,6 +83,11 @@ impl From<ResumeClaudeError> for RuntimeResumeError {
         match error {
             ResumeClaudeError::NotFound => Self::Lost,
             ResumeClaudeError::Transient(message) => Self::Unavailable {
+                code: "CLAUDE_ATTACH_RESUME_FAILED",
+                message,
+                owner: None,
+            },
+            ResumeClaudeError::Superseded(message) => Self::Superseded {
                 code: "CLAUDE_ATTACH_RESUME_FAILED",
                 message,
                 owner: None,
@@ -137,7 +149,9 @@ impl FreshClaudeState {
                         .resume_untracked(&msg, &operation_durable, fence, reopen_closed, initiator)
                         .await
                         .map_err(|error| {
-                            if error.counts_as_failed_launch() {
+                            if matches!(error, RuntimeResumeError::Superseded { .. }) {
+                                crate::session_recovery::RecoveryAttemptFailure::superseded(error)
+                            } else if error.counts_as_failed_launch() {
                                 crate::session_recovery::RecoveryAttemptFailure::launch(error)
                             } else {
                                 crate::session_recovery::RecoveryAttemptFailure::refusal(error)
@@ -239,7 +253,15 @@ impl FreshClaudeState {
             remaining.fail();
         }
         drop(ticket);
-        outcome.map_err(Into::into)
+        outcome.map_err(|error| {
+            let mut error = RuntimeResumeError::from(error);
+            if let RuntimeResumeError::Superseded { owner, .. } = &mut error {
+                *owner = crate::ownership_lane::terminal_owner_fields_from_snapshot(
+                    &self.ownership_snapshot(PROVIDER, durable),
+                );
+            }
+            error
+        })
     }
 
     pub(super) async fn ensure_runtime(
@@ -352,6 +374,11 @@ impl FreshClaudeState {
                 }
             }
             RuntimeResumeError::Unavailable {
+                code,
+                message,
+                owner,
+            }
+            | RuntimeResumeError::Superseded {
                 code,
                 message,
                 owner,
@@ -560,7 +587,8 @@ impl FreshClaudeState {
                 "SESSION_CLOSED",
                 "This Claude session was closed. Reopen the saved session to continue.".into(),
             ),
-            RuntimeResumeError::Unavailable { code, message, .. } => (code, message),
+            RuntimeResumeError::Unavailable { code, message, .. }
+            | RuntimeResumeError::Superseded { code, message, .. } => (code, message),
         };
         self.emit_control_error(session_id, session_type, request_id, code, &message);
     }
