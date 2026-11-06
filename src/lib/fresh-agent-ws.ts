@@ -22,6 +22,7 @@ import {
   nativeSourceAnnounced,
   nativeSourceAnnouncementCleared,
   resetNativeSourceAnnouncements,
+  snapshotSourceChanged,
   transcriptAnnounced,
   transcriptPatchApplied,
   transcriptProjectionBound,
@@ -282,6 +283,13 @@ export function handleFreshAgentMessage(
           for (const sessionId of new Set([materialized.previousSessionId, materialized.sessionId])) {
             innerDispatch(memoryWarningSourceChanged({ sessionId, sessionType: materialized.sessionType,
               provider: materialized.provider, nativeSessionId: newNative }))
+          }
+          const claim = getState().freshAgentLive?.bySession[makeFreshAgentSessionKey(locator)]?.nativeClaim
+          if (claim && claim.nativeSessionId !== newNative) {
+            // This announcement positively replaces the source named by the
+            // pending claim. Retire it before moving the live state, keeping
+            // its projection tombstone while permitting the new source.
+            innerDispatch(snapshotSourceChanged(locator))
           }
         }
         let replaceLiveProjection = false

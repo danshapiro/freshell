@@ -592,7 +592,17 @@ function invalidateChangedInventorySources(
     checked.add(key)
     const previous = inventoryCodexSource(previousSouls, locator.sessionType, locator.sessionId)
     const next = inventoryCodexSource(nextSouls, locator.sessionType, locator.sessionId)
-    if (!next) continue
+    if (!next) {
+      // A fork can move the known owner and remove its old presentation in
+      // the same inventory. Absence alone proves nothing, but observing that
+      // owner's native ID change fences its outstanding old-route reads.
+      const formerOwner = previous && nextSouls.find((soul) => soul.soulId === previous.soulId)
+      if (previous?.nativeSessionId && formerOwner?.nativeSessionId
+        && previous.nativeSessionId !== formerOwner.nativeSessionId) {
+        invalidateCodexSource(store, locator, invalidated)
+      }
+      continue
+    }
     if (!previous) {
       // The earlier inventory did not establish an owner. A response may
       // still have used the gateway's native fallback before this route was

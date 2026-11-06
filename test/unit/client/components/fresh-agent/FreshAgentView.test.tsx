@@ -417,18 +417,22 @@ function StoreBackedFreshAgentView({
   tabId,
   paneId,
   hidden = false,
+  optional = false,
 }: {
   tabId: string
   paneId: string
   hidden?: boolean
+  optional?: boolean
 }) {
   const paneContent = useAppSelector((state) => {
     const layout = state.panes.layouts[tabId]
     if (!layout || layout.type !== 'leaf' || layout.id !== paneId || layout.content.kind !== 'fresh-agent') {
+      if (optional) return undefined
       throw new Error(`Missing fresh-agent pane ${paneId}`)
     }
     return layout.content
   })
+  if (!paneContent) return null
   return <FreshAgentView tabId={tabId} paneId={paneId} paneContent={paneContent} hidden={hidden} />
 }
 
@@ -1927,7 +1931,13 @@ describe('FreshAgentView', () => {
     })
   }
 
-  async function mountProjectionReviewRoute(name: string, withSoul = true, withNativeRef = false, noSoulPublicId = 'native-b', hidden = false, overrides: Partial<FreshAgentPaneContent> = {}) {
+  function transientClaimHistory() {
+    const snapshot = hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Transient history', 2)
+    return { ...snapshot, extensions: { codex: { ...snapshot.extensions!.codex!,
+      ownerKind: 'vacant', nativeHistoryAvailable: true, statusFromLiveState: false, projection: undefined } } }
+  }
+
+  async function mountProjectionReviewRoute(name: string, withSoul = true, withNativeRef = false, noSoulPublicId = 'native-b', hidden = false, overrides: Partial<FreshAgentPaneContent> = {}, optional = false) {
     const { WsClient } = await vi.importActual<typeof import('@/lib/ws-client')>('@/lib/ws-client')
     const client = new WsClient(`ws://${name}.test/ws`)
     const store = createStore()
@@ -1943,7 +1953,7 @@ describe('FreshAgentView', () => {
       ...(withNativeRef ? { sessionRef: { provider: 'codex' as const, sessionId: 'native-b' } } : {}),
       ...overrides,
     } }))
-    const view = render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden={hidden} /></Provider>)
+    const view = render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden={hidden} optional={optional} /></Provider>)
     await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
     const receive = (message: Record<string, unknown>) => client.receiveMessageForTest(message as never)
     const announce = (native: string) => receive({ type: 'freshAgent.session.materialized', ...locator,
@@ -1955,7 +1965,7 @@ describe('FreshAgentView', () => {
       projectionId, historyGeneration, ops: [{ op: 'resetTurn', nativeTurnId: 'turn', revision,
         turns: [{ id: 'turn', turnId: 'turn', role: 'assistant', summary: '',
           items: [{ id: 'answer', kind: 'text', text: answer }] }] }] })
-    return { store, locator, initial, announce, event, init, patch, view }
+    return { store, locator, initial, receive, announce, event, init, patch, view }
   }
 
   async function prepareUncertainProjection(route: Awaited<ReturnType<typeof mountProjectionReviewRoute>>, withEventTurn = true) {
@@ -3093,6 +3103,90 @@ describe('FreshAgentView', () => {
     }
   })
 
+  it('keeps a current unbound claim read from changing a shared managed status', async () => {
+    const route = await mountProjectionReviewRoute('claim-shared-status', false)
+    const secondInitial = createDeferred<unknown>()
+    const unbound = createDeferred<unknown>()
+    const managed = createDeferred<unknown>()
+    const key = 'freshcodex:codex:native-b'
+    try {
+      const before = managedCodexInventory('native-b')
+      before.souls = [before.souls[0]]
+      before.viewIntents = []
+      apiMock.getManagedRuntimeInventory.mockResolvedValueOnce(before)
+      await act(async () => queueManagedRuntimeRefresh(route.store as any, 'before shared claim'))
+      await act(async () => route.initial.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Unbound before claim', 1)))
+      await expectRenderedText('Unbound before claim')
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(secondInitial.promise)
+      act(() => route.store.dispatch(initLayout({ tabId: 'tab-2', paneId: 'pane-2', content: {
+        kind: 'fresh-agent', ...route.locator, createRequestId: 'shared-managed-pane', status: 'idle',
+        soulId: 'soul-one', incarnationId: 'incarnation-one', sessionRef: { provider: 'codex', sessionId: 'native-b' },
+        initialCwd: '/shared-managed-pane',
+      } })))
+      const managedView = render(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-2" paneId="pane-2" /></Provider>)
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === secondInitial.promise)).toBe(true))
+      await act(async () => secondInitial.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Managed before claim', 1)))
+      await expectRenderedText('Managed before claim')
+      act(() => route.store.dispatch(sessionSnapshotReceived({ ...route.locator, latestTurnId: null, status: 'idle' })))
+      expect(route.store.getState().freshAgent.sessions[key]?.status).toBe('idle')
+      const after = structuredClone(before)
+      after.revision += 1
+      after.souls[0].freshAgentPresentationIds = ['native-b']
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation((_type, _provider, _id, options) =>
+        options?.cwd === '/shared-managed-pane' ? managed.promise : unbound.promise)
+      apiMock.getManagedRuntimeInventory.mockResolvedValueOnce(after)
+      await act(async () => queueManagedRuntimeRefresh(route.store as any, 'shared claim'))
+      await waitFor(() => {
+        expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === unbound.promise)).toBe(true)
+        expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === managed.promise)).toBe(true)
+      })
+      const revision = route.store.getState().freshAgentLive.snapshotSourceRevisionBySession[key]
+      expect(route.store.getState().freshAgentLive.bySession[key]?.nativeClaim).toBeDefined()
+      expect(getFreshAgentPaneContent(route.store).soulId).toBeUndefined()
+      vi.useFakeTimers()
+      act(() => {
+        route.store.dispatch(markSessionLost(route.locator))
+        route.store.dispatch(sessionError({ ...route.locator, code: 'LOOKUP_FAILED', message: 'Managed source unavailable' }))
+      })
+      const baseline = route.store.getState().freshAgent.sessions[key]
+      expect(baseline).toMatchObject({ status: 'idle', lost: true, lastError: 'Managed source unavailable' })
+      expect(within(managedView.container).getByTestId('fresh-agent-thinking-bar')).toHaveAttribute('data-state', 'idle')
+      expect(route.store.getState().freshAgentLive.snapshotSourceRevisionBySession[key]).toBe(revision)
+      await act(async () => unbound.resolve({ ...hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Current unbound route output', 2), status: 'running' }))
+      expect(within(route.view.container).getByText('Current unbound route output')).toBeInTheDocument()
+      expect(route.store.getState().freshAgentLive.bySession[key]?.nativeClaim).toBeUndefined()
+      expect(route.store.getState().freshAgent.sessions[key]).toMatchObject({
+        status: 'idle', statusVersion: baseline.statusVersion, lost: true, lastError: 'Managed source unavailable',
+      })
+      expect(within(managedView.container).getByTestId('fresh-agent-thinking-bar')).toHaveAttribute('data-state', 'idle')
+      expect(findPaneContent(route.store.getState().panes.layouts['tab-2'], 'pane-2')).toMatchObject({
+        sessionId: 'native-b', soulId: 'soul-one',
+      })
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      secondInitial.resolve(hostedCodexSnapshot('native-b', 'Second initial'))
+      unbound.resolve(hostedCodexSnapshot('native-b', 'Unbound'))
+      managed.resolve(hostedCodexSnapshot('native-b', 'Managed'))
+      vi.useRealTimers()
+    }
+  })
+
+  it('lets a truly unmanaged route update its status from a current live read', async () => {
+    const route = await mountProjectionReviewRoute('unmanaged-live-status', false)
+    try {
+      act(() => route.store.dispatch(sessionSnapshotReceived({ ...route.locator, latestTurnId: null, status: 'idle' })))
+      expect(route.store.getState().freshAgent.sessions['freshcodex:codex:native-b']?.status).toBe('idle')
+      await act(async () => route.initial.resolve({ ...hostedCodexProjectionSnapshot('native-b', 'local-q', 'Local live output', 1), status: 'running' }))
+      await expectRenderedText('Local live output')
+      expect(route.store.getState().freshAgent.sessions['freshcodex:codex:native-b']?.status).toBe('running')
+    } finally {
+      cleanup()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+    }
+  })
+
   it('does not let an older pane read regain authority after another pane settles a native claim', async () => {
     const route = await mountProjectionReviewRoute('claim-two-pane-ordering', false)
     const secondInitial = createDeferred<unknown>()
@@ -3157,6 +3251,77 @@ describe('FreshAgentView', () => {
     }
   })
 
+  it('retires a held native claim when its known owner forks away from the old route', async () => {
+    const route = await mountProjectionReviewRoute('claim-owner-forks', false)
+    const oldRoute = createDeferred<unknown>()
+    const newRoute = createDeferred<unknown>()
+    let current: ReturnType<typeof createDeferred<unknown>> | undefined
+    const key = 'freshcodex:codex:native-b'
+    try {
+      const prepared = await prepareNativeClaim(route)
+      current = prepared.current
+      const revision = route.store.getState().freshAgentLive.snapshotSourceRevisionBySession[key]
+      expect(route.store.getState().freshAgentLive.bySession[key]?.nativeClaim).toMatchObject({ nativeSessionId: 'native-b', projectionId: 'claim-q' })
+      expect(getFreshAgentPaneContent(route.store).soulId).toBeUndefined()
+      const forked = structuredClone(prepared.after)
+      forked.revision += 1
+      forked.souls[0].nativeSessionId = 'native-c'
+      forked.souls[0].freshAgentSessionId = 'native-c'
+      forked.souls[0].freshAgentPresentationIds = []
+      forked.souls[0].identityRevision += 1
+      forked.souls[0].evidenceRevision += 1
+      expect(forked.souls.some((soul) => soul.freshAgentSessionId === 'native-b' || soul.freshAgentPresentationIds?.includes('native-b'))).toBe(false)
+      expect(forked.souls[0]).toMatchObject({ soulId: 'soul-one', nativeSessionId: 'native-c' })
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation((_type, _provider, id) => id === 'native-c' ? newRoute.promise : oldRoute.promise)
+      apiMock.getManagedRuntimeInventory.mockResolvedValueOnce(forked)
+      await act(async () => queueManagedRuntimeRefresh(route.store as any, 'owner fork removed old route'))
+      await act(async () => current!.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Old held claim after fork', 2)))
+      expect(screen.queryByText('Old held claim after fork')).not.toBeInTheDocument()
+      expect(route.store.getState().freshAgentLive.snapshotSourceRevisionBySession[key]).toBe((revision ?? 0) + 1)
+      expect(route.store.getState().freshAgentLive.bySession[key]?.nativeClaim).toBeUndefined()
+      expect(route.store.getState().freshAgentLive.bySession[key]?.retiredProjectionIds?.['claim-q']).toBe(true)
+      act(() => { route.init('claim-q'); route.patch('claim-q', 3, 'Old fork patch') })
+      expect(screen.queryByText('Old fork patch')).not.toBeInTheDocument()
+      act(() => route.receive({ type: 'freshAgent.forked', parentSessionId: 'native-b', sessionId: 'native-c',
+        sessionType: 'freshcodex', provider: 'codex', runtimeProvider: 'codex', parentRetiredByRuntime: true }))
+      await waitFor(() => expect(getFreshAgentPaneContent(route.store).sessionId).toBe('native-c'))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === newRoute.promise)).toBe(true))
+      await act(async () => newRoute.resolve(hostedCodexProjectionSnapshot('native-c', 'fork-q', 'New fork output', 1)))
+      await expectRenderedText('New fork output')
+    } finally {
+      cleanup()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      current?.resolve(hostedCodexSnapshot('native-b', 'Current'))
+      oldRoute.resolve(hostedCodexSnapshot('native-b', 'Old route'))
+      newRoute.resolve(hostedCodexSnapshot('native-c', 'New route'))
+    }
+  })
+
+  it.each(['same native', 'owner absent'] as const)('does not retire a claim from route absence with %s', async (scenario) => {
+    const route = await mountProjectionReviewRoute(`claim-owner-absence-${scenario}`, false)
+    let current: ReturnType<typeof createDeferred<unknown>> | undefined
+    const key = 'freshcodex:codex:native-b'
+    try {
+      const prepared = await prepareNativeClaim(route)
+      current = prepared.current
+      const revision = route.store.getState().freshAgentLive.snapshotSourceRevisionBySession[key]
+      const absent = structuredClone(prepared.after)
+      absent.revision += 1
+      if (scenario === 'owner absent') absent.souls = []
+      else absent.souls[0].freshAgentPresentationIds = []
+      apiMock.getManagedRuntimeInventory.mockResolvedValueOnce(absent)
+      await act(async () => queueManagedRuntimeRefresh(route.store as any, 'route absence without observed source change'))
+      expect(route.store.getState().freshAgentLive.snapshotSourceRevisionBySession[key]).toBe(revision)
+      expect(route.store.getState().freshAgentLive.bySession[key]?.nativeClaim).toMatchObject({ nativeSessionId: 'native-b' })
+      await act(async () => current!.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Claim after absence', 2)))
+      await expectRenderedText('Claim after absence')
+    } finally {
+      cleanup()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      current?.resolve(hostedCodexSnapshot('native-b', 'Current'))
+    }
+  })
+
   it('upgrades an unresolved native claim to permanent retirement when inventory later replaces the source', async () => {
     const route = await mountProjectionReviewRoute('claim-later-replacement', false)
     const replacementRead = createDeferred<unknown>()
@@ -3189,6 +3354,214 @@ describe('FreshAgentView', () => {
       route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
       current?.resolve(hostedCodexSnapshot('native-b', 'Current'))
       replacementRead.resolve(hostedCodexSnapshot('native-b', 'Replacement'))
+    }
+  })
+
+  it.each(['same route', 'rekey'] as const)('recovers a new native projection on %s materialization during a claim', async (shape) => {
+    const route = await mountProjectionReviewRoute(`claim-materialize-${shape}`, false)
+    const replacement = createDeferred<unknown>()
+    const retiredRead = createDeferred<unknown>()
+    let current: ReturnType<typeof createDeferred<unknown>> | undefined
+    const newId = shape === 'same route' ? 'native-b' : 'native-c'
+    const newKey = `freshcodex:codex:${newId}`
+    const announce = () => route.receive({ type: 'freshAgent.session.materialized', previousSessionId: newId, sessionId: newId,
+      sessionType: 'freshcodex', provider: 'codex', sessionRef: { provider: 'codex', sessionId: 'native-c' } })
+    const event = (value: Record<string, unknown>) => route.receive({ type: 'freshAgent.event', sessionId: newId,
+      sessionType: 'freshcodex', provider: 'codex', event: { sessionId: newId, ...value } })
+    try {
+      ;({ current } = await prepareNativeClaim(route))
+      expect(route.store.getState().freshAgentLive.bySession['freshcodex:codex:native-b']?.nativeClaim)
+        .toMatchObject({ nativeSessionId: 'native-b', projectionId: 'claim-q' })
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(replacement.promise)
+      act(() => route.receive({ type: 'freshAgent.session.materialized', previousSessionId: 'native-b', sessionId: newId,
+        sessionType: 'freshcodex', provider: 'codex', sessionRef: { provider: 'codex', sessionId: 'native-c' } }))
+      await act(async () => current!.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Old materialization response', 2)))
+      expect(screen.queryByText('Old materialization response')).not.toBeInTheDocument()
+      await waitFor(() => expect(getFreshAgentPaneContent(route.store)).toMatchObject({
+        sessionId: newId, sessionRef: { provider: 'codex', sessionId: 'native-c' },
+      }))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === replacement.promise)).toBe(true))
+      const replacementCall = apiMock.getFreshAgentThreadSnapshot.mock.results.findIndex((result) => result.value === replacement.promise)
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[replacementCall][2]).toBe(newId)
+      await act(async () => replacement.resolve(hostedCodexProjectionSnapshot('native-c', 'materialized-q', 'New materialized output', 1)))
+      await expectRenderedText('New materialized output')
+      expect(route.store.getState().freshAgentLive.bySession[newKey]?.nativeClaim).toBeUndefined()
+      expect(route.store.getState().freshAgentLive.bySession[newKey]?.retiredProjectionIds?.['claim-q']).toBe(true)
+      expect(route.store.getState().freshAgentLive.bySession[newKey]?.uncertainProjectionIds?.['claim-q']).toBeUndefined()
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(retiredRead.promise)
+      act(() => {
+        announce()
+        event({ type: 'freshAgent.session.init', projectionId: 'claim-q', historyGeneration: 0 })
+        event({ type: 'freshAgent.transcript.patch', projectionId: 'claim-q', historyGeneration: 0,
+          ops: [{ op: 'resetTurn', nativeTurnId: 'turn', revision: 3,
+            turns: [{ id: 'turn', turnId: 'turn', role: 'assistant', summary: '', items: [{ id: 'answer', kind: 'text', text: 'Retired materialization patch' }] }] }] })
+      })
+      expect(screen.queryByText('Retired materialization patch')).not.toBeInTheDocument()
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === retiredRead.promise)).toBe(true))
+      await act(async () => retiredRead.resolve(hostedCodexProjectionSnapshot('native-c', 'claim-q', 'Retired materialization snapshot', 4)))
+      expect(screen.queryByText('Retired materialization snapshot')).not.toBeInTheDocument()
+      act(() => event({ type: 'freshAgent.transcript.patch', projectionId: 'materialized-q', historyGeneration: 0,
+        ops: [{ op: 'resetTurn', nativeTurnId: 'turn', revision: 2,
+          turns: [{ id: 'turn', turnId: 'turn', role: 'assistant', summary: '', items: [{ id: 'answer', kind: 'text', text: 'Current materialization patch' }] }] }] }))
+      await expectRenderedText('Current materialization patch')
+    } finally {
+      cleanup()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      current?.resolve(hostedCodexSnapshot('native-b', 'Current'))
+      replacement.resolve(hostedCodexSnapshot('native-c', 'Replacement'))
+      retiredRead.resolve(hostedCodexSnapshot('native-c', 'Retired'))
+    }
+  })
+
+  it.each(['history', 'invalid projection'] as const)('automatically retries an idle native claim after %s', async (kind) => {
+    const route = await mountProjectionReviewRoute(`claim-automatic-${kind}`, false)
+    const valid = createDeferred<unknown>()
+    let current: ReturnType<typeof createDeferred<unknown>> | undefined
+    const key = 'freshcodex:codex:native-b'
+    try {
+      ;({ current } = await prepareNativeClaim(route))
+      expect(route.store.getState().freshAgent.sessions[key]?.status).toBe('idle')
+      expect(getFreshAgentPaneContent(route.store).status).toBe('idle')
+      vi.useFakeTimers()
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(valid.promise)
+      const snapshot = hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Transient result', 2)
+      const codex = snapshot.extensions!.codex!
+      await act(async () => current!.resolve(kind === 'history' ? transientClaimHistory() : {
+        ...snapshot, extensions: { codex: { ...codex, projection: { id: 'claim-q' } } },
+      }))
+      expect(route.store.getState().freshAgentLive.bySession[key]?.nativeClaim).toBeDefined()
+      expect(route.store.getState().freshAgentLive.bySession[key]?.projection).toBeUndefined()
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_001) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === valid.promise)).toBe(true)
+      await act(async () => valid.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Automatically recovered claim', 3)))
+      expect(screen.getByText('Automatically recovered claim')).toBeInTheDocument()
+      expect(route.store.getState().freshAgentLive.bySession[key]?.nativeClaim).toBeUndefined()
+      act(() => route.patch('claim-q', 4, 'Patch after automatic recovery'))
+      expect(screen.getByText('Patch after automatic recovery')).toBeInTheDocument()
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      current?.resolve(hostedCodexSnapshot('native-b', 'Current'))
+      valid.resolve(hostedCodexSnapshot('native-b', 'Valid'))
+      vi.useRealTimers()
+    }
+  })
+
+  it('pauses a native claim retry while hidden and resumes it on reveal', async () => {
+    const route = await mountProjectionReviewRoute('claim-retry-hidden', false)
+    const valid = createDeferred<unknown>()
+    let current: ReturnType<typeof createDeferred<unknown>> | undefined
+    try {
+      ;({ current } = await prepareNativeClaim(route))
+      vi.useFakeTimers()
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(valid.promise)
+      await act(async () => current!.resolve(transientClaimHistory()))
+      route.view.rerender(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden /></Provider>)
+      await act(async () => { await vi.advanceTimersByTimeAsync(4_000) })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === valid.promise)).toBe(false)
+      route.view.rerender(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_001) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === valid.promise)).toBe(true)
+      await act(async () => valid.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Claim recovered after reveal', 3)))
+      expect(screen.getByText('Claim recovered after reveal')).toBeInTheDocument()
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      current?.resolve(hostedCodexSnapshot('native-b', 'Current'))
+      valid.resolve(hostedCodexSnapshot('native-b', 'Valid'))
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not carry a pending native claim retry across a materialized route change', async () => {
+    const route = await mountProjectionReviewRoute('claim-retry-rekey', false)
+    const oldRoute = createDeferred<unknown>()
+    const newRoute = createDeferred<unknown>()
+    let current: ReturnType<typeof createDeferred<unknown>> | undefined
+    try {
+      ;({ current } = await prepareNativeClaim(route))
+      vi.useFakeTimers()
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation((_type, _provider, id) => id === 'native-c' ? newRoute.promise : oldRoute.promise)
+      await act(async () => current!.resolve(transientClaimHistory()))
+      const oldReads = apiMock.getFreshAgentThreadSnapshot.mock.calls.filter((call) => call[2] === 'native-b').length
+      act(() => route.receive({ type: 'freshAgent.session.materialized', previousSessionId: 'native-b', sessionId: 'native-c',
+        sessionType: 'freshcodex', provider: 'codex', sessionRef: { provider: 'codex', sessionId: 'native-c' } }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      expect(getFreshAgentPaneContent(route.store).sessionId).toBe('native-c')
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === newRoute.promise)).toBe(true)
+      await act(async () => { await vi.advanceTimersByTimeAsync(5_000) })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.filter((call) => call[2] === 'native-b')).toHaveLength(oldReads)
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === oldRoute.promise)).toBe(false)
+      await act(async () => newRoute.resolve(hostedCodexProjectionSnapshot('native-c', 'new-q', 'New route after retry cancellation', 1)))
+      expect(screen.getByText('New route after retry cancellation')).toBeInTheDocument()
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      current?.resolve(hostedCodexSnapshot('native-b', 'Current'))
+      oldRoute.resolve(hostedCodexSnapshot('native-b', 'Old route'))
+      newRoute.resolve(hostedCodexSnapshot('native-c', 'New route'))
+      vi.useRealTimers()
+    }
+  })
+
+  it('cancels a pending native claim retry when an acknowledged tab close removes the pane', async () => {
+    const route = await mountProjectionReviewRoute('claim-retry-close', false, false, 'native-b', false, {}, true)
+    const later = createDeferred<unknown>()
+    let current: ReturnType<typeof createDeferred<unknown>> | undefined
+    try {
+      ;({ current } = await prepareNativeClaim(route))
+      vi.useFakeTimers()
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(later.promise)
+      await act(async () => current!.resolve(transientClaimHistory()))
+      wsMock.send.mockImplementation((message) => {
+        if (message.type === 'panes.closed') route.receive({ type: 'panes.closed.result', requestId: message.requestId, success: true })
+      })
+      await act(async () => {
+        const result = await route.store.dispatch(closeTab('tab-1'))
+        expect(closeTab.fulfilled.match(result)).toBe(true)
+      })
+      expect(route.store.getState().panes.layouts['tab-1']).toBeUndefined()
+      expect(route.view.container.querySelector('[data-pane-id="pane-1"]')).toBeNull()
+      await act(async () => { await vi.advanceTimersByTimeAsync(5_000) })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === later.promise)).toBe(false)
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      current?.resolve(hostedCodexSnapshot('native-b', 'Current'))
+      later.resolve(hostedCodexSnapshot('native-b', 'Later'))
+      vi.useRealTimers()
+    }
+  })
+
+  it('stops automatically retrying a native claim after a bounded sequence of non-live answers', async () => {
+    const route = await mountProjectionReviewRoute('claim-retry-limit', false)
+    let current: ReturnType<typeof createDeferred<unknown>> | undefined
+    try {
+      ;({ current } = await prepareNativeClaim(route))
+      vi.useFakeTimers()
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(transientClaimHistory())
+      await act(async () => current!.resolve(transientClaimHistory()))
+      const initialReads = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        await act(async () => { await vi.advanceTimersByTimeAsync(1_001) })
+        await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+        expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(initialReads + attempt)
+      }
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(initialReads + 5)
+      expect(route.store.getState().freshAgentLive.bySession['freshcodex:codex:native-b']?.nativeClaim).toBeDefined()
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      current?.resolve(hostedCodexSnapshot('native-b', 'Current'))
+      vi.useRealTimers()
     }
   })
 

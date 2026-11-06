@@ -179,6 +179,7 @@ export const FRESH_AGENT_RESERVE_RETRY_FLOOR_MS = 1_000
 // up). Exported so tests assert the cap against the real constant.
 export const IDLE_INCOMPLETE_MAX_RETRIES = 5
 const IDLE_INCOMPLETE_RETRY_DELAY_MS = 1_000
+const NATIVE_CLAIM_MAX_RETRIES = 5
 const REVEAL_REFRESH_MAX_WAIT_MS = 15_000
 const log = createLogger('FreshAgentView')
 let nextSnapshotAuditView = 0
@@ -1239,6 +1240,16 @@ export function FreshAgentView({
   // local echo is the loop's marker -- see applySnapshot.
   const idleIncompleteRetryCountRef = useRef(0)
   const idleIncompleteRetryTimerRef = useRef<number | null>(null)
+  const [nativeClaimRetry, setNativeClaimRetry] = useState<{
+    key: string
+    revision: string
+    projectionId: string
+    nativeSessionId: string
+    createRequestId: string
+    hadStoredLayout: boolean
+    attempts: number
+    pending: boolean
+  } | null>(null)
   const [queuedMessages, setQueuedMessages] = useState<string[]>([])
   // Reserve a turn synchronously: the provider's running event may arrive
   // after another submit. Only completion (or failure) releases the reservation.
@@ -1999,6 +2010,39 @@ export function FreshAgentView({
     recordSnapshotAudit('refresh_requested', () => ({ trigger, refreshSerial: snapshotRefreshSerialRef.current }))
     setSnapshotRefreshNonce((value) => value + 1)
   }, [])
+
+  // A non-live answer cannot settle a native claim. Retry a bounded number of
+  // times while the same pane and source remain visible; hiding pauses the
+  // timer, and a new source or closed pane cannot inherit the old retry.
+  useEffect(() => {
+    const retry = nativeClaimRetry
+    if (!retry?.pending) return
+    if (retry.key !== codexSnapshotKey || retry.revision !== codexSnapshotRevision
+      || retry.createRequestId !== paneContent.createRequestId) {
+      setNativeClaimRetry(null)
+      return
+    }
+    if (hidden || lifecycleBlocked || ownerDivergence || connectionStatus !== 'ready') return
+    const timer = window.setTimeout(() => {
+      const state = appStore.getState()
+      const layout = state.panes.layouts[tabId]
+      const pane = layout ? findPaneContent(layout, paneId) : retry.hadStoredLayout ? undefined : paneContentRef.current
+      const threadId = pane?.kind === 'fresh-agent' ? getFreshAgentViewSnapshotThreadId(pane, undefined) : undefined
+      const paneKey = pane?.kind === 'fresh-agent' && threadId
+        ? makeFreshAgentSessionKey({ sessionId: threadId, sessionType: pane.sessionType, provider: pane.provider }) : undefined
+      const claim = state.freshAgentLive?.bySession[retry.key]?.nativeClaim
+      if (!isMountedRef.current || hiddenRef.current || pane?.kind !== 'fresh-agent'
+        || pane.createRequestId !== retry.createRequestId || paneKey !== retry.key || isFreshAgentLifecycleBlocked(pane)
+        || codexSnapshotSourceRevision(state.freshAgentLive, retry.key) !== retry.revision
+        || claim?.projectionId !== retry.projectionId || claim.nativeSessionId !== retry.nativeSessionId
+        || ownerDivergenceRef.current
+        || (!isSupervisorRecoveryOwned(pane) && state.freshAgent.sessions[retry.key]?.lost)) return
+      setNativeClaimRetry((current) => current === retry ? { ...retry, pending: false, attempts: retry.attempts + 1 } : current)
+      requestSnapshotRefresh('idle-incomplete')
+    }, IDLE_INCOMPLETE_RETRY_DELAY_MS)
+    return () => window.clearTimeout(timer)
+  }, [appStore, codexSnapshotKey, codexSnapshotRevision, connectionStatus, hidden, lifecycleBlocked,
+    nativeClaimRetry, ownerDivergence, paneContent.createRequestId, paneId, requestSnapshotRefresh, tabId])
 
   const markSnapshotDirty = useCallback((cause: 'reconnect' | 'transcript' | 'send-accepted') => {
     if (!snapshotDirtyRef.current) {
@@ -3779,10 +3823,24 @@ export function FreshAgentView({
       // settle the route claim. Only the checked ordinary live read can.
       if (claim && !currentNativeClaimRead) {
         auditRequest('identity_rejected', () => ({ reason: 'unverified_native_claim_read' }))
+        if (!requestReadOnly && codexSnapshotRevision !== undefined) {
+          setNativeClaimRetry((previous) => {
+            const same = previous?.key === projectionKey && previous.revision === codexSnapshotRevision
+              && previous.projectionId === claim.projectionId && previous.nativeSessionId === claim.nativeSessionId
+              && previous.createRequestId === requestCreateRequestId
+            const attempts = same ? previous.attempts : 0
+            if (attempts >= NATIVE_CLAIM_MAX_RETRIES || (same && previous.pending)) return previous
+            return { key: projectionKey, revision: codexSnapshotRevision, projectionId: claim.projectionId,
+              nativeSessionId: claim.nativeSessionId, createRequestId: requestCreateRequestId,
+              hadStoredLayout, attempts, pending: true }
+          })
+        }
         return
       }
-      const routeOnlyManaged = Boolean(currentPane.soulId && ordinaryRoute
-        && (currentNativeClaimRead || liveSession?.routeOnlyProjectionId))
+      // The session record is shared by every pane on this route. A claim
+      // establishes a managed route even if this reader is unbound; its
+      // unmarked response cannot assert managed health or status for others.
+      const routeOnlyManaged = Boolean(ordinaryRoute && (currentNativeClaimRead || liveSession?.routeOnlyProjectionId))
       const announcedNative = liveSession?.awaitingNativeSessionId ?? liveState?.announcedNativeBySession?.[projectionKey]
       if (provider === 'codex' && !requestReadOnly && !historyOnly
         && resolved.extensions?.codex?.statusFromLiveState === true
@@ -3842,6 +3900,9 @@ export function FreshAgentView({
       if (snapshotAccepted && projectionMetadata) dispatch(transcriptProjectionSnapshotReceived({
         ...projectionLocator, snapshot: resolved, nativeSessionId: snapshotNativeSessionId, fromCurrentNativeClaimRead: currentNativeClaimRead,
       }))
+      if (currentNativeClaimRead && !appStore.getState().freshAgentLive?.bySession[projectionKey]?.nativeClaim) {
+        setNativeClaimRetry(null)
+      }
       const snapshotStatusAuthoritative = !routeOnlyManaged && !requestReadOnly && !historyOnly && (provider === 'codex'
         || resolved.extensions?.[provider]?.statusFromLiveState === true)
       const outgoing = outgoingTurnRef.current
