@@ -644,7 +644,6 @@ async fn fresh_agent_cold_unknown_parks_as_warming_across_reconcile() {
             provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
             observed_epoch: None,
             observed_generation: None,
-            authoritative: false,
             now_ms: 1_000,
             plugins: None,
         })
