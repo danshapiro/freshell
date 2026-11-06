@@ -4368,6 +4368,9 @@ describe('FreshAgentView', () => {
     })
 
     it.each(['codex', 'claude'] as const)('advances %s after reconnect when an authoritative idle snapshot contains the submitted turn', async (provider) => {
+      if (provider === 'codex') {
+        wsMock.getServerCapabilities.mockReturnValue({ freshAgentSendReconcileV1: true })
+      }
       const queue = await setup('idle', true, provider)
       queue.send('First message')
       queue.send('Second message')
@@ -4384,9 +4387,12 @@ describe('FreshAgentView', () => {
         reconnect()
       })
       if (provider === 'codex') {
-        await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(3))
-        expect(sentFreshAgentMessages('freshAgent.send')[1]).toEqual(first)
-        expect(sentFreshAgentMessages('freshAgent.send')[2]).toMatchObject({ text: 'Second message' })
+        await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+        expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Second message' })
+        expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toEqual([{
+          ...first,
+          type: 'freshAgent.send.reconcile',
+        }])
       } else {
         await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
         expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Second message' })
@@ -4416,6 +4422,7 @@ describe('FreshAgentView', () => {
     })
 
     it('keeps the reservation when a reconnect idle snapshot does not contain the submitted turn', async () => {
+      wsMock.getServerCapabilities.mockReturnValue({ freshAgentSendReconcileV1: true })
       const queue = await setup('idle')
       queue.send('Still awaiting acceptance')
       queue.send('Later follow-up')
@@ -4424,8 +4431,11 @@ describe('FreshAgentView', () => {
       const first = sentFreshAgentMessages('freshAgent.send')[0]
       act(() => reconnect())
       await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeGreaterThan(beforeRefresh))
-      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
-      expect(sentFreshAgentMessages('freshAgent.send')[1]).toEqual(first)
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toEqual([{
+        ...first,
+        type: 'freshAgent.send.reconcile',
+      }])
       expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
     })
 
@@ -22045,9 +22055,14 @@ describe('task6 hosted recovery in the mounted view', () => {
     }
   })
 
-  it.each([false, true] as const)(
-    'reconciles a pending Codex send after reconnect without resending provider input (prior ambiguity: %s)',
-    async (reportedAmbiguity) => {
+  it.each([
+    { hidden: false, reportedAmbiguity: false },
+    { hidden: false, reportedAmbiguity: true },
+    { hidden: true, reportedAmbiguity: false },
+    { hidden: true, reportedAmbiguity: true },
+  ])(
+    'reconciles a pending Codex send after reconnect without resending provider input (hidden: $hidden, prior ambiguity: $reportedAmbiguity)',
+    async ({ hidden, reportedAmbiguity }) => {
       const store = createStore()
       const handlers = new Set<(message: unknown) => void>()
       let reconnectHandler: (() => void) | undefined
@@ -22072,7 +22087,7 @@ describe('task6 hosted recovery in the mounted view', () => {
         recoverySummary: { desiredState: 'running', recoveryState: 'live',
           durabilityState: 'resume_captured', allocationState: 'verified_durable' },
       } }))
-      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const view = render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden={hidden} /></Provider>)
       const composer = screen.getByRole('textbox', { name: 'Chat message input' })
       await waitFor(() => expect(composer).toBeEnabled())
 
@@ -22092,11 +22107,12 @@ describe('task6 hosted recovery in the mounted view', () => {
         await waitFor(() => expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain'))
       }
 
-      // A settings change while disconnected must not alter the exact retry
-      // payload. The accepted receipt is tied to the original settings too.
+      // A settings change while disconnected must not alter the exact
+      // reconciliation payload, which remains tied to the original settings.
       act(() => store.dispatch(mergePaneContent({
         tabId: 'tab-1', paneId: 'pane-1', updates: { collaborationMode: 'plan' },
       })))
+      const snapshotsBeforeReconnect = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
       act(() => reconnectHandler?.())
       await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(1))
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
@@ -22104,6 +22120,11 @@ describe('task6 hosted recovery in the mounted view', () => {
         ...originalFrame,
         type: 'freshAgent.send.reconcile',
       })
+      if (hidden) {
+        expect(apiMock.getFreshAgentThreadSnapshot.mock.calls).toHaveLength(snapshotsBeforeReconnect)
+        view.rerender(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+        await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeGreaterThan(snapshotsBeforeReconnect))
+      }
 
       if (!reportedAmbiguity) {
         act(() => {
