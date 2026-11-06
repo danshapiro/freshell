@@ -2631,9 +2631,9 @@ impl FreshAgentHostActor {
         .map(|result| result.state)
     }
 
-    /// Return an already-persisted acknowledgement for an exact retained
-    /// Codex send. This path is read-only: an absent or unfinished record is
-    /// ambiguous and never enters the provider transport.
+    /// Return the durable outcome for an exact retained Codex send. An absent
+    /// or unfinished record is ambiguous, a cancelled record is a definite
+    /// refusal, and this path never enters the provider transport.
     pub async fn codex_recovery_send_receipt(
         &self,
         request_id: RequestId,
@@ -2660,11 +2660,10 @@ impl FreshAgentHostActor {
         if existing.payload_digest != expected_digest {
             return Err(ActorError::RequestConflict);
         }
-        if !matches!(
-            existing.state,
-            CommandState::ProviderAcked | CommandState::Completed
-        ) {
-            return Err(ActorError::AmbiguousDispatch);
+        match existing.state {
+            CommandState::ProviderAcked | CommandState::Completed => {}
+            CommandState::Cancelled => return Err(ActorError::SendRefused),
+            _ => return Err(ActorError::AmbiguousDispatch),
         }
         let native_identity = existing
             .native_identity

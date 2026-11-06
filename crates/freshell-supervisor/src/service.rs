@@ -3405,6 +3405,7 @@ impl Supervisor {
             FreshNativeAdmission::Live => false,
         };
         let codex_same_root_prepare = admission == FreshNativeAdmission::CodexCompactReadiness
+            && current.provider == "codex"
             && supports_codex_same_root_readiness
             && (!status.exited || retained_codex);
         if readiness_needed && can_prepare_claude {

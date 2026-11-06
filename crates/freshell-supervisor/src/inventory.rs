@@ -415,9 +415,11 @@ impl Supervisor {
                     _ => None,
                 };
                 let lifecycle = supervisor.lifecycle_lock(&view.soul_id).await;
-                let Ok(lifecycle_guard) = lifecycle.try_lock() else {
-                    return Ok(());
-                };
+                // Preserve this observation's recovery trigger when another
+                // lifecycle operation (such as an event read) owns the lock.
+                // Host authentication and Status remain outside the lock; the
+                // snapshot is revalidated immediately after acquiring it.
+                let lifecycle_guard = lifecycle.lock().await;
                 let current = supervisor.registry.recovery_context(view.soul_id.clone())
                     .await.map_err(map_registry)?;
                 if current.desired_state != DesiredState::Running
@@ -645,6 +647,7 @@ mod tests {
         probe_unavailable: Arc<AtomicBool>,
         stop_during_probe: Arc<AtomicBool>,
         hold_status: Arc<AtomicBool>,
+        fail_status_once: Arc<AtomicBool>,
         status_started: Arc<Notify>,
         release_status: Arc<Notify>,
         peer: JoinHandle<()>,
@@ -732,6 +735,7 @@ mod tests {
             let probe_unavailable = Arc::new(AtomicBool::new(false));
             let stop_during_probe = Arc::new(AtomicBool::new(false));
             let hold_status = Arc::new(AtomicBool::new(false));
+            let fail_status_once = Arc::new(AtomicBool::new(false));
             let status_started = Arc::new(Notify::new());
             let release_status = Arc::new(Notify::new());
             let peer = {
@@ -741,6 +745,7 @@ mod tests {
                 let probe_unavailable = Arc::clone(&probe_unavailable);
                 let stop_during_probe = Arc::clone(&stop_during_probe);
                 let hold_status = Arc::clone(&hold_status);
+                let fail_status_once = Arc::clone(&fail_status_once);
                 let status_started = Arc::clone(&status_started);
                 let release_status = Arc::clone(&release_status);
                 let soul = soul.clone();
@@ -787,7 +792,14 @@ mod tests {
                                     release_status.notified().await;
                                 }
                                 assert_eq!(incarnation_id, launch.incarnation_id);
-                                Ok(HostResult::Status { fresh_agent_recovery_source: None,
+                                if fail_status_once.swap(false, Ordering::SeqCst) {
+                                    status_started.notify_one();
+                                    Err(RuntimeError::new(
+                                        RuntimeErrorCode::HostUnreachable,
+                                        "synthetic host status failure",
+                                    ))
+                                } else {
+                                    Ok(HostResult::Status { fresh_agent_recovery_source: None,
                                     host_boot_id: boot.clone(), worker_pid: Some(42), worker_launch_count: 1,
                                     max_control_epoch: registry.control_epoch(), max_execution_generation: 1,
                                     fixture_evidence: serde_json::json!({}), exited: host_exited,
@@ -805,7 +817,8 @@ mod tests {
                                     }),
                                     native_readiness_receipt: None,
                                     opencode_transfer_receipt: None, opencode_adoption: Default::default(),
-                                })
+                                    })
+                                }
                             }
                             HostCommand::ProbeRecovery { incarnation_id, resume_spec, .. } => {
                                 assert_eq!(incarnation_id, launch.incarnation_id);
@@ -851,6 +864,7 @@ mod tests {
                 probe_unavailable,
                 stop_during_probe,
                 hold_status,
+                fail_status_once,
                 status_started,
                 release_status,
                 peer,
@@ -1032,6 +1046,65 @@ mod tests {
         assert!(
             lifecycle_lock_available,
             "a slow host Status request must not block SEND/Compact's lifecycle lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn observer_waits_for_busy_lifecycle_lock_before_scheduling_host_loss_recovery() {
+        let fixture = ObserverFixture::new(false).await;
+        fixture.fail_status_once.store(true, Ordering::SeqCst);
+        let lifecycle = fixture.supervisor.lifecycle_lock(&fixture.soul).await;
+        let lifecycle_guard = lifecycle.lock().await;
+        let supervisor = fixture.supervisor.clone();
+        let observer = tokio::spawn(async move { supervisor.observe_once().await });
+
+        tokio::time::timeout(Duration::from_secs(5), fixture.status_started.notified())
+            .await
+            .expect("observer should complete its failed host Status call");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let has_failure =
+                    std::fs::read_to_string(fixture.root.path().join("lifecycle.jsonl"))
+                        .unwrap_or_default()
+                        .lines()
+                        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                        .any(|event| {
+                            event["event"] == "supervisor.runtime_observer.host_status_failed"
+                                && event["data"]["soulId"] == fixture.soul.as_str()
+                        });
+                if has_failure {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("observer should record the failed host Status call");
+
+        assert!(
+            !observer.is_finished(),
+            "observer must retain the host-loss trigger while the lifecycle lock is busy"
+        );
+        drop(lifecycle_guard);
+        tokio::time::timeout(Duration::from_secs(15), observer)
+            .await
+            .expect("observer should schedule recovery after lifecycle ownership is available")
+            .expect("observer task should not panic")
+            .expect("observer pass should complete after scheduling recovery");
+
+        let events: Vec<serde_json::Value> =
+            std::fs::read_to_string(fixture.root.path().join("lifecycle.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert!(
+            events.iter().any(|event| {
+                event["event"] == "supervisor.runtime_observer.recovery_scheduled"
+                    && event["data"]["soulId"] == fixture.soul.as_str()
+                    && event["data"]["trigger"] == "host_unreachable"
+            }),
+            "a failed host Status observation must survive lock contention: {events:?}"
         );
     }
 
