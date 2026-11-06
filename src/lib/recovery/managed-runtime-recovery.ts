@@ -3,7 +3,7 @@ import { managedTerminalPaneStatus } from '../managed-terminal.js'
 import type { AppStore, RootState } from '@/store/store'
 import { addTab, updateTab } from '@/store/tabsSlice'
 import { initLayout, updatePaneContent } from '@/store/panesSlice'
-import { nativeProjectionRetired } from '@/store/freshAgentLiveSlice'
+import { nativeProjectionRetired, snapshotSourceChanged } from '@/store/freshAgentLiveSlice'
 import { memoryWarningSourceChanged } from '@/store/freshAgentSlice'
 import { findPaneContent } from '@/lib/pane-utils'
 import { streamBatcherFor } from '@/lib/fresh-agent-stream-batcher'
@@ -479,6 +479,12 @@ export function applyManagedRuntimeMergePlan(
       && previous.provider === 'codex' && next.provider === 'codex'
       && previous.sessionId && previous.sessionId === next.sessionId && next.sessionRef?.provider === 'codex') {
       const locator = { sessionId: previous.sessionId, sessionType: previous.sessionType, provider: previous.provider }
+      // A shared public route can survive a host replacement with the same
+      // native ID. Fence reads in every pane, including panes with no soul.
+      if (previous.soulId && next.soulId && (previous.soulId !== next.soulId
+        || (previous.incarnationId && next.incarnationId && previous.incarnationId !== next.incarnationId))) {
+        store.dispatch(snapshotSourceChanged(locator))
+      }
       store.dispatch(memoryWarningSourceChanged({ ...locator, nativeSessionId: next.sessionRef.sessionId, soulId: next.soulId }))
       // A public route without a native ref does not identify its source.
       // Inventory can overtake an older announcement even on that first bind.

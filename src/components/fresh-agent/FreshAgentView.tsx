@@ -136,7 +136,7 @@ import { asyncQuestionKey, asyncQuestionDraftPrefix, asyncQuestionKeysInText, fo
 import FreshAgentElicitationBanner from './FreshAgentElicitationBanner.js'
 import { FreshAgentTranscript, type FreshAgentTranscriptHandle, type FreshAgentTranscriptProps } from './FreshAgentTranscript'
 import { mergeFreshAgentTranscriptProjection, readTranscriptProjection } from '@/lib/fresh-agent-transcript-projection'
-import { acceptsTranscriptProjectionSnapshot, transcriptProjectionSnapshotReceived } from '@/store/freshAgentLiveSlice'
+import { acceptsTranscriptProjectionSnapshot, codexSnapshotSourceRevision, transcriptProjectionSnapshotReceived } from '@/store/freshAgentLiveSlice'
 import { FreshAgentLiveTail, liveTailShowsContent } from './FreshAgentLiveTail'
 import { useTranscriptLandings } from './useTranscriptLandings'
 import { landedTranscriptOf } from '@/lib/fresh-agent-landed-transcript'
@@ -578,6 +578,11 @@ function isNativeHistoryOnlySnapshot(snapshot: FreshAgentSnapshot | null): boole
   const state = snapshot?.extensions?.[snapshot.provider]
   return state?.ownerKind === 'vacant'
     || (state?.nativeHistoryAvailable === true && state.statusFromLiveState !== true)
+}
+
+function isLiveCodexSnapshot(snapshot: FreshAgentSnapshot): boolean {
+  return snapshot.provider === 'codex' && !isNativeHistoryOnlySnapshot(snapshot)
+    && Boolean(readTranscriptProjection(snapshot) || snapshot.extensions?.codex?.statusFromLiveState === true)
 }
 
 function mergeSnapshotForDisplay(
@@ -1876,6 +1881,26 @@ export function FreshAgentView({
   )
   const snapshotThreadIdRef = useRef(snapshotThreadId)
   snapshotThreadIdRef.current = snapshotThreadId
+  const codexSnapshotKey = paneContent.provider === 'codex' && snapshotThreadId
+    ? makeFreshAgentSessionKey({ sessionType: paneContent.sessionType, provider: paneContent.provider, sessionId: snapshotThreadId })
+    : undefined
+  const codexSnapshotRevision = useAppSelector((state) => codexSnapshotKey
+    ? codexSnapshotSourceRevision(state.freshAgentLive, codexSnapshotKey) : undefined)
+  const codexSourceRevision = useAppSelector((state) => codexSnapshotKey
+    ? state.freshAgentLive?.snapshotSourceRevisionBySession?.[codexSnapshotKey] ?? 0 : undefined)
+  const codexExpectedNative = useAppSelector((state) => codexSnapshotKey
+    ? state.freshAgentLive?.bySession[codexSnapshotKey]?.awaitingNativeSessionId
+      ?? state.freshAgentLive?.announcedNativeBySession?.[codexSnapshotKey] : undefined)
+  const previousCodexSourceRef = useRef({ key: codexSnapshotKey, revision: codexSourceRevision })
+  useEffect(() => {
+    const previous = previousCodexSourceRef.current
+    previousCodexSourceRef.current = { key: codexSnapshotKey, revision: codexSourceRevision }
+    if (!codexSnapshotKey) return
+    const displayed = snapshotRef.current
+    const sourceChanged = previous.key === codexSnapshotKey && previous.revision !== codexSourceRevision
+    const sourceMismatch = Boolean(displayed && codexExpectedNative && displayed.threadId !== codexExpectedNative)
+    if ((sourceChanged || sourceMismatch) && displayed && isLiveCodexSnapshot(displayed)) commitSnapshot(null)
+  }, [codexSnapshotKey, codexSourceRevision, codexExpectedNative, commitSnapshot])
   const managedCodexNativeId = paneContent.provider === 'codex' && paneContent.soulId
     ? (paneContent.sessionRef?.provider === 'codex' ? paneContent.sessionRef.sessionId : paneContent.sessionId)
     : undefined
@@ -3645,8 +3670,12 @@ export function FreshAgentView({
     const requestPaneSoulId = paneContent.soulId
     const requestPaneSoulRevision = paneContent.soulIntentRevision
     const requestNativeId = managedCodexNativeId
+    const requestIncarnationId = provider === 'codex' ? paneContent.incarnationId : undefined
     const requestOwnerFence = selectPaneOwnerFence(appStore.getState(), paneContent)
     const requestBootId = appStore.getState().connection.bootId
+    const projectionLocator = { sessionType: requestSessionType, provider, sessionId }
+    const projectionKey = makeFreshAgentSessionKey(projectionLocator)
+    const requestAnnouncedNative = provider === 'codex' ? appStore.getState().freshAgentLive?.announcedNativeBySession?.[projectionKey] : undefined
     // A missing soul uses the owned snapshot route, but remains a history-only
     // read: its status and errors cannot authorize runtime recovery.
     const requestReadOnly = snapshotReadOnly
@@ -3684,6 +3713,8 @@ export function FreshAgentView({
         ? (currentPane.sessionRef?.provider === 'codex' ? currentPane.sessionRef.sessionId : currentPane.sessionId)
         : undefined
       if (currentNativeId !== requestNativeId) return rejected('native')
+      if (provider === 'codex' && currentPane.incarnationId !== requestIncarnationId) return rejected('incarnation')
+      if (provider === 'codex' && codexSnapshotSourceRevision(appStore.getState().freshAgentLive, projectionKey) !== codexSnapshotRevision) return rejected('source_revision')
       if (appStore.getState().connection.bootId !== requestBootId) return rejected('boot')
       if (JSON.stringify(selectPaneOwnerFence(appStore.getState(), currentPane)) !== JSON.stringify(requestOwnerFence)) return rejected('owner')
       if (requestSerial < snapshotRequestAuthorityRef.current.applied) return rejected('applied_serial')
@@ -3740,14 +3771,38 @@ export function FreshAgentView({
       const snapshotIdentity = currentAutoTitleIdentityRef.current
       const resolved = next as FreshAgentSnapshot
       const projectionMetadata = readTranscriptProjection(resolved)
-      const projectionLocator = { sessionType: requestSessionType, provider, sessionId }
       const liveState = appStore.getState().freshAgentLive
-      const liveSession = liveState?.bySession[makeFreshAgentSessionKey(projectionLocator)]
+      const liveSession = liveState?.bySession[projectionKey]
       const liveProjection = liveSession?.projection
-      const snapshotNativeSessionId = provider === 'codex'
-        && (historyOnly || (requestPaneSoulId && resolved.extensions?.[provider]?.statusFromLiveState === true))
+      const announcedNative = liveSession?.awaitingNativeSessionId ?? liveState?.announcedNativeBySession?.[projectionKey]
+      if (provider === 'codex' && !requestReadOnly && !historyOnly
+        && resolved.extensions?.codex?.statusFromLiveState === true
+        && (resolved.provider !== provider || resolved.sessionType !== requestSessionType
+          || (announcedNative && resolved.threadId !== announcedNative))) {
+        auditRequest('identity_rejected', () => ({ reason: 'announced_source', providerMatches: resolved.provider === provider,
+          typeMatches: resolved.sessionType === requestSessionType, threadMatches: !announcedNative || resolved.threadId === announcedNative }))
+        return
+      }
+      // First-party Codex live producers construct the projection and threadId
+      // from the same native thread, including the unmarked local producer.
+      const liveCodexProjection = provider === 'codex' && !requestReadOnly && !historyOnly && projectionMetadata
+      if (liveCodexProjection && (resolved.provider !== provider || resolved.sessionType !== requestSessionType)) {
+        auditRequest('identity_rejected', () => ({ reason: 'projection_identity', providerMatches: resolved.provider === provider,
+          typeMatches: resolved.sessionType === requestSessionType }))
+        return
+      }
+      const identifiedNative = provider === 'codex'
+        && (liveCodexProjection || historyOnly || (requestPaneSoulId && resolved.extensions?.[provider]?.statusFromLiveState === true))
         ? resolved.threadId : undefined
-      if (projectionMetadata && !acceptsTranscriptProjectionSnapshot(liveState, projectionLocator, projectionMetadata.id, snapshotNativeSessionId)) return
+      if (projectionMetadata && !acceptsTranscriptProjectionSnapshot(liveState, projectionLocator, projectionMetadata.id, identifiedNative)) {
+        auditRequest('identity_rejected', () => ({ reason: 'projection_source_or_retirement' }))
+        return
+      }
+      // If a different projection was already bound before the first source
+      // announcement, an older read cannot establish which projection is newer.
+      const snapshotNativeSessionId = liveCodexProjection && liveProjection && liveProjection.id !== projectionMetadata.id
+        && requestAnnouncedNative !== liveState?.announcedNativeBySession?.[projectionKey]
+        ? undefined : identifiedNative
       if (projectionMetadata && liveProjection?.id === projectionMetadata.id) {
         const olderHistory = liveProjection.historyGeneration > projectionMetadata.historyGeneration
         const missingCoverage = liveProjection.historyGeneration === projectionMetadata.historyGeneration
@@ -4160,7 +4215,7 @@ export function FreshAgentView({
     // Keep interactive reads and recovery history reads distinct, with pane authority in both keys.
     const key = makeSnapshotKey({ sessionType: requestSessionType, provider, threadId: sessionId, cwd: requestCwd,
       soulId: requestPaneSoulId, soulIntentRevision: requestPaneSoulRevision })
-      + `:read-generation:${requestReadGeneration}:boot:${requestBootId ?? ''}:owner:${requestOwnerFence?.epoch ?? ''}:${requestOwnerFence?.generation ?? ''}:native:${requestNativeId ?? ''}`
+      + `:read-generation:${requestReadGeneration}:boot:${requestBootId ?? ''}:owner:${requestOwnerFence?.epoch ?? ''}:${requestOwnerFence?.generation ?? ''}:native:${requestNativeId ?? ''}:incarnation:${requestIncarnationId ?? ''}:source:${codexSnapshotRevision ?? ''}:announced:${requestAnnouncedNative ?? ''}`
     let ran = false
     auditRequest('request_queued')
     void getSnapshotScheduler().schedule(key, trigger, async () => {
@@ -4238,6 +4293,7 @@ export function FreshAgentView({
     agentSession?.lost,
     managedLostStatusVersion,
     managedCodexNativeId,
+    codexSnapshotRevision,
     appStore,
     captureFreshAgentAttachmentAttempt,
     claudeSession,
@@ -4247,6 +4303,7 @@ export function FreshAgentView({
     paneContent.provider,
     paneContent.soulId,
     paneContent.soulIntentRevision,
+    paneContent.incarnationId,
     paneContent.createRequestId,
     lifecycleBlocked,
     supervisorRecoveryOwned,

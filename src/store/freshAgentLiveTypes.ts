@@ -117,6 +117,9 @@ export type FreshAgentLiveState = {
   bySession: Record<string, FreshAgentLiveSession>
   /** Native source announcements are scoped to the current WebSocket connection. */
   announcedNativeBySession: Record<string, string>
+  /** In-flight snapshot reads cannot cross an observed source or connection change. */
+  snapshotSourceRevisionBySession: Record<string, number>
+  snapshotConnectionRevision: number
   noticeSeq: number
   /**
    * How many visible panes settle each session's tail (land its blocks and
