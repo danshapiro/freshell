@@ -208,11 +208,12 @@ fn host_agent_maintenance_error(request_id: Option<String>) -> ServerMessage {
     })
 }
 
-fn fresh_agent_maintenance_error(request_id: String) -> ServerMessage {
+fn fresh_agent_maintenance_error(request_id: String, view_id: Option<String>) -> ServerMessage {
     ServerMessage::FreshAgentCreateFailed(FreshAgentCreateFailed {
         code: "HOST_AGENT_MAINTENANCE".to_string(),
         message: HOST_AGENT_MAINTENANCE_MESSAGE.to_string(),
         request_id,
+        view_id,
         retryable: Some(true),
         owner_kind: None,
         owner_generation: None,
@@ -241,7 +242,10 @@ async fn dispatch_hosted_fresh_agent(
                     return Some(
                         send(
                             ws_tx,
-                            &fresh_agent_maintenance_error(create.request_id.clone()),
+                            &fresh_agent_maintenance_error(
+                                create.request_id.clone(),
+                                create.view_id.clone(),
+                            ),
                         )
                         .await,
                     );
@@ -2193,7 +2197,10 @@ async fn handle_client_text_with_view_routes(
                         Err(_) => {
                             return send(
                                 ws_tx,
-                                &fresh_agent_maintenance_error(create.request_id.clone()),
+                                &fresh_agent_maintenance_error(
+                                    create.request_id.clone(),
+                                    create.view_id.clone(),
+                                ),
                             )
                             .await;
                         }
@@ -2277,13 +2284,7 @@ async fn handle_client_text_with_view_routes(
             fresh_agent_views.detach_view(&detach.view_id);
             let session_ref = detach.session_ref.or_else(|| {
                 detach.session_id.map(|session_id| SessionLocator {
-                    provider: match detach.provider {
-                        AgentProvider::Claude => "claude",
-                        AgentProvider::Codex => "codex",
-                        AgentProvider::Opencode => "opencode",
-                        AgentProvider::Amplifier => "amplifier",
-                    }
-                    .to_string(),
+                    provider: agent_provider_wire(detach.provider).to_string(),
                     session_id,
                 })
             });
@@ -14512,6 +14513,93 @@ mod pane_reconcile_gate_tests {
 }
 
 #[cfg(test)]
+mod fresh_agent_detach_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn antigravity_detach_preserves_request_view_and_session_locator() {
+        let (mut ws_tx, mut client) =
+            super::pane_reconcile_gate_tests::loopback_sink_and_client().await;
+        let state = super::pane_reconcile_gate_tests::state();
+        let conn_sink: FrameSink = Arc::new(|_| {});
+        let (interactive_create_tx, mut interactive_create_rx) = mpsc::channel(8);
+        let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
+        let mut routes = FreshAgentViewRoutes::default();
+        for view_id in ["view-a", "view-b"] {
+            routes.observe_client_value(&serde_json::json!({
+                "type":"freshAgent.attach", "provider":"antigravity",
+                "sessionType":"freshcodex", "sessionId":"shared", "viewId":view_id,
+            }));
+        }
+        let event = serde_json::json!({
+            "type":"freshAgent.killed", "provider":"antigravity",
+            "sessionType":"freshcodex", "sessionId":"shared", "success":true,
+        })
+        .to_string();
+
+        for (view_id, explicit_ref) in [
+            ("view-a", None),
+            (
+                "view-b",
+                Some(serde_json::json!({"provider":"antigravity", "sessionId":"canonical"})),
+            ),
+        ] {
+            let request_id = format!("detach-{view_id}");
+            let mut request = serde_json::json!({
+                "type":"freshAgent.detach", "provider":"antigravity",
+                "sessionType":"freshcodex", "sessionId":"shared",
+                "requestId":request_id, "viewId":view_id,
+            });
+            if let Some(session_ref) = &explicit_ref {
+                request["sessionRef"] = session_ref.clone();
+            }
+            assert!(
+                handle_client_text_with_view_routes(
+                    &request.to_string(),
+                    &mut ws_tx,
+                    &state,
+                    9,
+                    &conn_sink,
+                    false,
+                    false,
+                    false,
+                    false,
+                    &interactive_create_tx,
+                    &create_cancel_rx,
+                    &mut None,
+                    &mut ConnectionIdentity::default(),
+                    &mut crate::paced_replay::PacedSessions::default(),
+                    &mut routes,
+                    &None,
+                )
+                .await
+            );
+            let reply = super::pane_reconcile_gate_tests::next_text_frame(&mut client).await;
+            assert_eq!(reply["type"], "freshAgent.detached");
+            assert_eq!(reply["requestId"], request_id);
+            assert_eq!(reply["viewId"], view_id);
+            assert_eq!(reply["success"], true);
+            assert_eq!(
+                reply["sessionRef"],
+                explicit_ref.unwrap_or_else(|| {
+                    serde_json::json!({"provider":"antigravity", "sessionId":"shared"})
+                })
+            );
+            assert_eq!(routes.should_deliver(&event), view_id == "view-a");
+        }
+        assert!(interactive_create_rx.try_recv().is_err());
+        assert_eq!(
+            state
+                .fresh_opencode
+                .host_agent_admission()
+                .status()
+                .active_permits,
+            0
+        );
+    }
+}
+
+#[cfg(test)]
 mod host_agent_admission_tests {
     use super::*;
     use freshell_freshagent::host_agent_admission::HostAgentAdmissionGate;
@@ -14632,7 +14720,7 @@ mod host_agent_admission_tests {
         assert!(interactive_create_rx.try_recv().is_err());
 
         for text in [
-            r#"{"type":"freshAgent.create","provider":"codex","sessionType":"freshcodex","requestId":"create-maintenance"}"#,
+            r#"{"type":"freshAgent.create","provider":"codex","sessionType":"freshcodex","requestId":"create-maintenance","viewId":"maintenance-view"}"#,
             r#"{"type":"freshAgent.send","provider":"codex","sessionId":"codex-maintenance-session","sessionType":"freshcodex","text":"resume","requestId":"send-maintenance"}"#,
             r#"{"type":"freshAgent.attach","provider":"codex","sessionId":"codex-maintenance-session","sessionType":"freshcodex"}"#,
         ] {
@@ -14647,8 +14735,12 @@ mod host_agent_admission_tests {
                 .await
             );
             let refusal = super::pane_reconcile_gate_tests::next_text_frame(&mut client).await;
-            if refusal["type"] == "freshAgent.create.failed" {
+            let request: serde_json::Value = serde_json::from_str(text).unwrap();
+            if request["type"] == "freshAgent.create" {
+                assert_eq!(refusal["type"], "freshAgent.create.failed");
                 assert_eq!(refusal["code"], "HOST_AGENT_MAINTENANCE");
+                assert_eq!(refusal["requestId"], "create-maintenance");
+                assert_eq!(refusal["viewId"], "maintenance-view");
                 assert_eq!(refusal["retryable"], true);
             } else {
                 assert_eq!(refusal["type"], "error");
@@ -14658,8 +14750,22 @@ mod host_agent_admission_tests {
         }
 
         assert_eq!(gate.status().phase, "quiesced");
+        assert_eq!(gate.status().active_permits, 0);
         gate.release(&lease).unwrap();
         assert!(gate.try_admit().is_ok());
+    }
+
+    #[test]
+    fn maintenance_create_failure_omits_absent_view_id() {
+        let reply = serde_json::to_value(fresh_agent_maintenance_error(
+            "legacy-maintenance".into(),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(reply["type"], "freshAgent.create.failed");
+        assert_eq!(reply["requestId"], "legacy-maintenance");
+        assert_eq!(reply["code"], "HOST_AGENT_MAINTENANCE");
+        assert!(reply.get("viewId").is_none());
     }
 
     #[tokio::test]
@@ -14689,6 +14795,7 @@ mod host_agent_admission_tests {
             "provider": "codex",
             "sessionType": "freshcodex",
             "requestId": "hosted-create-quiesced",
+            "viewId": "hosted-maintenance-view",
         }))
         .expect("hosted freshAgent.create frame decodes");
         let handled = super::dispatch_hosted_fresh_agent(
@@ -14709,6 +14816,7 @@ mod host_agent_admission_tests {
         let refusal = super::pane_reconcile_gate_tests::next_text_frame(&mut client).await;
         assert_eq!(refusal["type"], "freshAgent.create.failed");
         assert_eq!(refusal["requestId"], "hosted-create-quiesced");
+        assert_eq!(refusal["viewId"], "hosted-maintenance-view");
         assert_eq!(refusal["code"], "HOST_AGENT_MAINTENANCE");
         assert_eq!(refusal["retryable"], true);
         assert!(matches!(

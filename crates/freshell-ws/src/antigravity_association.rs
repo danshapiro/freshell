@@ -1791,7 +1791,6 @@ mod tests {
             activity: Some(hub),
             session_existence: Arc::new(crate::existence::NoIndexProbe::default()),
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-            fresh_agent_respawn_counts: Default::default(),
             ownership: None,
         };
         (state, rx, association)
