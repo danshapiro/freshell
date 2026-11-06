@@ -255,8 +255,11 @@ export function handleFreshAgentMessage(
       const materialized = msg as FreshAgentSessionMaterializedMessage
       const locator = { sessionId: materialized.previousSessionId, sessionType: materialized.sessionType, provider: materialized.provider }
       let awaitingNativeSessionId: string | undefined
+      let previouslyAnnouncedNative: string | undefined
       if (materialized.provider === 'codex') dispatch((_innerDispatch, getState) => {
-        awaitingNativeSessionId = getState().freshAgentLive?.bySession[makeFreshAgentSessionKey(locator)]?.awaitingNativeSessionId
+        const key = makeFreshAgentSessionKey(locator)
+        awaitingNativeSessionId = getState().freshAgentLive?.bySession[key]?.awaitingNativeSessionId
+        previouslyAnnouncedNative = getState().freshAgentLive?.announcedNativeBySession?.[key]
       })
       const announcedNative = materialized.provider === 'codex' && materialized.sessionRef?.provider === 'codex'
         ? materialized.sessionRef.sessionId : undefined
@@ -281,18 +284,31 @@ export function handleFreshAgentMessage(
               provider: materialized.provider, nativeSessionId: newNative }))
           }
         }
-        const replaceLiveProjection = materialized.provider === 'codex'
-          && materialized.previousSessionId === materialized.sessionId
-          && Boolean(newNative)
-          && Object.values(getState().panes?.layouts ?? {}).some((layout) => collectPaneEntries(layout).some(({ content }) => {
-            if (content.kind !== 'fresh-agent' || content.provider !== materialized.provider
-              || content.sessionType !== materialized.sessionType) return false
-            const matches = freshAgentPaneMatchesMaterializedSession(content, materialized)
-            const previousNative = content.sessionRef?.provider === 'codex'
-              ? content.sessionRef.sessionId
-              : (content.resumeSessionId ?? content.sessionId)
-            return matches && Boolean(previousNative) && previousNative !== newNative
-          }))
+        let replaceLiveProjection = false
+        if (materialized.provider === 'codex' && materialized.previousSessionId === materialized.sessionId && newNative) {
+          // Read the announcement from before this frame: clearing a pending
+          // fence above must not make a replacement look like a repeat.
+          if (previouslyAnnouncedNative) {
+            replaceLiveProjection = previouslyAnnouncedNative !== newNative
+          } else {
+            const panes = Object.values(getState().panes?.layouts ?? {}).flatMap(collectPaneEntries)
+              .map(({ content }) => content)
+              .filter((content) => content.kind === 'fresh-agent' && content.provider === materialized.provider
+                && content.sessionType === materialized.sessionType && freshAgentPaneMatchesMaterializedSession(content, materialized))
+            const knownNatives = panes.flatMap((content) => {
+              if (content.kind !== 'fresh-agent') return []
+              const native = content.sessionRef?.provider === 'codex' ? content.sessionRef.sessionId : content.resumeSessionId
+              return native ? [native] : []
+            })
+            // A public-only pane does not identify a different native source
+            // when another view already identifies this one, including after
+            // reconnect cleared the per-connection announcement cache.
+            replaceLiveProjection = knownNatives.some((native) => native !== newNative)
+              || (!knownNatives.includes(newNative) && panes.some((content) =>
+                content.kind === 'fresh-agent' && !content.sessionRef && !content.resumeSessionId
+                && content.sessionId !== newNative))
+          }
+        }
         innerDispatch(materializeFreshAgentSessionState({
           previousSessionId: materialized.previousSessionId,
           sessionId: materialized.sessionId,

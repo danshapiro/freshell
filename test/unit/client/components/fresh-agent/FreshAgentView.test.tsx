@@ -2385,6 +2385,106 @@ describe('FreshAgentView', () => {
     },
   )
 
+  it.each([
+    ['managed-public', 'same connection'], ['native-b', 'same connection'],
+    ['managed-public', 'reconnected'], ['native-b', 'reconnected'],
+  ] as const)(
+    'preserves shared output for %s on %s when a repeated announcement precedes the second pane identity', async (publicId, connection) => {
+      const { WsClient } = await vi.importActual<typeof import('@/lib/ws-client')>('@/lib/ws-client')
+      const client = new WsClient('ws://codex-repeated-announcement.test/ws')
+      const store = createStore()
+      const locator = { sessionId: publicId, sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      client.onMessage((message) => { handleFreshAgentMessage(store.dispatch, message, client) })
+      wsMock.onMessage.mockImplementation((handler) => client.onMessage(handler))
+      store.dispatch(sessionInit(locator))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+        kind: 'fresh-agent', ...locator, createRequestId: 'existing-shared-source', status: 'idle',
+        sessionRef: { provider: 'codex', sessionId: 'native-b' }, soulId: 'soul-one', viewIntentId: 'view-one',
+      } }))
+      const held = createDeferred<unknown>()
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(held.promise)
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      try {
+        await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+        const receive = (message: Record<string, unknown>) => client.receiveMessageForTest(message as never)
+        const announce = () => receive({ type: 'freshAgent.session.materialized', ...locator,
+          previousSessionId: publicId, sessionRef: { provider: 'codex', sessionId: 'native-b' } })
+        const event = (value: Record<string, unknown>) => receive({ type: 'freshAgent.event', ...locator,
+          event: { sessionId: publicId, ...value } })
+        const patch = (revision: number, text: string) => event({ type: 'freshAgent.transcript.patch',
+          projectionId: 'shared-projection', historyGeneration: 0,
+          ops: [{ op: 'resetTurn', nativeTurnId: 'turn', revision, turns: [{ id: 'turn', turnId: 'turn',
+            role: 'assistant', summary: '', items: [{ id: 'answer', kind: 'text', text }] }] }] })
+        act(() => {
+          announce()
+          event({ type: 'freshAgent.session.init', projectionId: 'shared-projection', historyGeneration: 0 })
+          patch(1, 'Shared answer before attach')
+        })
+        await expectRenderedText('Shared answer before attach')
+        act(() => {
+          if (connection === 'reconnected') foldReadyRuntimeOwners(store.dispatch, undefined)
+          store.dispatch(initLayout({ tabId: 'tab-2', paneId: 'pane-2', content: {
+            kind: 'fresh-agent', ...locator, createRequestId: 'unidentified-shared-source', status: 'idle',
+            soulId: 'soul-one', viewIntentId: 'view-two',
+          } }))
+          announce()
+        })
+        expect(screen.getByText('Shared answer before attach')).toBeInTheDocument()
+        act(() => patch(2, 'Shared answer after attach'))
+        await expectRenderedText('Shared answer after attach')
+      } finally {
+        cleanup()
+        held.resolve(hostedCodexSnapshot('native-b', 'Current snapshot'))
+      }
+    },
+  )
+
+  it('retires the old shared output when a new pane already references the replacement source', async () => {
+    const { WsClient } = await vi.importActual<typeof import('@/lib/ws-client')>('@/lib/ws-client')
+    const client = new WsClient('ws://codex-shared-replacement.test/ws')
+    const store = createStore()
+    const locator = { sessionId: 'managed-public', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    client.onMessage((message) => { handleFreshAgentMessage(store.dispatch, message, client) })
+    wsMock.onMessage.mockImplementation((handler) => client.onMessage(handler))
+    store.dispatch(sessionInit(locator))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      kind: 'fresh-agent', ...locator, createRequestId: 'shared-old-source', status: 'idle',
+      sessionRef: { provider: 'codex', sessionId: 'native-a' }, soulId: 'soul-one', viewIntentId: 'view-one',
+    } }))
+    const held = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValue(held.promise)
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    try {
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+      const receive = (message: Record<string, unknown>) => client.receiveMessageForTest(message as never)
+      const announce = (native: string) => receive({ type: 'freshAgent.session.materialized', ...locator,
+        previousSessionId: locator.sessionId, sessionRef: { provider: 'codex', sessionId: native } })
+      const text = (projection: string, answer: string) => {
+        const event = (value: Record<string, unknown>) => receive({ type: 'freshAgent.event', ...locator,
+          event: { sessionId: locator.sessionId, ...value } })
+        event({ type: 'freshAgent.session.init', projectionId: projection, historyGeneration: 0 })
+        event({ type: 'freshAgent.transcript.patch', projectionId: projection, historyGeneration: 0,
+          ops: [{ op: 'resetTurn', nativeTurnId: 'turn', revision: 1, turns: [{ id: 'turn', turnId: 'turn',
+            role: 'assistant', summary: '', items: [{ id: 'answer', kind: 'text', text: answer }] }] }] })
+      }
+      act(() => { announce('native-a'); text('old-shared-projection', 'Old shared source answer') })
+      await expectRenderedText('Old shared source answer')
+      act(() => {
+        store.dispatch(initLayout({ tabId: 'tab-2', paneId: 'pane-2', content: {
+          kind: 'fresh-agent', ...locator, createRequestId: 'shared-new-source', status: 'idle',
+          sessionRef: { provider: 'codex', sessionId: 'native-b' }, soulId: 'soul-one', viewIntentId: 'view-two',
+        } }))
+        announce('native-b')
+      })
+      expect(screen.queryByText('Old shared source answer')).not.toBeInTheDocument()
+      act(() => text('new-shared-projection', 'New shared source answer'))
+      await expectRenderedText('New shared source answer')
+    } finally {
+      cleanup()
+      held.resolve(hostedCodexSnapshot('native-b', 'Current snapshot'))
+    }
+  })
+
   it('shows current gateway failures while waiting for B and rejects stale source failures', async () => {
     const { WsClient } = await vi.importActual<typeof import('@/lib/ws-client')>('@/lib/ws-client')
     const client = new WsClient('ws://codex-gateway-failure.test/ws')
