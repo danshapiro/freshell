@@ -8660,6 +8660,17 @@ impl FreshOpencodeState {
             )
             .await;
 
+        // A requester-scoped ownership refusal takes precedence over the
+        // retained failure budget. Preflight does not change that shared
+        // budget, and the exhausted status still governs provider failures.
+        if matches!(
+            answer.result.as_ref(),
+            Err(crate::session_recovery::RecoveryFailure::Attempt(
+                OpencodeRecoveryFailure::Reserved
+            ))
+        ) {
+            return Err(ResumeOpencodeError::Reserved);
+        }
         if answer.status.exhausted {
             return Err(ResumeOpencodeError::Manager(
                 freshell_opencode::ServeError::StartupFailed(
@@ -8707,6 +8718,17 @@ impl FreshOpencodeState {
             .await
             .ok_or(ResumeOpencodeError::Reserved)?;
 
+        // A cached preflight refusal is requester-scoped and leaves the
+        // shared recovery budget intact, so map it before the retained
+        // exhausted status. Other failures still honor exhaustion below.
+        if matches!(
+            answer.result.as_ref(),
+            Err(crate::session_recovery::RecoveryFailure::Attempt(
+                OpencodeRecoveryFailure::Reserved
+            ))
+        ) {
+            return Err(ResumeOpencodeError::Reserved);
+        }
         if answer.status.exhausted {
             return Err(ResumeOpencodeError::Manager(
                 freshell_opencode::ServeError::StartupFailed(
@@ -18732,14 +18754,72 @@ mod tests {
         }
     }
 
-    async fn exercise_cached_map_hit_refuses_handoff(call: LateRecoveryJoinCall) {
+    async fn fail_opencode_recovery_attempt_for_cached_handoff_test(
+        state: &FreshOpencodeState,
+        identity: &Arc<crate::identity_sink::FakeIdentitySink>,
+        durable_id: &str,
+        expected_failures: u32,
+    ) {
+        let stall = identity.arm_binding_stall_result(PROVIDER, durable_id, true);
+        let recovery_state = state.clone();
+        let recovery_id = durable_id.to_string();
+        let recovery = tokio::spawn(async move {
+            recovery_state
+                .resume_durable_session(&recovery_id, None, None, None, None)
+                .await
+        });
+        stall
+            .entered
+            .recv_timeout(Duration::from_secs(15))
+            .expect("recovery reaches its binding write");
+        let _ = stall.release.send(());
+        let recovery_result = tokio::time::timeout(Duration::from_secs(10), recovery)
+            .await
+            .expect("the failed provider attempt settles")
+            .unwrap();
+        assert!(
+            recovery_result.is_err(),
+            "the binding write is configured to fail"
+        );
+        let status = state
+            .recovery_status(durable_id)
+            .await
+            .expect("the failed launch remains in the shared budget");
+        assert_eq!(status.failed_launches, expected_failures);
+        assert_eq!(status.exhausted, expected_failures >= 3);
+    }
+
+    async fn exercise_cached_map_hit_refuses_handoff(
+        call: LateRecoveryJoinCall,
+        exhaust_budget: bool,
+    ) {
         let durable_id = match call {
+            LateRecoveryJoinCall::Attach if exhaust_budget => {
+                "ses_task005_r4_exhausted_cached_attach_handoff"
+            }
+            LateRecoveryJoinCall::Create if exhaust_budget => {
+                "ses_task005_r4_exhausted_cached_create_handoff"
+            }
             LateRecoveryJoinCall::Attach => "ses_task005_r3_cached_attach_handoff",
             LateRecoveryJoinCall::Create => "ses_task005_r3_cached_create_handoff",
         };
         let (state, mut rx, registry, http) = tracked_fake_http_state().await;
         let identity = Arc::new(crate::identity_sink::FakeIdentitySink::default());
         state.set_identity_sink(identity.clone());
+        let prior_failures = if exhaust_budget { 2 } else { 0 };
+        for expected_failures in 1..=prior_failures {
+            fail_opencode_recovery_attempt_for_cached_handoff_test(
+                &state,
+                &identity,
+                durable_id,
+                expected_failures,
+            )
+            .await;
+            tokio::time::sleep(
+                crate::session_recovery::RECOVERY_RETRY_FLOOR + Duration::from_millis(25),
+            )
+            .await;
+        }
         let identity_stall = identity.arm_binding_stall_result(PROVIDER, durable_id, true);
         let recovery_state = state.clone();
         let recovery_id = durable_id.to_string();
@@ -18761,6 +18841,8 @@ mod tests {
         assert!(state.sessions.lock().await.contains_key(durable_id));
         let pause = state.arm_map_hit_join_pause(durable_id);
         let request_id = match call {
+            LateRecoveryJoinCall::Attach if exhaust_budget => "task005-r4-exhausted-attach-request",
+            LateRecoveryJoinCall::Create if exhaust_budget => "task005-r4-exhausted-create-request",
             LateRecoveryJoinCall::Attach => "task005-r3-cached-attach-request",
             LateRecoveryJoinCall::Create => "task005-r3-cached-create-request",
         };
@@ -18768,7 +18850,11 @@ mod tests {
             LateRecoveryJoinCall::Attach => {
                 let mut attach = attach_msg(durable_id);
                 attach.request_id = Some(request_id.to_string());
-                attach.view_id = Some("task005-r3-cached-map-hit-view".to_string());
+                attach.view_id = Some(if exhaust_budget {
+                    "task005-r4-exhausted-map-hit-view".to_string()
+                } else {
+                    "task005-r3-cached-map-hit-view".to_string()
+                });
                 attach.observed_epoch = Some(starting.epoch);
                 attach.observed_generation = Some(starting.generation);
                 let (reply, captured) = capturing_sink();
@@ -18814,12 +18900,14 @@ mod tests {
             .recovery_status(durable_id)
             .await
             .expect("the provider failure is retained during the retry floor");
-        assert_eq!(failed.failed_launches, 1);
+        let expected_failed_launches = prior_failures + 1;
+        assert_eq!(failed.failed_launches, expected_failed_launches);
+        assert_eq!(failed.exhausted, exhaust_budget);
         assert!(!failed.in_flight);
         assert_eq!(
             *http.get_session_ids.lock().expect("fake OpenCode GET ids"),
-            vec![durable_id],
-            "the shared recovery made exactly one provider GET before the late join"
+            vec![durable_id.to_string(); expected_failed_launches as usize],
+            "each real failed launch made one provider GET before the late join"
         );
 
         assert!(matches!(
@@ -18847,7 +18935,11 @@ mod tests {
                     replies.iter().any(|message| matches!(message,
                         ServerMessage::FreshAgentAttachFailed(failed)
                             if failed.request_id == request_id
-                                && failed.view_id.as_deref() == Some("task005-r3-cached-map-hit-view")
+                                && failed.view_id.as_deref() == Some(if exhaust_budget {
+                                    "task005-r4-exhausted-map-hit-view"
+                                } else {
+                                    "task005-r3-cached-map-hit-view"
+                                })
                                 && failed.session_id == durable_id
                                 && failed.code == "SESSION_RESERVED"
                     )),
@@ -18869,25 +18961,36 @@ mod tests {
         }
         assert_eq!(
             *http.get_session_ids.lock().expect("fake OpenCode GET ids"),
-            vec![durable_id],
+            vec![durable_id.to_string(); expected_failed_launches as usize],
             "a cached refusal makes no additional provider GET"
         );
         let after = state
             .recovery_status(durable_id)
             .await
             .expect("request-scoped reservation preserves the cached outcome");
-        assert_eq!(after.failed_launches, 1);
+        assert_eq!(after.failed_launches, expected_failed_launches);
+        assert_eq!(after.exhausted, exhaust_budget);
         assert!(!after.in_flight);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn task005_round3_opencode_create_cached_map_hit_refuses_terminal_handoff() {
-        exercise_cached_map_hit_refuses_handoff(LateRecoveryJoinCall::Create).await;
+        exercise_cached_map_hit_refuses_handoff(LateRecoveryJoinCall::Create, false).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn task005_round3_opencode_attach_cached_map_hit_refuses_terminal_handoff() {
-        exercise_cached_map_hit_refuses_handoff(LateRecoveryJoinCall::Attach).await;
+        exercise_cached_map_hit_refuses_handoff(LateRecoveryJoinCall::Attach, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn task005_round4_opencode_create_exhausted_cached_map_hit_refuses_terminal_handoff() {
+        exercise_cached_map_hit_refuses_handoff(LateRecoveryJoinCall::Create, true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn task005_round4_opencode_attach_exhausted_cached_map_hit_refuses_terminal_handoff() {
+        exercise_cached_map_hit_refuses_handoff(LateRecoveryJoinCall::Attach, true).await;
     }
 
     async fn cancel_parked_startup<T>(task: &mut tokio::task::JoinHandle<T>) {
