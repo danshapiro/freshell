@@ -1260,7 +1260,9 @@ export function FreshAgentView({
   const [rateLimitedUntil, setRateLimitedUntil] = useState<number | null>(null)
   void rateLimitedUntil
   const rateLimitRetryTimerRef = useRef<{ id: number; provider: FreshAgentPaneContent['provider'] } | null>(null)
-  const codexRateLimitRetryDueRef = useRef<(() => boolean) | null>(null)
+  const codexRateLimitRetryRef = useRef<{ key: string; retryAtMs: number; stillCurrent: () => boolean } | null>(null)
+  const codexRateLimitRetryDueRef = useRef(false)
+  const latestCodexRateLimitSerialRef = useRef(0)
   // Task 16: idle-incomplete re-poll budget and pending retry timer (deduped:
   // never a second timer while one counts down; cleared on unmount). The
   // local echo is the loop's marker -- see applySnapshot.
@@ -1937,7 +1939,8 @@ export function FreshAgentView({
     previousCodexRetryIdentityRef.current = codexRetryIdentity
     codexRetryGenerationRef.current += 1
     clearIdleIncompleteRetry()
-    codexRateLimitRetryDueRef.current = null
+    codexRateLimitRetryDueRef.current = false
+    codexRateLimitRetryRef.current = null
     if (rateLimitRetryTimerRef.current?.provider === 'codex') {
       window.clearTimeout(rateLimitRetryTimerRef.current.id)
       rateLimitRetryTimerRef.current = null
@@ -2125,7 +2128,7 @@ export function FreshAgentView({
     if (!retry) return
     if (retry.key !== codexSnapshotKey || retry.revision !== codexSnapshotRevision
       || retry.identity !== codexRetryIdentity || retry.createRequestId !== paneContent.createRequestId || lifecycleBlocked || ownerDivergence) {
-      setNativeClaimRetry(null)
+      setNativeClaimRetry((current) => current === retry ? null : current)
       return
     }
     if (!retry.pending || hidden || connectionStatus !== 'ready') return
@@ -3251,9 +3254,12 @@ export function FreshAgentView({
       idleIncompleteRetryGuardRef.current = undefined
       if (guard?.() && !snapshotDirtyRef.current) requestSnapshotRefresh('idle-incomplete')
     }
-    const rateLimitRetryDue = codexRateLimitRetryDueRef.current
-    codexRateLimitRetryDueRef.current = null
-    if (rateLimitRetryDue?.() && !snapshotDirtyRef.current) requestSnapshotRefresh('reveal-surface')
+    if (codexRateLimitRetryDueRef.current) {
+      codexRateLimitRetryDueRef.current = false
+      const retry = codexRateLimitRetryRef.current
+      codexRateLimitRetryRef.current = null
+      if (retry?.stillCurrent() && !snapshotDirtyRef.current) requestSnapshotRefresh('reveal-surface')
+    }
     requestRevealRefresh()
   }, [hidden, requestRevealRefresh, requestSnapshotRefresh, snapshotDirty])
 
@@ -3847,7 +3853,13 @@ export function FreshAgentView({
     const requestOutgoingTurnId = outgoingTurnRef.current?.requestId
     const requestLocalEchoId = localEchoRef.current?.requestId
     const trigger = snapshotRefreshTriggerRef.current
-    const requestClaimRetry = nativeClaimRetryRef.current
+    const observedClaimRetry = nativeClaimRetryRef.current
+    const matchesRequestClaimRetry = (retry: typeof nativeClaimRetry) => Boolean(retry
+      && retry.key === projectionKey && retry.revision === codexSnapshotRevision
+      && retry.identity === codexRetryIdentity && retry.createRequestId === requestCreateRequestId)
+    // A replacement's effect can run before the previous identity's queued
+    // state clear has rendered. That record does not belong to this request.
+    const requestClaimRetry = matchesRequestClaimRetry(observedClaimRetry) ? observedClaimRetry : null
     const refreshSerial = snapshotRefreshSerialRef.current
     const snapshotAuditData = (value: FreshAgentSnapshot) => ({ historyOnly: isNativeHistoryOnlySnapshot(value),
       live: value.extensions?.[provider]?.statusFromLiveState === true,
@@ -4532,10 +4544,10 @@ export function FreshAgentView({
             currentClaim = { projectionId: liveSession.routeOnlyProjectionId, nativeSessionId: liveSession.projectionNativeSessionId }
           }
           const current = nativeClaimRetryRef.current
-          const matches = current?.key === projectionKey && current.revision === codexSnapshotRevision
-            && current.identity === codexRetryIdentity && current.createRequestId === requestCreateRequestId
+          const matches = matchesRequestClaimRetry(current)
           if (requestClaimRetry && !matches) return
-          const retry = matches ? current : !current && currentClaim ? {
+          const observedForeign = Boolean(current && !matches && current === observedClaimRetry)
+          const retry = matches ? current : (!current || observedForeign) && currentClaim ? {
             key: projectionKey, revision: codexSnapshotRevision, projectionId: currentClaim.projectionId,
             nativeSessionId: currentClaim.nativeSessionId, createRequestId: requestCreateRequestId,
             hadStoredLayout, attempts: 0, pending: false, exhausted: false, identity: codexRetryIdentity,
@@ -4546,13 +4558,37 @@ export function FreshAgentView({
             const exhausted = retry.exhausted || retry.attempts >= NATIVE_CLAIM_MAX_RETRIES || exceedsRevealWait
             const unchanged = matches && (retry.exhausted || (retry.pending && !exhausted && retry.retryAtMs === outcome.retryAtMs))
             if (!unchanged) {
-              setNativeClaimRetry((latest) => latest === current
+              setNativeClaimRetry((latest) => latest === current || (observedForeign && latest === null)
                 ? { ...retry, pending: !exhausted, exhausted, retryAtMs: outcome.retryAtMs } : latest)
             }
             if (exhausted && snapshotDirtyRef.current) {
               revealRefreshStartedAtRef.current = null
               setSnapshotRevealError('The conversation did not finish refreshing. Try again.')
             }
+            return
+          }
+        }
+        // A newer current Codex outcome supersedes the guard of an existing
+        // retry. The timer may be shared only for the same key and deadline.
+        if (provider === 'codex') {
+          if (requestSerial <= latestCodexRateLimitSerialRef.current) return
+          latestCodexRateLimitSerialRef.current = requestSerial
+          const previous = codexRateLimitRetryRef.current
+          codexRateLimitRetryRef.current = {
+            key, retryAtMs: outcome.retryAtMs,
+            stillCurrent: () => codexRetryGenerationRef.current === requestCodexRetryGeneration
+              && !isStaleSnapshotRequest('outcome')
+              && !(nativeClaimRetryRef.current && nativeClaimRetryIsCurrent(nativeClaimRetryRef.current, false)),
+          }
+          const timer = rateLimitRetryTimerRef.current
+          const sameDeadline = previous?.key === key && previous.retryAtMs === outcome.retryAtMs
+          if (!sameDeadline) {
+            codexRateLimitRetryDueRef.current = false
+            if (timer?.provider === 'codex') {
+              window.clearTimeout(timer.id)
+              rateLimitRetryTimerRef.current = null
+            }
+          } else if (codexRateLimitRetryDueRef.current) {
             return
           }
         }
@@ -4569,22 +4605,28 @@ export function FreshAgentView({
           ) {
             revealRefreshStartedAtRef.current = null
             setSnapshotRevealError('The conversation did not finish refreshing. Try again.')
+            if (provider === 'codex') codexRateLimitRetryRef.current = null
             return
           }
           const id = window.setTimeout(() => {
             rateLimitRetryTimerRef.current = null
             setRateLimitedUntil(null)
             const retry = nativeClaimRetryRef.current
-            if (retry && nativeClaimRetryIsCurrent(retry, false)) return
+            if (retry && nativeClaimRetryIsCurrent(retry, false)) {
+              if (provider === 'codex') codexRateLimitRetryRef.current = null
+              return
+            }
             if (provider === 'codex') {
-              const stillCurrent = () => codexRetryGenerationRef.current === requestCodexRetryGeneration
-                && !isStaleSnapshotRequest('outcome')
-                && !(nativeClaimRetryRef.current && nativeClaimRetryIsCurrent(nativeClaimRetryRef.current, false))
-              if (!stillCurrent()) return
-              if (hiddenRef.current) {
-                codexRateLimitRetryDueRef.current = stillCurrent
+              const current = codexRateLimitRetryRef.current
+              if (!current?.stillCurrent()) {
+                codexRateLimitRetryRef.current = null
                 return
               }
+              if (hiddenRef.current) {
+                codexRateLimitRetryDueRef.current = true
+                return
+              }
+              codexRateLimitRetryRef.current = null
             }
             if (snapshotDirtyRef.current && !hiddenRef.current) {
               requestRevealRefresh(true)
