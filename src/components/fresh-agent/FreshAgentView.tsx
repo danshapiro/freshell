@@ -525,12 +525,13 @@ function localEchoLanded(
   options: {
     allowTextMatch?: boolean
     previousTurnKeys?: Set<string> | null
+    requireCorrelation?: boolean
   } = {},
 ): boolean {
   const needle = echo.text.slice(0, 80)
   const submittedTurnId = echo.submittedTurnId ?? pending?.submittedTurnId
   const previousTurnKeys = options.previousTurnKeys ?? null
-  const canMatchText = Boolean(needle) && (
+  const canMatchText = !options.requireCorrelation && Boolean(needle) && (
     options.allowTextMatch === true
     || pending?.legacyAccepted === true
     || !pending
@@ -557,11 +558,12 @@ function shouldClearStaleLocalEcho(
   snapshot: FreshAgentSnapshot,
   echo: LocalEcho,
   pending?: PendingSendMetadata,
+  requireCorrelation = false,
 ): boolean {
   if (isSnapshotInFlight(snapshot)) return false
   const accepted = Boolean(echo.submittedTurnId || pending?.submittedTurnId || pending?.legacyAccepted)
   if (!accepted) return false
-  return !localEchoLanded(snapshot.turns, echo, pending)
+  return !localEchoLanded(snapshot.turns, echo, pending, { requireCorrelation })
 }
 
 function isNativeHistoryOnlySnapshot(snapshot: FreshAgentSnapshot | null): boolean {
@@ -1250,6 +1252,8 @@ export function FreshAgentView({
     attempts: number
     pending: boolean
   } | null>(null)
+  const nativeClaimRetryRef = useRef(nativeClaimRetry)
+  nativeClaimRetryRef.current = nativeClaimRetry
   const [queuedMessages, setQueuedMessages] = useState<string[]>([])
   // Reserve a turn synchronously: the provider's running event may arrive
   // after another submit. Only completion (or failure) releases the reservation.
@@ -2011,39 +2015,6 @@ export function FreshAgentView({
     setSnapshotRefreshNonce((value) => value + 1)
   }, [])
 
-  // A non-live answer cannot settle a native claim. Retry a bounded number of
-  // times while the same pane and source remain visible; hiding pauses the
-  // timer, and a new source or closed pane cannot inherit the old retry.
-  useEffect(() => {
-    const retry = nativeClaimRetry
-    if (!retry?.pending) return
-    if (retry.key !== codexSnapshotKey || retry.revision !== codexSnapshotRevision
-      || retry.createRequestId !== paneContent.createRequestId) {
-      setNativeClaimRetry(null)
-      return
-    }
-    if (hidden || lifecycleBlocked || ownerDivergence || connectionStatus !== 'ready') return
-    const timer = window.setTimeout(() => {
-      const state = appStore.getState()
-      const layout = state.panes.layouts[tabId]
-      const pane = layout ? findPaneContent(layout, paneId) : retry.hadStoredLayout ? undefined : paneContentRef.current
-      const threadId = pane?.kind === 'fresh-agent' ? getFreshAgentViewSnapshotThreadId(pane, undefined) : undefined
-      const paneKey = pane?.kind === 'fresh-agent' && threadId
-        ? makeFreshAgentSessionKey({ sessionId: threadId, sessionType: pane.sessionType, provider: pane.provider }) : undefined
-      const claim = state.freshAgentLive?.bySession[retry.key]?.nativeClaim
-      if (!isMountedRef.current || hiddenRef.current || pane?.kind !== 'fresh-agent'
-        || pane.createRequestId !== retry.createRequestId || paneKey !== retry.key || isFreshAgentLifecycleBlocked(pane)
-        || codexSnapshotSourceRevision(state.freshAgentLive, retry.key) !== retry.revision
-        || claim?.projectionId !== retry.projectionId || claim.nativeSessionId !== retry.nativeSessionId
-        || ownerDivergenceRef.current
-        || (!isSupervisorRecoveryOwned(pane) && state.freshAgent.sessions[retry.key]?.lost)) return
-      setNativeClaimRetry((current) => current === retry ? { ...retry, pending: false, attempts: retry.attempts + 1 } : current)
-      requestSnapshotRefresh('idle-incomplete')
-    }, IDLE_INCOMPLETE_RETRY_DELAY_MS)
-    return () => window.clearTimeout(timer)
-  }, [appStore, codexSnapshotKey, codexSnapshotRevision, connectionStatus, hidden, lifecycleBlocked,
-    nativeClaimRetry, ownerDivergence, paneContent.createRequestId, paneId, requestSnapshotRefresh, tabId])
-
   const markSnapshotDirty = useCallback((cause: 'reconnect' | 'transcript' | 'send-accepted') => {
     if (!snapshotDirtyRef.current) {
       const revision = snapshotRef.current?.revision
@@ -2067,6 +2038,46 @@ export function FreshAgentView({
     setSnapshotRevealError(null)
     requestSnapshotRefresh('reveal')
   }, [requestSnapshotRefresh])
+
+  // A non-live answer cannot settle a native claim. Retry a bounded number of
+  // times while the same pane and source remain visible; hiding pauses the
+  // timer, and a new source or closed pane cannot inherit the old retry.
+  useEffect(() => {
+    const retry = nativeClaimRetry
+    if (!retry?.pending) return
+    if (retry.key !== codexSnapshotKey || retry.revision !== codexSnapshotRevision
+      || retry.createRequestId !== paneContent.createRequestId) {
+      setNativeClaimRetry(null)
+      return
+    }
+    if (hidden || lifecycleBlocked || ownerDivergence || connectionStatus !== 'ready') return
+    const timer = window.setTimeout(() => {
+      const state = appStore.getState()
+      const layout = state.panes.layouts[tabId]
+      const pane = layout ? findPaneContent(layout, paneId) : retry.hadStoredLayout ? undefined : paneContentRef.current
+      const threadId = pane?.kind === 'fresh-agent' ? getFreshAgentViewSnapshotThreadId(pane, undefined) : undefined
+      const paneKey = pane?.kind === 'fresh-agent' && threadId
+        ? makeFreshAgentSessionKey({ sessionId: threadId, sessionType: pane.sessionType, provider: pane.provider }) : undefined
+      const liveSession = state.freshAgentLive?.bySession[retry.key]
+      const claim = liveSession?.nativeClaim
+      // A sibling can settle the same claim with its own local snapshot. The
+      // unchanged source and route-only marker still require this pane's read.
+      const claimStillCurrent = claim
+        ? claim.projectionId === retry.projectionId && claim.nativeSessionId === retry.nativeSessionId
+        : Boolean(liveSession?.routeOnlyProjectionId)
+      if (!isMountedRef.current || hiddenRef.current || pane?.kind !== 'fresh-agent'
+        || pane.createRequestId !== retry.createRequestId || paneKey !== retry.key || isFreshAgentLifecycleBlocked(pane)
+        || codexSnapshotSourceRevision(state.freshAgentLive, retry.key) !== retry.revision
+        || !claimStillCurrent
+        || ownerDivergenceRef.current
+        || (!isSupervisorRecoveryOwned(pane) && state.freshAgent.sessions[retry.key]?.lost)) return
+      setNativeClaimRetry((current) => current === retry ? { ...retry, pending: false, attempts: retry.attempts + 1 } : current)
+      if (snapshotDirtyRef.current) requestRevealRefresh(true)
+      else requestSnapshotRefresh('idle-incomplete')
+    }, IDLE_INCOMPLETE_RETRY_DELAY_MS)
+    return () => window.clearTimeout(timer)
+  }, [appStore, codexSnapshotKey, codexSnapshotRevision, connectionStatus, hidden, lifecycleBlocked,
+    nativeClaimRetry, ownerDivergence, paneContent.createRequestId, paneId, requestRevealRefresh, requestSnapshotRefresh, tabId])
 
   // kata b8ke (round-3 F6): the ONE fenced attach sender — every
   // freshAgent.attach producer (mount rebind, reconnect re-attach,
@@ -3767,6 +3778,7 @@ export function FreshAgentView({
     const requestAgentSessionStatusVersion = agentSessionStatusVersionRef.current
     const requestSessionWasLost = agentSessionLostRef.current
     const requestOutgoingTurnId = outgoingTurnRef.current?.requestId
+    const requestLocalEchoId = localEchoRef.current?.requestId
     const trigger = snapshotRefreshTriggerRef.current
     const refreshSerial = snapshotRefreshSerialRef.current
     const snapshotAuditData = (value: FreshAgentSnapshot) => ({ historyOnly: isNativeHistoryOnlySnapshot(value),
@@ -3824,10 +3836,19 @@ export function FreshAgentView({
       if (claim && !currentNativeClaimRead) {
         auditRequest('identity_rejected', () => ({ reason: 'unverified_native_claim_read' }))
         if (!requestReadOnly && codexSnapshotRevision !== undefined) {
+          const isSameRetry = (retry: typeof nativeClaimRetry): retry is NonNullable<typeof nativeClaimRetry> => retry?.key === projectionKey
+            && retry.revision === codexSnapshotRevision && retry.projectionId === claim.projectionId
+            && retry.nativeSessionId === claim.nativeSessionId && retry.createRequestId === requestCreateRequestId
+          const retry = nativeClaimRetryRef.current
+          const exhausted = isSameRetry(retry) && retry.attempts >= NATIVE_CLAIM_MAX_RETRIES
+          if (exhausted && trigger === 'reveal' && snapshotDirtyRef.current
+            && revealRefreshVersionRef.current === snapshotDirtyVersionRef.current
+            && refreshSerial === snapshotRefreshSerialRef.current) {
+            revealRefreshStartedAtRef.current = null
+            setSnapshotRevealError('The conversation did not finish refreshing. Try again.')
+          }
           setNativeClaimRetry((previous) => {
-            const same = previous?.key === projectionKey && previous.revision === codexSnapshotRevision
-              && previous.projectionId === claim.projectionId && previous.nativeSessionId === claim.nativeSessionId
-              && previous.createRequestId === requestCreateRequestId
+            const same = isSameRetry(previous)
             const attempts = same ? previous.attempts : 0
             if (attempts >= NATIVE_CLAIM_MAX_RETRIES || (same && previous.pending)) return previous
             return { key: projectionKey, revision: codexSnapshotRevision, projectionId: claim.projectionId,
@@ -3905,15 +3926,26 @@ export function FreshAgentView({
       }
       const snapshotStatusAuthoritative = !routeOnlyManaged && !requestReadOnly && !historyOnly && (provider === 'codex'
         || resolved.extensions?.[provider]?.statusFromLiveState === true)
+      // The route response cannot speak for managed health or shared status.
+      // A current live projection can nevertheless identify this pane's own
+      // accepted send by its request or submitted-turn ID.
+      const appliedProjection = appStore.getState().freshAgentLive?.bySession[projectionKey]?.projection
+      const routeOnlyLocalEvidence = routeOnlyManaged && !requestReadOnly && !historyOnly
+        && provider === 'codex' && resolved.extensions?.codex?.statusFromLiveState === true
+        && projectionMetadata && (currentNativeClaimRead || liveSession?.routeOnlyProjectionId === projectionMetadata.id)
+        && appliedProjection?.id === projectionMetadata.id
+        && appliedProjection.historyGeneration === projectionMetadata.historyGeneration
+        && !appliedProjection.needsResnapshot && projectionMetadata.eventRevision >= appliedProjection.eventRevision
       const outgoing = outgoingTurnRef.current
       if (
         outgoing && outgoing.requestId === requestOutgoingTurnId
         && snapshotAccepted && displaySnapshot.status === 'idle'
-        && snapshotStatusAuthoritative
+        && (snapshotStatusAuthoritative || routeOnlyLocalEvidence)
         && agentSessionStatusVersionRef.current === requestAgentSessionStatusVersion
         && localEchoLanded(displaySnapshot.turns, outgoing, pendingSendMetadataRef.current.get(outgoing.requestId), {
           allowTextMatch: true,
           previousTurnKeys: new Set((outgoing.previousTurns ?? []).map(getTurnKey)),
+          requireCorrelation: routeOnlyManaged,
         })
       ) {
         // Reconnect may miss every stream/status event. A current idle snapshot
@@ -3973,12 +4005,12 @@ export function FreshAgentView({
       }
       // This read has no live actor authority, even if Retry cleared the intervention while it ran.
       const liveProviderState = resolved.extensions?.[provider]
-      if (requestReadOnly || historyOnly || routeOnlyManaged) return
+      if (requestReadOnly || historyOnly || (routeOnlyManaged && !routeOnlyLocalEvidence)) return
       // An older coalesced reader may already display this exact response.
       // The current reader can still authorize recovery; rejected revisions cannot.
       const snapshotAcceptedForRecovery = snapshotAccepted || displaySnapshot === resolved
       if (
-        snapshotAcceptedForRecovery && currentPane.soulId && requestSessionWasLost && agentSessionLostRef.current
+        !routeOnlyManaged && snapshotAcceptedForRecovery && currentPane.soulId && requestSessionWasLost && agentSessionLostRef.current
         && agentSessionStatusVersionRef.current === requestAgentSessionStatusVersion
         && resolved.provider === provider && resolved.sessionType === requestSessionType
         && resolved.threadId === (requestNativeId ?? sessionId)
@@ -3989,23 +4021,27 @@ export function FreshAgentView({
         dispatch(clearSessionError({ sessionId: currentPane.sessionId!, sessionType: requestSessionType, provider, preserveUndismissedWarning: true }))
       }
       const echo = localEchoRef.current
+      // A route-only read started before this send cannot reconcile its echo,
+      // even if its eventual response happens to include a matching turn.
+      if (routeOnlyManaged && echo && echo.requestId !== requestLocalEchoId) return
       const echoPendingMetadata = echo ? pendingSendMetadataRef.current.get(echo.requestId) : undefined
       const landedEcho = echo
         ? localEchoLanded(displaySnapshot.turns, echo, echoPendingMetadata, {
             allowTextMatch: snapshotAccepted,
             previousTurnKeys: echo.previousTurnKeys ? new Set(echo.previousTurnKeys) : null,
+            requireCorrelation: routeOnlyManaged,
           })
         : false
       // Task 16: 'accepted but not landed' -- the raw input predicate of the
       // stale-echo clear, INDEPENDENT of the retry-exhaustion gate below.
       const echoStillPending = echo
-        ? !landedEcho && shouldClearStaleLocalEcho(displaySnapshot, echo, echoPendingMetadata)
+        ? !landedEcho && shouldClearStaleLocalEcho(displaySnapshot, echo, echoPendingMetadata, routeOnlyManaged)
         : false
       // The echo is the idle-incomplete re-poll loop's marker: it may only be
       // cleared as STALE once the bounded retry budget is exhausted. A landed
       // echo still clears immediately.
       const staleEcho = echo
-        ? snapshotAccepted
+        ? !routeOnlyManaged && snapshotAccepted
           && idleIncompleteRetryCountRef.current >= IDLE_INCOMPLETE_MAX_RETRIES
           && shouldClearStaleLocalEcho(displaySnapshot, echo, echoPendingMetadata)
         : false
@@ -4050,6 +4086,7 @@ export function FreshAgentView({
       } else if (!echoStillPending && !Object.values(projectionMetadata?.turnOutputStates ?? {}).some((state) => state.refreshPending)) {
         idleIncompleteRetryCountRef.current = 0
       }
+      if (routeOnlyManaged) return
       const fresh = currentSnapshotPane()
       if (!fresh) return
       if (requestReadOnly || isFreshAgentLifecycleBlocked(fresh)) return
@@ -5751,7 +5788,10 @@ export function FreshAgentView({
                         <button
                           type="button"
                           className="shrink-0 rounded border border-border/70 px-2 py-1 text-xs"
-                          onClick={() => requestRevealRefresh(true)}
+                          onClick={() => {
+                            setNativeClaimRetry(null)
+                            requestRevealRefresh(true)
+                          }}
                         >
                           Retry
                         </button>

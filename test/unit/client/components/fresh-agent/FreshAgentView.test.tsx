@@ -1937,6 +1937,18 @@ describe('FreshAgentView', () => {
       ownerKind: 'vacant', nativeHistoryAvailable: true, statusFromLiveState: false, projection: undefined } } }
   }
 
+  function claimSnapshotWithUserTurn(turnId: string, text: string, revision: number) {
+    const snapshot = hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Assistant before send', revision)
+    const projection = snapshot.extensions!.codex!.projection!
+    return { ...snapshot,
+      turns: [...snapshot.turns, { id: turnId, turnId, role: 'user' as const, summary: '',
+        items: [{ id: `${turnId}-text`, kind: 'text' as const, text }] }],
+      extensions: { codex: { ...snapshot.extensions!.codex!, projection: {
+        ...projection, eventOwnedTurnIds: ['turn', turnId], turnRows: { turn: ['turn'], [turnId]: [turnId] },
+      } } },
+    }
+  }
+
   async function mountProjectionReviewRoute(name: string, withSoul = true, withNativeRef = false, noSoulPublicId = 'native-b', hidden = false, overrides: Partial<FreshAgentPaneContent> = {}, optional = false) {
     const { WsClient } = await vi.importActual<typeof import('@/lib/ws-client')>('@/lib/ws-client')
     const client = new WsClient(`ws://${name}.test/ws`)
@@ -2004,6 +2016,32 @@ describe('FreshAgentView', () => {
     await act(async () => queueManagedRuntimeRefresh(route.store as any, 'first native claim'))
     await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === current.promise)).toBe(true))
     return { after, current }
+  }
+
+  async function prepareHiddenNativeClaim(route: Awaited<ReturnType<typeof mountProjectionReviewRoute>>) {
+    const before = managedCodexInventory('native-b')
+    before.souls = [before.souls[0]]
+    before.viewIntents = []
+    apiMock.getManagedRuntimeInventory.mockResolvedValueOnce(before)
+    await act(async () => queueManagedRuntimeRefresh(route.store as any, 'before hidden claim'))
+    await act(async () => route.initial.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Before hidden claim', 1)))
+    await expectRenderedText('Before hidden claim')
+    route.view.rerender(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden /></Provider>)
+    const current = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValue(current.promise)
+    const after = structuredClone(before)
+    after.revision += 1
+    after.souls[0].freshAgentPresentationIds = ['native-b']
+    apiMock.getManagedRuntimeInventory.mockResolvedValueOnce(after)
+    await act(async () => queueManagedRuntimeRefresh(route.store as any, 'hidden claim'))
+    expect(route.store.getState().freshAgentLive.bySession['freshcodex:codex:native-b']?.nativeClaim).toBeDefined()
+    expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === current.promise)).toBe(false)
+    route.view.rerender(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === current.promise)).toBe(true))
+    const revealCall = apiMock.getFreshAgentThreadSnapshot.mock.results.findIndex((result) => result.value === current.promise)
+    expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[revealCall][3]).toMatchObject({ trigger: 'reveal' })
+    expect(screen.getByRole('status', { name: 'Refreshing conversation' })).toBeInTheDocument()
+    return current
   }
 
   function codexGatewayWarningFrames() {
@@ -3251,6 +3289,254 @@ describe('FreshAgentView', () => {
     }
   })
 
+  it('fetches a pane-local snapshot after a sibling settles its pending native claim retry', async () => {
+    const route = await mountProjectionReviewRoute('claim-sibling-retry', false)
+    const secondInitial = createDeferred<unknown>()
+    const first = createDeferred<unknown>()
+    const sibling = createDeferred<unknown>()
+    const retry = createDeferred<unknown>()
+    const key = 'freshcodex:codex:native-b'
+    try {
+      const before = managedCodexInventory('native-b')
+      before.souls = [before.souls[0]]
+      before.viewIntents = []
+      apiMock.getManagedRuntimeInventory.mockResolvedValueOnce(before)
+      await act(async () => queueManagedRuntimeRefresh(route.store as any, 'before sibling retry claim'))
+      await act(async () => route.initial.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'First before sibling claim', 1)))
+      await expectRenderedText('First before sibling claim')
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(secondInitial.promise)
+      act(() => route.store.dispatch(initLayout({ tabId: 'tab-2', paneId: 'pane-2', content: {
+        kind: 'fresh-agent', ...route.locator, createRequestId: 'sibling-retry-pane', status: 'idle',
+        soulId: 'soul-one', incarnationId: 'incarnation-one', sessionRef: { provider: 'codex', sessionId: 'native-b' },
+        initialCwd: '/sibling-retry-pane',
+      } })))
+      const siblingView = render(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-2" paneId="pane-2" /></Provider>)
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === secondInitial.promise)).toBe(true))
+      await act(async () => secondInitial.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Sibling before claim', 1)))
+      await expectRenderedText('Sibling before claim')
+      const after = structuredClone(before)
+      after.revision += 1
+      after.souls[0].freshAgentPresentationIds = ['native-b']
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation((_type, _provider, _id, options) =>
+        options?.cwd === '/sibling-retry-pane' ? sibling.promise : first.promise)
+      apiMock.getManagedRuntimeInventory.mockResolvedValueOnce(after)
+      await act(async () => queueManagedRuntimeRefresh(route.store as any, 'sibling retry claim'))
+      await waitFor(() => {
+        expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === first.promise)).toBe(true)
+        expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === sibling.promise)).toBe(true)
+      })
+      const composer = within(route.view.container).getByRole('textbox', { name: 'Chat message input' })
+      expect(composer).toBeDisabled()
+      expect(route.store.getState().freshAgentLive.bySession[key]?.nativeClaim).toBeDefined()
+      vi.useFakeTimers()
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(retry.promise)
+      await act(async () => first.resolve(transientClaimHistory()))
+      await act(async () => sibling.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Sibling settled claim', 2)))
+      expect(route.store.getState().freshAgentLive.bySession[key]?.nativeClaim).toBeUndefined()
+      expect(within(siblingView.container).getByText('Sibling settled claim')).toBeInTheDocument()
+      expect(composer).toBeDisabled()
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_001) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      const retryCall = apiMock.getFreshAgentThreadSnapshot.mock.results.findIndex((result) => result.value === retry.promise)
+      expect(retryCall).toBeGreaterThanOrEqual(0)
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[retryCall]).toMatchObject(['freshcodex', 'codex', 'native-b', { trigger: 'idle-incomplete' }])
+      await act(async () => retry.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'First pane recovered', 3)))
+      expect(within(route.view.container).getByText('First pane recovered')).toBeInTheDocument()
+      expect(composer).toBeEnabled()
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      secondInitial.resolve(hostedCodexSnapshot('native-b', 'Second initial'))
+      first.resolve(transientClaimHistory())
+      sibling.resolve(hostedCodexSnapshot('native-b', 'Sibling'))
+      retry.resolve(hostedCodexSnapshot('native-b', 'Retry'))
+      vi.useRealTimers()
+    }
+  })
+
+  it.each(['correlated', 'same-text different turn'] as const)('reconciles an unbound pane send only from a %s snapshot', async (correlation) => {
+    const route = await mountProjectionReviewRoute(`claim-unbound-send-${correlation}`, false)
+    const sentSnapshot = createDeferred<unknown>()
+    const statusRead = createDeferred<unknown>()
+    let claimRead: ReturnType<typeof createDeferred<unknown>> | undefined
+    let unsubscribe: (() => void) | undefined
+    const key = 'freshcodex:codex:native-b'
+    try {
+      ;({ current: claimRead } = await prepareNativeClaim(route))
+      await act(async () => claimRead!.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Unbound ready to send', 2)))
+      await expectRenderedText('Unbound ready to send')
+      expect(route.store.getState().freshAgentLive.bySession[key]?.nativeClaim).toBeUndefined()
+      expect(route.store.getState().freshAgentLive.bySession[key]?.routeOnlyProjectionId).toBe('claim-q')
+      expect(getFreshAgentPaneContent(route.store).soulId).toBeUndefined()
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(statusRead.promise)
+      act(() => route.store.dispatch(sessionSnapshotReceived({ ...route.locator, latestTurnId: null, status: 'idle' })))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === statusRead.promise)).toBe(true))
+      await act(async () => statusRead.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Unbound ready to send', 2)))
+      vi.useFakeTimers()
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      expect(composer).toBeEnabled()
+      const send = (text: string) => {
+        fireEvent.change(composer, { target: { value: text } })
+        fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      }
+      send('My accepted message')
+      send('Queued follow-up')
+      const first = sentFreshAgentMessages('freshAgent.send')[0]
+      expect(first).toMatchObject({ text: 'My accepted message', sessionId: 'native-b' })
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({ requestId: first.requestId })
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(sentSnapshot.promise)
+      act(() => route.receive({ type: 'freshAgent.send.accepted', ...route.locator,
+        requestId: first.requestId, submittedTurnId: 'my-submitted-turn' }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === sentSnapshot.promise)).toBe(true)
+      const readCall = apiMock.getFreshAgentThreadSnapshot.mock.results.findIndex((result) => result.value === sentSnapshot.promise)
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[readCall]).toMatchObject(['freshcodex', 'codex', 'native-b', { trigger: 'send-accepted' }])
+      expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({ requestId: first.requestId, submittedTurnId: 'my-submitted-turn' })
+      // Keep the unbound pane's separately scheduled lost-session recovery
+      // from changing its identity before this already-held GET settles.
+      act(() => {
+        if (correlation === 'correlated') route.store.dispatch(markSessionLost(route.locator))
+        route.store.dispatch(sessionError({ ...route.locator, code: 'LOOKUP_FAILED', message: 'Managed source unavailable' }))
+      })
+      const shared = route.store.getState().freshAgent.sessions[key]
+      expect(shared).toMatchObject({ status: 'idle', lost: correlation === 'correlated', lastError: 'Managed source unavailable' })
+      const observedEchoIds: Array<string | undefined> = []
+      unsubscribe = route.store.subscribe(() => observedEchoIds.push(getFreshAgentPaneContent(route.store).pendingLocalEcho?.requestId))
+      const turnId = correlation === 'correlated' ? 'my-submitted-turn' : 'someone-elses-turn'
+      const response = claimSnapshotWithUserTurn(turnId, 'My accepted message', 3)
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(response)
+      await act(async () => sentSnapshot.resolve(response))
+      expect(route.store.getState().freshAgentLive.bySession[key]?.projection).toMatchObject({ id: 'claim-q', eventRevision: 3 })
+      expect(route.store.getState().freshAgent.sessions[key]).toMatchObject({
+        status: 'idle', statusVersion: shared.statusVersion, lost: correlation === 'correlated', lastError: 'Managed source unavailable',
+      })
+      if (correlation === 'correlated') {
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
+        const second = sentFreshAgentMessages('freshAgent.send')[1]
+        expect(second).toMatchObject({ text: 'Queued follow-up' })
+        expect(observedEchoIds).toContain(undefined)
+        expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({ requestId: second.requestId })
+      } else {
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+        expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({ requestId: first.requestId })
+        expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+        const initialReads = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+        for (let attempt = 1; attempt <= IDLE_INCOMPLETE_MAX_RETRIES; attempt++) {
+          await act(async () => { await vi.advanceTimersByTimeAsync(1_001) })
+          await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+          expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(initialReads + attempt)
+        }
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+        expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({ requestId: first.requestId })
+        expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+        expect(observedEchoIds).not.toContain(undefined)
+        expect(route.store.getState().freshAgent.sessions[key]).toMatchObject({
+          status: 'idle', statusVersion: shared.statusVersion, lost: false, lastError: 'Managed source unavailable',
+        })
+      }
+    } finally {
+      unsubscribe?.()
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      claimRead?.resolve(hostedCodexSnapshot('native-b', 'Claim'))
+      statusRead.resolve(hostedCodexSnapshot('native-b', 'Status'))
+      sentSnapshot.resolve(hostedCodexSnapshot('native-b', 'Sent'))
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not reconcile an unbound send from a read started before that send', async () => {
+    const route = await mountProjectionReviewRoute('claim-unbound-pre-send-read', false)
+    const earlier = createDeferred<unknown>()
+    const current = createDeferred<unknown>()
+    let claimRead: ReturnType<typeof createDeferred<unknown>> | undefined
+    try {
+      ;({ current: claimRead } = await prepareNativeClaim(route))
+      await act(async () => claimRead!.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Ready before held read', 2)))
+      await expectRenderedText('Ready before held read')
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(earlier.promise)
+      act(() => route.event({ type: 'freshAgent.session.changed', reason: 'codex-thread' }))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === earlier.promise)).toBe(true))
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      expect(composer).toBeEnabled()
+      const send = (text: string) => {
+        fireEvent.change(composer, { target: { value: text } })
+        fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      }
+      send('Message after read started')
+      send('Follow-up after held read')
+      const first = sentFreshAgentMessages('freshAgent.send')[0]
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(current.promise)
+      act(() => route.receive({ type: 'freshAgent.send.accepted', ...route.locator,
+        requestId: first.requestId, submittedTurnId: 'turn-after-held-read' }))
+      await act(async () => earlier.resolve(claimSnapshotWithUserTurn('turn-after-held-read', 'Message after read started', 3)))
+      expect(route.store.getState().freshAgentLive.bySession['freshcodex:codex:native-b']?.projection?.eventRevision).toBe(3)
+      expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({ requestId: first.requestId })
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === current.promise)).toBe(true))
+      await act(async () => current.resolve(claimSnapshotWithUserTurn('turn-after-held-read', 'Message after read started', 4)))
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+      expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Follow-up after held read' })
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      claimRead?.resolve(hostedCodexSnapshot('native-b', 'Claim'))
+      earlier.resolve(hostedCodexSnapshot('native-b', 'Earlier'))
+      current.resolve(hostedCodexSnapshot('native-b', 'Current'))
+    }
+  })
+
+  it('does not reconcile an unbound send from a snapshot behind an observed projection revision', async () => {
+    const route = await mountProjectionReviewRoute('claim-unbound-stale-send-revision', false)
+    const stale = createDeferred<unknown>()
+    const current = createDeferred<unknown>()
+    let claimRead: ReturnType<typeof createDeferred<unknown>> | undefined
+    const key = 'freshcodex:codex:native-b'
+    try {
+      ;({ current: claimRead } = await prepareNativeClaim(route))
+      await act(async () => claimRead!.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Ready before stale send read', 2)))
+      await expectRenderedText('Ready before stale send read')
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      const send = (text: string) => {
+        fireEvent.change(composer, { target: { value: text } })
+        fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      }
+      send('Message with newer projection')
+      send('Follow-up after newer projection')
+      const first = sentFreshAgentMessages('freshAgent.send')[0]
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(stale.promise)
+      act(() => route.receive({ type: 'freshAgent.send.accepted', ...route.locator,
+        requestId: first.requestId, submittedTurnId: 'revision-checked-turn' }))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === stale.promise)).toBe(true))
+      act(() => route.patch('claim-q', 4, 'Newer projection observed'))
+      expect(route.store.getState().freshAgentLive.bySession[key]?.projection?.eventRevision).toBe(4)
+      await act(async () => stale.resolve(claimSnapshotWithUserTurn('revision-checked-turn', 'Message with newer projection', 3)))
+      expect(route.store.getState().freshAgentLive.bySession[key]?.projection?.eventRevision).toBe(4)
+      expect(getFreshAgentPaneContent(route.store).pendingLocalEcho).toMatchObject({ requestId: first.requestId })
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(current.promise)
+      act(() => route.event({ type: 'freshAgent.session.changed', reason: 'codex-thread' }))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === current.promise)).toBe(true))
+      await act(async () => current.resolve(claimSnapshotWithUserTurn('revision-checked-turn', 'Message with newer projection', 5)))
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+      expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Follow-up after newer projection' })
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      claimRead?.resolve(hostedCodexSnapshot('native-b', 'Claim'))
+      stale.resolve(hostedCodexSnapshot('native-b', 'Stale'))
+      current.resolve(hostedCodexSnapshot('native-b', 'Current'))
+    }
+  })
+
   it('retires a held native claim when its known owner forks away from the old route', async () => {
     const route = await mountProjectionReviewRoute('claim-owner-forks', false)
     const oldRoute = createDeferred<unknown>()
@@ -3444,6 +3730,72 @@ describe('FreshAgentView', () => {
       resetSnapshotSchedulerForTests()
       route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
       current?.resolve(hostedCodexSnapshot('native-b', 'Current'))
+      valid.resolve(hostedCodexSnapshot('native-b', 'Valid'))
+      vi.useRealTimers()
+    }
+  })
+
+  it.each(['history', 'invalid projection'] as const)('clears a dirty reveal after retrying a native claim with %s', async (kind) => {
+    const route = await mountProjectionReviewRoute(`hidden-claim-retry-${kind}`, false)
+    const valid = createDeferred<unknown>()
+    let reveal: ReturnType<typeof createDeferred<unknown>> | undefined
+    try {
+      reveal = await prepareHiddenNativeClaim(route)
+      vi.useFakeTimers()
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(valid.promise)
+      const malformed = hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Malformed reveal', 2)
+      await act(async () => reveal!.resolve(kind === 'history' ? transientClaimHistory() : {
+        ...malformed, extensions: { codex: { ...malformed.extensions!.codex!, projection: { id: 'claim-q' } } },
+      }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_001) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === valid.promise)).toBe(true)
+      const retryCall = apiMock.getFreshAgentThreadSnapshot.mock.results.findIndex((result) => result.value === valid.promise)
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[retryCall]).toMatchObject(['freshcodex', 'codex', 'native-b', { trigger: 'reveal' }])
+      await act(async () => valid.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Recovered hidden claim', 3)))
+      expect(route.store.getState().freshAgentLive.bySession['freshcodex:codex:native-b']?.nativeClaim).toBeUndefined()
+      expect(screen.queryByRole('status', { name: 'Refreshing conversation' })).not.toBeInTheDocument()
+      expect(screen.getByText('Recovered hidden claim')).toBeVisible()
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      reveal?.resolve(transientClaimHistory())
+      valid.resolve(hostedCodexSnapshot('native-b', 'Valid'))
+      vi.useRealTimers()
+    }
+  })
+
+  it('offers an actionable retry when a dirty reveal exhausts its native claim retries', async () => {
+    const route = await mountProjectionReviewRoute('hidden-claim-retry-exhaustion', false)
+    const valid = createDeferred<unknown>()
+    let reveal: ReturnType<typeof createDeferred<unknown>> | undefined
+    try {
+      reveal = await prepareHiddenNativeClaim(route)
+      vi.useFakeTimers()
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(transientClaimHistory())
+      await act(async () => reveal!.resolve(transientClaimHistory()))
+      const initialReads = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        await act(async () => { await vi.advanceTimersByTimeAsync(1_001) })
+        await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+        expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(initialReads + attempt)
+      }
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(initialReads + 5)
+      expect(screen.getByRole('alert', { name: 'The conversation could not be refreshed.' })).toBeInTheDocument()
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(valid.promise)
+      fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === valid.promise)).toBe(true)
+      await act(async () => valid.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Recovered after retry', 3)))
+      expect(screen.queryByRole('alert', { name: 'The conversation could not be refreshed.' })).not.toBeInTheDocument()
+      expect(screen.getByText('Recovered after retry')).toBeVisible()
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      reveal?.resolve(transientClaimHistory())
       valid.resolve(hostedCodexSnapshot('native-b', 'Valid'))
       vi.useRealTimers()
     }
