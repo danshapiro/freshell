@@ -142,7 +142,7 @@ pub enum ClientMessage {
 
 /// The exact `type` discriminants of every client→server message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const CLIENT_MESSAGE_TYPES: [&str; 43] = [
+pub const CLIENT_MESSAGE_TYPES: [&str; 44] = [
     "amplifier.activity.list",
     // Promoted from EXTENSION_CLIENT_MESSAGE_TYPES by the focused-repair
     // round 2 contract reconcile (pnpm run contract:generate re-froze the
