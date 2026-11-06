@@ -3705,6 +3705,85 @@ describe('FreshAgentView', () => {
     },
   )
 
+  it.each((['sibling settles', 'observation advances'] as const).flatMap((ordering) =>
+    (['visible', 'hidden'] as const).map((visibility) => ({ ordering, visibility }))))(
+    'bounds a first claim 429 after a competing projection $ordering ($visibility)', async ({ ordering, visibility }) => {
+      const route = await mountProjectionReviewRoute(`claim-competing-rate-limit-${ordering}-${visibility}`, false)
+      const secondInitial = createDeferred<unknown>()
+      const firstQ = createDeferred<unknown>()
+      const siblingQ = createDeferred<unknown>()
+      const firstR = createDeferred<unknown>()
+      const siblingR = createDeferred<unknown>()
+      const valid = createDeferred<unknown>()
+      const key = 'freshcodex:codex:native-b'
+      const paneReads = () => apiMock.getFreshAgentThreadSnapshot.mock.calls.filter((call) => call[3]?.cwd !== '/sibling-retry-pane').length
+      try {
+        await prepareSiblingClaim(route, secondInitial, firstQ, siblingQ)
+        vi.useFakeTimers()
+        apiMock.getFreshAgentThreadSnapshot.mockImplementation((_type, _provider, _id, options) =>
+          options?.cwd === '/sibling-retry-pane' ? siblingR.promise : firstR.promise)
+        act(() => { route.init('claim-r'); route.patch('claim-r', 3, 'Competing event') })
+        await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+        expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === firstR.promise)).toBe(true)
+        expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === siblingR.promise)).toBe(true)
+        const before = route.store.getState().freshAgentLive.bySession[key]!
+        expect(before.nativeClaim).toMatchObject({ projectionId: 'claim-q', competing: { projectionId: 'claim-r' } })
+        const observation = before.nativeClaim!.observationVersion
+        const sourceRevision = route.store.getState().freshAgentLive.snapshotSourceRevisionBySession[key]
+        if (ordering === 'sibling settles') {
+          await act(async () => siblingR.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-r', 'Sibling settled R', 3)))
+          expect(route.store.getState().freshAgentLive.bySession[key]).toMatchObject({ routeOnlyProjectionId: 'claim-r', routeOnlyObservationVersion: observation })
+        } else {
+          act(() => route.patch('claim-r', 4, 'Later competing event'))
+          expect(route.store.getState().freshAgentLive.bySession[key]?.nativeClaim?.observationVersion).toBeGreaterThan(observation)
+        }
+        expect(route.store.getState().freshAgentLive.snapshotSourceRevisionBySession[key]).toBe(sourceRevision)
+        const shared = route.store.getState().freshAgent.sessions[key]
+        apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new ApiError(429, 'Too many requests', undefined, 1_000))
+        await act(async () => firstR.reject(new ApiError(429, 'Too many requests', undefined, 5_000)))
+        const reads = paneReads()
+        await act(async () => { await vi.advanceTimersByTimeAsync(5_049) })
+        expect(paneReads()).toBe(reads)
+        if (visibility === 'hidden') {
+          route.view.rerender(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden /></Provider>)
+          await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+          expect(paneReads()).toBe(reads)
+          route.view.rerender(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+        }
+        for (let attempt = 1; attempt <= 5; attempt++) {
+          await act(async () => { await vi.advanceTimersByTimeAsync(1_051 + SNAPSHOT_DEBOUNCE_MS) })
+          expect(paneReads()).toBe(reads + attempt)
+        }
+        await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+        expect(paneReads()).toBe(reads + 5)
+        const alert = within(route.view.container).getByRole('alert', { name: 'Live conversation could not be refreshed' })
+        apiMock.getFreshAgentThreadSnapshot.mockReturnValue(valid.promise)
+        fireEvent.click(within(alert).getByRole('button', { name: 'Retry' }))
+        await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+        expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === valid.promise)).toBe(true)
+        await act(async () => valid.resolve(hostedCodexProjectionSnapshot('native-b', 'claim-r', 'Current R after rate limit', 4)))
+        expect(within(route.view.container).getByText('Current R after rate limit')).toBeInTheDocument()
+        expect(within(route.view.container).getByRole('textbox', { name: 'Chat message input' })).toBeEnabled()
+        expect(route.store.getState().freshAgentLive.snapshotSourceRevisionBySession[key]).toBe(sourceRevision)
+        expect(route.store.getState().freshAgent.sessions[key]?.status).toBe(shared.status)
+        expect(route.store.getState().freshAgent.sessions[key]?.statusVersion).toBe(shared.statusVersion)
+        expect(route.store.getState().freshAgent.sessions[key]?.lost).toBe(shared.lost)
+        expect(route.store.getState().freshAgent.sessions[key]?.lastError).toBe(shared.lastError)
+      } finally {
+        cleanup()
+        resetSnapshotSchedulerForTests()
+        route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+        secondInitial.resolve(hostedCodexSnapshot('native-b', 'Second initial'))
+        firstQ.resolve(hostedCodexSnapshot('native-b', 'First Q'))
+        siblingQ.resolve(hostedCodexSnapshot('native-b', 'Sibling Q'))
+        firstR.resolve(hostedCodexSnapshot('native-b', 'First R'))
+        siblingR.resolve(hostedCodexSnapshot('native-b', 'Sibling R'))
+        valid.resolve(hostedCodexSnapshot('native-b', 'Valid'))
+        vi.useRealTimers()
+      }
+    },
+  )
+
   it('keeps dirty-reveal retries bounded after a sibling settles the claim', async () => {
     const route = await mountProjectionReviewRoute('claim-rate-limited-dirty-reveal', false)
     const secondInitial = createDeferred<unknown>()
@@ -3976,6 +4055,159 @@ describe('FreshAgentView', () => {
       }
     },
   )
+
+  it.each(['source', 'pane away and back', 'pane address away and back', 'owner', 'lifecycle away and back'] as const)(
+    'does not carry an already armed generic Codex 429 timer across %s', async (change) => {
+      const route = await mountProjectionReviewRoute(`generic-rate-limit-fence-${change}`, false)
+      const limited = createDeferred<unknown>()
+      const away = createDeferred<unknown>()
+      const current = createDeferred<unknown>()
+      try {
+        await act(async () => route.initial.resolve(hostedCodexProjectionSnapshot('native-b', 'initial-q', 'Initial live', 1)))
+        await expectRenderedText('Initial live')
+        vi.useFakeTimers()
+        apiMock.getFreshAgentThreadSnapshot.mockReturnValue(limited.promise)
+        act(() => route.event({ type: 'freshAgent.session.changed', reason: 'codex-thread' }))
+        await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+        expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === limited.promise)).toBe(true)
+        await act(async () => limited.reject(new ApiError(429, 'Too many requests', undefined, 5_000)))
+        const original = getFreshAgentPaneContent(route.store)
+        if (change === 'source') {
+          apiMock.getFreshAgentThreadSnapshot.mockReturnValue(current.promise)
+          act(() => route.receive({ type: 'freshAgent.session.materialized', previousSessionId: 'native-b', sessionId: 'native-c',
+            sessionType: 'freshcodex', provider: 'codex', sessionRef: { provider: 'codex', sessionId: 'native-c' } }))
+        } else if (change === 'owner') {
+          apiMock.getFreshAgentThreadSnapshot.mockReturnValue(current.promise)
+          act(() => route.store.dispatch(applyRuntimeOwner({ type: 'session.runtimeOwner', ...route.locator, epoch: 3, generation: 4,
+            ownerKind: 'fresh-agent', transition: 'handoff-committed', operationId: 'generic-rate-new-owner' })))
+        } else if (change === 'pane address away and back') {
+          apiMock.getFreshAgentThreadSnapshot.mockReturnValue(away.promise)
+          act(() => route.store.dispatch(initLayout({ tabId: 'tab-2', paneId: 'pane-2', content: { ...original, initialCwd: '/identity-away' } })))
+          route.view.rerender(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-2" paneId="pane-2" /></Provider>)
+          await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+          await act(async () => away.resolve(hostedCodexProjectionSnapshot('native-b', 'initial-q', 'Away live', 1)))
+          apiMock.getFreshAgentThreadSnapshot.mockReturnValue(current.promise)
+          act(() => route.store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: { ...original, initialCwd: '/identity-return' } })))
+          route.view.rerender(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+        } else {
+          apiMock.getFreshAgentThreadSnapshot.mockReturnValue(away.promise)
+          const changed = change === 'pane away and back'
+            ? { ...original, createRequestId: 'other-generic-rate-pane', initialCwd: '/identity-away' }
+            : { ...original, initialCwd: '/identity-away', recoverySummary: { desiredState: 'stopped' as const, recoveryState: 'stopped' as const,
+              durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } }
+          act(() => route.store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: changed })))
+          await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+          await act(async () => away.resolve(hostedCodexProjectionSnapshot('native-b', 'initial-q', 'Away live', 1)))
+          apiMock.getFreshAgentThreadSnapshot.mockReturnValue(current.promise)
+          // The scheduler key differs, so this is the returning identity's own
+          // GET, not a trailing cohort of the original rate-limited request.
+          act(() => route.store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: { ...original, initialCwd: '/identity-return' } })))
+        }
+        await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+        expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === current.promise)).toBe(true)
+        await act(async () => current.resolve(hostedCodexProjectionSnapshot(change === 'source' ? 'native-c' : 'native-b', 'current-q', 'Current live', 2)))
+        expect(within(route.view.container).getByText('Current live')).toBeInTheDocument()
+        // A materialization can queue its own trailing refresh behind the
+        // identity GET. Let that current-source cohort finish while visible.
+        await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+        route.view.rerender(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden /></Provider>)
+        apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(hostedCodexSnapshot(change === 'source' ? 'native-c' : 'native-b', 'Unexpected retry'))
+        const reads = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+        await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+        expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.slice(reads)).toEqual([])
+      } finally {
+        cleanup()
+        resetSnapshotSchedulerForTests()
+        route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+        limited.resolve(hostedCodexSnapshot('native-b', 'Limited'))
+        away.resolve(hostedCodexSnapshot('native-b', 'Away'))
+        current.resolve(hostedCodexSnapshot('native-b', 'Current'))
+        vi.useRealTimers()
+      }
+    },
+  )
+
+  it('defers a current generic Codex backoff read while hidden and resumes it on reveal', async () => {
+    const route = await mountProjectionReviewRoute('generic-rate-limit-current-deferred', false)
+    const limited = createDeferred<unknown>()
+    const current = createDeferred<unknown>()
+    try {
+      await act(async () => route.initial.resolve(hostedCodexProjectionSnapshot('native-b', 'initial-q', 'Initial live', 1)))
+      await expectRenderedText('Initial live')
+      vi.useFakeTimers()
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(limited.promise)
+      act(() => route.event({ type: 'freshAgent.session.changed', reason: 'codex-thread' }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      await act(async () => limited.reject(new ApiError(429, 'Too many requests', undefined, 5_000)))
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(current.promise)
+      const original = getFreshAgentPaneContent(route.store)
+      // The new pane's immediate identity read meets the same key's backoff.
+      act(() => route.store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: { ...original, createRequestId: 'new-backoff-pane' } })))
+      await act(async () => { await Promise.resolve() })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === current.promise)).toBe(false)
+      route.view.rerender(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden /></Provider>)
+      const reads = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(reads)
+      route.view.rerender(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === current.promise)).toBe(true)
+      await act(async () => current.resolve(hostedCodexProjectionSnapshot('native-b', 'current-q', 'Current after reveal', 2)))
+      expect(within(route.view.container).getByText('Current after reveal')).toBeInTheDocument()
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      limited.resolve(hostedCodexSnapshot('native-b', 'Limited'))
+      current.resolve(hostedCodexSnapshot('native-b', 'Current'))
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not revive an old generic timer after the view changes pane address away and back', async () => {
+    const route = await mountProjectionReviewRoute('generic-rate-limit-pane-address-held', false)
+    const limited = createDeferred<unknown>()
+    const away = createDeferred<unknown>()
+    const current = createDeferred<unknown>()
+    try {
+      await act(async () => route.initial.resolve(hostedCodexProjectionSnapshot('native-b', 'initial-q', 'Initial live', 1)))
+      await expectRenderedText('Initial live')
+      vi.useFakeTimers()
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(limited.promise)
+      act(() => route.event({ type: 'freshAgent.session.changed', reason: 'codex-thread' }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      await act(async () => limited.reject(new ApiError(429, 'Too many requests', undefined, 5_000)))
+      const original = getFreshAgentPaneContent(route.store)
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(away.promise)
+      act(() => route.store.dispatch(initLayout({ tabId: 'tab-2', paneId: 'pane-2', content: { ...original, initialCwd: '/identity-away' } })))
+      route.view.rerender(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-2" paneId="pane-2" /></Provider>)
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === away.promise)).toBe(true)
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(current.promise)
+      act(() => route.store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: { ...original, initialCwd: '/identity-return' } })))
+      route.view.rerender(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.results.some((result) => result.value === current.promise)).toBe(true)
+      route.view.rerender(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden /></Provider>)
+      const reads = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(reads)
+      route.view.rerender(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      await act(async () => current.resolve(hostedCodexProjectionSnapshot('native-b', 'current-q', 'Current live', 2)))
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.slice(reads)).toEqual([])
+      expect(within(route.view.container).getByText('Current live')).toBeInTheDocument()
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      limited.resolve(hostedCodexSnapshot('native-b', 'Limited'))
+      away.resolve(hostedCodexSnapshot('native-b', 'Away'))
+      current.resolve(hostedCodexSnapshot('native-b', 'Current'))
+      vi.useRealTimers()
+    }
+  })
 
   it.each(['visibility', 'source', 'lifecycle', 'owner'] as const)(
     'keeps an exhausted live-read action scoped to its %s', async (change) => {
