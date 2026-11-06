@@ -732,6 +732,13 @@ impl Registry {
                     "UPDATE souls SET configured_limits=?1,resource_profile='custom',intent_revision=?2,updated_at=?3 WHERE soul_id=?4 AND intent_revision=?5",
                     params![encoded, next_revision, now, soul_id.as_str(), current_revision],
                 )?;
+                // Resource limits do not change the provider's native writer.
+                // Carry forward only claims bound to the intent being updated;
+                // an already-stale claim must remain invalid.
+                tx.execute(
+                    "UPDATE writer_claims SET intent_revision=?1 WHERE soul_id=?2 AND intent_revision=?3",
+                    params![next_revision, soul_id.as_str(), current_revision],
+                )?;
                 let mut statement = tx.prepare(
                     "SELECT view_id FROM view_intents WHERE soul_id=?1 ORDER BY view_id",
                 )?;

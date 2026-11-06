@@ -1958,6 +1958,63 @@ async fn retained_codex_send_receipt_can_be_read_after_a_lost_reply_without_disp
 }
 
 #[tokio::test]
+async fn retained_codex_send_receipt_reports_a_persisted_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = Arc::new(RefusedInputTransport {
+        dispatches: AtomicUsize::new(0),
+    });
+    let mut initial_profile = profile(
+        FreshProvider::Codex,
+        "refused-receipt-store",
+        Some("owned-native"),
+    );
+    initial_profile.runtime_variant = "codex-app-server".into();
+    let actor = FreshAgentHostActor::open(dir.path(), initial_profile, transport.clone())
+        .await
+        .unwrap();
+    let source = NativeIdentityObservation {
+        native_session_id: "owned-native".into(),
+        incarnation_id: freshell_runtime_protocol::IncarnationId::new(),
+        launch_nonce: "refused-receipt-launch".into(),
+        evidence_revision: 7,
+        source: freshell_runtime_protocol::NativeIdentitySource::FreshProviderHandshake,
+        evidence_digest: "c".repeat(64),
+    };
+    let request_id = RequestId::parse("retained-refused-send").unwrap();
+    assert_eq!(
+        actor
+            .dispatch_with_codex_recovery_source(
+                request_id.clone(),
+                "the provider refused this prompt".into(),
+                None,
+                Some("attempt-refused".into()),
+                Some(source),
+            )
+            .await
+            .unwrap_err(),
+        ActorError::ProviderSendDiagnostic(freshell_runtime_protocol::FreshAgentSendDiagnostic {
+            outcome: freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused,
+            message: Some("Codex recovery send is unsupported by this transport".into()),
+        })
+    );
+    assert_eq!(
+        actor
+            .codex_recovery_send_receipt(
+                request_id,
+                "the provider refused this prompt",
+                None,
+                Some("attempt-refused"),
+            )
+            .await
+            .unwrap_err(),
+        ActorError::SendRefused,
+        "the receipt lookup should preserve the actor journal's definitive refusal"
+    );
+    assert_eq!(transport.dispatches.load(Ordering::SeqCst), 0);
+    actor.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn pending_permission_persists_and_is_answered_exactly_once_after_gateway_restart() {
     let dir = tempfile::tempdir().unwrap();
     let transport = FakeTransport::new("thread-7");

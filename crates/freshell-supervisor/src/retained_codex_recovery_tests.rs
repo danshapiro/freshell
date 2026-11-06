@@ -102,6 +102,7 @@ struct ControlledCodex {
     sending: Arc<Notify>,
     release: Arc<Notify>,
     transient_status: Arc<Notify>,
+    status_observed: Arc<Notify>,
     worker: Arc<AtomicBool>,
     capability: Arc<AtomicBool>,
     receipt_capability: Arc<AtomicBool>,
@@ -219,6 +220,7 @@ impl ControlledCodex {
         let sending = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let transient_status = Arc::new(Notify::new());
+        let status_observed = Arc::new(Notify::new());
         let worker = Arc::new(AtomicBool::new(true));
         let capability = Arc::new(AtomicBool::new(true));
         let receipt_capability = Arc::new(AtomicBool::new(true));
@@ -251,6 +253,7 @@ impl ControlledCodex {
             let sending = sending.clone();
             let release = release.clone();
             let transient_status = transient_status.clone();
+            let status_observed = status_observed.clone();
             let worker = worker.clone();
             let capability = capability.clone();
             let receipt_capability = receipt_capability.clone();
@@ -286,6 +289,7 @@ impl ControlledCodex {
                     let boot = boot.clone();
                     let launch = launch.clone();
                     let transient_status = transient_status.clone();
+                    let status_observed = status_observed.clone();
                     let worker = worker.clone();
                     let capability = capability.clone();
                     let receipt_capability = receipt_capability.clone();
@@ -348,6 +352,7 @@ impl ControlledCodex {
                             },
                             HostCommand::Status { .. } => {
                                 statuses.fetch_add(1, Ordering::SeqCst);
+                                status_observed.notify_one();
                                 let ended = exited.load(Ordering::SeqCst);
                                 let observation = source.lock().unwrap().clone();
                                 HostResult::Status {
@@ -689,6 +694,7 @@ impl ControlledCodex {
             sending,
             release,
             transient_status,
+            status_observed,
             worker,
             capability,
             receipt_capability,
@@ -1056,6 +1062,53 @@ async fn public_compact_prepares_live_codex_same_root_when_current_proof_is_miss
         Some("native-parent"),
         "live same-root readiness must preserve the current Codex identity"
     );
+}
+
+#[tokio::test]
+async fn public_compact_does_not_run_codex_readiness_for_another_provider() {
+    let fixture = ControlledCodex::new().await;
+    fixture.exited.store(false, Ordering::SeqCst);
+    fixture
+        .native_observation_missing
+        .store(true, Ordering::SeqCst);
+
+    let context = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    let mut agent = context.fresh_agent.unwrap();
+    agent.provider = FreshProvider::Opencode;
+    agent.session_type = "freshopencode".into();
+    agent.runtime_variant = "freshopencode".into();
+    let conn = Connection::open(fixture.supervisor.registry.database_path()).unwrap();
+    conn.execute(
+        "UPDATE souls SET provider='opencode' WHERE soul_id=?1",
+        [fixture.soul.as_str()],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE incarnations SET fresh_agent_spec=?1 WHERE incarnation_id=?2",
+        params![
+            serde_json::to_string(&agent).unwrap(),
+            fixture.incarnation.as_str()
+        ],
+    )
+    .unwrap();
+
+    let error = fixture.compact().await.unwrap_err();
+    assert_eq!(
+        error.code,
+        RuntimeErrorCode::RecoveryBlocked,
+        "the synthetic OpenCode fixture has no committed native identity"
+    );
+    assert_eq!(
+        fixture.same_root_prepares.load(Ordering::SeqCst),
+        0,
+        "Codex same-root readiness must not be sent for an OpenCode soul"
+    );
+    assert_eq!(fixture.compacts.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -1576,6 +1629,49 @@ async fn ordinary_same_root_codex_send_skips_identity_rewrite_after_intent_chang
 }
 
 #[tokio::test]
+async fn configured_limits_change_preserves_current_codex_recovery_source() {
+    let fixture = ControlledCodex::new().await;
+    let before = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    let source_before = fixture
+        .supervisor
+        .registry
+        .codex_dispatch_recovery_source(fixture.soul.clone())
+        .await
+        .unwrap()
+        .expect("current Codex writer should have a recovery source");
+    assert!(source_before.matches_context(&before));
+
+    let mut limits = before.requested_limits;
+    limits.cpu_milli += 100;
+    fixture
+        .supervisor
+        .registry
+        .update_configured_limits(fixture.soul.clone(), limits, before.intent_revision)
+        .await
+        .unwrap();
+
+    let after = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    let source_after = fixture
+        .supervisor
+        .registry
+        .codex_dispatch_recovery_source(fixture.soul.clone())
+        .await
+        .unwrap()
+        .expect("a limits-only intent change must preserve the current Codex writer source");
+    assert!(source_after.matches_context(&after));
+}
+
+#[tokio::test]
 async fn manual_retry_prepares_retained_codex_before_marking_it_live() {
     let fixture = ControlledCodex::new().await;
     let before = fixture
@@ -1893,10 +1989,17 @@ async fn public_compact_rechecks_writer_and_generation_after_held_readiness() {
             tokio::spawn(async move { fixture.compact().await })
         };
         fixture.sending.notified().await;
-        tokio::time::timeout(Duration::from_secs(2), fixture.supervisor.observe_once())
+        let observer = {
+            let fixture = fixture.clone();
+            tokio::spawn(async move { fixture.supervisor.observe_once().await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), fixture.status_observed.notified())
             .await
-            .unwrap()
-            .unwrap();
+            .expect("observer should snapshot host status while Compact owns the lifecycle lock");
+        assert!(
+            !observer.is_finished(),
+            "observer should wait for the lifecycle lock instead of dropping its observation"
+        );
         fixture.assert_retained().await;
         let conn = Connection::open(fixture.supervisor.registry.database_path()).unwrap();
         match case {
@@ -1937,6 +2040,7 @@ async fn public_compact_rechecks_writer_and_generation_after_held_readiness() {
             compact.await.unwrap().is_err(),
             "changed {case} must refuse before strict Compact"
         );
+        observer.await.unwrap().unwrap();
         assert_eq!(fixture.prepares.load(Ordering::SeqCst), 1);
         assert_eq!(fixture.compacts.load(Ordering::SeqCst), 0);
         assert_eq!(fixture.inputs.load(Ordering::SeqCst), 0);

@@ -18,7 +18,7 @@ import { selectPaneOwnerFence } from '@/store/selectors/runtimeOwner'
 import tabsReducer, { closeTab, closePaneWithCleanup } from '@/store/tabsSlice'
 import connectionReducer, { setBootId } from '@/store/connectionSlice'
 import managedRuntimeReducer from '@/store/managedRuntimeSlice'
-import { FreshAgentView, FRESH_AGENT_RESERVE_RETRY_FLOOR_MS, IDLE_INCOMPLETE_MAX_RETRIES, locatorMatchesPane } from '@/components/fresh-agent/FreshAgentView'
+import { FreshAgentView, FRESH_AGENT_CODEX_RECEIPT_RETRY_DELAY_MS, FRESH_AGENT_RESERVE_RETRY_FLOOR_MS, IDLE_INCOMPLETE_MAX_RETRIES, locatorMatchesPane } from '@/components/fresh-agent/FreshAgentView'
 import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSettingsButton'
 import {
   initLayout,
@@ -22187,6 +22187,76 @@ describe('task6 hosted recovery in the mounted view', () => {
 
     expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
     expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(0)
+  })
+
+  it('reconciles an ambiguous Codex send after supervisor restart without a WebSocket reconnect', async () => {
+    const store = createStore()
+    const handlers = new Set<(message: unknown) => void>()
+    wsMock.onMessage.mockImplementation((handler) => { handlers.add(handler); return () => { handlers.delete(handler) } })
+    wsMock.getServerCapabilities.mockReturnValue({ freshAgentSendReconcileV1: true })
+    const locator = { sessionId: 'codex-open-socket-receipt', sessionType: 'freshcodex', provider: 'codex' }
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      ...locator, threadId: locator.sessionId, status: 'idle',
+      capabilities: { send: true, interrupt: true }, turns: [],
+      extensions: { codex: { ownerKind: 'fresh-agent', statusFromLiveState: true } },
+    })
+    store.dispatch(sessionInit(locator))
+    store.dispatch(setSessionStatus({ ...locator, status: 'idle' }))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      kind: 'fresh-agent', ...locator, sessionRef: { provider: 'codex', sessionId: locator.sessionId },
+      createRequestId: 'codex-open-socket-receipt-create', status: 'idle', soulId: 'codex-open-socket-receipt-soul',
+      soulIntentRevision: 1,
+      recoverySummary: { desiredState: 'running', recoveryState: 'live',
+        durabilityState: 'resume_captured', allocationState: 'verified_durable' },
+    } }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+    await waitFor(() => expect(composer).toBeEnabled())
+    fireEvent.change(composer, { target: { value: 'Recover this accepted send' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1))
+    const originalFrame = sentFreshAgentMessages('freshAgent.send')[0]
+
+    vi.useFakeTimers()
+    try {
+      act(() => {
+        for (const handler of [...handlers]) handler({
+          type: 'error', code: 'INTERNAL_ERROR', requestId: originalFrame.requestId,
+          message: 'CODEX_DELIVERY_AMBIGUOUS: native response was lost',
+        })
+      })
+      expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain')
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(FRESH_AGENT_CODEX_RECEIPT_RETRY_DELAY_MS) })
+      expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toEqual([{
+        ...originalFrame,
+        type: 'freshAgent.send.reconcile',
+      }])
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+
+      act(() => {
+        for (const handler of [...handlers]) handler({
+          type: 'error', code: 'INTERNAL_ERROR', requestId: originalFrame.requestId,
+          message: 'CODEX_DELIVERY_AMBIGUOUS: supervisor receipt is still unavailable',
+        })
+      })
+      await act(async () => { await vi.advanceTimersByTimeAsync(FRESH_AGENT_CODEX_RECEIPT_RETRY_DELAY_MS) })
+      expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(2)
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+
+      const accepted = {
+        type: 'freshAgent.send.accepted', ...locator,
+        requestId: originalFrame.requestId,
+      }
+      act(() => {
+        handleFreshAgentMessage(store.dispatch, accepted as never)
+        for (const handler of [...handlers]) handler(accepted)
+      })
+      await act(async () => { await vi.advanceTimersByTimeAsync(FRESH_AGENT_CODEX_RECEIPT_RETRY_DELAY_MS) })
+      expect(sentFreshAgentMessages('freshAgent.send.reconcile')).toHaveLength(2)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it.each(([
