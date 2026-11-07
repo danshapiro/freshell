@@ -1,7 +1,8 @@
 //! How a freshclaude session ends when nobody asked it to (design §5.7 and §11.3
-//! of docs/plans/2026-10-22-freshclaude-core-runtime.md; G02, G23). Every case runs
-//! the REAL claude sidecar over the CLI simulator (RealSidecarSim,
-//! `common::claude_rig`).
+//! of docs/plans/2026-10-22-freshclaude-core-runtime.md; G02, G23). Runtime cases
+//! run the real Claude sidecar over the CLI simulator (RealSidecarSim,
+//! `common::claude_rig`) or the pinned CLI where indicated. A missing canonical
+//! UUID also exercises the server's preflight refusal without a CLI query.
 //!
 //! The sidecar hosts one session, so when that session's SDK stream ends it reports
 //! the end (`sdk.stream.ended`) and exits; the server's end-of-output path then ends
@@ -17,6 +18,10 @@
 //! after the boot, so a boot the CLI refuses is a typed `freshAgent.create.failed`,
 //! never a `freshAgent.created` for a session that is already dead, and a resume's
 //! `created` names the resumed conversation in `sessionRef`.
+//! A missing canonical UUID is refused by shared recovery with the server's
+//! generic CONVERSATION_NOT_FOUND message. An unknown non-UUID resume reaches the
+//! sidecar: the simulator returns CONVERSATION_NOT_FOUND naming the id, while the
+//! pinned CLI rejects the invalid id/title and the sidecar reports BOOT_FAILED.
 //!
 //! Unix only: the tests read the sidecar's pid and signal it (rust-gate runs on Linux).
 #![cfg(unix)]
@@ -408,33 +413,18 @@ async fn a_send_to_a_dead_session_with_a_missing_transcript_gets_lost_and_a_requ
 
 // ── Boot (C10): `created` only after the CLI booted; typed boot failures ──────────
 
-/// The pid of the sidecar process of the `n`th query() the simulator ran in this rig
-/// (1-based; every query() writes a `query` row, booted or not).
-async fn query_pid(rig: &ClaudeRig, n: usize) -> i32 {
-    let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
-    loop {
-        if let Some(row) = rig.ledger_rows("query").get(n - 1) {
-            return row["pid"].as_i64().expect("the query row carries a pid") as i32;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the sidecar never made query() #{n}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
 /// The create frame's field that resumes `durable`, as the client sends it.
 fn resume_fields(durable: &str) -> Value {
     json!({ "sessionRef": { "provider": "claude", "sessionId": durable } })
 }
 
-/// A resume create of a conversation the CLI does not have is refused at create
-/// (T5): one typed `freshAgent.create.failed` with the CLI's own sentence, never a
-/// `freshAgent.created` for a session that is already dead, and no sidecar is left
-/// behind. On both rigs: the simulator, and the pinned CLI itself.
-async fn a_resume_create_of_a_missing_conversation_fails_typed(kind: RigKind) {
-    let rig = ClaudeRig::start(kind).await;
+/// Shared recovery refuses a missing canonical UUID with the server's generic
+/// message. The simulator ledger proves no CLI query occurred; it does not
+/// observe sidecar process creation. The launch-route tests below separately
+/// check the provider's own refusals and simulated-sidecar cleanup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resume_create_of_a_missing_uuid_fails_typed_without_a_cli_query() {
+    let rig = ClaudeRig::start(RigKind::Sim).await;
     let mut conn = rig.connect().await;
     let missing = uuid::Uuid::new_v4().to_string();
 
@@ -444,12 +434,69 @@ async fn a_resume_create_of_a_missing_conversation_fails_typed(kind: RigKind) {
     assert_eq!(answer["type"], "freshAgent.create.failed", "{answer}");
     assert_eq!(answer["code"], "CONVERSATION_NOT_FOUND", "{answer}");
     assert_eq!(
-        answer["message"],
-        format!("No conversation found with session ID: {missing}"),
+        answer["message"], "No conversation found with that session ID.",
         "{answer}"
     );
-    if kind == RigKind::Sim {
-        wait_until_gone(query_pid(&rig, 1).await).await;
+
+    conn.read_for(QUIET).await;
+    assert!(
+        rig.ledger_rows("query").is_empty(),
+        "the missing conversation is refused before any CLI query"
+    );
+    assert!(
+        !conn
+            .frames
+            .iter()
+            .any(|v| v["type"] == "freshAgent.created" || v["type"] == "freshAgent.event"),
+        "nothing of the refused create reaches the client; frames: {:?}",
+        conn.frames
+    );
+    assert!(!rig.fresh_claude.has_live_session(&missing).await);
+}
+
+/// An unknown non-UUID id has no canonical recovery identity, so create launches
+/// the sidecar and lets the provider refuse the resume. The simulator reports
+/// its T5 missing-conversation refusal; the pinned CLI validates ids/titles first
+/// and reports an unclassified boot failure. Both preserve the provider's text.
+async fn a_resume_create_of_an_unknown_non_uuid_fails_typed(kind: RigKind) {
+    let rig = ClaudeRig::start(kind).await;
+    let mut conn = rig.connect().await;
+    let missing = "missing-conversation";
+
+    let answer = conn
+        .request_create("create-missing", resume_fields(missing))
+        .await;
+    assert_eq!(answer["type"], "freshAgent.create.failed", "{answer}");
+    match kind {
+        RigKind::Sim => {
+            assert_eq!(answer["code"], "CONVERSATION_NOT_FOUND", "{answer}");
+            assert_eq!(
+                answer["message"],
+                format!("No conversation found with session ID: {missing}"),
+                "{answer}"
+            );
+            let queries = rig.ledger_rows("query");
+            assert_eq!(queries.len(), 1, "the CLI was queried once: {queries:?}");
+            assert_eq!(queries[0]["options"]["resume"], missing, "{queries:?}");
+            let pid = queries[0]["pid"]
+                .as_i64()
+                .expect("the query row carries the sidecar's pid") as i32;
+            wait_until_gone(pid).await;
+        }
+        RigKind::Cli => {
+            assert_eq!(answer["code"], "BOOT_FAILED", "{answer}");
+            let message = answer["message"].as_str().expect("a boot failure message");
+            assert!(
+                message.contains("--resume requires a valid session ID or session title"),
+                "the CLI explains its resume validation: {answer}"
+            );
+            assert!(
+                message.contains(&format!(
+                    "Provided value \"{missing}\" is not a UUID and does not match any session title."
+                )),
+                "the CLI names the rejected id/title: {answer}"
+            );
+        }
     }
 
     conn.read_for(QUIET).await;
@@ -461,17 +508,17 @@ async fn a_resume_create_of_a_missing_conversation_fails_typed(kind: RigKind) {
         "nothing of the refused boot reaches the client; frames: {:?}",
         conn.frames
     );
-    assert!(!rig.fresh_claude.has_live_session(&missing).await);
+    assert!(!rig.fresh_claude.has_live_session(missing).await);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_resume_create_of_a_missing_conversation_fails_typed_and_leaves_no_sidecar() {
-    a_resume_create_of_a_missing_conversation_fails_typed(RigKind::Sim).await;
+async fn a_resume_create_of_an_unknown_non_uuid_fails_typed_and_reaps_the_sidecar() {
+    a_resume_create_of_an_unknown_non_uuid_fails_typed(RigKind::Sim).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_resume_create_of_a_missing_conversation_fails_typed_on_the_pinned_cli() {
-    a_resume_create_of_a_missing_conversation_fails_typed(RigKind::Cli).await;
+async fn a_resume_create_of_an_unknown_title_fails_typed_on_the_pinned_cli() {
+    a_resume_create_of_an_unknown_non_uuid_fails_typed(RigKind::Cli).await;
 }
 
 /// A CLAUDE_CMD that is not the CLI fails the create (the pinned SDK cannot spawn
