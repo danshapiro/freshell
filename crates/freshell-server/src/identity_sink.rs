@@ -1941,6 +1941,194 @@ mod tests {
             assert_eq!(fixture.registry.observe("codex", NEW), owner);
         }
 
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn staged_replacement_binding_publication_preserves_an_explicitly_closed_source() {
+            use std::time::Duration;
+
+            struct ReleaseParkOnDrop(Arc<AuthoritativeWritePark>);
+            impl Drop for ReleaseParkOnDrop {
+                fn drop(&mut self) {
+                    self.0.release();
+                }
+            }
+
+            let fixture = fixture().await;
+            fixture
+                .sink
+                .stage_replacement_binding(fixture.replacement.clone())
+                .await
+                .unwrap();
+            let target = &fixture.target_claim;
+            assert_eq!(
+                fixture.registry.commit_live(
+                    "codex",
+                    NEW,
+                    &target.operation_id,
+                    target.generation,
+                    OwnerIdentity {
+                        kind: RuntimeOwnerKind::FreshAgent,
+                        terminal_id: None,
+                        live_session_key: Some(NEW.into()),
+                        pid: None,
+                        ownership_id: Some(target.operation_id.clone()),
+                    },
+                ),
+                CommitOutcome::Committed
+            );
+            let live_target = fixture.registry.observe("codex", NEW);
+            let target_row = fixture.ledger.load_binding("codex", NEW).unwrap();
+            let mut publish = fixture.replacement.clone();
+            publish.claim.as_mut().unwrap().kind = BindingClaimKind::LiveFreshAgent;
+            publish.settings = SettingsUpdate::Keep;
+            let park = AuthoritativeWritePark::new();
+            let _release_on_drop = ReleaseParkOnDrop(park.clone());
+            let publisher =
+                LedgerIdentitySink::new(fixture.ledger.clone(), Some(fixture.registry.clone()))
+                    .with_authoritative_park_after_validation(park.clone());
+            let publication = tokio::spawn(publisher.record_binding(publish));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !park.reached() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the final write passes the real target ownership check before close");
+
+            // A no-stamp close may already have observed the source Vacant
+            // before publication acquired its source claim. Its durable close
+            // therefore still needs to win at the ledger mutation boundary.
+            fixture.sink.retire_closed("codex", OLD).await.unwrap();
+            let closed = fixture.ledger.load_binding("codex", OLD).unwrap();
+            assert_eq!(closed.retired_reason, Some(RetiredReason::Closed));
+            assert_eq!(closed.superseded_by, None);
+            park.release();
+            let result = tokio::time::timeout(Duration::from_secs(5), publication)
+                .await
+                .expect("the released final publication settles")
+                .unwrap();
+            assert_eq!(
+                fixture.ledger.load_binding("codex", OLD).unwrap(),
+                closed,
+                "publication must not relabel an explicit close as supersession"
+            );
+            assert_eq!(fixture.sink.chain_terminus("codex", OLD), None);
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("CLOSED_REPLACEMENT_SOURCE"),
+                "the caller must learn that the source was closed"
+            );
+            assert_eq!(fixture.registry.observe("codex", NEW), live_target);
+            assert_eq!(
+                fixture.ledger.load_binding("codex", NEW).unwrap(),
+                target_row
+            );
+            assert!(fixture
+                .ledger
+                .pending_for_terminal("replacement-pending")
+                .is_some());
+            let restarted = PaneLedger::new(Some(fixture.directory.path().to_path_buf()));
+            assert_eq!(restarted.load_binding("codex", OLD).unwrap(), closed);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn staged_replacement_binding_boot_preserves_target_recovery_without_publishing_source(
+        ) {
+            let fixture = fixture().await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while now_ms() <= fixture.source.updated_at {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the replacement has a later durable observation for the real CRID lookup");
+            fixture
+                .sink
+                .stage_replacement_binding(fixture.replacement.clone())
+                .await
+                .unwrap();
+            let staged = fixture.ledger.load_binding("codex", NEW).unwrap();
+            assert_eq!(staged.state, RowState::Bound);
+            assert_source_unpublished(&fixture);
+
+            // The same durable shape can mean a crash after staging OR a
+            // valid Live target whose final publication writes all failed.
+            // Boot must preserve recovery data rather than infer a failed
+            // transition from the absent source link.
+            let restarted = Arc::new(PaneLedger::new(Some(
+                fixture.directory.path().to_path_buf(),
+            )));
+            let boot_time = now_ms();
+            let report = restarted.boot_scan(boot_time, &|_, _| false, None);
+            assert!(report.supersession_repairs.is_empty());
+            assert_eq!(restarted.load_binding("codex", NEW).unwrap(), staged);
+            assert_eq!(
+                restarted.load_binding("codex", OLD).unwrap(),
+                fixture.source
+            );
+            let registry = Arc::new(RuntimeOwnershipRegistry::with_epoch(
+                restarted.reserve_boot_epoch().unwrap().unwrap(),
+            ));
+            assert!(registry.boot_epoch() > fixture.target_claim.epoch);
+            let sink = LedgerIdentitySink::new(restarted.clone(), Some(registry.clone()));
+            assert_eq!(sink.chain_terminus("codex", OLD), None);
+            assert_eq!(
+                sink.lookup_by_create_request_id("codex", "source-create").as_deref(),
+                Some(NEW),
+                "the production recovery lookup can find the newer target by its inherited pane lineage"
+            );
+            let recovery_claim = claim(&registry, NEW);
+            let settings = sink
+                .load_settings_for_recovery_claim(&recovery_claim)
+                .unwrap();
+            assert_eq!(settings.model.as_deref(), Some("native-model"));
+            assert_eq!(settings.cwd.as_deref(), Some("/native-workspace"));
+            assert_eq!(
+                sink.load_provenance("codex", NEW),
+                fixture.sink.load_provenance("codex", OLD)
+            );
+            let mut recovered = fixture.replacement.clone();
+            recovered.supersedes = None;
+            recovered.resolves_pending = None;
+            recovered.observed_epoch = Some(recovery_claim.epoch);
+            recovered.observed_generation = Some(recovery_claim.generation);
+            recovered.claim = Some(recovery_claim.clone());
+            recovered.settings = SettingsUpdate::Keep;
+            sink.record_binding(recovered).await.unwrap();
+            assert_eq!(
+                registry.commit_live(
+                    "codex",
+                    NEW,
+                    &recovery_claim.operation_id,
+                    recovery_claim.generation,
+                    OwnerIdentity {
+                        kind: RuntimeOwnerKind::FreshAgent,
+                        terminal_id: None,
+                        live_session_key: Some(NEW.into()),
+                        pid: None,
+                        ownership_id: Some(recovery_claim.operation_id.clone()),
+                    },
+                ),
+                CommitOutcome::Committed
+            );
+            let target = restarted.load_binding("codex", NEW).unwrap();
+            assert_eq!(target.state, RowState::Bound);
+            assert_eq!(target.owner_epoch, Some(recovery_claim.epoch));
+            assert_eq!(target.model, staged.model);
+            assert_eq!(target.cwd, staged.cwd);
+            assert_eq!(target.create_request_id, staged.create_request_id);
+            assert_eq!(
+                target.origin_create_request_id,
+                staged.origin_create_request_id
+            );
+            assert_eq!(sink.chain_terminus("codex", OLD), None);
+            restarted.boot_scan(boot_time + 1, &|_, _| false, None);
+            let reloaded = PaneLedger::new(Some(fixture.directory.path().to_path_buf()));
+            assert_eq!(reloaded.load_binding("codex", NEW).unwrap(), target);
+            assert_eq!(reloaded.load_binding("codex", OLD).unwrap(), fixture.source);
+        }
+
         // This exercises the real registry and ledger publication boundary.
         // Codex's inline orchestration is private to another crate; its own
         // native-recovery tests must additionally prove it retains these guards.

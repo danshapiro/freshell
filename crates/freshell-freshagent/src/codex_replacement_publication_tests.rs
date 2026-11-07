@@ -183,7 +183,14 @@ async fn superseded_mint_staging_preserves_original_owner_runtime_and_durable_ch
     assert!(!methods.iter().any(|method| method == "thread/resume"));
 }
 
-async fn assert_committed_replacement_survives_publication(cancel: bool) {
+#[derive(Clone, Copy)]
+enum SourcePublicationCase {
+    Cancel,
+    FailureBeforeWrite,
+    FailureAfterApply,
+}
+
+async fn assert_committed_replacement_survives_publication(case: SourcePublicationCase) {
     let _environment = ENV_LOCK.lock().await;
     let (mut state, original, sink) = crashed_publication_fixture().await;
     let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
@@ -212,43 +219,80 @@ async fn assert_committed_replacement_survives_publication(cancel: bool) {
         crate::PaneIdentitySink::chain_terminus(sink.as_ref(), PROVIDER, &original),
         None
     );
-    let publication = sink.arm_binding_stall_result(PROVIDER, target, !cancel);
+    let source_state = sink
+        .states
+        .lock()
+        .unwrap()
+        .get(&(PROVIDER.into(), original.clone()))
+        .copied();
+    let source_retires = sink.retires.lock().unwrap().clone();
+    let staged_generation = registry.observe(PROVIDER, target).generation;
+    let (pid, runtime_id) = {
+        let sessions = state.sessions.lock().await;
+        let target_session = &sessions[target];
+        (
+            target_session.sidecar_pid.unwrap(),
+            target_session.sidecar_ownership_id.clone(),
+        )
+    };
+    assert!(!crate::ownership_lane::partial_pid_confirmed_dead(pid));
+    let publication = match case {
+        SourcePublicationCase::Cancel => Some(sink.arm_binding_stall(PROVIDER, target)),
+        SourcePublicationCase::FailureBeforeWrite => {
+            // Stage has already applied. This makes the final write refuse
+            // before applying any source retirement or old-to-new link.
+            sink.set_fail_writes(true);
+            None
+        }
+        SourcePublicationCase::FailureAfterApply => {
+            Some(sink.arm_binding_stall_result(PROVIDER, target, true))
+        }
+    };
     stage.release.send(()).unwrap();
-    publication
-        .entered
-        .recv_timeout(Duration::from_secs(10))
-        .expect("source link publishes after Live commit");
-    let target_owner = registry.observe(PROVIDER, target);
-    assert!(matches!(
-        target_owner.state,
-        freshell_ownership::OwnershipState::Live { .. }
-    ));
-    assert!(
-        matches!(
-            registry.begin_start(
-                PROVIDER,
-                &original,
-                freshell_ownership::RuntimeOwnerKind::Terminal,
-                "late-source-takeover",
-                None,
-                "test",
-                0
+    let parked_target_owner = publication.as_ref().map(|publication| {
+        publication
+            .entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("source link publishes after Live commit");
+        let target_owner = registry.observe(PROVIDER, target);
+        assert!(matches!(
+            target_owner.state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ));
+        assert!(
+            matches!(
+                registry.begin_start(
+                    PROVIDER,
+                    &original,
+                    freshell_ownership::RuntimeOwnerKind::Terminal,
+                    "late-source-takeover",
+                    None,
+                    "test",
+                    0
+                ),
+                freshell_ownership::BeginOutcome::Blocked { .. }
             ),
-            freshell_ownership::BeginOutcome::Blocked { .. }
-        ),
-        "the source stays owned while its durable replacement link is publishing"
-    );
-    let pid = state.sessions.lock().await[target].sidecar_pid.unwrap();
-    if cancel {
+            "the source stays owned while its durable replacement link is publishing"
+        );
+        target_owner
+    });
+    if matches!(case, SourcePublicationCase::Cancel) {
+        let publication = publication.expect("cancellation parks the final publication");
         task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the canceled requester settles")
+            .unwrap_err()
+            .is_cancelled());
         publication.release.send(()).unwrap();
         publication
             .completed
             .recv_timeout(Duration::from_secs(10))
             .expect("publication outlives its canceled waiter");
     } else {
-        publication.release.send(()).unwrap();
+        if let Some(publication) = publication {
+            publication.release.send(()).unwrap();
+        }
         let outcome = tokio::time::timeout(Duration::from_secs(10), task)
             .await
             .unwrap()
@@ -269,11 +313,57 @@ async fn assert_committed_replacement_survives_publication(cancel: bool) {
     }
     assert!(state.has_live_session(target).await);
     assert!(!crate::ownership_lane::partial_pid_confirmed_dead(pid));
-    assert_eq!(registry.observe(PROVIDER, target), target_owner);
-    assert_eq!(
-        crate::PaneIdentitySink::chain_terminus(sink.as_ref(), PROVIDER, &original).as_deref(),
-        Some(target)
-    );
+    let target_owner = registry.observe(PROVIDER, target);
+    assert_eq!(target_owner.generation, staged_generation);
+    assert!(matches!(&target_owner.state,
+        freshell_ownership::OwnershipState::Live { owner, .. }
+            if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                && owner.live_session_key.as_deref() == Some(target)
+                && owner.pid == Some(pid)));
+    if let Some(parked_owner) = parked_target_owner {
+        assert_eq!(target_owner, parked_owner);
+    }
+    {
+        let sessions = state.sessions.lock().await;
+        assert_eq!(sessions[target].sidecar_pid, Some(pid));
+        assert_eq!(sessions[target].sidecar_ownership_id, runtime_id);
+    }
+    let source_chain = crate::PaneIdentitySink::chain_terminus(sink.as_ref(), PROVIDER, &original);
+    match case {
+        SourcePublicationCase::FailureBeforeWrite => {
+            assert_eq!(
+                source_chain, None,
+                "a failed write cannot publish the source link"
+            );
+            assert_eq!(
+                sink.states
+                    .lock()
+                    .unwrap()
+                    .get(&(PROVIDER.into(), original.clone()))
+                    .copied(),
+                source_state,
+                "the failed write leaves the original row unchanged"
+            );
+            assert_eq!(
+                *sink.retires.lock().unwrap(),
+                source_retires,
+                "the failed write never retires the original"
+            );
+            assert!(!sink
+                .bindings
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|binding| binding.supersedes.as_deref() == Some(original.as_str())));
+        }
+        SourcePublicationCase::Cancel | SourcePublicationCase::FailureAfterApply => {
+            assert_eq!(
+                source_chain.as_deref(),
+                Some(target),
+                "a successfully applied source link survives cancellation or its later error"
+            );
+        }
+    }
     assert!(
         matches!(state.leases.claim(PROVIDER, &original, "competitor", crate::session_lease::now_epoch_ms()),
         crate::session_lease::FreshSessionClaim::BoundLive { live_session_key } if live_session_key == target)
@@ -284,15 +374,25 @@ async fn assert_committed_replacement_survives_publication(cancel: bool) {
         .unwrap()
         .iter()
         .any(|repair| repair.1 == target));
-    state.shutdown().await;
+    sink.set_fail_writes(false);
+    tokio::time::timeout(Duration::from_secs(15), state.shutdown())
+        .await
+        .expect("the committed replacement is cleaned up after publication observations");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn canceled_source_publication_retains_the_committed_replacement_writer() {
-    assert_committed_replacement_survives_publication(true).await;
+    assert_committed_replacement_survives_publication(SourcePublicationCase::Cancel).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_source_publication_retains_the_committed_replacement_writer_and_reports_io() {
-    assert_committed_replacement_survives_publication(false).await;
+    assert_committed_replacement_survives_publication(SourcePublicationCase::FailureBeforeWrite)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_source_publication_after_apply_retains_committed_writer_and_persisted_link() {
+    assert_committed_replacement_survives_publication(SourcePublicationCase::FailureAfterApply)
+        .await;
 }

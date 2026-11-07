@@ -7182,6 +7182,49 @@ fn a_close_is_one_record_and_a_failed_row_projection_is_dominance_covered_hygien
     std::fs::remove_dir_all(&root).ok();
 }
 
+#[test]
+fn replacement_publication_respects_a_source_close_when_its_row_projection_failed() {
+    let root = temp_root("replacement-source-close-projection");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_fresh_agent_binding(&fa_write("codex", "source", 1_000))
+        .unwrap();
+    ledger
+        .record_fresh_agent_binding(&fa_write("codex", "target", 1_100))
+        .unwrap();
+    let source = ledger.load_binding("codex", "source").unwrap();
+    let target = ledger.load_binding("codex", "target").unwrap();
+    ledger.fail_next_binding_writes(1);
+    ledger.retire_closed("codex", "source", 2_000).unwrap();
+    assert_eq!(ledger.load_binding("codex", "source").unwrap(), source);
+    assert_eq!(ledger.kill_tombstone_at("codex", "source"), Some(2_000));
+
+    let error = ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            supersedes: Some("source"),
+            // Dominance still wins long after the close-fence TTL: the Bound
+            // remnant is explicit close evidence that never converged.
+            ..fa_write("codex", "target", 2_001 + KILL_TOMBSTONE_TTL_MS)
+        })
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("CLOSED_REPLACEMENT_SOURCE"),
+        "{error}"
+    );
+    assert_eq!(ledger.load_binding("codex", "source").unwrap(), source);
+    assert_eq!(ledger.load_binding("codex", "target").unwrap(), target);
+    assert!(
+        !ledger
+            .lookup_by_session("codex", "source")
+            .unwrap()
+            .corrected
+    );
+    let restarted = PaneLedger::new(Some(root.clone()));
+    assert_eq!(restarted.load_binding("codex", "target").unwrap(), target);
+    assert_eq!(restarted.kill_tombstone_at("codex", "source"), Some(2_000));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// A close whose RECORD write fails reports a clean failure — nothing
 /// durable (row Bound, no fence, nothing on disk) and a retried close
 /// succeeds idempotently. (The pre-journal model needed compensation to
