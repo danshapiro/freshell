@@ -367,3 +367,57 @@ Expected: every configured phase, cloud local companion and local Electron lane 
 Stage 2 decision evidence stays in the external run reports: load-bearing-finder.md, load-bearing-strategist.md and load-bearing-validator-{env-cgroup,cid,override,budget-clippy}.md under /home/dan/code/freshell/.worktrees/.the-usual-logs/mdmw-sandbox-budget/reports/. Static proof selected the architecture; the execution checkpoint above records the subsequent actual guest, observer/defaults and cold outcomes without treating that earlier static proof as empirical evidence.
 
 Self-review: the canonical User Request remains unchanged exactly once; every obligation maps above. Removed invalid env-default implementation drafts and VM-before-finite-fake-test dependency; retained intended behavior and exact interfaces rather than substituting new unexecuted product snippets. The user-approved follow-up targets only required sandbox review findings and the Codex blockers; no stub-as-acceptance, permanent host-monitoring framework or blanket failure exemption is introduced.
+
+## Follow-up: report observed Cargo jobs
+
+Kata criterion 2 requires logging the effective job and memory limits. The
+existing receipt records own-cgroup controls and the pre-caller exported
+`CARGO_BUILD_JOBS` input, but it does not observe what Cargo selected; project,
+inline, CLI and inherited-jobserver settings can differ. Keep those existing
+fields accurately labeled and add a narrowly scoped, secret-safe product
+observation rather than inferring jobs from the CPU quota or parsing the
+caller command or Cargo configuration.
+
+Use a fixed-purpose, unprivileged observer within the sandbox's existing
+process/cgroup boundary. It may emit only positively witnessed, validated
+Cargo build-script `NUM_JOBS` values, associated with the existing phase,
+container identity and command digest. Emit an explicit unknown baseline;
+never claim all invocations were observed, a value for a missed or cached
+script, actual simultaneous processes, or the capacity of a shared jobserver.
+Multiple observations may differ. Do not emit command lines, paths, raw
+environment, raw errors or unrelated process data. Bound scan rate, retained
+data and output, and document that missed, inaccessible and short-lived
+scripts remain unknown.
+
+The observer must not become a child of the caller, read caller stdin, own or
+wait for the caller, or alter its command, environment, own stdout/stderr
+bytes, status, signals, Docker `--rm` lifecycle, guard or exact cleanup. A
+short joined launcher that lets the existing container init adopt the observer
+is a candidate; establish the actual process relationship and preserve failure
+semantics instead of relying on `setsid` or backgrounding alone. Qualify
+positive script identification using real supported Cargo ancestry and its
+build-script executable convention; reject ambiguous/raced identities and
+never promote unrelated `NUM_JOBS` values. Observer startup, read or output
+failures leave the workload status intact and evidence unknown. Its CPU,
+memory and PID use counts within the unchanged sandbox limits.
+
+Before implementation, write a causal behavioral RED through the actual
+launcher in the existing strict disposable sandbox: a tiny offline real Cargo
+fixture independently records its own `NUM_JOBS`, remains alive long enough
+to observe, and exits successfully with the real memory receipt present; the
+missing observed-jobs event must be the failure. Then implement, GREEN and
+refactor. Cover real default and project/environment/inline/CLI settings,
+competing values, distinct invocations, inherited jobserver or explicit
+unknown, absent/missed scripts, secret canaries and bounded output. Verify
+caller child/wait behavior, observer failure, signals, nonzero exit and exact
+cleanup without weakening existing tests. Qualify the actual init/namespace
+and `/proc` behavior in a harmless real isolated container; fake process
+trees alone do not suffice.
+
+Obtain a fresh independent requirements and quality review of the committed
+repair, including the two open design findings. The final supported-toolchain
+cold Clippy must observe a real build-script jobs value in that exact workload
+and bind it to actual container/source/limit evidence; a separate smoke or an
+unknown does not suffice. Rebuild/retest changed final-source artifacts and
+run the complete configured final suite and independent full-delta review as
+already required. No PR or deployment is authorized by this task.
