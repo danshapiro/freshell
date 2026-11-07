@@ -21,10 +21,18 @@ TEST_ID="${SCRATCH_ROOT##*/}"
 chmod 0755 "${SCRATCH_ROOT}"
 FIRST_ROOT="${SCRATCH_ROOT}/first"
 SECOND_ROOT="${SCRATCH_ROOT}/second"
-mkdir -p "${FIRST_ROOT}/scripts" "${SECOND_ROOT}/scripts"
+mkdir -p "${FIRST_ROOT}/scripts/testing" "${SECOND_ROOT}/scripts/testing"
 chmod 0755 "${FIRST_ROOT}" "${SECOND_ROOT}"
+# Strict preparation re-enters with --workspace-root, which requires a Git
+# root trusted by its copied wrapper. These are disposable fixture repositories.
+git -C "${FIRST_ROOT}" init --quiet
+git -C "${SECOND_ROOT}" init --quiet
 cp "${REPO_ROOT}/scripts/sandbox-test.sh" "${FIRST_ROOT}/scripts/sandbox-test.sh"
 cp "${REPO_ROOT}/scripts/sandbox-test.sh" "${SECOND_ROOT}/scripts/sandbox-test.sh"
+cp "${REPO_ROOT}/scripts/testing/sandbox-diagnostics.mjs" "${FIRST_ROOT}/scripts/testing/"
+cp "${REPO_ROOT}/scripts/testing/sandbox-diagnostics.mjs" "${SECOND_ROOT}/scripts/testing/"
+chmod 0755 "${FIRST_ROOT}/scripts" "${FIRST_ROOT}/scripts/testing" "${SECOND_ROOT}/scripts" "${SECOND_ROOT}/scripts/testing"
+chmod 0644 "${FIRST_ROOT}/scripts/testing/sandbox-diagnostics.mjs" "${SECOND_ROOT}/scripts/testing/sandbox-diagnostics.mjs"
 chmod 0755 "${FIRST_ROOT}/scripts/sandbox-test.sh" "${SECOND_ROOT}/scripts/sandbox-test.sh"
 
 hash_path() {

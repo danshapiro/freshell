@@ -16,11 +16,19 @@ if (process.env.FRESHELL_SANDBOX_MODE !== 'runtime-suite') {
 function fixture(mode: string) {
   const root = mkdtempSync(path.join(process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR ?? os.tmpdir(), 'sandbox-wrapper-'))
   for (const subdir of ['scripts', 'bin', 'control']) mkdirSync(path.join(root, subdir))
+  // Runtime preparation re-enters the trusted wrapper with --workspace-root.
+  // Give the copied wrapper a real Git root so that trust validation runs.
+  const gitInit = spawnSync('git', ['init', '-q', root], { encoding: 'utf8', timeout: 10_000 })
+  if (gitInit.status !== 0) throw new Error(`fixture Git setup failed: ${gitInit.stderr}`)
   copyFileSync(path.resolve('scripts/sandbox-test.sh'), path.join(root, 'scripts/sandbox-test.sh'))
   const guardSource = process.env.FIXTURE_GUARD_SOURCE ?? 'scripts/testing/sandbox-owner-guard.py'
+  mkdirSync(path.join(root, 'scripts/testing'))
   if (existsSync(guardSource)) {
-    mkdirSync(path.join(root, 'scripts/testing'))
     copyFileSync(guardSource, path.join(root, 'scripts/testing/sandbox-owner-guard.py'))
+  }
+  const diagnosticSource = process.env.FIXTURE_DIAGNOSTIC_SOURCE ?? path.resolve('scripts/testing/sandbox-diagnostics.mjs')
+  if (existsSync(diagnosticSource)) {
+    copyFileSync(diagnosticSource, path.join(root, 'scripts/testing/sandbox-diagnostics.mjs'))
   }
   const receipt = path.join(root, 'receipt.jsonl')
   const state = path.join(root, 'owned-object.json')
@@ -126,6 +134,39 @@ with (root / 'receipt.jsonl').open('a') as log:
       saveVolumes(storedVolumes);
       const name = args[args.indexOf('--name')+1], cidfile = args[args.indexOf('--cidfile')+1];
       record({kind:'run', name, cidfile});
+      if (mode === 'budget-launch-failure') process.exit(125);
+      if (mode.startsWith('budget-')) {
+        fs.writeFileSync(state, JSON.stringify({cid, name}));
+        fs.writeFileSync(cidfile, cid);
+        let status = mode === 'budget-success' ? 0 : mode === 'budget-137' ? 137 : 37;
+        if (process.env.FIXTURE_EXECUTE_PRELUDE === '1') {
+          const tail = args.slice(args.lastIndexOf('bash') + 1);
+          // Model the wrapper's actual bind mounts when executing its prelude.
+          // A helper under /workspace belongs to the selected target, which can
+          // be a different linked worktree from the trusted wrapper.
+          const mapped = [...tail];
+          const helper = mapped[3];
+          for (let i = 0; i < args.length; i++) {
+            if (args[i] !== '--mount') continue;
+            const fields = args[i + 1].split(',');
+            if (!fields.includes('type=bind') || !fields.includes('dst=' + helper)) continue;
+            mapped[3] = fields.find(field => field.startsWith('src='))?.slice(4) ?? helper;
+          }
+          if (mapped[3] === helper && helper.startsWith('/workspace/')) {
+            const workspace = args.find((arg, i) => i > 0 && args[i - 1] === '-v' && arg.endsWith(':/workspace'));
+            mapped[3] = path.join(workspace.slice(0, -':/workspace'.length), helper.slice('/workspace/'.length));
+          } else if (mapped[3] === helper && helper.startsWith('/run/')) {
+            // Do not accidentally inherit the outer sandbox's own mount.
+            mapped[3] = path.join(path.dirname(state), 'unmounted', path.basename(helper));
+          }
+          const child = spawnSync('bash', mapped, {encoding:'utf8', timeout:5000});
+          process.stdout.write(child.stdout ?? '');
+          process.stderr.write(child.stderr ?? '');
+          status = child.status ?? 124;
+        }
+        if (args.includes('--rm')) fs.unlinkSync(state);
+        process.exit(status);
+      }
       if (mode === 'watchdog-pending-creation') {
         const root = path.dirname(state);
         const starter = spawnSync('python3', [root+'/pending-creator.py', root, name], {stdio:'ignore', timeout:5000});
@@ -192,14 +233,22 @@ with (root / 'receipt.jsonl').open('a') as log:
       if (!run) throw new Error(`Fixture never launched its owned workload: ${JSON.stringify(events)}`)
       return { status, events, watchdogEvents, control: path.dirname(run.cidfile), name: run.name }
     },
-    run(guard = false, runtimeSuite = true, twoPhase = false) {
-      const wrapperArgs = runtimeSuite ? ['--runtime-suite', 'true'] : ['true']
+    run(guard = false, runtimeSuite = true, twoPhase = false, options: { command?: string; cargoJobs?: string; executePrelude?: boolean; prepareOnly?: boolean; workspaceRoot?: string } = {}) {
+      const command = options.command ?? 'true'
+      const wrapperArgs = [
+        ...(options.workspaceRoot ? ['--workspace-root', options.workspaceRoot] : []),
+        ...(runtimeSuite ? ['--runtime-suite', command] : [command]),
+      ]
+      const callerEnv = { ...process.env }
+      delete callerEnv.CARGO_BUILD_JOBS
+      if (options.cargoJobs !== undefined) callerEnv.CARGO_BUILD_JOBS = options.cargoJobs
       const result = spawnSync('bash', [path.join(root, 'scripts/sandbox-test.sh'), ...wrapperArgs], {
-        env: { ...process.env, PATH: `${root}/bin:${process.env.PATH}`, TMPDIR: path.join(root, 'control'),
+        env: { ...callerEnv, PATH: `${root}/bin:${process.env.PATH}`, TMPDIR: path.join(root, 'control'),
           FIXTURE_MODE: mode, FIXTURE_STATE: state, FIXTURE_RECEIPT: receipt,
           FIXTURE_VOLUME_STATE: volumeState,
+          FIXTURE_EXECUTE_PRELUDE: options.executePrelude ? '1' : '0',
           FRESHELL_SANDBOX_OWNER_GUARD: guard ? '1' : '0',
-          FRESHELL_SANDBOX_DEPENDENCIES_READY: twoPhase ? '' : '1', FRESHELL_SANDBOX_PREPARE_ONLY: '' },
+          FRESHELL_SANDBOX_DEPENDENCIES_READY: twoPhase ? '' : '1', FRESHELL_SANDBOX_PREPARE_ONLY: options.prepareOnly ? '1' : '' },
         encoding: 'utf8', timeout: 40_000,
       })
       const events = readFileSync(receipt, 'utf8').trim().split('\n').map(line => JSON.parse(line))
@@ -240,6 +289,246 @@ with (root / 'receipt.jsonl').open('a') as log:
     },
   }
 }
+
+function metadata(stderr: string) {
+  return stderr.split('\n').flatMap(line => {
+    try { return [JSON.parse(line)] } catch { return [] }
+  })
+}
+
+describe('sandbox build budget and compact failure receipts', () => {
+  const cid = 'a'.repeat(64)
+  const launches = (events: Array<{ kind: string; args?: string[] }>) => events
+    .filter(event => event.kind === 'docker' && event.args?.[0] === 'run').map(event => event.args!)
+  const budget = (args: string[]) => {
+    expect(args).toContain('--rm')
+    expect(args).toContain('--init')
+    for (const [flag, value] of [['--cpus', '2'], ['--memory', '8g'], ['--memory-swap', '16g'], ['--pids-limit', '512']]) {
+      expect(args[args.indexOf(flag) + 1], flag).toBe(value)
+    }
+  }
+
+  it.each([false, true])('applies one budget without a jobs fallback, runtime=%s', runtime => {
+    const f = fixture('budget-success')
+    try {
+      const result = f.run(true, runtime, runtime)
+      expect(result.status, result.stderr).toBe(0)
+      const runs = launches(result.events)
+      expect(runs).toHaveLength(runtime ? 2 : 1)
+      for (const args of runs) {
+        budget(args)
+        expect(args.some(argument => argument.startsWith('CARGO_BUILD_JOBS='))).toBe(false)
+      }
+      const rows = metadata(result.stderr)
+      const phases = runtime ? ['dependency-preparation', 'runtime-suite'] : ['ordinary']
+      expect(rows.filter(row => row.event === 'sandbox_resources_requested').map(row => row.phase)).toEqual(phases)
+      for (const phase of phases) {
+        expect(rows).toContainEqual(expect.objectContaining({ severity: 'info', event: 'sandbox_resources_requested', phase,
+          cpus: 2, memory_bytes: 8589934592, memory_swap_bytes: 17179869184, pids_limit: 512, cargo_build_jobs_env: null }))
+        expect(rows).toContainEqual(expect.objectContaining({ event: 'sandbox_result', phase, docker_status: 0, final_status: 0, settled: true }))
+      }
+      expect(readdirSync(path.join(f.root, 'control'))).toEqual([])
+    } finally { f.cleanup() }
+  })
+
+  it.each([
+    ['ordinary', false, false],
+    ['dependency-preparation', true, true],
+    ['runtime-suite', true, false],
+  ] as const)('executes the real effective-limits helper in the %s prelude', (phase, runtime, prepareOnly) => {
+    const f = fixture('budget-success')
+    const command = "printf 'prelude-caller-ok'"
+    try {
+      const result = f.run(false, runtime, false, { command, cargoJobs: '3', executePrelude: true, prepareOnly })
+      expect(result.status, result.stderr).toBe(0)
+      expect(result.stdout).toBe('prelude-caller-ok')
+      const limits = Object.fromEntries([
+        ['cpu_max', 'cpu.max'], ['memory_max', 'memory.max'],
+        ['memory_swap_max', 'memory.swap.max'], ['pids_max', 'pids.max'],
+      ].map(([field, file]) => [field, readFileSync(`/sys/fs/cgroup/${file}`, 'utf8').trim()]))
+      const [quota, period] = limits.cpu_max.split(' ').map(Number)
+      expect(quota / period).toBe(2)
+      expect(limits.memory_max).toBe('8589934592')
+      expect(limits.memory_swap_max).toBe('8589934592')
+      expect(limits.pids_max).toBe('512')
+      const receipts = metadata(result.stderr).filter(row => row.event === 'sandbox_effective_limits')
+      expect(receipts).toHaveLength(1)
+      expect(receipts[0]).toEqual(expect.objectContaining({
+        severity: 'info', phase, container: result.name,
+        command_sha256: createHash('sha256').update(command).digest('hex'),
+        cargo_build_jobs_env: '3', availability: 'complete', ...limits,
+      }))
+      expect(metadata(result.stderr).some(row => row.event === 'sandbox_diagnostics_unavailable')).toBe(false)
+    } finally { f.cleanup() }
+  })
+
+  it.each(['missing', 'different'] as const)(
+    'uses the trusted helper for a strict linked worktree with a %s target helper', targetHelper => {
+      const f = fixture('budget-success')
+      const git = (...args: string[]) => {
+        const result = spawnSync('git', args, { cwd: f.root, encoding: 'utf8', timeout: 10_000 })
+        expect(result.status, result.stderr).toBe(0)
+      }
+      try {
+        git('init', '-q')
+        git('-c', 'user.name=Sandbox Test', '-c', 'user.email=sandbox@example.invalid',
+          'commit', '--allow-empty', '-qm', 'fixture')
+        const target = path.join(f.root, 'linked target')
+        git('worktree', 'add', '--detach', '-q', target, 'HEAD')
+        if (targetHelper === 'different') {
+          const helper = path.join(target, 'scripts/testing/sandbox-diagnostics.mjs')
+          mkdirSync(path.dirname(helper), { recursive: true })
+          writeFileSync(helper, "console.error('WRONG_TARGET_HELPER'); process.exit(79)\n")
+        }
+        const command = 'id -u'
+        const result = f.run(false, true, false, { command, executePrelude: true, workspaceRoot: target })
+        expect(result.status, result.stderr).toBe(0)
+        expect(Number(result.stdout.trim())).toBeGreaterThan(0)
+        const args = launches(result.events)[0]
+        expect(args).toContain('--read-only')
+        expect(args[args.indexOf('--network') + 1]).toBe('none')
+        expect(args).toContain(`${target}:/workspace`)
+        const rows = metadata(result.stderr)
+        expect(rows).toContainEqual(expect.objectContaining({ event: 'sandbox_effective_limits',
+          phase: 'runtime-suite', command_sha256: createHash('sha256').update(command).digest('hex'),
+          availability: 'complete' }))
+        expect(rows.some(row => row.event === 'sandbox_diagnostics_unavailable')).toBe(false)
+        expect(result.stderr).not.toContain('WRONG_TARGET_HELPER')
+        const trustedHelper = path.join(f.root, 'scripts/testing/sandbox-diagnostics.mjs')
+        const helperMount = args.find(argument => argument.includes(`src=${trustedHelper},`))
+        expect(helperMount).toContain('type=bind,')
+        expect(helperMount).toContain(',readonly')
+      } finally { f.cleanup() }
+    },
+  )
+
+  it.each(['1', '3', '-1', 'invalid\nBUDGET_SECRET_SENTINEL'])('forwards deliberate jobs string %# without changing the quota', cargoJobs => {
+    const f = fixture('budget-success')
+    try {
+      const result = f.run(false, false, false, { cargoJobs })
+      expect(result.status, result.stderr).toBe(0)
+      const args = launches(result.events)[0]
+      budget(args)
+      expect(args).toContain(`CARGO_BUILD_JOBS=${cargoJobs}`)
+      const row = metadata(result.stderr).find(row => row.event === 'sandbox_resources_requested')
+      expect(row?.cargo_build_jobs_env).toBe(/^-?\d+$/.test(cargoJobs) ? cargoJobs : 'non-numeric')
+      expect(result.stderr).not.toContain('BUDGET_SECRET_SENTINEL')
+      expect(result.stderr).not.toContain('invalid')
+    } finally { f.cleanup() }
+  })
+
+  it('leaves an explicitly empty jobs input absent for Cargo', () => {
+    const f = fixture('budget-success')
+    try {
+      const result = f.run(false, false, false, { cargoJobs: '' })
+      expect(result.status, result.stderr).toBe(0)
+      expect(launches(result.events)[0].some(argument => argument.startsWith('CARGO_BUILD_JOBS='))).toBe(false)
+      expect(metadata(result.stderr)).toContainEqual(expect.objectContaining({ event: 'sandbox_resources_requested', cargo_build_jobs_env: null }))
+    } finally { f.cleanup() }
+  })
+
+  it('preserves the exact final caller argument and records only its digest', () => {
+    const f = fixture('budget-success')
+    const command = 'printf \'BUDGET_SECRET_SENTINEL "quoted" $dollar ; & | *\'\nprintf "second line\\n"'
+    try {
+      const result = f.run(false, false, false, { command })
+      expect(result.status, result.stderr).toBe(0)
+      expect(launches(result.events)[0].at(-1)).toBe(command)
+      const rows = metadata(result.stderr).filter(row => ['sandbox_resources_requested', 'sandbox_workload_exit', 'sandbox_result'].includes(row.event))
+      expect(rows).toHaveLength(3)
+      for (const row of rows) expect(row.command_sha256).toBe(createHash('sha256').update(command).digest('hex'))
+      for (const fragment of ['BUDGET_SECRET_SENTINEL', 'quoted', '$dollar', 'second line']) expect(result.stderr).not.toContain(fragment)
+    } finally { f.cleanup() }
+  })
+
+  it.each([['budget-success', 0], ['budget-failure', 37], ['budget-137', 137], ['budget-launch-failure', 125]] as const)(
+    'retains true attached status and published identity after auto-removal: %s', (mode, status) => {
+      const f = fixture(mode)
+      try {
+        const result = f.run()
+        expect(result.status, result.stderr).toBe(status)
+        const rows = metadata(result.stderr)
+        expect(rows).toContainEqual(expect.objectContaining({ severity: status === 0 ? 'info' : 'error', event: 'sandbox_workload_exit',
+          cid: mode === 'budget-launch-failure' ? null : cid, docker_status: status, state: 'not_retained', oom_killed: null }))
+        expect(rows).toContainEqual(expect.objectContaining({ event: 'sandbox_result', docker_status: status, final_status: status, settled: true }))
+        expect(existsSync(f.state)).toBe(false)
+        expect(existsSync(result.control)).toBe(false)
+      } finally { f.cleanup() }
+    },
+  )
+
+  it('separates attached failure from cleanup failure and retains the owned evidence', () => {
+    const f = fixture('remove-failed')
+    try {
+      const result = f.run()
+      expect(result.status, result.stderr).toBe(1)
+      expect(metadata(result.stderr)).toContainEqual(expect.objectContaining({ event: 'sandbox_workload_exit', cid, docker_status: 42 }))
+      expect(metadata(result.stderr)).toContainEqual(expect.objectContaining({ event: 'sandbox_result', docker_status: 42, final_status: 1, settled: false }))
+      expect(existsSync(result.control)).toBe(true)
+    } finally { f.cleanup() }
+  })
+
+  it('does not report an interrupted attached wait as a successful workload', () => {
+    const f = fixture('late-creation')
+    try {
+      const result = f.run()
+      expect(result.status, result.stderr).toBe(143)
+      const row = metadata(result.stderr).find(row => row.event === 'sandbox_workload_exit')
+      expect(row).toBeDefined()
+      expect(row.docker_status).toBeNull()
+    } finally { f.cleanup() }
+  })
+
+  for (const failure of ['missing', 'digest', 'configured', 'workload', 'final']) {
+    it.each([['budget-success', 0, 0], ['budget-failure', 37, 37], ['remove-failed', 42, 1]] as const)(
+      `preserves caller and settlement when diagnostics ${failure} fails: %s`, (mode, attached, status) => {
+        const f = fixture(mode)
+        try {
+          const helper = path.join(f.root, 'scripts/testing/sandbox-diagnostics.mjs')
+          if (failure === 'missing') rmSync(helper, { force: true })
+          else if (existsSync(helper)) {
+            const original = path.join(f.root, 'scripts/testing/original-diagnostics.mjs')
+            copyFileSync(helper, original)
+            writeFileSync(helper, `if (process.argv[2] === ${JSON.stringify(failure)}) { console.error('BUDGET_SECRET_SENTINEL'); process.exit(79) }\nawait import('./original-diagnostics.mjs')\n`)
+          }
+          const result = f.run(false, false)
+          expect(result.status, result.stderr).toBe(status)
+          expect(result.events.filter(event => event.kind === 'run')).toHaveLength(1)
+          expect(existsSync(result.control)).toBe(mode === 'remove-failed')
+          const rows = metadata(result.stderr)
+          expect(rows).toContainEqual(expect.objectContaining({ severity: 'warn', event: 'sandbox_diagnostics_unavailable', mode: failure === 'missing' ? 'digest' : failure }))
+          if (!['missing', 'workload'].includes(failure)) expect(rows).toContainEqual(expect.objectContaining({ event: 'sandbox_workload_exit', docker_status: attached,
+            command_sha256: failure === 'digest' ? null : createHash('sha256').update('true').digest('hex') }))
+          if (!['missing', 'final'].includes(failure)) expect(rows).toContainEqual(expect.objectContaining({ event: 'sandbox_result', docker_status: attached, final_status: status,
+            settled: mode !== 'remove-failed' }))
+          expect(result.stderr).not.toContain('BUDGET_SECRET_SENTINEL')
+        } finally { f.cleanup() }
+      },
+    )
+  }
+
+  it.each(['missing', 'failing'])('executes the real prelude and unchanged caller when effective diagnostics is %s', failure => {
+    const f = fixture('budget-failure')
+    try {
+      const helper = path.join(f.root, 'scripts/testing/sandbox-diagnostics.mjs')
+      if (failure === 'missing') rmSync(helper, { force: true })
+      else {
+        mkdirSync(path.dirname(helper), { recursive: true })
+        writeFileSync(helper, "console.error('BUDGET_SECRET_SENTINEL'); process.exit(79)\n")
+      }
+      const marker = path.join(f.root, 'caller-ran')
+      const command = `printf 'exact caller output\\n'; printf marker > '${marker}'; exit 37`
+      const result = f.run(false, false, false, { command, executePrelude: true })
+      expect(result.status, result.stderr).toBe(37)
+      expect(launches(result.events)[0].at(-1)).toBe(command)
+      expect(readFileSync(marker, 'utf8')).toBe('marker')
+      expect(result.stdout).toBe('exact caller output\n')
+      expect(metadata(result.stderr)).toContainEqual(expect.objectContaining({ severity: 'warn', event: 'sandbox_diagnostics_unavailable', mode: 'effective' }))
+      expect(metadata(result.stderr).some(row => row.event === 'sandbox_effective_limits')).toBe(false)
+      expect(result.stderr).not.toContain('BUDGET_SECRET_SENTINEL')
+    } finally { f.cleanup() }
+  })
+})
 
 describe('sandbox wrapper owned launch settlement', () => {
   it('joins a completed guard when procfs reports ESRCH during its exit', () => {

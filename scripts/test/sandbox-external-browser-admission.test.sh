@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
-TEST_TMP="$(mktemp -d "${REPO_ROOT}/.test-tmp/sandbox-external-browser.XXXXXXXX")"
+REPO_ROOT="${FRESHELL_SANDBOX_ADMISSION_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)}"
+TEST_TMP="$(mktemp -d "${FRESHELL_SANDBOX_TEST_TMP_DIR:-${REPO_ROOT}/.test-tmp}/sandbox-external-browser.XXXXXXXX")"
 FAKE_BIN="${TEST_TMP}/bin"
 DOCKER_CALLS="${TEST_TMP}/docker-calls.jsonl"
 DESCRIPTOR_DIR="$(mktemp -d "${TMPDIR:-/tmp}/freshell-sandbox-external-handoff.XXXXXXXX")"
@@ -287,6 +287,11 @@ assert f"{sys.argv[3]}:/home/sandbox/.local/share/pnpm/store" in prepared
 assert f"{sys.argv[3]}:/home/sandbox/.local/share/pnpm/store" in executed
 events = [json.loads(line) for line in open(sys.argv[4], encoding="utf-8")
           if line.strip().startswith("{")]
+resources = [row for row in events if row.get("event") == "sandbox_resources_requested"]
+assert [row.get("phase") for row in resources] == ["dependency-preparation", "external-browser"], resources
+assert all(row.get("cpus") == 2 and row.get("memory_bytes") == 8589934592
+           and row.get("memory_swap_bytes") == 17179869184 and row.get("pids_limit") == 512
+           for row in resources), resources
 finished = [row for row in events if row.get("event") == "sandbox_workload_finished"]
 assert [row.get("phase") for row in finished] == ["preparation", "execution"], finished
 assert all(row.get("code") == 0 for row in finished)

@@ -36,6 +36,23 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 WORKSPACE_ROOT="${REPO_ROOT}"
 IMAGE_TAG="freshell-sandbox:latest"
 CACHE_PREFIX="${FRESHELL_SANDBOX_CACHE_PREFIX:-freshell-sandbox}"
+DIAGNOSTIC_HELPER="${REPO_ROOT}/scripts/testing/sandbox-diagnostics.mjs"
+DIAGNOSTIC_PHASE="ordinary"
+COMMAND_SHA256=""
+DOCKER_STATUS=""
+
+sandbox_diagnostics_unavailable() {
+  printf '{"severity":"warn","event":"sandbox_diagnostics_unavailable","mode":"%s"}\n' "$1" >&2 || true
+}
+
+sandbox_receipt() {
+  local output
+  if output="$(node "${DIAGNOSTIC_HELPER}" "$@" 2>&1)"; then
+    printf '%s\n' "${output}" >&2 || true
+  else
+    sandbox_diagnostics_unavailable "$1"
+  fi
+}
 PNPM_STORE_VOLUME="${CACHE_PREFIX}-pnpm-store"
 P2_G01_RUN_ID="${FRESHELL_SANDBOX_P2_G01_RUN_ID:-}"
 P2_G01_PNPM_STORE_VOLUME="${FRESHELL_SANDBOX_P2_G01_PNPM_STORE_VOLUME:-}"
@@ -587,6 +604,18 @@ PY
   OWNED_CONTROL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/freshell-sandbox-XXXXXXXX")"
   OWNED_CONTAINER_NAME="$(basename "${OWNED_CONTROL_DIR}")"
   printf '%s\n' "${OWNED_CONTAINER_NAME}" > "${OWNED_CONTROL_DIR}/container.name"
+  if [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" = 1 ]; then
+    DIAGNOSTIC_PHASE="dependency-preparation"
+  elif [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
+    DIAGNOSTIC_PHASE="external-browser"
+  elif [ "${RUNTIME_SUITE}" -eq 1 ]; then
+    DIAGNOSTIC_PHASE="runtime-suite"
+  fi
+  if ! COMMAND_SHA256="$(printf '%s' "${CMD}" | node "${DIAGNOSTIC_HELPER}" digest 2>/dev/null)" \
+    || ! [[ "${COMMAND_SHA256}" =~ ^[a-f0-9]{64}$ ]]; then
+    COMMAND_SHA256=""
+    sandbox_diagnostics_unavailable digest
+  fi
 fi
 OWNED_CID_FILE="${OWNED_CONTROL_DIR}/container.id"
 OWNER_GUARD_PID=""
@@ -623,14 +652,22 @@ owned_docker_client_running() {
 cleanup_owned_container() {
   local cleanup_status=0
   local owned_cid=""
+  local identity_status=0
   if [ -s "${OWNED_CID_FILE}" ]; then
     owned_cid="$(cat "${OWNED_CID_FILE}")"
   else
     # Creation may reach the daemon before the attached client publishes its
     # CID. The preallocated exact name is still ours; missing publication is
     # unknown state, not evidence that no container was created.
-    owned_cid="$(docker ps -aq --no-trunc --filter "name=^/${OWNED_CONTAINER_NAME}$")" || return 1
+    if ! owned_cid="$(docker ps -aq --no-trunc --filter "name=^/${OWNED_CONTAINER_NAME}$")"; then
+      owned_cid=""
+      identity_status=1
+    fi
   fi
+  if [ "${SETTLE_ONLY}" -eq 0 ]; then
+    sandbox_receipt workload "${OWNED_CONTAINER_NAME}" "${DIAGNOSTIC_PHASE}" "${COMMAND_SHA256}" "${owned_cid}" "${DOCKER_STATUS}"
+  fi
+  [ "${identity_status}" -eq 0 ] || return 1
   if [ -n "${owned_cid}" ]; then
     if ! [[ "${owned_cid}" =~ ^[a-f0-9]{64}$ ]]; then
       sandbox_log error sandbox_invalid_owned_identity 1
@@ -752,6 +789,7 @@ finish_owned_sandbox() {
   else
     sandbox_completion_log error sandbox_workload_failed "${result}"
   fi
+  sandbox_receipt final "${OWNED_CONTAINER_NAME}" "${DIAGNOSTIC_PHASE}" "${COMMAND_SHA256}" "${DOCKER_STATUS}" "${result}" "${container_settled}"
   exit "${result}"
 }
 
@@ -797,7 +835,9 @@ DOCKER_ARGS=(
   --name "${OWNED_CONTAINER_NAME}" --cidfile "${OWNED_CID_FILE}"
   "${NETWORK_ARGS[@]}"
   --pids-limit 512
+  --cpus 2
   --memory 8g
+  --memory-swap 16g
   -e GIT_OPTIONAL_LOCKS=0
   -v "${WORKSPACE_ROOT}:/workspace"
   -v "${CACHE_PREFIX}-cargo-registry:/usr/local/cargo/registry"
@@ -813,6 +853,20 @@ DOCKER_ARGS=(
   -v "${CACHE_PREFIX}-mcp-node-modules:/workspace/packages/freshell-mcp-runtime/node_modules"
   -v "${CACHE_PREFIX}-playwright-cache:/home/sandbox/.cache/ms-playwright"
 )
+
+# Preserve Cargo's quota-derived default and any project-level build.jobs.
+# Only deliberate, nonempty exported values are passed through unchanged.
+if [ -n "${CARGO_BUILD_JOBS:-}" ]; then
+  DOCKER_ARGS+=(-e "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}")
+fi
+
+# The mounted workspace may be another linked worktree. Observe with the
+# helper belonging to this trusted wrapper, even when that workspace has a
+# missing or different version. An absent helper must not block the caller.
+DIAGNOSTIC_CONTAINER_HELPER="/run/freshell-sandbox-diagnostics.mjs"
+if [ -f "${DIAGNOSTIC_HELPER}" ]; then
+  DOCKER_ARGS+=(--mount "type=bind,src=${DIAGNOSTIC_HELPER},dst=${DIAGNOSTIC_CONTAINER_HELPER},readonly")
+fi
 
 if [ -n "${LINKED_WORKTREE_GIT_COMMON_DIR}" ]; then
   DOCKER_ARGS+=(
@@ -900,11 +954,19 @@ done
 # Plain (non-login) shell: a login shell (-l) would source /etc/profile,
 # which on Debian unconditionally overwrites PATH and would clobber the
 # cargo/rustup PATH entry set via the image's Dockerfile ENV.
-DOCKER_STATUS=0
+sandbox_receipt configured "${OWNED_CONTAINER_NAME}" "${DIAGNOSTIC_PHASE}" "${COMMAND_SHA256}" "${CARGO_BUILD_JOBS:-}"
 sandbox_log info sandbox_workload_started 0
-docker "${DOCKER_ARGS[@]}" "${IMAGE_TAG}" bash -c "${CMD}" &
+docker "${DOCKER_ARGS[@]}" "${IMAGE_TAG}" bash -c '
+  if observation="$(node "$1" effective "$2" "$3" "$4" "$5" 2>&1)"; then
+    printf "%s\n" "$observation" >&2 || true
+  else
+    printf '\''{"severity":"warn","event":"sandbox_diagnostics_unavailable","mode":"effective"}\n'\'' >&2 || true
+  fi
+  exec bash -c "$6"
+' sandbox-observe "${DIAGNOSTIC_CONTAINER_HELPER}" \
+  "${OWNED_CONTAINER_NAME}" "${DIAGNOSTIC_PHASE}" "${COMMAND_SHA256}" "${CARGO_BUILD_JOBS:-}" "${CMD}" &
 DOCKER_CLIENT_PID=$!
-wait "${DOCKER_CLIENT_PID}" || DOCKER_STATUS=$?
+if wait "${DOCKER_CLIENT_PID}"; then DOCKER_STATUS=0; else DOCKER_STATUS=$?; fi
 DOCKER_CLIENT_PID=""
 
 # Guard-rail: verify the pre-create step above actually did its job, rather

@@ -7,7 +7,14 @@ export default defineConfig({
   ...baseConfig,
   test: {
     ...baseConfig.test,
-    include: ['test/unit/tooling/sandbox-test.sandbox.ts', 'test/unit/tooling/run-rust-tests.test.ts', 'test/unit/tooling/rust-launcher-resources.sandbox.ts'],
+    include: [
+      'test/unit/tooling/sandbox-test.sandbox.ts',
+      'test/unit/tooling/sandbox-budget-smoke.test.ts',
+      'test/unit/tooling/sandbox-selftests.sandbox.ts',
+      'test/unit/tooling/run-rust-tests.test.ts',
+      'test/unit/tooling/rust-launcher-resources.sandbox.ts',
+      'test/unit/tooling/sandbox-selftest-sentinel.sandbox.ts',
+    ],
     // Process-budget probes must not compete with other files for the same
     // container's PID allowance. Preserve concurrency inside each probe.
     fileParallelism: false,

@@ -16,6 +16,42 @@ pnpm run test:sandbox "cargo test -p freshell-ws"
 The image builds automatically on first use (`scripts/sandbox-build.sh` runs it directly if you
 need to force a rebuild after changing `docker/sandbox/Dockerfile`).
 
+## Build budget and diagnostics
+
+Every ordinary workload, runtime dependency preparation, and runtime workload
+has a fixed aggregate CPU quota of 2, 8 GiB of RAM, 16 GiB of total RAM plus
+swap (up to 8 GiB of swap), and 512 processes. Cargo's native cgroup-aware
+default selects the build concurrency; the wrapper leaves `CARGO_BUILD_JOBS`
+absent unless the caller exports a nonempty value. Project `build.jobs`,
+exported values, inline assignments, and Cargo's `--jobs` retain their normal
+precedence. Higher job counts still share the same two-CPU quota, which can
+reduce throughput for highly parallel workloads. The wrapper adds no CPU
+quota override.
+
+JSONL receipts on stderr distinguish requested policy from the workload's
+observed own-cgroup `cpu.max`, `memory.max`, `memory.swap.max`, and `pids.max`.
+The observation runs as the sandbox user immediately before the caller;
+unavailable controls stay null and these paths do not describe invisible
+ancestor limits. The observer comes from the trusted wrapper and is mounted
+read-only, including when the wrapper targets another linked worktree.
+Receipts identify the phase, exact command SHA256, published
+full container ID when available, attached Docker status, final status, and
+cleanup outcome. They omit command text and arbitrary environment values.
+Jobs inputs appear as numeric strings, null, or a fixed non-numeric marker.
+Workload stdout and stderr keep their original contents.
+
+Containers retain `--rm`, so their post-exit state is reported as
+`not_retained`. Unavailable OOM state remains null; this launcher never
+classifies exit 137 as OOM. Diagnostic helper failures emit a fixed unavailable
+event and preserve execution and cleanup statuses. Such a run lacks required
+diagnostic evidence even if its workload succeeds.
+
+The self-test includes six-member offline Cargo smokes for the native default,
+project, exported, inline, and CLI job settings. Each checks actual build-script
+`NUM_JOBS`, overlapping work, kernel limits, and low memory pressure in a fresh
+container after a separate dependency warmup. This small smoke does not replace
+the isolated cold-build acceptance for substantial compiler workloads.
+
 ## The `--corpus` flag
 
 For realistic-data perf tests, mount real session corpora **read-only**:

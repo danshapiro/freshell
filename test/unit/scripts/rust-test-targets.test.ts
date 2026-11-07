@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import {
   computeRustTestPlan,
   graphFromCargoMetadata,
@@ -496,6 +497,12 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
       path.resolve(import.meta.dirname, '../../../scripts/sandbox-test.sh'),
       path.join(sharedScriptsDir, 'sandbox-test.sh'),
     )
+    const sharedTestingDir = path.join(sharedScriptsDir, 'testing')
+    fs.mkdirSync(sharedTestingDir, { recursive: true })
+    fs.copyFileSync(
+      path.resolve(import.meta.dirname, '../../../scripts/testing/sandbox-diagnostics.mjs'),
+      path.join(sharedTestingDir, 'sandbox-diagnostics.mjs'),
+    )
     writeFixture(path.join(sharedBinDir, 'tsx'), `#!/bin/sh\nexec "${realTsx}" "$@"\n`)
     fs.chmodSync(path.join(sharedBinDir, 'tsx'), 0o755)
     const dockerBinDir = path.join(fixtureRoot, 'fake-docker-bin')
@@ -506,11 +513,26 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
       [
         '#!/usr/bin/env node',
         'import fs from "node:fs"',
+        'import path from "node:path"',
+        'import { spawnSync } from "node:child_process"',
         'const args = process.argv.slice(2)',
         'fs.appendFileSync(process.env.DOCKER_ARGS_FILE, JSON.stringify(args) + "\\n")',
         'if (["volume", "image", "network", "ps"].includes(args[0])) process.exit(0)',
         'if (args[0] === "container") process.exit(1)',
-        'if (args[0] === "run") { const cidIndex = args.indexOf("--cidfile"); if (cidIndex >= 0) fs.writeFileSync(args[cidIndex + 1], "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n"); process.exit(Number(process.env.DOCKER_RUN_STATUS ?? 0)) }',
+        'if (args[0] === "run") {',
+        '  const cidIndex = args.indexOf("--cidfile"); if (cidIndex >= 0) fs.writeFileSync(args[cidIndex + 1], "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n")',
+        '  if (process.env.DOCKER_EXECUTE_PRELUDE === "1") {',
+        '    const tail = args.slice(args.lastIndexOf("bash") + 1), helper = tail[3]',
+        '    const binds = args.flatMap((arg, i) => i > 0 && args[i - 1] === "--mount" ? [arg.split(",")] : [])',
+        '    const bind = binds.find(fields => fields.includes("type=bind") && fields.includes("dst=" + helper))',
+        '    const workspace = args.find((arg, i) => i > 0 && args[i - 1] === "-v" && arg.endsWith(":/workspace"))',
+        '    tail[3] = bind?.find(field => field.startsWith("src="))?.slice(4) ?? (helper.startsWith("/workspace/") ? path.join(workspace.slice(0, -":/workspace".length), helper.slice("/workspace/".length)) : path.join(process.env.TMPDIR, "unmounted-helper"))',
+        '    const result = spawnSync("bash", tail, {cwd:process.cwd(), env:process.env, encoding:"utf8", timeout:10000})',
+        '    process.stdout.write(result.stdout ?? ""); process.stderr.write(result.stderr ?? "")',
+        '    process.exit(result.status ?? 124)',
+        '  }',
+        '  process.exit(Number(process.env.DOCKER_RUN_STATUS ?? 0))',
+        '}',
         'process.exit(0)',
         '',
       ].join('\n'),
@@ -521,10 +543,18 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
 
   afterAll(() => {
     if (pushedWorktreeRoot && fs.existsSync(pushedWorktreeRoot)) {
-      git(['worktree', 'remove', '--force', pushedWorktreeRoot], { cwd: fixtureRoot })
+      for (const generated of ['target', 'node_modules', 'crates/freshell-claude-sidecar', 'packages/freshell-mcp-runtime', 'scripts']) {
+        const entry = path.join(pushedWorktreeRoot, generated)
+        if (fs.existsSync(entry)) fs.rmSync(entry, { recursive: true })
+      }
+      git(['worktree', 'remove', pushedWorktreeRoot], { cwd: fixtureRoot })
     }
     if (sharedOwnerRoot && fs.existsSync(sharedOwnerRoot)) {
-      git(['worktree', 'remove', '--force', sharedOwnerRoot], { cwd: fixtureRoot })
+      for (const generated of ['package.json', 'node_modules', 'scripts']) {
+        const entry = path.join(sharedOwnerRoot, generated)
+        if (fs.existsSync(entry)) fs.rmSync(entry, { recursive: true })
+      }
+      git(['worktree', 'remove', sharedOwnerRoot], { cwd: fixtureRoot })
     }
     if (pushedWorktreeParent) fs.rmSync(pushedWorktreeParent, { recursive: true, force: true })
     fs.rmSync(fixtureRoot, { recursive: true, force: true })
@@ -638,6 +668,7 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
 
   function runHookThroughSharedSandbox(
     dockerRunStatus = 0,
+    executePrelude = false,
   ): { status: number; stderr: string; dockerCalls: string[][] } {
     fs.rmSync(sandboxDockerArgsPath, { force: true })
     fs.writeFileSync(fakeCargoLog, '')
@@ -652,6 +683,7 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
         CARGO_METADATA_FILE: cargoMetadataPath,
         DOCKER_ARGS_FILE: sandboxDockerArgsPath,
         DOCKER_RUN_STATUS: String(dockerRunStatus),
+        DOCKER_EXECUTE_PRELUDE: executePrelude ? '1' : '0',
         TMPDIR: fixtureRoot,
         FRESHELL_PREPUSH_DEBUG: '0',
       },
@@ -736,6 +768,35 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
       'CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=4 TOKIO_WORKER_THREADS=2 cargo test --locked -p freshell-freshagent -p freshell-server -p freshell-ws',
     )
   })
+
+  it.each(['missing', 'different'] as const)(
+    'runs the shared pre-push wrapper helper when the pushed worktree helper is %s', targetHelper => {
+      const targetScripts = path.join(pushedWorktreeRoot, 'scripts')
+      try {
+        if (targetHelper === 'different') {
+          writeFixture(path.join(targetScripts, 'testing/sandbox-diagnostics.mjs'),
+            "console.error('WRONG_TARGET_HELPER'); process.exit(79)\n")
+        }
+        const out = runHookThroughSharedSandbox(0, true)
+        expect(out.status, out.stderr).toBe(0)
+        const command = 'CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=4 TOKIO_WORKER_THREADS=2 cargo test --locked -p freshell-freshagent -p freshell-server -p freshell-ws'
+        const rows = out.stderr.split('\n').flatMap(line => {
+          try { return [JSON.parse(line)] } catch { return [] }
+        })
+        expect(rows).toContainEqual(expect.objectContaining({
+          event: 'sandbox_effective_limits', phase: 'ordinary',
+          command_sha256: createHash('sha256').update(command).digest('hex'),
+        }))
+        expect(rows.some(row => row.event === 'sandbox_diagnostics_unavailable')).toBe(false)
+        expect(out.stderr).not.toContain('WRONG_TARGET_HELPER')
+        const cargo = fs.readFileSync(fakeCargoLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+        expect(cargo).toContainEqual(expect.objectContaining({ args: ['test', '--locked', '-p',
+          'freshell-freshagent', '-p', 'freshell-server', '-p', 'freshell-ws'], buildJobs: '3' }))
+      } finally {
+        if (fs.existsSync(targetScripts)) fs.rmSync(targetScripts, { recursive: true })
+      }
+    },
+  )
 
   it('fails the hook when the shared sandbox command fails', () => {
     const out = runHookThroughSharedSandbox(23)

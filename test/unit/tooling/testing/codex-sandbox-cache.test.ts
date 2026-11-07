@@ -11,7 +11,7 @@ function fixture(mode: 'available' | 'missing' | 'foreign' | 'stale-policy') {
   const gitInit = spawnSync('git', ['init', '--quiet'], { cwd: root, encoding: 'utf8', timeout: 10_000 })
   expect(gitInit.status, gitInit.stderr).toBe(0)
   for (const file of [
-    'scripts/sandbox-test.sh', 'scripts/testing/prepare-codex-contract.mjs',
+    'scripts/sandbox-test.sh', 'scripts/testing/prepare-codex-contract.mjs', 'scripts/testing/sandbox-diagnostics.mjs',
     'test/integration/providers/codex-local-provider.mjs',
     'test/fixtures/coding-cli/codex-native-artifact.json', 'docker/runtime/codex-native-sandbox.json',
   ]) {
