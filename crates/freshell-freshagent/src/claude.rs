@@ -319,6 +319,19 @@ fn claude_session_ref(session_id: &str) -> freshell_protocol::SessionLocator {
     }
 }
 
+fn settings_from_create(msg: &FreshAgentCreate) -> crate::identity_sink::FreshAgentSettings {
+    crate::identity_sink::FreshAgentSettings {
+        collaboration_mode: None,
+        model: msg.model.clone(),
+        sandbox: None,
+        permission_mode: msg.permission_mode.clone(),
+        effort: msg.effort.clone().flatten(),
+        cwd: msg.cwd.clone(),
+        plugins: None,
+    }
+    .with_plugins(msg.plugins.clone())
+}
+
 /// The per-session pending approval/question set folded from the sidecar's stdout
 /// stream (Task 2). Feeds the respond handlers' membership check and the Task 3
 /// snapshot overlay. Lives behind a shared handle (the `identity` precedent): the
@@ -1557,6 +1570,7 @@ impl FreshClaudeState {
                 &mut own_ticket,
                 Some(generation),
                 Some(handoff_claim),
+                None,
             )
             .await;
         if let Some(mut g) = lease_guard.take() {
@@ -2362,16 +2376,7 @@ impl FreshClaudeState {
         // P1.13: the FULL settings snapshot the session records at
         // `sdk.session.init` (claude has no sandbox concept: always `None`), and
         // the launch is built from the same values (G15: the plugins too).
-        let settings = crate::identity_sink::FreshAgentSettings {
-            collaboration_mode: None,
-            model: msg.model.clone(),
-            sandbox: None,
-            permission_mode: msg.permission_mode.clone(),
-            effort: msg.effort.clone().flatten(),
-            cwd: msg.cwd.clone(),
-            plugins: None,
-        }
-        .with_plugins(msg.plugins.clone());
+        let settings = settings_from_create(&msg);
         let spec = ClaudeLaunchSpec::new(
             request_id.clone(),
             session_type,
@@ -2511,12 +2516,16 @@ impl FreshClaudeState {
             pane_id: msg.pane_id.clone(),
         };
         let recovery = self
-            .resume_shared(
+            .resume_shared_with_settings(
                 attach,
                 durable.to_string(),
                 fence,
                 true,
                 "freshclaude/create-resume",
+                Some(crate::claude::recovery::CreateResumeSettings {
+                    settings: settings_from_create(msg),
+                    model_selection: serde_json::to_value(&msg.model_selection).ok(),
+                }),
             )
             .await;
         let is_owner_refusal = matches!(
@@ -5632,6 +5641,7 @@ impl FreshClaudeState {
         // generation before the runner commits the replacement runtime.
         handoff_generation: Option<u64>,
         handoff_claim: Option<crate::identity_sink::BindingClaim>,
+        create_settings: Option<recovery::CreateResumeSettings>,
     ) -> Result<(), ResumeClaudeError> {
         let durable = claim.durable.as_str();
         let claim_dead_state = claim.dead_state;
@@ -5679,7 +5689,7 @@ impl FreshClaudeState {
                 )
             })
             .or_else(|| handoff_claim.clone());
-        let recovered = sink
+        let stored_settings = sink
             .as_ref()
             .and_then(|s| s.load_settings("claude", durable))
             .or_else(|| {
@@ -5690,6 +5700,12 @@ impl FreshClaudeState {
                 })
             })
             .or_else(|| dead.as_ref().map(|dead| dead.settings.clone()));
+        let create_settings = create_settings.filter(|_| stored_settings.is_none());
+        let recovered = stored_settings.or_else(|| {
+            create_settings
+                .as_ref()
+                .map(|requested| requested.settings.clone())
+        });
         if recovered.is_none()
             && sink
                 .as_ref()
@@ -5731,6 +5747,7 @@ impl FreshClaudeState {
             self.hosted_mcp,
         )
         .with_session_id(minted_id)
+        .with_model_selection(create_settings.and_then(|requested| requested.model_selection))
         .with_freshell_context(
             crate::claude_freshell_mcp::ClaudeFreshellContext::from_ids(
                 msg.tab_id.as_deref(),

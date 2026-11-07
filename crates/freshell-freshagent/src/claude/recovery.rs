@@ -2,6 +2,15 @@
 
 use super::*;
 
+/// Settings supplied by a cold create-with-resume request. Persisted settings
+/// remain authoritative when available; this snapshot supplies the initial
+/// hosted launch when the caller has no identity ledger to restore from.
+#[derive(Clone)]
+pub(super) struct CreateResumeSettings {
+    pub(super) settings: crate::identity_sink::FreshAgentSettings,
+    pub(super) model_selection: Option<serde_json::Value>,
+}
+
 impl FreshClaudeState {
     pub(super) fn try_resume_flight(&self, durable: &str) -> Option<ResumingFlagGuard> {
         let mut active = self.resuming.lock().expect("resuming lock");
@@ -130,6 +139,19 @@ impl FreshClaudeState {
         reopen_closed: bool,
         initiator: &'static str,
     ) -> crate::session_recovery::RecoveryAnswer<(), RuntimeResumeError> {
+        self.resume_shared_with_settings(msg, durable, fence, reopen_closed, initiator, None)
+            .await
+    }
+
+    pub(super) async fn resume_shared_with_settings(
+        &self,
+        msg: FreshAgentAttach,
+        durable: String,
+        fence: Option<freshell_ownership::ObservedFence>,
+        reopen_closed: bool,
+        initiator: &'static str,
+        create_settings: Option<CreateResumeSettings>,
+    ) -> crate::session_recovery::RecoveryAnswer<(), RuntimeResumeError> {
         let state = self.clone();
         let operation_durable = durable.clone();
         let preflight_durable = durable.clone();
@@ -146,7 +168,14 @@ impl FreshClaudeState {
                         return Ok(());
                     }
                     state
-                        .resume_untracked(&msg, &operation_durable, fence, reopen_closed, initiator)
+                        .resume_untracked(
+                            &msg,
+                            &operation_durable,
+                            fence,
+                            reopen_closed,
+                            initiator,
+                            create_settings,
+                        )
                         .await
                         .map_err(|error| {
                             if matches!(error, RuntimeResumeError::Superseded { .. }) {
@@ -184,6 +213,7 @@ impl FreshClaudeState {
         fence: Option<freshell_ownership::ObservedFence>,
         reopen_closed: bool,
         initiator: &str,
+        create_settings: Option<CreateResumeSettings>,
     ) -> Result<(), RuntimeResumeError> {
         let claim_dead_state = self.claim_dead_state_snapshot(durable);
         if !reopen_closed && claim_dead_state.is_some() {
@@ -247,6 +277,7 @@ impl FreshClaudeState {
                 &mut ticket,
                 None,
                 None,
+                create_settings,
             )
             .await;
         if let Some(mut remaining) = lease.take() {
@@ -488,8 +519,15 @@ impl FreshClaudeState {
                 tab_id: None,
                 pane_id: None,
             };
-            self.resume_untracked(&attach, &durable, None, false, "freshclaude/configure")
-                .await?;
+            self.resume_untracked(
+                &attach,
+                &durable,
+                None,
+                false,
+                "freshclaude/configure",
+                None,
+            )
+            .await?;
             return self
                 .resolve_session_key(&durable)
                 .await
