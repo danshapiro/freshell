@@ -387,6 +387,35 @@ fn hidden_flavor_for_cli(mode: &str) -> Option<&'static str> {
 
 pub type FlavorWriter = Arc<dyn FlavorWrite>;
 
+/// A target-start refusal keeps the owner observed by its provider through
+/// handoff cleanup and the requester reply. Unknown owners stay absent.
+#[derive(Debug)]
+pub(crate) struct HandoffStartFailure {
+    pub(crate) code: String,
+    pub(crate) detail: String,
+    pub(crate) owner: Option<crate::ownership_lane::TerminalOwnerFields>,
+}
+
+impl From<(String, String)> for HandoffStartFailure {
+    fn from((code, detail): (String, String)) -> Self {
+        Self {
+            code,
+            detail,
+            owner: None,
+        }
+    }
+}
+
+impl HandoffStartFailure {
+    pub(crate) fn with_owner(
+        mut self,
+        owner: Option<crate::ownership_lane::TerminalOwnerFields>,
+    ) -> Self {
+        self.owner = owner;
+        self
+    }
+}
+
 pub struct SessionHandoffRunner {
     auth_token: Arc<String>,
     broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
@@ -1259,8 +1288,7 @@ impl SessionHandoffRunner {
                     &req,
                     owner,
                     &initiator,
-                    &operation_id,
-                    generation,
+                    (&operation_id, generation),
                     false,
                     &admission_permit,
                 )
@@ -1913,7 +1941,11 @@ impl SessionHandoffRunner {
                     }
                 }
             }
-            Err((code, detail)) => {
+            Err(HandoffStartFailure {
+                code,
+                detail,
+                owner,
+            }) => {
                 // 7. Typed recoverable state — the prior was reaped, so the
                 // key ends Vacant (never restore a dead runtime as Live).
                 let _ = guard.disarm_and_fail();
@@ -1946,7 +1978,13 @@ impl SessionHandoffRunner {
                     "ownership.handoff.done",
                     TransitionLevel::Warn,
                 );
-                typed_failure("TARGET_SPAWN_FAILED", &detail, true, generation)
+                let mut failure = typed_failure("TARGET_SPAWN_FAILED", &detail, true, generation);
+                if let Some(owner) = owner {
+                    failure["error"]["ownerKind"] = json!(owner.owner_kind);
+                    failure["error"]["ownerEpoch"] = json!(owner.owner_epoch);
+                    failure["error"]["ownerGeneration"] = json!(owner.owner_generation);
+                }
+                failure
             }
         }
     }
@@ -2384,8 +2422,7 @@ impl SessionHandoffRunner {
                         req,
                         owner,
                         "handoff-runner-stale-commit",
-                        operation_id,
-                        generation,
+                        (operation_id, generation),
                         true,
                         admission_permit,
                     )
@@ -3440,8 +3477,7 @@ impl SessionHandoffRunner {
         req: &HandoffRequest,
         owner: &OwnerIdentity,
         initiator: &str,
-        operation_id: &str,
-        generation: u64,
+        (operation_id, generation): (&str, u64),
         repair_failed_target: bool,
         admission_permit: &Arc<HostAgentAdmissionPermit>,
     ) -> StopOutcomePriv {
@@ -4193,7 +4229,7 @@ impl SessionHandoffRunner {
             OwnerIdentity,
             Option<crate::opencode_ws::OpencodeSessionHandle>,
         ),
-        (String, String),
+        HandoffStartFailure,
     > {
         // b8ke ext r23 F2: the attempt marker — start_target was ENTERED
         // (the spawn/resume is being attempted on this call). The
@@ -4221,7 +4257,8 @@ impl SessionHandoffRunner {
                     "the target spawn was attempted and failed (the fixture's \
                      deterministic failure)"
                         .to_string(),
-                ));
+                )
+                    .into());
             }
         }
         match req.target_kind {
@@ -4278,7 +4315,7 @@ impl SessionHandoffRunner {
                             .and_then(Value::as_str)
                             .map(str::to_string)
                             .unwrap_or_else(|| format!("terminal spawn failed (status {status})"));
-                        return Err((code, message));
+                        return Err((code, message).into());
                     }
                 };
                 // Session-ID preservation: the spawned pane must carry the
@@ -4300,7 +4337,8 @@ impl SessionHandoffRunner {
                     return Err((
                         "terminal spawn did not preserve the session id".to_string(),
                         format!("expected sessionRef {}, got {:?}", req.session_id, echoed),
-                    ));
+                    )
+                        .into());
                 }
                 let owner = spawned.owner_identity.unwrap_or_else(|| OwnerIdentity {
                     kind: RuntimeOwnerKind::Terminal,
@@ -4365,7 +4403,9 @@ impl SessionHandoffRunner {
                     )
                     .await
                     .map(|owner| (owner, None)),
-                Some(other) => Err(("unsupported sessionType".to_string(), other.to_string())),
+                Some(other) => {
+                    Err(("unsupported sessionType".to_string(), other.to_string()).into())
+                }
             },
         }
     }

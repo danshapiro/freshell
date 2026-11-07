@@ -619,6 +619,72 @@ fn handoff_req_fresh(provider: &str, sid: &str, session_type: &str) -> HandoffRe
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn target_resume_refusal_preserves_observed_owner_in_handoff_reply() {
+    let mut rig = build_rig(None);
+    let ownership = rig.ownership.clone();
+    Arc::get_mut(&mut rig.runner)
+        .unwrap()
+        .fresh_opencode
+        .set_terminal_liveness(Arc::new(move |provider, sid| {
+            let OwnershipState::Handoff {
+                operation_id,
+                generation,
+                ..
+            } = ownership.observe(provider, sid).state
+            else {
+                panic!("the target checks liveness inside the original handoff");
+            };
+            ownership.fail(provider, sid, &operation_id, generation, false);
+            let BeginOutcome::Granted { generation } = ownership.begin_start(
+                provider,
+                sid,
+                RuntimeOwnerKind::Terminal,
+                "new-terminal-owner",
+                None,
+                "test",
+                1,
+            ) else {
+                panic!("replacement terminal obtains ownership");
+            };
+            assert_eq!(
+                ownership.commit_live(
+                    provider,
+                    sid,
+                    "new-terminal-owner",
+                    generation,
+                    freshell_ownership::OwnerIdentity {
+                        kind: RuntimeOwnerKind::Terminal,
+                        terminal_id: Some("replacement-terminal".into()),
+                        live_session_key: None,
+                        pid: None,
+                        ownership_id: None
+                    }
+                ),
+                freshell_ownership::CommitOutcome::Committed
+            );
+            true
+        }));
+    let sid = "ses_handoff_owner_refusal";
+    let reply = tokio::time::timeout(
+        Duration::from_secs(10),
+        rig.runner
+            .spawn_handoff(handoff_req_fresh("opencode", sid, "freshopencode"))
+            .completion,
+    )
+    .await
+    .expect("the handoff refusal settles")
+    .unwrap();
+    let owner = rig.ownership.observe("opencode", sid);
+    assert!(matches!(owner.state, OwnershipState::Live { ref owner, .. }
+        if owner.terminal_id.as_deref() == Some("replacement-terminal")));
+    assert_eq!(reply["error"]["code"], "TARGET_SPAWN_FAILED");
+    assert_eq!(reply["error"]["ownerKind"], "terminal");
+    assert_eq!(reply["error"]["ownerEpoch"], owner.epoch);
+    assert_eq!(reply["error"]["ownerGeneration"], owner.generation);
+    assert!(!rig.fresh_opencode.has_live_session(sid).await);
+}
+
 #[test]
 fn handoff_action_contract_defaults_legacy_ack_only_to_clear() {
     assert_eq!(
@@ -6413,9 +6479,21 @@ async fn handoff_abort_during_fresh_target_resume_reaps_the_registered_session_a
     std::env::set_var("CLAUDE_CONFIG_DIR", &store_dir);
 
     let resume_pause = Arc::new(tokio::sync::Notify::new());
-    let mut rig = build_rig_with_claude_pauses(None, None, Some(Arc::clone(&resume_pause)));
-    establish_fresh_claude_owner(&mut rig, &sid).await;
+    let mut rig = build_rig(None);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        establish_fresh_claude_owner(&mut rig, &sid),
+    )
+    .await
+    .expect("initial owner setup must complete before the handoff pause is armed");
     let prior_pid = env.sidecar_pid_for(&sid).expect("the prior sidecar's pid");
+    // Initial public create also uses attach-resume for this saved session.
+    // Arm only the runner's target pause after setup has completed, so setup
+    // cannot consume the abort window that this test needs to exercise.
+    Arc::get_mut(&mut rig.runner)
+        .expect("setup does not retain the handoff runner")
+        .fresh_claude
+        .set_handoff_test_pauses(None, Some(Arc::clone(&resume_pause)));
 
     let handle = rig
         .runner
@@ -6434,7 +6512,11 @@ async fn handoff_abort_during_fresh_target_resume_reaps_the_registered_session_a
 
     // ABORT inside the fresh-target resume await.
     handle.abort();
-    let _ = handle.task.await;
+    let canceled = tokio::time::timeout(Duration::from_secs(10), handle.task)
+        .await
+        .expect("the parked handoff operation must join after cancellation")
+        .expect_err("the parked handoff operation must be canceled");
+    assert!(canceled.is_cancelled());
 
     // The registered-but-uncommitted target session was reaped by the
     // cleanup's lane sweep — no live unowned writer.
@@ -6476,7 +6558,14 @@ async fn handoff_abort_during_fresh_target_resume_reaps_the_registered_session_a
     )
     .await;
     resume_pause.notify_one();
-    let result = retry.completion.await.expect("retry completed");
+    let result = tokio::time::timeout(Duration::from_secs(10), retry.completion)
+        .await
+        .expect("the released handoff retry must settle")
+        .expect("retry completed");
+    tokio::time::timeout(Duration::from_secs(10), retry.task)
+        .await
+        .expect("the completed handoff task must join")
+        .expect("the retry task must succeed");
     assert_eq!(
         result["ok"],
         json!(true),
@@ -6485,10 +6574,12 @@ async fn handoff_abort_during_fresh_target_resume_reaps_the_registered_session_a
     assert_eq!(result["owner"]["sessionId"], json!(sid));
 
     // Cleanup: the runner retained the stamp — the lane kill works.
-    let _ = rig
-        .fresh_claude
-        .kill_for_handoff(&sid, "test-cleanup")
-        .await;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        rig.fresh_claude.kill_for_handoff(&sid, "test-cleanup"),
+    )
+    .await
+    .expect("the resumed test session must finish cleanup");
     std::env::remove_var("CLAUDE_CONFIG_DIR");
     let _ = std::fs::remove_dir_all(&store_dir);
 }
@@ -6770,9 +6861,20 @@ async fn handoff_abort_holds_the_fence_until_the_uncommitted_target_continuation
     // The one-round confirmation window: the cleanup's lane kill cannot
     // confirm the target tree while a TERM-immune tagged descendant lives
     // — the NotConfirmed continuation shape.
-    let mut rig = build_rig_full(None, None, Some(Arc::clone(&resume_pause)), 8_000, Some(1));
-    establish_fresh_claude_owner(&mut rig, &sid).await;
+    let mut rig = build_rig_full(None, None, None, 8_000, Some(1));
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        establish_fresh_claude_owner(&mut rig, &sid),
+    )
+    .await
+    .expect("initial owner setup must complete before the handoff pause is armed");
     let prior_pid = env.sidecar_pid_for(&sid).expect("the prior sidecar's pid");
+    // The saved-session setup uses the same attach-resume path; only the
+    // handoff target should park at the registered-session abort window.
+    Arc::get_mut(&mut rig.runner)
+        .expect("setup does not retain the handoff runner")
+        .fresh_claude
+        .set_handoff_test_pauses(None, Some(Arc::clone(&resume_pause)));
 
     let handle = rig
         .runner
@@ -6821,7 +6923,11 @@ async fn handoff_abort_holds_the_fence_until_the_uncommitted_target_continuation
 
     // ABORT inside the fresh-target resume await.
     handle.abort();
-    let _ = handle.task.await;
+    let canceled = tokio::time::timeout(Duration::from_secs(10), handle.task)
+        .await
+        .expect("the parked handoff operation must join after cancellation")
+        .expect_err("the parked handoff operation must be canceled");
+    assert!(canceled.is_cancelled());
 
     // THE R3-6 regression: the record did NOT go plain-Vacant — the
     // cleanup's target reap (its NotConfirmed continuation) is still in
@@ -6883,7 +6989,10 @@ async fn handoff_abort_holds_the_fence_until_the_uncommitted_target_continuation
     let _ = rig
         .ownership
         .fail("claude", &sid, "r36-competing-start-after", 1, false);
-    let _ = grandchild.wait().await;
+    tokio::time::timeout(Duration::from_secs(10), grandchild.wait())
+        .await
+        .expect("the confirmed-dead test descendant must join")
+        .expect("reap the test descendant");
     std::env::remove_var("CLAUDE_CONFIG_DIR");
     let _ = std::fs::remove_dir_all(&store_dir);
 }
@@ -9390,8 +9499,7 @@ async fn the_prior_stop_never_confirms_on_a_missing_row() {
             &handoff_req_terminal("claude", &sid, "claude"),
             &live_owner,
             "test",
-            "op-r6-f2",
-            1,
+            ("op-r6-f2", 1),
             false,
             &admission_permit,
         )
@@ -9424,8 +9532,7 @@ async fn the_prior_stop_never_confirms_on_a_missing_row() {
             &handoff_req_terminal("claude", &sid, "claude"),
             &dead_owner,
             "test",
-            "op-r6-f2-dead",
-            2,
+            ("op-r6-f2-dead", 2),
             false,
             &admission_permit,
         )

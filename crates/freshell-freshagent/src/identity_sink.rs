@@ -216,8 +216,15 @@ impl BindingClaim {
     /// A displaced owner is supersession; an error under the same claim is
     /// still a genuine persistence failure. Call before cleanup changes state.
     pub fn is_current(&self, registry: &freshell_ownership::RuntimeOwnershipRegistry) -> bool {
-        use freshell_ownership::{OwnershipState, RuntimeOwnerKind};
         let snapshot = registry.observe(&self.provider, &self.session_id);
+        self.matches_snapshot(&snapshot)
+    }
+
+    /// The common authority check for a snapshot observed at this claim's
+    /// provider/session key. Runtime lookup keys are not part of the immutable
+    /// owner identity; the operation id, kind, epoch, and generation are.
+    pub fn matches_snapshot(&self, snapshot: &freshell_ownership::OwnershipSnapshot) -> bool {
+        use freshell_ownership::{OwnershipState, RuntimeOwnerKind};
         snapshot.epoch == self.epoch
             && match (self.kind, &snapshot.state) {
                 (
@@ -246,7 +253,6 @@ impl BindingClaim {
                 ) => {
                     owner.kind == RuntimeOwnerKind::FreshAgent
                         && owner.ownership_id.as_deref() == Some(self.operation_id.as_str())
-                        && owner.live_session_key.as_deref() == Some(self.session_id.as_str())
                         && *generation == self.generation
                 }
                 _ => false,

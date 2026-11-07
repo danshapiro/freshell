@@ -1467,10 +1467,17 @@ impl FreshClaudeState {
         pane_id: Option<&str>,
         generation: u64,
         operation_id: &str,
-    ) -> Result<freshell_ownership::OwnerIdentity, (String, String)> {
+    ) -> Result<freshell_ownership::OwnerIdentity, crate::session_handoff::HandoffStartFailure>
+    {
+        let refusal = |code: &str, detail: String| {
+            crate::session_handoff::HandoffStartFailure::from((code.to_string(), detail))
+                .with_owner(crate::ownership_lane::terminal_owner_fields_from_snapshot(
+                    &self.ownership_snapshot(PROVIDER, session_id),
+                ))
+        };
         let Some(flavor) = session_type_from_flavor(session_type) else {
-            return Err((
-                "unsupported claude-lane sessionType for handoff".to_string(),
+            return Err(refusal(
+                "unsupported claude-lane sessionType for handoff",
                 session_type.to_string(),
             ));
         };
@@ -1480,8 +1487,8 @@ impl FreshClaudeState {
         // resume is in flight" forever. The guard removes it on every exit
         // path, drop included.
         let Some(_resuming_flag) = self.try_resume_flight(session_id) else {
-            return Err((
-                "another resume is in flight for this session".to_string(),
+            return Err(refusal(
+                "another resume is in flight for this session",
                 session_id.to_string(),
             ));
         };
@@ -1494,14 +1501,14 @@ impl FreshClaudeState {
         {
             LaunchLease::Acquired(guard) => Some(guard),
             LaunchLease::BoundLive { .. } | LaunchLease::Held => {
-                return Err((
-                    "another lifecycle operation holds this session's lease".to_string(),
+                return Err(refusal(
+                    "another lifecycle operation holds this session's lease",
                     session_id.to_string(),
                 ));
             }
             LaunchLease::ExpiredUnconfirmed => {
-                return Err((
-                    "the prior lease holder expired and could not be confirmed dead".to_string(),
+                return Err(refusal(
+                    "the prior lease holder expired and could not be confirmed dead",
                     session_id.to_string(),
                 ));
             }
@@ -1527,8 +1534,8 @@ impl FreshClaudeState {
         // tail's commit is a no-op — the runner performs the one commit_live.
         let mut own_ticket: Option<freshell_ownership::OperationTicket> = None;
         let Some(registry) = self.ownership.as_ref() else {
-            return Err((
-                "the ownership coordinator is unavailable for handoff resume".to_string(),
+            return Err(refusal(
+                "the ownership coordinator is unavailable for handoff resume",
                 session_id.to_string(),
             ));
         };
@@ -1574,12 +1581,12 @@ impl FreshClaudeState {
                     ownership_id: None,
                 })
             }
-            Err(ResumeClaudeError::NotFound) => Err((
-                "claude transcript not found for this session".to_string(),
+            Err(ResumeClaudeError::NotFound) => Err(refusal(
+                "claude transcript not found for this session",
                 session_id.to_string(),
             )),
             Err(ResumeClaudeError::Transient(detail) | ResumeClaudeError::Superseded(detail)) => {
-                Err(("claude resume failed".to_string(), detail))
+                Err(refusal("claude resume failed", detail))
             }
         }
     }
@@ -4033,6 +4040,7 @@ impl FreshClaudeState {
     /// Closed row). All OTHER binding-write lanes (fork children, crash
     /// respawns, in-stream adoptions) deliberately do NOT commit: none of
     /// them claims an identity a user just closed.
+    #[cfg(test)]
     async fn commit_session_claim(
         &self,
         durable_id: &str,
@@ -4051,7 +4059,7 @@ impl FreshClaudeState {
     }
 
     /// Preserve stale-close refusals separately from persistence failures for
-    /// recovery accounting; callers that only need admission keep the bool facade.
+    /// recovery accounting; claim-admission tests retain the bool facade.
     async fn commit_session_claim_outcome(
         &self,
         durable_id: &str,
@@ -5798,11 +5806,21 @@ impl FreshClaudeState {
 
     /// A top-level `error` frame correlated to `request_id`.
     fn send_request_error(&self, request_id: &Option<String>, code: ErrorCode, message: &str) {
+        self.send_request_error_with_owner(request_id, code, message, None);
+    }
+
+    fn send_request_error_with_owner(
+        &self,
+        request_id: &Option<String>,
+        code: ErrorCode,
+        message: &str,
+        owner: Option<&crate::ownership_lane::TerminalOwnerFields>,
+    ) {
         self.broadcast(&ServerMessage::Error(ErrorMsg {
             provider_preparation_failure: None,
-            owner_kind: None,
-            owner_generation: None,
-            owner_epoch: None,
+            owner_kind: owner.map(|owner| owner.owner_kind.into()),
+            owner_generation: owner.map(|owner| owner.owner_generation),
+            owner_epoch: owner.map(|owner| owner.owner_epoch),
             code,
             message: message.to_string(),
             timestamp: now_iso(),

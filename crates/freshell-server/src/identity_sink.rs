@@ -259,50 +259,7 @@ impl PaneIdentitySink for LedgerIdentitySink {
                         ));
                     };
                     let snap = registry.observe(&upsert.provider, &upsert.session_id);
-                    let transition_owned = snap.epoch == w_epoch
-                        && match (claim.kind, &snap.state) {
-                            (
-                                freshell_freshagent::BindingClaimKind::Starting,
-                                freshell_ownership::OwnershipState::Starting {
-                                    kind,
-                                    operation_id,
-                                    generation,
-                                    ..
-                                },
-                            ) => {
-                                *kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
-                                    && operation_id == &claim.operation_id
-                                    && *generation == w_generation
-                            }
-                            (
-                                freshell_freshagent::BindingClaimKind::Handoff,
-                                freshell_ownership::OwnershipState::Handoff {
-                                    to_kind,
-                                    operation_id,
-                                    generation,
-                                    ..
-                                },
-                            ) => {
-                                *to_kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
-                                    && operation_id == &claim.operation_id
-                                    && *generation == w_generation
-                            }
-                            (
-                                freshell_freshagent::BindingClaimKind::LiveFreshAgent,
-                                freshell_ownership::OwnershipState::Live {
-                                    owner,
-                                    generation,
-                                    ..
-                                },
-                            ) => {
-                                *generation == w_generation
-                                    && owner.kind
-                                        == freshell_ownership::RuntimeOwnerKind::FreshAgent
-                                    && owner.ownership_id.as_deref()
-                                        == Some(claim.operation_id.as_str())
-                            }
-                            _ => false,
-                        };
+                    let transition_owned = claim.matches_snapshot(&snap);
                     if !transition_owned {
                         tracing::warn!(target: "invariant",
                             provider = %upsert.provider,
@@ -2543,6 +2500,66 @@ mod tests {
                 })
                 .await
                 .expect("the post-commit authoritative write lands");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn live_binding_claim_and_sink_accept_different_or_absent_runtime_keys() {
+            for live_session_key in [None, Some("provider-runtime-key".to_string())] {
+                let tmp = tempfile::tempdir().unwrap();
+                let ledger = Arc::new(PaneLedger::new(Some(tmp.path().to_path_buf())));
+                let registry = Arc::new(RuntimeOwnershipRegistry::new());
+                drive_terminal_live(&registry);
+                let generation = drive_handoff_window(&registry, "claim-predicate-handoff");
+                seed_terminal_row(&ledger, "t-old");
+                LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
+                    .record_binding(authoritative_upsert(
+                        registry.boot_epoch(),
+                        generation,
+                        Some("claim-predicate-handoff"),
+                    ))
+                    .await
+                    .expect("the handoff establishes the fresh-agent row before a live refresh");
+                let mut owner = fresh_agent_owner();
+                owner.live_session_key = live_session_key;
+                assert_eq!(
+                    registry.commit_live(
+                        "claude",
+                        SID,
+                        "claim-predicate-handoff",
+                        generation,
+                        owner
+                    ),
+                    CommitOutcome::Committed
+                );
+                let claim = BindingClaim::live_fresh_agent(
+                    "claude",
+                    SID,
+                    "own-x",
+                    registry.boot_epoch(),
+                    generation,
+                );
+                let mut upsert = authoritative_upsert(registry.boot_epoch(), generation, None);
+                upsert.claim = Some(claim.clone());
+                LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
+                    .record_binding(upsert)
+                    .await
+                    .expect("the exact settled owner may persist regardless of runtime lookup key");
+                assert_eq!(
+                    ledger
+                        .load_binding("claude", SID)
+                        .unwrap()
+                        .pane_kind
+                        .as_deref(),
+                    Some("fresh-agent")
+                );
+                assert!(
+                    claim.is_current(&registry),
+                    "recovery classification must agree with the sink's accepted exact owner"
+                );
+                let mut foreign = claim.clone();
+                foreign.operation_id = "different-owner".into();
+                assert!(!foreign.is_current(&registry));
+            }
         }
 
         #[tokio::test(flavor = "multi_thread")]

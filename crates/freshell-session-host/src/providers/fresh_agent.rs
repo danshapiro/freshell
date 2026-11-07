@@ -1430,14 +1430,23 @@ impl FreshAgentTransport for HostedTransport {
             ));
         };
         match state.handle_create_for_native_readiness(create, None).await {
-            freshell_freshagent::codex::CodexCreateOutcome::Failed { code, .. }
-                if code == freshell_freshagent::codex::NATIVE_READINESS_RESUME_NOT_FOUND =>
+            freshell_freshagent::codex::CodexCreateOutcome::Failed { code, recovery, .. }
+                if code == freshell_freshagent::codex::NATIVE_READINESS_RESUME_NOT_FOUND
+                    && !recovery.is_superseded() =>
             {
                 Ok(NativeReadinessResumeStart::PriorThreadNotFound)
             }
-            freshell_freshagent::codex::CodexCreateOutcome::Failed { code, message, .. } => {
-                Err(native_readiness_create_failure(&code, &message, false))
-            }
+            freshell_freshagent::codex::CodexCreateOutcome::Failed {
+                code,
+                message,
+                recovery,
+                ..
+            } => Err(native_readiness_create_failure(
+                &code,
+                &message,
+                false,
+                recovery.is_superseded(),
+            )),
             freshell_freshagent::codex::CodexCreateOutcome::Created { .. } => {
                 let started = self
                     .finish_codex_start(
@@ -1512,12 +1521,22 @@ impl FreshAgentTransport for HostedTransport {
                 )
             })?;
         match state.handle_create(create, None).await {
-            freshell_freshagent::codex::CodexCreateOutcome::Failed { code, message, .. } => {
+            freshell_freshagent::codex::CodexCreateOutcome::Failed {
+                code,
+                message,
+                recovery,
+                ..
+            } => {
                 self.native_identity
                     .lock()
                     .expect("native identity lock")
                     .abort_cold_replacement(authorization);
-                Err(native_readiness_create_failure(&code, &message, true))
+                Err(native_readiness_create_failure(
+                    &code,
+                    &message,
+                    true,
+                    recovery.is_superseded(),
+                ))
             }
             freshell_freshagent::codex::CodexCreateOutcome::Created { session_id, .. } => {
                 let observed_created = self.wait_created().await.map_err(|error| {
@@ -2972,22 +2991,20 @@ fn native_readiness_create_failure(
     code: &str,
     message: &str,
     replacement: bool,
+    superseded: bool,
 ) -> NativeReadinessProviderStartFailure {
     use NativeReadinessProviderStartCause as Cause;
 
-    let cause = match (replacement, code) {
-        (_, "CODEX_APP_SERVER_START_FAILED") => {
-            if replacement {
-                Cause::ReplacementAppServerStart
-            } else {
-                Cause::ExactResumeAppServerStart
-            }
-        }
-        (true, "CODEX_THREAD_START_FAILED") => Cause::ReplacementThreadStart,
-        (true, "FRESH_AGENT_CREATE_FAILED") => Cause::ReplacementCreateFinalize,
-        (true, _) => Cause::ReplacementCreateRejected,
-        (false, "FRESH_AGENT_CREATE_FAILED") => Cause::ExactResumeRpc,
-        (false, _) => Cause::ExactResumeCreateRejected,
+    let cause = match (replacement, superseded, code) {
+        (true, true, _) => Cause::ReplacementSuperseded,
+        (false, true, _) => Cause::ExactResumeSuperseded,
+        (true, false, "CODEX_APP_SERVER_START_FAILED") => Cause::ReplacementAppServerStart,
+        (false, false, "CODEX_APP_SERVER_START_FAILED") => Cause::ExactResumeAppServerStart,
+        (true, false, "CODEX_THREAD_START_FAILED") => Cause::ReplacementThreadStart,
+        (true, false, "FRESH_AGENT_CREATE_FAILED") => Cause::ReplacementCreateFinalize,
+        (true, false, _) => Cause::ReplacementCreateRejected,
+        (false, false, "FRESH_AGENT_CREATE_FAILED") => Cause::ExactResumeRpc,
+        (false, false, _) => Cause::ExactResumeCreateRejected,
     };
     NativeReadinessProviderStartFailure::from_provider_error(cause, message)
 }
@@ -3766,6 +3783,91 @@ mod tests {
     include!("fresh_agent_stop_tests.rs");
 
     include!("fresh_agent_send_delivery_tests.rs");
+
+    #[test]
+    fn native_readiness_create_failure_classifies_supersession_from_recovery_metadata() {
+        use freshell_agent_runtime::host_actor::{ActorError, ProviderStartDiagnostic};
+        use freshell_runtime_protocol::{RuntimeDiagnosticCode, RuntimeErrorCode};
+
+        for (replacement, expected) in [
+            (false, "exact_resume_superseded"),
+            (true, "replacement_superseded"),
+        ] {
+            for code in [
+                "CODEX_APP_SERVER_START_FAILED",
+                "CODEX_THREAD_START_FAILED",
+                "FRESH_AGENT_CREATE_FAILED",
+                "SESSION_CLOSED",
+                "SESSION_RESERVED",
+            ] {
+                let failure = native_readiness_create_failure(
+                    code,
+                    "private provider detail",
+                    replacement,
+                    true,
+                );
+                assert_eq!(failure.cause.as_str(), expected, "public code: {code}");
+                assert_eq!(failure.diagnostic, ProviderStartDiagnostic::NoDiagnostic);
+                assert!(!format!("{failure:?}").contains("private provider detail"));
+                let error = ActorError::NativeReadinessProviderStartFailed {
+                    cause: failure.cause,
+                    diagnostic: failure.diagnostic,
+                };
+                let diagnostic = crate::fresh_agent_open_failure_data(&error);
+                assert_eq!(diagnostic["nativeReadinessProviderStartCause"], expected);
+                assert!(!diagnostic.to_string().contains("private provider detail"));
+                let outward = crate::map_fresh_agent_open_error(error);
+                assert_eq!(outward.code, RuntimeErrorCode::HostUnreachable);
+                assert_eq!(
+                    outward.diagnostic_code,
+                    Some(RuntimeDiagnosticCode::FreshAgentOpenFailed)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_readiness_create_failure_preserves_real_startup_failure_categories() {
+        use NativeReadinessProviderStartCause as Cause;
+
+        for (replacement, code, expected) in [
+            (
+                false,
+                "CODEX_APP_SERVER_START_FAILED",
+                Cause::ExactResumeAppServerStart,
+            ),
+            (false, "FRESH_AGENT_CREATE_FAILED", Cause::ExactResumeRpc),
+            (false, "SESSION_RESERVED", Cause::ExactResumeCreateRejected),
+            (
+                true,
+                "CODEX_APP_SERVER_START_FAILED",
+                Cause::ReplacementAppServerStart,
+            ),
+            (
+                true,
+                "CODEX_THREAD_START_FAILED",
+                Cause::ReplacementThreadStart,
+            ),
+            (
+                true,
+                "FRESH_AGENT_CREATE_FAILED",
+                Cause::ReplacementCreateFinalize,
+            ),
+            (true, "SESSION_RESERVED", Cause::ReplacementCreateRejected),
+        ] {
+            let failure = native_readiness_create_failure(
+                code,
+                "superseded appears in provider output (startup diagnostic: network)",
+                replacement,
+                false,
+            );
+            assert_eq!(failure.cause, expected, "public code: {code}");
+            assert_eq!(
+                failure.diagnostic,
+                freshell_agent_runtime::host_actor::ProviderStartDiagnostic::Network
+            );
+        }
+    }
 
     #[tokio::test]
     async fn hosted_codex_send_refusal_retains_the_published_diagnostic_across_host_boundary() {

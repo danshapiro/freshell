@@ -761,9 +761,12 @@ enum ResumeOpencodeError {
     /// timeout, ...) -- NOT evidence the session is gone; safe to retry, never mapped to
     /// `INVALID_SESSION_ID`.
     Manager(freshell_opencode::ServeError),
-    /// The native resume succeeded, but a stop or newer owner superseded its
-    /// publication. Preserve the diagnostic without charging a failed launch.
-    Superseded(freshell_opencode::ServeError),
+    /// A stop or newer owner superseded this attempt. Keep its observed
+    /// owner and diagnostic without charging a failed launch.
+    Superseded(
+        freshell_opencode::ServeError,
+        Option<crate::ownership_lane::TerminalOwnerFields>,
+    ),
     /// Task 13 (D8): another create/attach holds this sessionRef's lease -- the caller
     /// answers `freshAgent.error { code: "SESSION_RESERVED" }` (retryable, never lost).
     Reserved(Option<crate::ownership_lane::TerminalOwnerFields>),
@@ -772,12 +775,30 @@ enum ResumeOpencodeError {
 enum OpencodeRecoveryFailure {
     NotFound,
     Manager(freshell_opencode::ServeError),
-    Superseded(freshell_opencode::ServeError),
+    Superseded(
+        freshell_opencode::ServeError,
+        Option<crate::ownership_lane::TerminalOwnerFields>,
+    ),
     Reserved(Option<crate::ownership_lane::TerminalOwnerFields>),
 }
 
 enum OpencodeRecoveryReady {
     Resumed(Arc<OpencodeSessionCell>),
+}
+
+impl ResumeOpencodeError {
+    fn provider_failure(
+        &self,
+    ) -> (
+        &freshell_opencode::ServeError,
+        Option<&crate::ownership_lane::TerminalOwnerFields>,
+    ) {
+        match self {
+            Self::Manager(error) => (error, None),
+            Self::Superseded(error, owner) => (error, owner.as_ref()),
+            _ => unreachable!("only provider failure variants carry a serve error"),
+        }
+    }
 }
 
 impl OpencodeSession {
@@ -1855,6 +1876,19 @@ impl FreshOpencodeState {
         })
     }
 
+    fn superseded_resume_error(
+        &self,
+        session_id: &str,
+        error: freshell_opencode::ServeError,
+    ) -> ResumeOpencodeError {
+        ResumeOpencodeError::Superseded(
+            error,
+            crate::ownership_lane::terminal_owner_fields_from_snapshot(
+                &self.ownership_snapshot(PROVIDER, session_id),
+            ),
+        )
+    }
+
     fn binding_claim_superseded(&self, claim: Option<&crate::identity_sink::BindingClaim>) -> bool {
         claim.is_some_and(|claim| {
             self.fresh_agent
@@ -1940,6 +1974,14 @@ impl FreshOpencodeState {
             .and_then(|sink| sink.kill_tombstone_at_ms(PROVIDER, durable_id))
     }
 
+    fn claim_dead_state_advanced(&self, durable_id: &str, baseline: Option<i64>) -> bool {
+        match (self.claim_dead_state_snapshot(durable_id), baseline) {
+            (Some(current), Some(baseline)) => current > baseline,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    }
+
     /// Broadcast a `freshAgent.create.failed` frame (mirrors codex.rs's `fail_create`;
     /// `ws-handler.ts:3388-3405`'s generic catch -- always `retryable: true`,
     /// `ws-handler.ts:3403`).
@@ -1970,11 +2012,21 @@ impl FreshOpencodeState {
     }
 
     fn send_error(&self, request_id: &Option<String>, code: &str, message: &str) {
+        self.send_error_with_owner(request_id, code, message, None);
+    }
+
+    fn send_error_with_owner(
+        &self,
+        request_id: &Option<String>,
+        code: &str,
+        message: &str,
+        owner: Option<&crate::ownership_lane::TerminalOwnerFields>,
+    ) {
         self.broadcast(&ServerMessage::Error(ErrorMsg {
             provider_preparation_failure: None,
-            owner_kind: None,
-            owner_generation: None,
-            owner_epoch: None,
+            owner_kind: owner.map(|owner| owner.owner_kind.into()),
+            owner_generation: owner.map(|owner| owner.owner_generation),
+            owner_epoch: owner.map(|owner| owner.owner_epoch),
             code: ErrorCode::InternalError,
             message: format!("{code}: {message}"),
             timestamp: now_iso(),
@@ -2432,14 +2484,16 @@ impl FreshOpencodeState {
                             return;
                         }
                         Err(
-                            ResumeOpencodeError::Manager(error)
-                            | ResumeOpencodeError::Superseded(error),
+                            failure @ (ResumeOpencodeError::Manager(_)
+                            | ResumeOpencodeError::Superseded(_, _)),
                         ) => {
-                            self.fail_create(
+                            let (error, owner) = failure.provider_failure();
+                            self.fail_create_with_owner(
                                 &request_id,
                                 view_id,
                                 "FRESH_AGENT_CREATE_FAILED",
                                 &error.to_string(),
+                                owner,
                             );
                             return;
                         }
@@ -2573,12 +2627,17 @@ impl FreshOpencodeState {
                     );
                     return;
                 }
-                Err(ResumeOpencodeError::Manager(err) | ResumeOpencodeError::Superseded(err)) => {
-                    self.fail_create(
+                Err(
+                    failure @ (ResumeOpencodeError::Manager(_)
+                    | ResumeOpencodeError::Superseded(_, _)),
+                ) => {
+                    let (err, owner) = failure.provider_failure();
+                    self.fail_create_with_owner(
                         &request_id,
                         view_id,
                         "FRESH_AGENT_CREATE_FAILED",
                         &err.to_string(),
+                        owner,
                     );
                     return;
                 }
@@ -4771,7 +4830,10 @@ impl FreshOpencodeState {
         cwd: Option<&str>,
         operation_id: &str,
         generation: u64,
-    ) -> Result<(freshell_ownership::OwnerIdentity, OpencodeSessionHandle), (String, String)> {
+    ) -> Result<
+        (freshell_ownership::OwnerIdentity, OpencodeSessionHandle),
+        crate::session_handoff::HandoffStartFailure,
+    > {
         match self
             .resume_durable_session(
                 session_id,
@@ -4801,14 +4863,25 @@ impl FreshOpencodeState {
             Err(ResumeOpencodeError::NotFound) => Err((
                 "opencode session not known to the shared serve".to_string(),
                 session_id.to_string(),
-            )),
-            Err(ResumeOpencodeError::Manager(err) | ResumeOpencodeError::Superseded(err)) => {
-                Err(("opencode serve failure".to_string(), err.to_string()))
+            )
+                .into()),
+            Err(
+                failure @ (ResumeOpencodeError::Manager(_) | ResumeOpencodeError::Superseded(_, _)),
+            ) => {
+                let (error, owner) = failure.provider_failure();
+                Err(crate::session_handoff::HandoffStartFailure::from((
+                    "opencode serve failure".into(),
+                    error.to_string(),
+                ))
+                .with_owner(owner.cloned()))
             }
-            Err(ResumeOpencodeError::Reserved(_)) => Err((
-                "opencode session reserved by another lifecycle operation".to_string(),
-                session_id.to_string(),
-            )),
+            Err(ResumeOpencodeError::Reserved(owner)) => {
+                Err(crate::session_handoff::HandoffStartFailure::from((
+                    "opencode session reserved by another lifecycle operation".to_string(),
+                    session_id.to_string(),
+                ))
+                .with_owner(owner))
+            }
         }
     }
 
@@ -8235,13 +8308,15 @@ impl FreshOpencodeState {
                             return;
                         }
                         Err(
-                            ResumeOpencodeError::Manager(error)
-                            | ResumeOpencodeError::Superseded(error),
+                            failure @ (ResumeOpencodeError::Manager(_)
+                            | ResumeOpencodeError::Superseded(_, _)),
                         ) => {
-                            self.send_error(
+                            let (error, owner) = failure.provider_failure();
+                            self.send_error_with_owner(
                                 &None,
                                 "OPENCODE_ATTACH_RESUME_FAILED",
                                 &error.to_string(),
+                                owner,
                             );
                             return;
                         }
@@ -8513,8 +8588,17 @@ impl FreshOpencodeState {
                     self.broadcast(&lost_session_frame(&msg.session_id));
                     return;
                 }
-                Err(ResumeOpencodeError::Manager(err) | ResumeOpencodeError::Superseded(err)) => {
-                    self.send_error(&None, "OPENCODE_ATTACH_RESUME_FAILED", &err.to_string());
+                Err(
+                    failure @ (ResumeOpencodeError::Manager(_)
+                    | ResumeOpencodeError::Superseded(_, _)),
+                ) => {
+                    let (err, owner) = failure.provider_failure();
+                    self.send_error_with_owner(
+                        &None,
+                        "OPENCODE_ATTACH_RESUME_FAILED",
+                        &err.to_string(),
+                        owner,
+                    );
                     return;
                 }
                 Err(ResumeOpencodeError::Reserved(owner)) => {
@@ -8701,9 +8785,9 @@ impl FreshOpencodeState {
                                 OpencodeRecoveryFailure::Reserved(owner),
                             ))
                         }
-                        Err(ResumeOpencodeError::Superseded(error)) => {
+                        Err(ResumeOpencodeError::Superseded(error, owner)) => {
                             Err(crate::session_recovery::RecoveryAttemptFailure::superseded(
-                                OpencodeRecoveryFailure::Superseded(error),
+                                OpencodeRecoveryFailure::Superseded(error, owner),
                             ))
                         }
                         Err(ResumeOpencodeError::Manager(error)) => {
@@ -8741,8 +8825,11 @@ impl FreshOpencodeState {
                 OpencodeRecoveryFailure::Manager(error),
             )) => Err(ResumeOpencodeError::Manager(error.clone())),
             Err(crate::session_recovery::RecoveryFailure::Attempt(
-                OpencodeRecoveryFailure::Superseded(error),
-            )) => Err(ResumeOpencodeError::Superseded(error.clone())),
+                OpencodeRecoveryFailure::Superseded(error, owner),
+            )) => Err(ResumeOpencodeError::Superseded(
+                error.clone(),
+                owner.clone(),
+            )),
             Err(crate::session_recovery::RecoveryFailure::Attempt(
                 OpencodeRecoveryFailure::Reserved(owner),
             )) => Err(ResumeOpencodeError::Reserved(owner.clone())),
@@ -8800,8 +8887,11 @@ impl FreshOpencodeState {
                 OpencodeRecoveryFailure::Manager(error),
             )) => Err(ResumeOpencodeError::Manager(error.clone())),
             Err(crate::session_recovery::RecoveryFailure::Attempt(
-                OpencodeRecoveryFailure::Superseded(error),
-            )) => Err(ResumeOpencodeError::Superseded(error.clone())),
+                OpencodeRecoveryFailure::Superseded(error, owner),
+            )) => Err(ResumeOpencodeError::Superseded(
+                error.clone(),
+                owner.clone(),
+            )),
             Err(crate::session_recovery::RecoveryFailure::Attempt(
                 OpencodeRecoveryFailure::Reserved(owner),
             )) => Err(ResumeOpencodeError::Reserved(owner.clone())),
@@ -9023,12 +9113,12 @@ impl FreshOpencodeState {
         // Classify that before interpreting even a failure/404, and before
         // cleanup releases our own claim or a stale success publishes a row.
         if self.binding_claim_superseded(binding_claim.as_ref())
-            || self.claim_dead_state_snapshot(session_id) != claim_dead_state
+            || self.claim_dead_state_advanced(session_id, claim_dead_state)
         {
             lease_guard.fail();
-            return Err(ResumeOpencodeError::Superseded(
+            return Err(self.superseded_resume_error(session_id,
                 freshell_opencode::ServeError::Transport(format!(
-                    "opencode session {session_id} ownership changed during resume; native lookup superseded"
+                    "opencode session {session_id} ownership or close changed during resume; native lookup superseded"
                 )),
             ));
         }
@@ -9169,13 +9259,26 @@ impl FreshOpencodeState {
         // dropped, bridge aborted, lease failed open) — a revoked lease whose
         // dead-state is UNCHANGED (an expired handle-less holder, no kill)
         // still commits and keeps the registered session (the round-3 keep).
-        let claim_commit = self
+        let claim_failure = match self
             .commit_session_claim(session_id, claim_dead_state)
-            .await;
-        if !matches!(
-            claim_commit,
-            Ok(crate::identity_sink::ClaimCommit::Committed)
-        ) {
+            .await
+        {
+            Ok(crate::identity_sink::ClaimCommit::Committed) => None,
+            Ok(crate::identity_sink::ClaimCommit::RefusedStale) => {
+                Some(self.superseded_resume_error(
+                    session_id,
+                    freshell_opencode::ServeError::Transport(format!(
+                    "opencode session {session_id} closed while the resume was in flight; torn down"
+                )),
+                ))
+            }
+            Err(error) => Some(ResumeOpencodeError::Manager(
+                freshell_opencode::ServeError::Transport(format!(
+                "opencode session {session_id} claim could not be persisted: {error}; torn down"
+            )),
+            )),
+        };
+        if let Some(failure) = claim_failure {
             let repaired = binding_guard
                 .as_mut()
                 .expect("binding guard is present")
@@ -9187,17 +9290,7 @@ impl FreshOpencodeState {
                 drop(binding_guard.take());
             }
             lease_guard.fail();
-            return Err(match claim_commit {
-                Ok(crate::identity_sink::ClaimCommit::RefusedStale) => {
-                    ResumeOpencodeError::Superseded(freshell_opencode::ServeError::Transport(format!(
-                        "opencode session {session_id} closed while the resume was in flight; torn down"
-                    )))
-                }
-                Err(error) => ResumeOpencodeError::Manager(freshell_opencode::ServeError::Transport(format!(
-                    "opencode session {session_id} claim could not be persisted: {error}; torn down"
-                ))),
-                Ok(crate::identity_sink::ClaimCommit::Committed) => unreachable!("handled above"),
-            });
+            return Err(failure);
         }
 
         // Every verified resume establishes identity before the coordinator
@@ -9247,6 +9340,15 @@ impl FreshOpencodeState {
                 superseded,
                 "freshagent.opencode.resume_binding_failed: identity persistence failed before Live"
             );
+            let failure = if superseded {
+                self.superseded_resume_error(session_id, freshell_opencode::ServeError::Transport(format!(
+                    "opencode session {session_id} ownership or close changed during resume; binding write superseded: {error}"
+                )))
+            } else {
+                ResumeOpencodeError::Manager(freshell_opencode::ServeError::Transport(format!(
+                    "opencode session {session_id} identity could not be persisted: {error}; torn down"
+                )))
+            };
             let repaired = binding_guard
                 .as_mut()
                 .expect("binding guard is present")
@@ -9259,14 +9361,7 @@ impl FreshOpencodeState {
             }
 
             lease_guard.fail();
-            let error = freshell_opencode::ServeError::Transport(format!(
-                "opencode session {session_id} identity could not be persisted: {error}; torn down"
-            ));
-            return Err(if superseded {
-                ResumeOpencodeError::Superseded(error)
-            } else {
-                ResumeOpencodeError::Manager(error)
-            });
+            return Err(failure);
         }
 
         // The durable identity is now established under the exact claim;
@@ -9285,6 +9380,12 @@ impl FreshOpencodeState {
                     outcome = ?outcome,
                     "freshagent.opencode.resume_commit_stale: the coordinator moved after identity persistence"
                 );
+                let failure = self.superseded_resume_error(
+                    session_id,
+                    freshell_opencode::ServeError::Transport(format!(
+                        "opencode session {session_id} ownership changed during resume; torn down"
+                    )),
+                );
                 let repaired = binding_guard
                     .as_mut()
                     .expect("binding guard is present")
@@ -9296,11 +9397,7 @@ impl FreshOpencodeState {
                     drop(binding_guard.take());
                 }
 
-                return Err(ResumeOpencodeError::Superseded(
-                    freshell_opencode::ServeError::Transport(format!(
-                        "opencode session {session_id} ownership changed during resume; torn down"
-                    )),
-                ));
+                return Err(failure);
             }
         }
         own_ticket = binding_guard.take().and_then(|guard| guard.finish());
@@ -9343,7 +9440,8 @@ impl FreshOpencodeState {
             .await,
             TransitionalBridgeRescue::Refused
         ) {
-            return Err(ResumeOpencodeError::Superseded(
+            return Err(self.superseded_resume_error(
+                session_id,
                 freshell_opencode::ServeError::Transport(format!(
                     "opencode session {session_id} ownership changed during resume; \
                      the session was retired mid-operation"
@@ -11602,7 +11700,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_resume_failure_after_supersession_preserves_the_launch_budget() {
-        for supersession in ["none", "owner", "durable-close"] {
+        for supersession in ["none", "owner", "durable-close", "cleared-close"] {
             let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
             let fresh_agent = FreshAgentState::new(Arc::new("tok".into()), Arc::new(tx));
             let http = Arc::new(GatedRecoveryFailureHttp::default());
@@ -11627,6 +11725,9 @@ mod tests {
             let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
             state.set_identity_sink(sink.clone());
             let id = "ses_native_failure_supersession";
+            if supersession == "cleared-close" {
+                sink.retire_closed(PROVIDER, id).await.unwrap();
+            }
             let task = {
                 let state = state.clone();
                 tokio::spawn(async move {
@@ -11649,6 +11750,12 @@ mod tests {
                 commit_terminal_owner(&registry, id).await;
             } else if supersession == "durable-close" {
                 sink.retire_closed(PROVIDER, id).await.unwrap();
+            } else if supersession == "cleared-close" {
+                let prior = sink.kill_tombstone_at_ms(PROVIDER, id);
+                assert_eq!(
+                    sink.commit_claim(PROVIDER, id, prior).await.unwrap(),
+                    crate::identity_sink::ClaimCommit::Committed
+                );
             }
             let newer_owner = registry.observe(PROVIDER, id);
             http.release_failures();
@@ -11656,16 +11763,17 @@ mod tests {
                 .await
                 .expect("native failure settles")
                 .unwrap();
-            if supersession == "none" {
+            let provider_failed = matches!(supersession, "none" | "cleared-close");
+            if provider_failed {
                 assert!(matches!(result, Err(ResumeOpencodeError::Manager(_))));
             } else {
-                assert!(matches!(result, Err(ResumeOpencodeError::Superseded(_))),
+                assert!(matches!(result, Err(ResumeOpencodeError::Superseded(_, _))),
                     "{supersession} supersession remains typed even when the pending native request fails");
                 assert_eq!(registry.observe(PROVIDER, id), newer_owner);
             }
             let status = state.recovery_status(id).await.unwrap();
-            assert_eq!(status.failed_launches, u32::from(supersession == "none"));
-            assert_eq!(status.retry_after_ms.is_some(), supersession == "none");
+            assert_eq!(status.failed_launches, u32::from(provider_failed));
+            assert_eq!(status.retry_after_ms.is_some(), provider_failed);
             assert!(!status.exhausted && !status.in_flight);
             assert!(!state.sessions.lock().await.contains_key(id));
             assert_eq!(http.get_requests.load(Ordering::SeqCst), 1);
@@ -18834,7 +18942,7 @@ mod tests {
             .await
             .expect("the winning recovery settles after release")
             .unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(10), attach_task.unwrap())
+        tokio::time::timeout(Duration::from_secs(10), attach_task.unwrap())
             .await
             .expect("the late requester settles with the shared recovery result")
             .unwrap();
@@ -19210,7 +19318,7 @@ mod tests {
             .expect("resume failure settles")
             .unwrap();
         assert!(if supersede {
-            matches!(result, Err(ResumeOpencodeError::Superseded(_)))
+            matches!(result, Err(ResumeOpencodeError::Superseded(_, _)))
         } else {
             matches!(result, Err(ResumeOpencodeError::Manager(_)))
         });
@@ -19296,6 +19404,102 @@ mod tests {
             .unwrap()
             .shutdown()
             .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn superseded_resume_preserves_owner_on_ws_create_and_attach() {
+        for create in [true, false] {
+            let (state, mut rx, registry, _http) = tracked_fake_http_state().await;
+            let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+            state.set_identity_sink(sink.clone());
+            let id = "ses_superseded_owner_reply";
+            let stall = sink.arm_binding_stall(PROVIDER, id);
+            let task = {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    if create {
+                        let mut msg = create_msg("superseded-owner-request");
+                        msg.resume_session_id = Some(id.into());
+                        state.handle_create(msg, None).await;
+                        drain_frames(&mut rx)
+                    } else {
+                        let mut msg = attach_msg(id);
+                        msg.request_id = Some("superseded-owner-request".into());
+                        let (reply, captured) = capturing_sink();
+                        let outcome = state.handle_attach(msg, reply).await;
+                        let crate::attach::AttachOutcome::Failed {
+                            legacy_messages, ..
+                        } = outcome
+                        else {
+                            panic!("superseded attach must fail");
+                        };
+                        let mut frames: Vec<Value> = captured
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .map(|frame| serde_json::to_value(frame).unwrap())
+                            .collect();
+                        frames.extend(
+                            legacy_messages
+                                .iter()
+                                .map(|frame| serde_json::to_value(frame).unwrap()),
+                        );
+                        frames
+                    }
+                })
+            };
+            stall.entered.recv_timeout(Duration::from_secs(10)).unwrap();
+            let claim = sink
+                .bindings
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .claim
+                .clone()
+                .unwrap();
+            registry.fail(PROVIDER, id, &claim.operation_id, claim.generation, false);
+            commit_terminal_owner(&registry, id).await;
+            let owner = registry.observe(PROVIDER, id);
+            stall.release.send(()).unwrap();
+            let frames = tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .unwrap()
+                .unwrap();
+            let expected_type = if create {
+                "freshAgent.create.failed"
+            } else {
+                "freshAgent.attach.failed"
+            };
+            let reply = frames
+                .iter()
+                .find(|frame| {
+                    frame["type"] == expected_type
+                        && frame["requestId"] == "superseded-owner-request"
+                })
+                .expect("the requester receives its failure");
+            assert_eq!(reply["ownerKind"], "terminal");
+            assert_eq!(reply["ownerEpoch"], owner.epoch);
+            assert_eq!(reply["ownerGeneration"], owner.generation);
+            if !create {
+                let legacy = frames
+                    .iter()
+                    .find(|frame| frame["type"] == "error")
+                    .expect("legacy attach receives an error");
+                assert_eq!(legacy["ownerKind"], "terminal");
+                assert_eq!(legacy["ownerEpoch"], owner.epoch);
+                assert_eq!(legacy["ownerGeneration"], owner.generation);
+            }
+            assert_eq!(registry.observe(PROVIDER, id), owner);
+            assert_eq!(state.recovery_status(id).await.unwrap().failed_launches, 0);
+            state
+                .fresh_agent
+                .peek_running_manager()
+                .await
+                .unwrap()
+                .shutdown()
+                .await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -28995,7 +29199,10 @@ mod tests {
         // the retired session (pre-fix: the resume returned the killed
         // session and the rescue had installed a fresh bridge on it).
         match out {
-            Err(ResumeOpencodeError::Superseded(freshell_opencode::ServeError::Transport(msg))) => {
+            Err(ResumeOpencodeError::Superseded(
+                freshell_opencode::ServeError::Transport(msg),
+                _,
+            )) => {
                 assert!(
                     msg.contains("ownership changed during resume"),
                     "the typed refusal names the ownership change: {msg}"
@@ -29707,7 +29914,7 @@ mod tests {
         let mut messages = Vec::new();
         for result in [results.0.unwrap(), results.1.unwrap()] {
             match result {
-                Err(ResumeOpencodeError::Superseded(freshell_opencode::ServeError::Transport(message))) => {
+                Err(ResumeOpencodeError::Superseded(freshell_opencode::ServeError::Transport(message), _)) => {
                     assert!(message.contains("ownership changed during resume"), "{message}");
                     messages.push(message);
                 }
@@ -29864,7 +30071,7 @@ mod tests {
             .await.expect("the independent replacement resume settles")
         {
             Ok(arc) => arc,
-            Err(ResumeOpencodeError::Manager(err) | ResumeOpencodeError::Superseded(err)) => panic!(
+            Err(ResumeOpencodeError::Manager(err) | ResumeOpencodeError::Superseded(err, _)) => panic!(
                 "fixture: the replacement resume commits a fresh instance under the vacated key: {err:?}"
             ),
             Err(ResumeOpencodeError::NotFound) => {
@@ -29908,7 +30115,10 @@ mod tests {
         // adopted the same-kind replacement, answered Healthy, and the
         // resume returned its own removed-and-killed `Arc`).
         match out {
-            Err(ResumeOpencodeError::Superseded(freshell_opencode::ServeError::Transport(msg))) => {
+            Err(ResumeOpencodeError::Superseded(
+                freshell_opencode::ServeError::Transport(msg),
+                _,
+            )) => {
                 assert!(
                     msg.contains("ownership changed during resume"),
                     "the typed refusal names the ownership change: {msg}"
@@ -30047,7 +30257,7 @@ mod tests {
                 .await
             {
                 Ok(arc) => arc,
-                Err(ResumeOpencodeError::Manager(err) | ResumeOpencodeError::Superseded(err)) => panic!(
+                Err(ResumeOpencodeError::Manager(err) | ResumeOpencodeError::Superseded(err, _)) => panic!(
                     "fixture: the replacement resume commits a fresh instance under the vacated key: {err:?}"
                 ),
                 Err(ResumeOpencodeError::NotFound) => {

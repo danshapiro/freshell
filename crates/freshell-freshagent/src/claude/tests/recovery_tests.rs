@@ -1,6 +1,239 @@
 use super::*;
 use std::{future::Future, task::Poll};
 
+async fn assert_superseded_recovery_owner_reply(kind: &'static str) {
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
+    for session_type in [SessionType::Freshclaude, SessionType::Kilroy] {
+        let _env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        write_fake_transcript(home.path(), &id);
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        let (mut state, mut bus) = state_with_bus();
+        let identity = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        identity.seed(
+            PROVIDER,
+            &id,
+            crate::identity_sink::FreshAgentSettings::default(),
+        );
+        state.set_identity_sink(identity.clone());
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::with_epoch(
+            211,
+        ));
+        state.set_ownership(registry.clone());
+        let handoff_generation = if kind == "handoff" {
+            let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_handoff(
+                PROVIDER,
+                &id,
+                freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                "handoff-recovery",
+                None,
+                "test",
+                1,
+            ) else {
+                panic!("the fixture owns the handoff claim");
+            };
+            Some(generation)
+        } else {
+            None
+        };
+        let gate = identity.arm_binding_stall_result(PROVIDER, &id, kind == "handoff");
+        let frames = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let captured = frames.clone();
+        let st = state.clone();
+        let operation_id = id.clone();
+        let request = tokio::spawn(async move {
+            match kind {
+                "attach_legacy" | "attach_modern" => {
+                    // An old pane id is intentionally not the registry key;
+                    // the refusal payload must carry the canonical owner's fields.
+                    let mut msg = attach_msg_with_resume("old-pane-key", &operation_id);
+                    msg.session_type = session_type;
+                    if kind == "attach_modern" {
+                        msg.request_id = Some("owner-reply".into());
+                    }
+                    st.handle_attach(
+                        msg,
+                        Arc::new(move |frame| {
+                            captured
+                                .lock()
+                                .unwrap()
+                                .push(serde_json::to_value(frame).unwrap())
+                        }),
+                    )
+                    .await;
+                    None
+                }
+                "create" => {
+                    let mut msg = dedup_create_msg("owner-reply");
+                    msg.resume_session_id = Some(operation_id);
+                    msg.session_type = session_type;
+                    let ClaudeCreateOutcome::Failed { code, owner, .. } =
+                        st.handle_create(msg, None).await
+                    else {
+                        panic!("superseded create must fail");
+                    };
+                    assert_eq!(code, "CLAUDE_ATTACH_RESUME_FAILED");
+                    owner
+                }
+                "send" => {
+                    let mut msg = send_msg(&operation_id, "not sent");
+                    msg.request_id = Some("owner-reply".into());
+                    msg.session_type = session_type;
+                    let ClaudeSendOutcome::Refused { code, owner, .. } = st.handle_send(msg).await
+                    else {
+                        panic!("superseded send must be refused");
+                    };
+                    assert_eq!(code, "CLAUDE_ATTACH_RESUME_FAILED");
+                    owner
+                }
+                "compact" => {
+                    let mut msg = compact_msg(&operation_id, None);
+                    msg.request_id = Some("owner-reply".into());
+                    msg.session_type = session_type;
+                    st.handle_compact(msg).await;
+                    None
+                }
+                "handoff" => {
+                    let error = st
+                        .resume_for_handoff(
+                            session_type_str(session_type),
+                            &operation_id,
+                            None,
+                            None,
+                            None,
+                            handoff_generation.unwrap(),
+                            "handoff-recovery",
+                        )
+                        .await
+                        .expect_err("the superseded handoff must refuse");
+                    assert_eq!(error.code, "claude resume failed");
+                    assert!(error.detail.contains("ownership changed"));
+                    error.owner
+                }
+                _ => unreachable!(),
+            }
+        });
+        gate.entered.recv_timeout(Duration::from_secs(15)).unwrap();
+        let old_owner = registry.observe(PROVIDER, &id);
+        let generation = old_owner.generation;
+        let (freshell_ownership::OwnershipState::Starting { operation_id, .. }
+        | freshell_ownership::OwnershipState::Handoff { operation_id, .. }) = old_owner.state
+        else {
+            panic!("the parked recovery owns a real claim");
+        };
+        registry.fail(PROVIDER, &id, &operation_id, generation, false);
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
+            PROVIDER,
+            &id,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "current-owner",
+            None,
+            "test",
+            1,
+        ) else {
+            panic!("replacement terminal claim");
+        };
+        assert_eq!(
+            registry.commit_live(
+                PROVIDER,
+                &id,
+                "current-owner",
+                generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("replacement-terminal".into()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None
+                }
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        );
+        gate.release.send(()).unwrap();
+        let outcome_owner = tokio::time::timeout(Duration::from_secs(15), request)
+            .await
+            .unwrap()
+            .unwrap();
+        state.shutdown().await;
+        if matches!(kind, "create" | "send" | "handoff") {
+            assert_eq!(
+                outcome_owner,
+                Some(crate::ownership_lane::TerminalOwnerFields {
+                    owner_kind: "terminal",
+                    owner_epoch: 211,
+                    owner_generation: generation,
+                })
+            );
+        }
+        if kind == "handoff" {
+            continue;
+        }
+        let mut replies = frames.lock().unwrap().clone();
+        replies.extend(
+            std::iter::from_fn(|| bus.try_recv().ok())
+                .map(|raw| serde_json::from_str::<Value>(&raw).unwrap())
+                .filter(|frame| {
+                    frame["requestId"] == "owner-reply"
+                        || frame["event"]["requestId"] == "owner-reply"
+                }),
+        );
+        assert_eq!(
+            replies.len(),
+            1,
+            "{session_type:?}/{kind}: exactly one requester reply: {replies:?}"
+        );
+        let payload = replies[0].get("event").unwrap_or(&replies[0]);
+        assert_eq!(
+            json!([
+                payload["ownerKind"],
+                payload["ownerEpoch"],
+                payload["ownerGeneration"]
+            ]),
+            json!(["terminal", 211, generation]),
+            "{session_type:?}/{kind}: preserve the refusal's owner: {replies:?}"
+        );
+        if kind == "send" {
+            assert!(payload["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("CLAUDE_ATTACH_RESUME_FAILED:"));
+        } else {
+            assert_eq!(payload["code"], "CLAUDE_ATTACH_RESUME_FAILED");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_superseded_recovery_legacy_attach_preserves_owner() {
+    assert_superseded_recovery_owner_reply("attach_legacy").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_superseded_recovery_modern_attach_preserves_owner() {
+    assert_superseded_recovery_owner_reply("attach_modern").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_superseded_recovery_create_preserves_owner() {
+    assert_superseded_recovery_owner_reply("create").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_superseded_recovery_send_preserves_owner() {
+    assert_superseded_recovery_owner_reply("send").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_superseded_recovery_compact_preserves_owner() {
+    assert_superseded_recovery_owner_reply("compact").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_superseded_recovery_handoff_preserves_owner() {
+    assert_superseded_recovery_owner_reply("handoff").await;
+}
+
 async fn assert_shared_resume_binding_outcome(cause: &str) {
     let _guard = CLAUDE_ENV_LOCK.lock().await;
     for session_type in [SessionType::Freshclaude, SessionType::Kilroy] {
@@ -182,7 +415,9 @@ async fn shared_claude_kilroy_claim_io_and_boot_failures_spend_launch_budget() {
             let id = uuid::Uuid::new_v4().to_string();
             write_fake_transcript(home.path(), &id);
             std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
-            let (state, _rx) = state_with_bus();
+            let (mut state, _rx) = state_with_bus();
+            let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+            state.set_ownership(registry.clone());
             let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
             sink.seed(
                 PROVIDER,
@@ -195,11 +430,15 @@ async fn shared_claude_kilroy_claim_io_and_boot_failures_spend_launch_budget() {
             msg.session_type = session_type;
             let answer = tokio::time::timeout(
                 Duration::from_secs(15),
-                state.resume_shared(msg, id, None, true, "test/genuine-failure"),
+                state.resume_shared(msg, id.clone(), None, true, "test/genuine-failure"),
             )
             .await
             .expect("the failed launch settles");
             state.shutdown().await;
+            assert!(
+                registry.observe(PROVIDER, &id).generation > 0,
+                "the failed launch acquired a real ownership claim"
+            );
             assert!(matches!(answer.result.as_ref(), Err(crate::session_recovery::RecoveryFailure::Attempt(recovery::RuntimeResumeError::Unavailable { .. }))),
                 "{session_type:?}/boot_failure={boot_failure}: genuine failures keep their type: {:?}", answer.result);
             assert_eq!(answer.status.failed_launches, 1);
