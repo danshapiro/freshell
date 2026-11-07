@@ -1983,6 +1983,40 @@ describe('new conversation close acceptance', () => {
 })
 
 describe('FreshAgentView', () => {
+  it('shows both Codex replacement recovery warnings from wire events and dismisses them together', async () => {
+    const store = createStore()
+    const locator = { sessionId: 'replacement-warning-thread', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ status: 'idle', capabilities: { send: true, interrupt: true }, turns: [] })
+    store.dispatch(sessionInit(locator))
+    render(<Provider store={store}><FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={{
+      kind: 'fresh-agent', ...locator, createRequestId: 'replacement-warning-create', status: 'connected',
+    }} /></Provider>)
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeEnabled())
+    const ledgerMessage = 'The replacement is running, but its session link could not be saved.'
+    const memoryMessage = 'Codex restarted as a new thread and no longer remembers the earlier conversation.'
+    act(() => {
+      for (const [code, message] of [['LEDGER_WRITE_FAILED', ledgerMessage], ['THREAD_MEMORY_LOST', memoryMessage]]) {
+        handleFreshAgentMessage(store.dispatch, {
+          type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.error', code, message },
+        })
+      }
+    })
+    const disclosure = document.querySelector<HTMLDetailsElement>('details[data-agent-error="session"]')!
+    expect(disclosure).not.toBeNull()
+    fireEvent.click(disclosure.querySelector('summary')!)
+    const warning = within(disclosure).getByText(`Agent error: ${memoryMessage} ${ledgerMessage}`)
+    expect(warning).toBeVisible()
+    expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeEnabled()
+    fireEvent.click(within(disclosure).getByRole('button', { name: 'Dismiss' }))
+    expect(document.querySelector('[data-agent-error="session"]')).toBeNull()
+    act(() => handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event', ...locator,
+      event: { type: 'freshAgent.error', code: 'THREAD_MEMORY_LOST', message: memoryMessage },
+    }))
+    expect(screen.getByText(`${memoryMessage} — Agent error`)).toBeVisible()
+    expect(screen.queryByText(new RegExp(ledgerMessage))).toBeNull()
+  })
+
   it('converges Codex native settings into the next send while preserving newer staged choices and absent metadata', async () => {
     const store = createStore()
     const locator = { sessionId: 'settings-convergence', sessionType: 'freshcodex' as const, provider: 'codex' as const }

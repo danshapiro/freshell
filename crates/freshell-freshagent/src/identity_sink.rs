@@ -489,6 +489,32 @@ impl FreshAgentBindingUpsert {
 pub type SinkWrite =
     std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'static>>;
 
+/// A binding refusal is lifecycle evidence, not a storage outage. Keep its
+/// type inside the I/O result so callers can choose cleanup without parsing
+/// diagnostic text or treating an unrelated filesystem failure as a close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingWriteRefusal {
+    ClosedReplacementSource,
+}
+
+impl BindingWriteRefusal {
+    pub fn from_io_error(error: &std::io::Error) -> Option<&Self> {
+        error.get_ref()?.downcast_ref()
+    }
+}
+
+impl std::fmt::Display for BindingWriteRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ClosedReplacementSource => formatter.write_str(
+                "CLOSED_REPLACEMENT_SOURCE: the source session was explicitly closed; replacement publication is refused",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BindingWriteRefusal {}
+
 /// The awaited shutdown-marker write. `false` means the durable binding row
 /// was absent or no longer belonged to a live fresh-agent session.
 pub type SinkMarkTurnInterruptedWrite =
@@ -607,8 +633,11 @@ pub type SinkAliasClearWrite = std::pin::Pin<
 /// AWAITED writes (wave-A durable-before-answer policy, V8/A11): callers
 /// `.await` the returned future before replying/broadcasting/proceeding.
 /// Implementations run fsync work on `spawn_blocking` and propagate failures
-/// as `Err` — call sites surface them user-visibly, then proceed (a write
-/// failure never blocks the identity event). Reads are memory-fast + sync.
+/// as `Err` — ordinary I/O failures are surfaced while preserving the valid
+/// identity event. A [`BindingWriteRefusal`] instead carries a lifecycle
+/// decision: Codex source publication must settle the rejected replacement
+/// rather than treat an explicit source close as a storage outage. Reads are
+/// memory-fast + sync.
 pub trait PaneIdentitySink: Send + Sync {
     fn record_pending(&self, placeholder_id: &str, mode: &str, cwd: Option<&str>) -> SinkWrite;
     fn record_binding(&self, upsert: FreshAgentBindingUpsert) -> SinkWrite;
@@ -1427,6 +1456,9 @@ pub(crate) struct FakeIdentitySink {
     /// kata b8ke Task 3 review M-1 test hook — see
     /// [`Self::arm_binding_stall`].
     binding_stall: std::sync::Mutex<Option<BindingStallGate>>,
+    /// A final source-linked publication parked before its source-close
+    /// check and mutations; staging does not consume this gate.
+    binding_before_write_stall: std::sync::Mutex<Option<BindingStallGate>>,
     /// Task 3 cancellation regression: holds one failed-transition repair
     /// before its result so the test can prove the Starting ticket remains
     /// active until durable repair succeeds.
@@ -1487,6 +1519,7 @@ pub(crate) type ObservedBindingPairMap =
 pub(crate) enum FakeRowState {
     Bound,
     Closed,
+    FailedTransition,
 }
 
 /// Focused-ep5-r1 Finding 2 test hook: the armed orphan gate's state.
@@ -1662,6 +1695,8 @@ pub(crate) struct RepairBarrierHandles {
 /// fires when the stalled write's mutations LANDED (row recorded, answer
 /// parked); `release` lets the stalled answer resolve, and `completed`
 /// fires when the returned future is polled to completion.
+/// [`FakeIdentitySink::arm_binding_before_write_stall`] reuses these handles,
+/// but `entered` marks the boundary before lifecycle checks and mutations.
 #[cfg(test)]
 pub(crate) struct BindingStallHandles {
     pub entered: std::sync::mpsc::Receiver<()>,
@@ -1672,10 +1707,11 @@ pub(crate) struct BindingStallHandles {
 #[cfg(test)]
 impl FakeIdentitySink {
     pub(crate) fn arm_repair_barrier(
-        &self,
+        self: &Arc<Self>,
         provider: &str,
         session_id: &str,
     ) -> RepairBarrierHandles {
+        *self.self_weak.lock().unwrap() = Arc::downgrade(self);
         let (entered_tx, entered) = tokio::sync::mpsc::unbounded_channel();
         let (release, release_rx) = tokio::sync::watch::channel(false);
         *self.repair_barrier.lock().unwrap() = Some(RepairBarrierGate {
@@ -1686,7 +1722,12 @@ impl FakeIdentitySink {
         RepairBarrierHandles { entered, release }
     }
 
-    pub(crate) fn arm_repair_gate(&self, provider: &str, session_id: &str) -> RepairGateHandles {
+    pub(crate) fn arm_repair_gate(
+        self: &Arc<Self>,
+        provider: &str,
+        session_id: &str,
+    ) -> RepairGateHandles {
+        *self.self_weak.lock().unwrap() = Arc::downgrade(self);
         let (entered_tx, entered) = tokio::sync::oneshot::channel();
         let (release, release_rx) = tokio::sync::oneshot::channel();
         *self.repair_gate.lock().unwrap() = Some(RepairGate {
@@ -1695,6 +1736,38 @@ impl FakeIdentitySink {
             release_rx: std::sync::Mutex::new(Some(release_rx)),
         });
         RepairGateHandles { entered, release }
+    }
+
+    /// Mirror the real ledger's conditional row projection at completion,
+    /// using the current binding rather than the one seen when repair began.
+    fn apply_failed_transition_repair(
+        &self,
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+        epoch: u64,
+        generation: u64,
+    ) {
+        let bindings = self.bindings.lock().unwrap();
+        let owns_binding = bindings
+            .iter()
+            .rev()
+            .find(|binding| binding.provider == provider && binding.session_id == session_id)
+            .and_then(|binding| binding.claim.as_ref())
+            .is_some_and(|claim| {
+                claim.provider == provider
+                    && claim.session_id == session_id
+                    && claim.operation_id == operation_id
+                    && claim.epoch == epoch
+                    && claim.generation == generation
+            });
+        if owns_binding {
+            let mut states = self.states.lock().unwrap();
+            let key = (provider.into(), session_id.into());
+            if states.get(&key) == Some(&FakeRowState::Bound) {
+                states.insert(key, FakeRowState::FailedTransition);
+            }
+        }
     }
 
     #[allow(dead_code)] // used by identity-event tasks (Tasks 4-10 tests)
@@ -1980,6 +2053,32 @@ impl FakeIdentitySink {
             completed: completed_rx,
         }
     }
+
+    /// Pause a source-linked publication before checking whether its source
+    /// closed. Staging never consumes this gate; `completed` fires after the
+    /// released write succeeds or refuses without mutation.
+    pub(crate) fn arm_binding_before_write_stall(
+        self: &std::sync::Arc<Self>,
+        provider: &str,
+        session_id: &str,
+    ) -> BindingStallHandles {
+        *self.self_weak.lock().unwrap() = std::sync::Arc::downgrade(self);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.binding_before_write_stall.lock().unwrap() = Some(BindingStallGate {
+            fail: false,
+            key: (provider.into(), session_id.into()),
+            entered_tx,
+            completed_tx,
+            release_rx: std::sync::Mutex::new(Some(release_rx)),
+        });
+        BindingStallHandles {
+            entered: entered_rx,
+            release: release_tx,
+            completed: completed_rx,
+        }
+    }
     /// The shared claim-commit decide+apply (the direct path AND the claim
     /// gate's + stall's tasks): EXACTLY `PaneLedger::commit_claim`'s
     /// conditional-transition contract against the fake's state. Refusal
@@ -2036,20 +2135,41 @@ impl FakeIdentitySink {
         }
         ClaimCommit::Committed
     }
-    /// The shared binding-write apply (the normal path AND the orphan gate's
-    /// detached task): mutations only — the caller owns the SinkWrite knob.
-    /// The kill-tombstone consult lives HERE so both paths fence identically.
+    /// The shared binding-write apply (normal, stalled and detached writes).
+    /// Lifecycle checks precede every mutation, at apply time.
     #[cfg(test)]
-    fn apply_binding(&self, upsert: FreshAgentBindingUpsert) {
+    fn apply_binding(&self, upsert: FreshAgentBindingUpsert) -> std::io::Result<()> {
+        if upsert.provider == "codex" {
+            if let Some(source) = upsert
+                .supersedes
+                .as_ref()
+                .filter(|source| **source != upsert.session_id)
+            {
+                let source_key = (upsert.provider.clone(), source.clone());
+                let closed = self.states.lock().unwrap().get(&source_key)
+                    == Some(&FakeRowState::Closed)
+                    || self
+                        .kill_tombstones
+                        .lock()
+                        .unwrap()
+                        .contains_key(&source_key);
+                if closed {
+                    return Err(std::io::Error::other(
+                        BindingWriteRefusal::ClosedReplacementSource,
+                    ));
+                }
+            }
+        }
         // Focused-ep5-r1 Finding 2 mirror: a tombstoned identity writes
         // NOTHING (the ledger's `record_fresh_agent_binding` suppression).
         let key0 = (upsert.provider.clone(), upsert.session_id.clone());
         if self.kill_tombstones.lock().unwrap().contains_key(&key0) {
             self.suppressed.lock().unwrap().push(key0);
-            return;
+            return Ok(());
         }
         // ...delegated to the existing mutation body below
         self.apply_binding_mutations(upsert);
+        Ok(())
     }
     /// The mutation body of `record_binding`, minus the tombstone consult.
     #[cfg(test)]
@@ -2194,6 +2314,39 @@ impl PaneIdentitySink for FakeIdentitySink {
     }
     fn record_binding(&self, upsert: FreshAgentBindingUpsert) -> SinkWrite {
         if !self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            let before_write = {
+                let mut gate = self.binding_before_write_stall.lock().unwrap();
+                if upsert
+                    .supersedes
+                    .as_deref()
+                    .is_some_and(|source| source != upsert.session_id)
+                    && gate.as_ref().is_some_and(|gate| {
+                        gate.key == (upsert.provider.clone(), upsert.session_id.clone())
+                    })
+                {
+                    gate.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(gate) = before_write {
+                let release = gate.release_rx.lock().unwrap().take();
+                let me = self.self_weak.lock().unwrap().upgrade();
+                let _ = gate.entered_tx.send(());
+                return Box::pin(async move {
+                    if let Some(release) = release {
+                        let _ = release.await;
+                    }
+                    let Some(me) = me else {
+                        return Err(std::io::Error::other(
+                            "the parked fake binding sink was dropped",
+                        ));
+                    };
+                    let result = me.apply_binding(upsert);
+                    let _ = gate.completed_tx.send(());
+                    result
+                });
+            }
             // Focused-ep5-r1 Finding 2 orphan-gate arm: an armed gate for this
             // EXACT key DETACHES the apply — it runs when the test releases
             // the gate (tombstone consult at apply time), exactly like the
@@ -2219,7 +2372,12 @@ impl PaneIdentitySink for FakeIdentitySink {
                 tokio::spawn(async move {
                     let _ = release_rx.await;
                     if let Some(me) = me.upgrade() {
-                        me.apply_binding(upsert);
+                        if let Err(error) = me.apply_binding(upsert) {
+                            tracing::warn!(
+                                error = %error,
+                                "detached fake binding write was refused before mutation"
+                            );
+                        }
                     }
                     let _ = applied_tx.send(());
                 });
@@ -2240,11 +2398,12 @@ impl PaneIdentitySink for FakeIdentitySink {
             if let Some((entered_tx, completed_tx, release_rx, fail)) = stall_arm {
                 // One-shot: disarm so later writes for the key apply inline.
                 *self.binding_stall.lock().unwrap() = None;
-                self.apply_binding(upsert);
+                let result = self.apply_binding(upsert);
                 let _ = entered_tx.send(());
                 return Box::pin(async move {
                     let _ = release_rx.await;
                     let _ = completed_tx.send(());
+                    result?;
                     if fail {
                         Err(std::io::Error::other("binding failed after persistence"))
                     } else {
@@ -2252,7 +2411,7 @@ impl PaneIdentitySink for FakeIdentitySink {
                     }
                 });
             }
-            self.apply_binding(upsert);
+            return Box::pin(std::future::ready(self.apply_binding(upsert)));
         }
         self.write_result()
     }
@@ -2396,6 +2555,9 @@ impl PaneIdentitySink for FakeIdentitySink {
             epoch,
             generation,
         ));
+        let provider = provider.to_string();
+        let session_id = session_id.to_string();
+        let operation_id = operation_id.to_string();
         #[cfg(test)]
         {
             let gate = {
@@ -2412,14 +2574,26 @@ impl PaneIdentitySink for FakeIdentitySink {
             if let Some(gate) = gate {
                 let release = gate.release_rx.lock().unwrap().take();
                 let fail = self.fail_writes.load(std::sync::atomic::Ordering::SeqCst);
+                let sink = self.self_weak.lock().unwrap().upgrade();
                 return Box::pin(async move {
                     let _ = gate.entered_tx.send(());
                     if let Some(release) = release {
-                        let _ = release.await;
+                        release.await.map_err(|_| {
+                            std::io::Error::other("fake repair gate released without a result")
+                        })?;
                     }
                     if fail {
                         Err(std::io::Error::other("fake write failure"))
                     } else {
+                        let sink = sink
+                            .ok_or_else(|| std::io::Error::other("fake repair sink was dropped"))?;
+                        sink.apply_failed_transition_repair(
+                            &provider,
+                            &session_id,
+                            &operation_id,
+                            epoch,
+                            generation,
+                        );
                         Ok(())
                     }
                 });
@@ -2434,6 +2608,7 @@ impl PaneIdentitySink for FakeIdentitySink {
                 .cloned();
             if let Some(barrier) = barrier {
                 let fail = self.fail_writes.load(std::sync::atomic::Ordering::SeqCst);
+                let sink = self.self_weak.lock().unwrap().upgrade();
                 return Box::pin(async move {
                     let _ = barrier.entered_tx.send(());
                     let mut release = barrier.release_rx;
@@ -2447,10 +2622,28 @@ impl PaneIdentitySink for FakeIdentitySink {
                     if fail {
                         Err(std::io::Error::other("fake write failure"))
                     } else {
+                        let sink = sink
+                            .ok_or_else(|| std::io::Error::other("fake repair sink was dropped"))?;
+                        sink.apply_failed_transition_repair(
+                            &provider,
+                            &session_id,
+                            &operation_id,
+                            epoch,
+                            generation,
+                        );
                         Ok(())
                     }
                 });
             }
+        }
+        if !self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            self.apply_failed_transition_repair(
+                &provider,
+                &session_id,
+                &operation_id,
+                epoch,
+                generation,
+            );
         }
         self.write_result()
     }
@@ -2992,6 +3185,210 @@ mod tests {
             generation,
             "binding-guard-test",
         )
+    }
+
+    fn repair_binding(claim: BindingClaim) -> FreshAgentBindingUpsert {
+        FreshAgentBindingUpsert {
+            provider: claim.provider.clone(),
+            session_id: claim.session_id.clone(),
+            mode: "freshcodex".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            name_transition: None,
+            provenance: ProvenanceUpdate::Inherit,
+            observed_epoch: Some(claim.epoch),
+            observed_generation: Some(claim.generation),
+            claim: Some(claim),
+            settings: SettingsUpdate::Replace(FreshAgentSettings {
+                model: Some("retained-model".into()),
+                ..Default::default()
+            }),
+            genesis: GenesisUpdate::Keep,
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_failed_transition_repair_retires_only_its_exact_bound_claim() {
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let ticket = starting_ticket(&registry, "repair-target", "repair-operation");
+        let claim = BindingClaim::from_ticket(&ticket, BindingClaimKind::Starting).unwrap();
+        for case in [
+            "exact",
+            "closed",
+            "operation",
+            "epoch",
+            "generation",
+            "provider",
+            "session",
+            "unclaimed",
+            "write-failure",
+        ] {
+            let fake = FakeIdentitySink::default();
+            let mut binding = repair_binding(claim.clone());
+            match case {
+                "operation" => {
+                    binding.claim.as_mut().unwrap().operation_id = "replacement-operation".into()
+                }
+                "epoch" => binding.claim.as_mut().unwrap().epoch += 1,
+                "generation" => binding.claim.as_mut().unwrap().generation += 1,
+                "provider" => binding.claim.as_mut().unwrap().provider = "claude".into(),
+                "session" => binding.claim.as_mut().unwrap().session_id = "other-target".into(),
+                "unclaimed" => binding.claim = None,
+                _ => {}
+            }
+            fake.record_binding(binding).await.unwrap();
+            if case == "closed" {
+                fake.retire_closed("codex", &claim.session_id)
+                    .await
+                    .unwrap();
+            }
+            if case == "write-failure" {
+                fake.fail_writes
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            let result = fake
+                .repair_failed_transition(
+                    &claim.provider,
+                    &claim.session_id,
+                    &claim.operation_id,
+                    claim.epoch,
+                    claim.generation,
+                )
+                .await;
+            assert_eq!(
+                result.is_err(),
+                case == "write-failure",
+                "{case}: {result:?}"
+            );
+            let expected = match case {
+                "exact" => FakeRowState::FailedTransition,
+                "closed" => FakeRowState::Closed,
+                _ => FakeRowState::Bound,
+            };
+            assert_eq!(
+                fake.states
+                    .lock()
+                    .unwrap()
+                    .get(&(claim.provider.clone(), claim.session_id.clone())),
+                Some(&expected),
+                "{case}: only the exact still-Bound claim may retire",
+            );
+            assert_eq!(
+                fake.load_settings(&claim.provider, &claim.session_id)
+                    .unwrap()
+                    .model
+                    .as_deref(),
+                Some("retained-model")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_gated_repair_checks_current_binding_only_after_successful_release() {
+        for case in [
+            "success",
+            "new-owner",
+            "closed",
+            "write-failure",
+            "release-dropped",
+            "barrier",
+        ] {
+            let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+            let ticket = starting_ticket(&registry, "gated-repair", "gated-operation");
+            let claim = BindingClaim::from_ticket(&ticket, BindingClaimKind::Starting).unwrap();
+            let fake = Arc::new(FakeIdentitySink::default());
+            fake.record_binding(repair_binding(claim.clone()))
+                .await
+                .unwrap();
+            let repair = if case == "barrier" {
+                let mut gate = fake.arm_repair_barrier("codex", &claim.session_id);
+                let task = tokio::spawn(fake.repair_failed_transition(
+                    &claim.provider,
+                    &claim.session_id,
+                    &claim.operation_id,
+                    claim.epoch,
+                    claim.generation,
+                ));
+                tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    fake.states
+                        .lock()
+                        .unwrap()
+                        .get(&(claim.provider.clone(), claim.session_id.clone())),
+                    Some(&FakeRowState::Bound)
+                );
+                gate.release.send(true).unwrap();
+                task
+            } else {
+                let gate = fake.arm_repair_gate("codex", &claim.session_id);
+                if case == "write-failure" {
+                    fake.fail_writes
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                let task = tokio::spawn(fake.repair_failed_transition(
+                    &claim.provider,
+                    &claim.session_id,
+                    &claim.operation_id,
+                    claim.epoch,
+                    claim.generation,
+                ));
+                tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    fake.states
+                        .lock()
+                        .unwrap()
+                        .get(&(claim.provider.clone(), claim.session_id.clone())),
+                    Some(&FakeRowState::Bound)
+                );
+                if case == "new-owner" {
+                    let mut replacement = claim.clone();
+                    replacement.operation_id = "later-operation".into();
+                    replacement.generation += 1;
+                    fake.record_binding(repair_binding(replacement))
+                        .await
+                        .unwrap();
+                } else if case == "closed" {
+                    fake.retire_closed("codex", &claim.session_id)
+                        .await
+                        .unwrap();
+                }
+                if case == "release-dropped" {
+                    drop(gate.release);
+                } else {
+                    gate.release.send(()).unwrap();
+                }
+                task
+            };
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), repair)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                result.is_err(),
+                matches!(case, "write-failure" | "release-dropped"),
+                "{case}: {result:?}"
+            );
+            let expected = match case {
+                "success" | "barrier" => FakeRowState::FailedTransition,
+                "closed" => FakeRowState::Closed,
+                _ => FakeRowState::Bound,
+            };
+            assert_eq!(
+                fake.states
+                    .lock()
+                    .unwrap()
+                    .get(&(claim.provider.clone(), claim.session_id.clone())),
+                Some(&expected),
+                "{case}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3863,6 +4260,94 @@ mod tests {
             1,
             "post-clear the genuine claim's write lands"
         );
+    }
+
+    #[tokio::test]
+    async fn fake_closed_replacement_source_refusal_is_typed_and_leaves_target_untouched() {
+        let fake = Arc::new(FakeIdentitySink::default());
+        let upsert = |session_id: &str, supersedes: Option<&str>| FreshAgentBindingUpsert {
+            provider: "codex".into(),
+            session_id: session_id.into(),
+            mode: "freshcodex".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: supersedes.map(str::to_string),
+            name_transition: None,
+            provenance: ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+            claim: None,
+            settings: SettingsUpdate::Replace(FreshAgentSettings {
+                model: Some(session_id.into()),
+                ..Default::default()
+            }),
+            genesis: GenesisUpdate::Keep,
+        };
+        fake.record_binding(upsert("source", None)).await.unwrap();
+        let gate = fake.arm_binding_before_write_stall("codex", "target");
+        fake.stage_replacement_binding(upsert("target", Some("source")))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                gate.entered.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "staging must not consume the final publication gate"
+        );
+        let before = fake.bindings.lock().unwrap().clone();
+        let settings = fake.load_settings("codex", "target");
+        let publication = tokio::spawn(fake.record_binding(upsert("target", Some("source"))));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while gate.entered.try_recv().is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the final publication parks before its source-state check");
+        assert_eq!(
+            *fake.bindings.lock().unwrap(),
+            before,
+            "a parked publication has not mutated the binding"
+        );
+        fake.retire_closed("codex", "source").await.unwrap();
+        gate.release.send(()).unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), publication)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        gate.completed
+            .try_recv()
+            .expect("publication reports completion after its refusal");
+        assert_eq!(
+            BindingWriteRefusal::from_io_error(&error),
+            Some(&BindingWriteRefusal::ClosedReplacementSource),
+        );
+        assert_eq!(*fake.bindings.lock().unwrap(), before);
+        assert_eq!(fake.load_settings("codex", "target"), settings);
+        assert_eq!(fake.chain_terminus("codex", "source"), None);
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("codex".into(), "source".into())),
+            Some(&FakeRowState::Closed)
+        );
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("codex".into(), "target".into())),
+            Some(&FakeRowState::Bound)
+        );
+
+        // Identical diagnostic text from an unrelated I/O error is not
+        // authority to tear down a replacement.
+        let untyped = std::io::Error::other(error.to_string());
+        assert_eq!(BindingWriteRefusal::from_io_error(&untyped), None);
+        let filesystem = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(BindingWriteRefusal::from_io_error(&filesystem), None);
     }
 
     /// Focused-ep5-r3 Finding 1 (fake mirror): the conditional commit is

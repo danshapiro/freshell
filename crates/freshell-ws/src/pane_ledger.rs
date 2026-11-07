@@ -2625,10 +2625,14 @@ impl PaneLedger {
         let mut index = self.guard();
 
         let key = (w.provider.to_string(), w.session_id.to_string());
-        if let Some(source_id) = w
-            .supersedes
-            .filter(|source_id| publish_source && *source_id != w.session_id)
-        {
+        // Codex mint recovery settles its rejected replacement on this typed
+        // refusal. Other providers retain their existing binding contracts:
+        // Claude conversation reset already moved the live runtime and only
+        // reports persistence errors, so a new refusal there would lose its
+        // binding/rollback rekey without a matching lifecycle decision.
+        if let Some(source_id) = w.supersedes.filter(|source_id| {
+            w.provider == "codex" && publish_source && *source_id != w.session_id
+        }) {
             let source_key = (w.provider.to_string(), source_id.to_string());
             let source = index.bindings.get(&source_key);
             let closed = source.is_some_and(|row| {
@@ -2658,7 +2662,7 @@ impl PaneLedger {
                     "pane_ledger_replacement_refused_closed_source: explicit close prevents source publication"
                 );
                 return Err(std::io::Error::other(
-                    "CLOSED_REPLACEMENT_SOURCE: the source session was explicitly closed; replacement publication is refused",
+                    freshell_freshagent::identity_sink::BindingWriteRefusal::ClosedReplacementSource,
                 ));
             }
         }

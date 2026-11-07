@@ -131,6 +131,7 @@ export type FreshAgentSessionState = FreshAgentSessionLocator & {
   totalInputTokens: number
   totalOutputTokens: number
   lastError?: string
+  lastRecoveryWarnings?: Partial<Record<'LEDGER_WRITE_FAILED' | 'THREAD_MEMORY_LOST', string>>
   lastErrorRequestId?: string
   lastErrorOperationAttemptId?: string
   lastErrorWasOperationFallback?: boolean

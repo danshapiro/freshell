@@ -409,6 +409,91 @@ mod tests {
         routes.detach_view("view-b");
     }
 
+    #[tokio::test]
+    async fn codex_replacement_publication_routes_materialization_before_both_alarms() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        const OLD: &str = "original-codex-thread";
+        const NEW: &str = "replacement-codex-thread";
+        const LEDGER_MESSAGE: &str =
+            "The replacement is running, but its previous-session link could not be saved.";
+        let (broadcast, mut frames) = tokio::sync::broadcast::channel(16);
+        let state = freshell_freshagent::FreshCodexState::new(
+            Arc::new("route-test-auth".into()),
+            Arc::new(broadcast),
+            json!({"freshAgent":{"enabled":true}}),
+        );
+        let mut requester = FreshAgentViewRoutes::default();
+        let mut unrelated = FreshAgentViewRoutes::default();
+        for (routes, session_id, view_id) in [
+            (&mut requester, OLD, "recovering-view"),
+            (&mut unrelated, "unrelated-thread", "unrelated-view"),
+        ] {
+            routes.observe_client_value(&json!({
+                "type":"freshAgent.attach", "provider":"codex", "sessionType":"freshcodex",
+                "sessionId":session_id, "viewId":view_id
+            }));
+        }
+
+        // Exercise the production publisher through the ordinary crate
+        // dependency; the frames below are its actual serialized broadcasts.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            state.publish_replacement_materialization_for_test(OLD, NEW, Some(LEDGER_MESSAGE)),
+        )
+        .await
+        .expect("replacement materialization and both alarms publish promptly");
+
+        for (kind, code) in [
+            ("freshAgent.session.materialized", None),
+            ("freshAgent.event", Some("LEDGER_WRITE_FAILED")),
+            ("freshAgent.event", Some("THREAD_MEMORY_LOST")),
+        ] {
+            let wire = tokio::time::timeout(Duration::from_secs(5), frames.recv())
+                .await
+                .expect("the production publisher emits each ordered frame")
+                .expect("the production broadcast bus remains open");
+            let value: serde_json::Value = serde_json::from_str(&wire).unwrap();
+            assert_eq!(value["type"], kind, "{wire}");
+            assert_eq!(value["provider"], "codex", "{wire}");
+            assert_eq!(value["sessionType"], "freshcodex", "{wire}");
+            assert_eq!(value["sessionId"], NEW, "{wire}");
+            if let Some(code) = code {
+                assert_eq!(value["event"]["type"], "freshAgent.error", "{wire}");
+                assert_eq!(value["event"]["sessionId"], NEW, "{wire}");
+                assert_eq!(value["event"]["code"], code, "{wire}");
+                if code == "LEDGER_WRITE_FAILED" {
+                    assert_eq!(value["event"]["message"], LEDGER_MESSAGE, "{wire}");
+                }
+            } else {
+                assert_eq!(value["previousSessionId"], OLD, "{wire}");
+            }
+            assert!(
+                requester.should_deliver(&wire),
+                "the recovering view must receive materialization before its alarms: {wire}"
+            );
+            assert!(
+                !unrelated.should_deliver(&wire),
+                "replacement frames must not reach an unrelated view: {wire}"
+            );
+        }
+        let replacement = super::Locator {
+            provider: "codex".into(),
+            session_type: "freshcodex".into(),
+            session_id: NEW.into(),
+        };
+        assert_eq!(
+            requester.views.get(&replacement),
+            Some(&std::collections::HashSet::from(["recovering-view".into()]))
+        );
+        assert!(!requester
+            .views
+            .keys()
+            .any(|locator| locator.session_id == OLD));
+        assert!(!unrelated.views.contains_key(&replacement));
+    }
+
     #[test]
     fn detaching_a_pending_create_suppresses_its_late_ack_and_events() {
         let mut routes = FreshAgentViewRoutes::default();

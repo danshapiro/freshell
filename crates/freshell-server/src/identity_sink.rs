@@ -2012,12 +2012,11 @@ mod tests {
                 "publication must not relabel an explicit close as supersession"
             );
             assert_eq!(fixture.sink.chain_terminus("codex", OLD), None);
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("CLOSED_REPLACEMENT_SOURCE"),
-                "the caller must learn that the source was closed"
+            let error = result.unwrap_err();
+            assert_eq!(
+                freshell_freshagent::identity_sink::BindingWriteRefusal::from_io_error(&error),
+                Some(&freshell_freshagent::identity_sink::BindingWriteRefusal::ClosedReplacementSource),
+                "the caller must distinguish an explicit close from a storage failure: {error}"
             );
             assert_eq!(fixture.registry.observe("codex", NEW), live_target);
             assert_eq!(
@@ -2028,8 +2027,31 @@ mod tests {
                 .ledger
                 .pending_for_terminal("replacement-pending")
                 .is_some());
+            fixture
+                .sink
+                .repair_failed_transition(
+                    "codex",
+                    NEW,
+                    &target.operation_id,
+                    target.epoch,
+                    target.generation,
+                )
+                .await
+                .unwrap();
+            let retired_target = fixture.ledger.load_binding("codex", NEW).unwrap();
+            assert_eq!(retired_target.state, RowState::Retired);
+            assert_eq!(
+                retired_target.retired_reason,
+                Some(RetiredReason::FailedTransition)
+            );
+            assert_eq!(fixture.ledger.load_binding("codex", OLD).unwrap(), closed);
+            assert_eq!(fixture.sink.chain_terminus("codex", OLD), None);
             let restarted = PaneLedger::new(Some(fixture.directory.path().to_path_buf()));
             assert_eq!(restarted.load_binding("codex", OLD).unwrap(), closed);
+            assert_eq!(
+                restarted.load_binding("codex", NEW).unwrap(),
+                retired_target
+            );
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2561,6 +2583,67 @@ mod tests {
         assert!(
             sink.load_rollback("codex", "old-thread").is_some(),
             "the codex old-thread row stays put"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_rekey_from_closed_source_preserves_its_existing_binding_and_rollback_contract()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(PaneLedger::new(Some(directory.path().to_path_buf())));
+        let sink = LedgerIdentitySink::new(ledger.clone(), None);
+        let upsert = |session_id: &str, supersedes: Option<&str>| FreshAgentBindingUpsert {
+            provider: "claude".into(),
+            session_id: session_id.into(),
+            mode: "freshclaude".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: supersedes.map(str::to_string),
+            name_transition: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+            claim: None,
+            settings: SettingsUpdate::Replace(FreshAgentSettings {
+                model: Some("claude-model".into()),
+                ..Default::default()
+            }),
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
+        };
+        sink.record_binding(upsert("old", None)).await.unwrap();
+        let rollback = RollbackRecord::empty(100);
+        sink.record_rollback("claude", "old", rollback.clone())
+            .await
+            .unwrap();
+        sink.retire_closed("claude", "old").await.unwrap();
+        let source_close = ledger.kill_tombstone_at("claude", "old");
+        assert!(source_close.is_some());
+
+        // Claude conversation reset already moved the healthy runtime before
+        // this write. Its existing diagnostic-only failure path cannot adopt
+        // Codex's new refusal/teardown contract as an incidental ledger change.
+        sink.record_binding(upsert("new", Some("old")))
+            .await
+            .unwrap();
+        assert_eq!(
+            sink.load_settings("claude", "new")
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("claude-model")
+        );
+        assert_eq!(sink.load_rollback("claude", "new"), Some(rollback.clone()));
+        assert_eq!(sink.load_rollback("claude", "old"), None);
+        assert_eq!(sink.chain_terminus("claude", "old").as_deref(), Some("new"));
+        assert_eq!(ledger.kill_tombstone_at("claude", "old"), source_close);
+        let restarted = LedgerIdentitySink::new(
+            Arc::new(PaneLedger::new(Some(directory.path().to_path_buf()))),
+            None,
+        );
+        assert_eq!(restarted.load_rollback("claude", "new"), Some(rollback));
+        assert_eq!(
+            restarted.chain_terminus("claude", "old").as_deref(),
+            Some("new")
         );
     }
 

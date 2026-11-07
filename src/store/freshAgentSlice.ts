@@ -51,6 +51,7 @@ function operationReceiptFingerprint(parts: readonly unknown[]): string {
 
 function clearSessionErrorState(session: FreshAgentSessionState) {
   session.lastError = undefined
+  session.lastRecoveryWarnings = undefined
   session.lastErrorCode = undefined
   session.lastErrorRequestId = undefined
   session.lastErrorOperationAttemptId = undefined
@@ -61,6 +62,26 @@ function clearSessionErrorState(session: FreshAgentSessionState) {
   session.earlierControlUncertainties = undefined
   session.unattributedControlErrors = undefined
   session.pendingControlFallbacks = undefined
+}
+
+function mergeReplacementRecoveryWarnings(session: FreshAgentSessionState, payload: {
+  code?: string; message: string; operationReceipt?: boolean
+}): string {
+  const { code, message } = payload
+  if (payload.operationReceipt || (code !== 'LEDGER_WRITE_FAILED' && code !== 'THREAD_MEMORY_LOST')) {
+    session.lastRecoveryWarnings = undefined
+    return message
+  }
+  // One replacement can report both persistence failure and lost conversation
+  // memory. Keep one current message per cause until dismissal or another error.
+  const warnings = session.lastErrorWasOperationFallback === undefined
+    && (session.lastErrorCode === 'LEDGER_WRITE_FAILED' || session.lastErrorCode === 'THREAD_MEMORY_LOST')
+    ? session.lastRecoveryWarnings ?? {}
+    : {}
+  warnings[code] = message
+  session.lastRecoveryWarnings = warnings
+  // Keep the memory-loss notice first even in the collapsed error summary.
+  return [warnings.THREAD_MEMORY_LOST, warnings.LEDGER_WRITE_FAILED].filter(Boolean).join(' ')
 }
 
 function earlierControlUncertainty(session: FreshAgentSessionState, requestId?: string): string | undefined {
@@ -701,7 +722,7 @@ const freshAgentSlice = createSlice({
         ? 'The outcome could not be confirmed. Check the conversation before trying again.' : undefined
       const uncertainty = priorUncertainty || nativeUncertainty
         || (action.payload.operationFallback && action.payload.operationOutcomeUncertain ? action.payload.message : undefined)
-      session.lastError = [action.payload.message, priorUncertainty || nativeUncertainty,
+      session.lastError = [mergeReplacementRecoveryWarnings(session, action.payload), priorUncertainty || nativeUncertainty,
         earlierControlUncertainty(session, requestId), unattributedControlError(session, requestId)].filter(Boolean).join(' ')
       session.lastErrorRequestId = action.payload.operationReceipt ? action.payload.requestId : undefined
       session.lastErrorOperationAttemptId = action.payload.operationReceipt ? operationAttemptId : undefined

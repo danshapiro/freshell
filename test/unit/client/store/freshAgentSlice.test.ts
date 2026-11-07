@@ -159,6 +159,58 @@ describe('freshAgentSlice busy/streaming clearing', () => {
   })
 })
 
+describe('Codex replacement recovery warnings', () => {
+  const loc = { sessionId: 'replacement-thread', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+  const key = makeFreshAgentSessionKey(loc)
+  const ledger = { code: 'LEDGER_WRITE_FAILED', message: 'The replacement is running, but its session link could not be saved.' }
+  const memory = { code: 'THREAD_MEMORY_LOST', message: 'Codex restarted as a new thread and no longer remembers the earlier conversation.' }
+
+  it.each([{ first: ledger, second: memory }, { first: memory, second: ledger }])('preserves both warnings when $first.code arrives before $second.code', ({ first, second }) => {
+    let state = reducer(undefined, sessionSnapshotReceived({ ...loc, latestTurnId: null, status: 'running', streamingActive: true }))
+    state = reducer(state, sessionError({ ...loc, ...first }))
+    state = reducer(state, sessionError({ ...loc, ...second }))
+    expect(state.sessions[key].lastError).toBe(`${memory.message} ${ledger.message}`)
+    expect(state.sessions[key].lastErrorCode).toBe(second.code)
+    expect(state.sessions[key].status).toBe('idle')
+    expect(state.sessions[key].streamingActive).toBe(false)
+  })
+
+  it('replaces repeated warning details without duplicating or losing the other warning', () => {
+    let state = reducer(undefined, sessionError({ ...loc, ...ledger }))
+    state = reducer(state, sessionError({ ...loc, ...memory }))
+    state = reducer(state, sessionError({ ...loc, ...memory }))
+    const updatedLedger = { ...ledger, message: 'The session link still could not be saved.' }
+    state = reducer(state, sessionError({ ...loc, ...updatedLedger }))
+    expect(state.sessions[key].lastError).toBe(`${memory.message} ${updatedLedger.message}`)
+  })
+
+  it('dismisses both warnings without reviving the old warning on a later error', () => {
+    let state = reducer(undefined, sessionError({ ...loc, ...ledger }))
+    state = reducer(state, sessionError({ ...loc, ...memory }))
+    state = reducer(state, clearSessionError(loc))
+    expect(state.sessions[key].lastError).toBeUndefined()
+    state = reducer(state, sessionError({ ...loc, ...memory }))
+    expect(state.sessions[key].lastError).toBe(memory.message)
+  })
+
+  it('keeps unrelated errors separate from the recovery warning pair', () => {
+    let state = reducer(undefined, sessionError({ ...loc, ...ledger }))
+    state = reducer(state, sessionError({ ...loc, code: 'SEND_FAILED', message: 'The prompt could not be sent.' }))
+    expect(state.sessions[key].lastError).toBe('The prompt could not be sent.')
+    state = reducer(state, sessionError({ ...loc, ...memory }))
+    expect(state.sessions[key].lastError).toBe(memory.message)
+  })
+
+  it('keeps request-scoped operation failures separate from the recovery warning pair', () => {
+    let state = reducer(undefined, sessionError({ ...loc, ...memory }))
+    state = reducer(state, sessionError({ ...loc, ...ledger, operationReceipt: true, requestId: 'save-link-request' }))
+    expect(state.sessions[key].lastError).toBe(ledger.message)
+    expect(state.sessions[key].lastErrorRequestId).toBe('save-link-request')
+    state = reducer(state, sessionError({ ...loc, ...memory }))
+    expect(state.sessions[key].lastError).toBe(memory.message)
+  })
+})
+
 describe('freshAgentSlice', () => {
   const codexLoc = { sessionId: 'thread-status-version', sessionType: 'freshcodex' as const, provider: 'codex' as const }
   const codexKey = makeFreshAgentSessionKey(codexLoc)
