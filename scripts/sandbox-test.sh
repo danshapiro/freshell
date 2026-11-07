@@ -865,7 +865,15 @@ fi
 # missing or different version. An absent helper must not block the caller.
 DIAGNOSTIC_CONTAINER_HELPER="/run/freshell-sandbox-diagnostics.mjs"
 if [ -f "${DIAGNOSTIC_HELPER}" ]; then
-  DOCKER_ARGS+=(--mount "type=bind,src=${DIAGNOSTIC_HELPER},dst=${DIAGNOSTIC_CONTAINER_HELPER},readonly")
+  # Docker parses --mount as CSV. Quote the whole source field when needed,
+  # doubling embedded quotes so the trusted pathname remains one field.
+  case "${DIAGNOSTIC_HELPER}" in
+    *','*|*'"'*|*$'\n'*|*$'\r'*)
+      DIAGNOSTIC_SOURCE_FIELD="\"src=${DIAGNOSTIC_HELPER//\"/\"\"}\""
+      ;;
+    *) DIAGNOSTIC_SOURCE_FIELD="src=${DIAGNOSTIC_HELPER}" ;;
+  esac
+  DOCKER_ARGS+=(--mount "type=bind,${DIAGNOSTIC_SOURCE_FIELD},dst=${DIAGNOSTIC_CONTAINER_HELPER},readonly")
 fi
 
 if [ -n "${LINKED_WORKTREE_GIT_COMMON_DIR}" ]; then
