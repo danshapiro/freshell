@@ -2327,33 +2327,26 @@ async fn native_name_transient_lifecycle_admission_preserves_the_current_request
         request.source.host_boot_id.clone(),
     );
     let lifecycle = fixture.supervisor.lifecycle_lock(&fixture.soul).await;
-    let held = lifecycle.lock().await;
+    let held = lifecycle.clone().lock_owned().await;
     let mut operation = Box::pin(fixture.supervisor.fresh_agent_native_name(request));
     let first_poll = std::future::poll_fn(|cx| {
         std::task::Poll::Ready(std::future::Future::poll(operation.as_mut(), cx))
     })
     .await;
-    let std::task::Poll::Ready(reply) = first_poll else {
-        panic!("lifecycle contention must refuse immediately rather than queue native work");
-    };
-    assert_eq!(
-        reply.unwrap(),
-        FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::LifecycleBusy)
+    assert!(
+        matches!(first_poll, std::task::Poll::Pending),
+        "a transient lifecycle conflict waits briefly for the same request"
     );
     assert!(
         received.lock().unwrap().is_empty(),
-        "refused admission performs no host/native work"
+        "a request waiting for lifecycle admission performs no host/native work"
     );
-    drop(operation);
-    drop(held);
-    // Only a new request with freshly observed authority may use the released
-    // lock. The refused future must never resume or spend a native attempt.
-    let fresh = native_name_request(&fixture).await;
-    let reply = fixture
-        .supervisor
-        .fresh_agent_native_name(fresh)
-        .await
-        .unwrap();
+    let release_busy = tokio::spawn(async move {
+        sleep(Duration::from_millis(25)).await;
+        drop(held);
+    });
+    let reply = operation.await.unwrap();
+    release_busy.await.unwrap();
     host.abort();
     let _ = host.await;
     assert_eq!(reply, FreshAgentNativeNameReply::Renamed);
@@ -2807,6 +2800,8 @@ async fn native_name_queued_stop_cancellation_and_deadline_never_dispatch_late()
         let mut request = native_name_request(&fixture).await;
         if case == "deadline" {
             request.deadline_unix_ms = Some(super::now_millis() + 5_000);
+        } else if case == "epoch" {
+            request.expected_control_epoch = Some(fixture.supervisor.registry.control_epoch() + 1);
         }
         let (received, host) = fake_host_with_boot(
             &fixture.runtime_dir,
@@ -2814,24 +2809,20 @@ async fn native_name_queued_stop_cancellation_and_deadline_never_dispatch_late()
             request.source.host_boot_id.clone(),
         );
         let lifecycle = fixture.supervisor.lifecycle_lock(&fixture.soul).await;
-        let held = lifecycle.lock().await;
-        let mut operation = Box::pin(fixture.supervisor.fresh_agent_native_name(request.clone()));
+        let held = lifecycle.clone().lock_owned().await;
+        let mut operation = Box::pin(fixture.supervisor.fresh_agent_native_name(request));
         let first_poll = std::future::poll_fn(|cx| {
             std::task::Poll::Ready(std::future::Future::poll(operation.as_mut(), cx))
         })
         .await;
-        let std::task::Poll::Ready(reply) = first_poll else {
-            panic!("{case}: lifecycle contention must not leave a queued request");
-        };
-        assert_eq!(
-            reply.unwrap(),
-            FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::LifecycleBusy)
+        assert!(
+            matches!(first_poll, std::task::Poll::Pending),
+            "{case}: lifecycle contention uses only the bounded lock wait"
         );
         assert!(
             received.lock().unwrap().is_empty(),
-            "{case}: typed refusal must precede every host/native operation"
+            "{case}: no host/native operation starts while lifecycle admission is held"
         );
-        drop(operation);
         match case {
             "stop" => {
                 fixture
@@ -2840,39 +2831,39 @@ async fn native_name_queued_stop_cancellation_and_deadline_never_dispatch_late()
                     .begin_stop_expected(fixture.soul.clone(), None)
                     .await
                     .unwrap();
-            }
-            "deadline" => {
-                // Even after the refused request's old deadline and lock
-                // release, no detached queue entry may survive its caller.
-                tokio::time::pause();
-                tokio::time::advance(std::time::Duration::from_millis(5_001)).await;
-                tokio::time::resume();
-            }
-            "epoch" => {
-                request.expected_control_epoch =
-                    Some(fixture.supervisor.registry.control_epoch() + 1)
-            }
-            "cancel" => {}
-            _ => unreachable!(),
-        }
-        drop(held);
-        if matches!(case, "stop" | "epoch") {
-            // A fresh attempt must reject the stopped source or stale epoch
-            // before authenticating, rather than revive the old refusal.
-            let reply = fixture.supervisor.fresh_agent_native_name(request).await;
-            if case == "epoch" {
-                assert_eq!(reply.unwrap_err().code, RuntimeErrorCode::StaleControlEpoch);
-            } else {
-                assert!(
-                    reply.is_err()
-                        || matches!(
-                            reply.unwrap(),
-                            FreshAgentNativeNameReply::Failed(
-                                FreshAgentNativeNameError::Unavailable { .. }
-                            )
-                        )
+                drop(held);
+                assert_eq!(
+                    operation.await.unwrap_err().code,
+                    RuntimeErrorCode::UnknownSoul
                 );
             }
+            "deadline" => {
+                // The original deadline wins over the bounded lock wait; a
+                // timed-out request must not dispatch after the lock is freed.
+                tokio::time::pause();
+                tokio::time::advance(std::time::Duration::from_millis(5_001)).await;
+                assert!(matches!(
+                    operation.await.unwrap(),
+                    FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Timeout { .. })
+                ));
+                tokio::time::resume();
+                drop(held);
+            }
+            "epoch" => {
+                // Epoch validation occurs after admission; stale authority
+                // must refuse before the held operation reaches the host.
+                drop(held);
+                assert_eq!(
+                    operation.await.unwrap_err().code,
+                    RuntimeErrorCode::StaleControlEpoch
+                );
+            }
+            "cancel" => {
+                // Dropping a request while it waits must remove its waiter.
+                drop(operation);
+                drop(held);
+            }
+            _ => unreachable!(),
         }
         tokio::task::yield_now().await;
         assert!(
