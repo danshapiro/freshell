@@ -131,7 +131,31 @@ async fn assert_unconfirmed_startup_cleanup_releases_requester(
     assert!(crate::ownership_lane::partial_pid_confirmed_dead(
         recorded.pid
     ));
+    let reusable = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if matches!(
+                state.leases.claim(
+                    PROVIDER,
+                    &id,
+                    "after-proof",
+                    crate::session_lease::now_epoch_ms()
+                ),
+                crate::session_lease::FreshSessionClaim::Acquired
+            ) {
+                state.leases.fail(PROVIDER, &id, "after-proof");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
     state.shutdown().await;
+
+    assert!(
+        reusable,
+        "confirmed deferred cleanup must release its lease promptly, without TTL recovery"
+    );
 
     assert!(
         requester_finished,
@@ -492,7 +516,7 @@ async fn canceled_source_publication_claim_observably_drops_ticket_before_watchd
 }
 
 #[tokio::test(start_paused = true)]
-async fn complete_identity_cleanup_retries_have_a_finite_budget_and_one_active_probe() {
+async fn complete_identity_cleanup_recovers_after_rapid_retry_budget_with_one_active_probe() {
     let attempts = Arc::new(StdMutex::new(Vec::new()));
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let seen = attempts.clone();
@@ -506,10 +530,14 @@ async fn complete_identity_cleanup_retries_have_a_finite_budget_and_one_active_p
                 0,
                 "only one owned proof may run at once"
             );
-            seen.lock().unwrap().push(tokio::time::Instant::now());
+            let confirmed = {
+                let mut attempts = seen.lock().unwrap();
+                attempts.push(tokio::time::Instant::now());
+                attempts.len() == 10
+            };
             tokio::task::yield_now().await;
             assert_eq!(running.fetch_sub(1, Ordering::SeqCst), 1);
-            Ok(false)
+            Ok(confirmed)
         })
     });
     let recorded = crate::session_lease::CondemnedRuntimeIdentity {
@@ -521,29 +549,282 @@ async fn complete_identity_cleanup_retries_have_a_finite_budget_and_one_active_p
         capture_complete: true,
     };
     let result = tokio::time::timeout(
-        Duration::from_secs(120),
-        codex_tree_death_escalation(
-            recorded,
-            "bounded-proof-fixture".into(),
-            "bounded-proof-session".into(),
-            Some(probe),
-        ),
+        Duration::from_secs(1200),
+        codex_tree_death_escalation(recorded, "bounded-proof-session".into(), Some(probe)),
     )
     .await;
     assert_eq!(
         result,
-        Ok(false),
-        "exhaustion retains the caller's fence without indefinite helper launches"
+        Ok(true),
+        "a temporary failure beyond the rapid budget must still settle the exact cleanup owner"
     );
     let times = attempts.lock().unwrap().clone();
-    assert_eq!(times.len(), 8);
+    assert_eq!(times.len(), 10);
     for pair in times.windows(2) {
         assert!(pair[1].duration_since(pair[0]) >= Duration::from_millis(250));
     }
     for pair in times.windows(3) {
         assert!(pair[2].duration_since(pair[1]) >= pair[1].duration_since(pair[0]));
     }
+    assert!(
+        times[8].duration_since(times[7]) >= Duration::from_secs(60),
+        "exhaustion moves to slow background confirmation, without a helper every thirty seconds"
+    );
     tokio::time::advance(Duration::from_secs(3600)).await;
-    assert_eq!(attempts.lock().unwrap().len(), 8);
+    assert_eq!(attempts.lock().unwrap().len(), 10);
     assert_eq!(active.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn job_object_cleanup_proves_a_windows_shaped_identity_without_proc_capture() {
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = attempts.clone();
+    let probe: CodexSidecarCleanupProbe = Arc::new(move |_| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(true) })
+    });
+    let recorded = crate::session_lease::CondemnedRuntimeIdentity {
+        pid: 123,
+        start_time: None,
+        tree: vec![],
+        root_parent: None,
+        ownership_id: "job-object-identity".into(),
+        capture_complete: false,
+    };
+    assert!(
+        confirm_codex_tree_with_retries(
+            recorded,
+            "job-session".into(),
+            CodexTreeDeathProof::WindowsJob(probe),
+            None,
+            None
+        )
+        .await,
+        "the exact job handle supplies the tree proof; Linux capture fields do not apply"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn local_cleanup_accepts_a_complete_capture_after_the_root_exited() {
+    let runtime = mint_ownership_id();
+    let mut child = tokio::process::Command::new("true")
+        .env(CODEX_SIDECAR_OWNERSHIP_ENV, &runtime)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    child.wait().await.unwrap();
+    let recorded = crate::session_lease::record_condemned_runtime_identity(
+        pid,
+        CODEX_SIDECAR_OWNERSHIP_ENV,
+        &runtime,
+    );
+    assert!(recorded.capture_complete);
+    assert_eq!(recorded.start_time, None);
+    assert!(
+        confirm_codex_tree_with_retries(
+            recorded,
+            "already-exited".into(),
+            CodexTreeDeathProof::Local,
+            None,
+            None
+        )
+        .await,
+        "complete local evidence can prove a tree gone without signaling its reused root PID"
+    );
+}
+
+#[tokio::test]
+async fn hosted_cleanup_rejects_missing_root_or_incomplete_capture_without_launching_a_helper() {
+    for (start_time, capture_complete) in [(None, true), (Some(123), false)] {
+        let probe: CodexSidecarCleanupProbe = Arc::new(|_| panic!("unsafe hosted probe"));
+        let recorded = crate::session_lease::CondemnedRuntimeIdentity {
+            pid: 123,
+            start_time,
+            tree: vec![],
+            root_parent: None,
+            ownership_id: "hosted-incomplete".into(),
+            capture_complete,
+        };
+        assert!(
+            !confirm_codex_tree_with_retries(
+                recorded,
+                "hosted".into(),
+                CodexTreeDeathProof::Hosted(probe),
+                None,
+                None
+            )
+            .await
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn deferred_cleanup_after_the_rapid_budget_releases_its_real_lease_and_ticket() {
+    let (mut state, _, _) = state_with_sink();
+    let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+    state.set_ownership(registry.clone());
+    let id = "deferred-after-rapid-budget";
+    let ticket = match state.begin_lane_claim_at(id, "deferred-startup", None, "test") {
+        crate::ownership_lane::LaneClaim::Granted(ticket) => ticket,
+        _ => panic!("fixture owns its Starting claim"),
+    };
+    assert!(matches!(
+        state.leases.claim(
+            PROVIDER,
+            id,
+            "deferred-startup",
+            crate::session_lease::now_epoch_ms()
+        ),
+        crate::session_lease::FreshSessionClaim::Acquired
+    ));
+    let runtime = mint_ownership_id();
+    let child = tokio::process::Command::new("sleep")
+        .arg("30")
+        .env(CODEX_SIDECAR_OWNERSHIP_ENV, &runtime)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .ok()
+            .as_deref()
+            != Some("sleep\n")
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut lease = crate::FreshSessionLeaseGuard::armed(
+        state.leases.clone(),
+        PROVIDER,
+        id,
+        "deferred-startup",
+    );
+    lease.set_kill_handle(pid, &runtime);
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = attempts.clone();
+    state.set_sidecar_cleanup_probe(Arc::new(move |recorded| {
+        let attempt = observed.fetch_add(1, Ordering::SeqCst) + 1;
+        Box::pin(async move {
+            Ok(attempt >= 10
+                && crate::session_lease::kill_and_confirm_recorded_tree_dead(
+                    &recorded,
+                    CODEX_SIDECAR_OWNERSHIP_ENV,
+                )
+                .await)
+        })
+    }));
+    let (transport, _peer) = freshell_codex::new_channel_transport();
+    let (client, _notifications) = CodexAppServerClient::connect(transport);
+    assert!(
+        !state
+            .settle_unregistered_startup(
+                id,
+                (Arc::new(client), runtime, child.into()),
+                Some(lease),
+                Some(ticket)
+            )
+            .await
+    );
+    assert!(matches!(
+        state.leases.claim(
+            PROVIDER,
+            id,
+            "blocked",
+            crate::session_lease::now_epoch_ms()
+        ),
+        crate::session_lease::FreshSessionClaim::Held { .. }
+    ));
+    tokio::time::pause();
+    tokio::time::timeout(Duration::from_secs(1200), async {
+        while state.condemned_priors.lock().unwrap().contains_key(id) {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        // Evidence is cleared inside cleanup, before its confirmed-result
+        // destructor releases the retained lease and ticket in the same task.
+        while !matches!(
+            registry.observe(PROVIDER, id).state,
+            freshell_ownership::OwnershipState::Vacant
+        ) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the original detached owner settles after delayed exact proof");
+    assert_eq!(attempts.load(Ordering::SeqCst), 10);
+    assert!(
+        matches!(
+            state.leases.claim(
+                PROVIDER,
+                id,
+                "after-proof",
+                crate::session_lease::now_epoch_ms()
+            ),
+            crate::session_lease::FreshSessionClaim::Acquired
+        ),
+        "proof releases the killed lease without waiting for wall-clock TTL"
+    );
+    state.leases.fail(PROVIDER, id, "after-proof");
+    assert!(crate::ownership_lane::partial_pid_confirmed_dead(pid));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn cleanup_reaps_a_child_that_exits_during_a_failed_proof_before_retrying() {
+    let runtime = mint_ownership_id();
+    let mut child: CodexChild = tokio::process::Command::new("sleep")
+        .arg("30")
+        .env(CODEX_SIDECAR_OWNERSHIP_ENV, &runtime)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap()
+        .into();
+    let pid = child.id().unwrap();
+    let recorded = crate::session_lease::record_condemned_runtime_identity(
+        pid,
+        CODEX_SIDECAR_OWNERSHIP_ENV,
+        &runtime,
+    );
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = attempts.clone();
+    let probe: CodexSidecarCleanupProbe = Arc::new(move |_| {
+        let attempt = observed.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            if attempt == 0 {
+                // This test owns and retains the exact Child, so PID cannot
+                // be reused until the cleanup owner reaps it.
+                assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGKILL) }, 0);
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while !crate::ownership_lane::partial_pid_confirmed_dead(pid) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                Ok(false)
+            } else {
+                assert!(
+                    !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+                    "each retry must reap the now-exited direct child, not retain its zombie"
+                );
+                Ok(true)
+            }
+        })
+    });
+    assert!(
+        confirm_codex_tree_with_retries(
+            recorded,
+            "late-child-exit".into(),
+            CodexTreeDeathProof::Hosted(probe),
+            None,
+            Some(&mut child)
+        )
+        .await
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }

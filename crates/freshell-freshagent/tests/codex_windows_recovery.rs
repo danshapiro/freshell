@@ -14,7 +14,9 @@ use std::{
 use freshell_freshagent::codex::{
     CodexCreateOutcome, FreshCodexState, NATIVE_READINESS_RESUME_NOT_FOUND,
 };
-use freshell_protocol::{AgentProvider, FreshAgentCreate, SessionLocator, SessionType};
+use freshell_protocol::{
+    AgentProvider, FreshAgentAttach, FreshAgentCreate, SessionLocator, SessionType,
+};
 use serde_json::{json, Value};
 use windows_sys::Win32::{
     Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
@@ -115,6 +117,7 @@ fn request(cwd: &Path) -> FreshAgentCreate {
         observed_epoch: None,
         observed_generation: None,
         request_id: "windows-recovery".into(),
+        view_id: None,
         session_type: SessionType::Freshcodex,
         provider: Some(AgentProvider::Codex),
         cwd: Some(cwd.to_string_lossy().into_owned()),
@@ -324,6 +327,33 @@ async fn run_case(error: Option<Value>, unconfirmed: bool, cancel_resume: bool) 
     }
 }
 
+async fn attach_with_replies(state: &FreshCodexState, mut attach: FreshAgentAttach) -> Vec<Value> {
+    attach.request_id = Some("windows-recovery-attach".into());
+    attach.view_id = Some("windows-recovery-view".into());
+    let replies = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = replies.clone();
+    state
+        .handle_attach(
+            attach,
+            Arc::new(move |frame| {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::to_value(frame).unwrap());
+            }),
+        )
+        .await;
+    let frames = replies.lock().unwrap().clone();
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame["requestId"] == "windows-recovery-attach"
+                && frame["viewId"] == "windows-recovery-view"),
+        "requester receives its correlated attach reply: {frames:?}"
+    );
+    frames
+}
+
 async fn assert_attach_fenced(
     state: &FreshCodexState,
     rx: &mut tokio::sync::broadcast::Receiver<String>,
@@ -340,18 +370,14 @@ async fn assert_attach_fenced(
         "cwd": cwd,
     }))
     .unwrap();
-    tokio::time::timeout(Duration::from_secs(30), state.handle_attach(attach))
+    let frames = tokio::time::timeout(Duration::from_secs(30), attach_with_replies(state, attach))
         .await
         .expect("a fenced attach returns");
-    let frames: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
-        .map(|raw| serde_json::from_str(&raw).unwrap())
-        .collect();
     assert!(
         frames
             .iter()
-            .any(|frame| frame["type"] == "freshAgent.event"
-                && frame["event"]["type"] == "freshAgent.error"
-                && frame["event"]["code"] == "SESSION_RESERVED"),
+            .any(|frame| frame["type"] == "freshAgent.attach.failed"
+                && frame["code"] == "SESSION_RESERVED"),
         "attach must report the fenced prior runtime: {frames:?}"
     );
     assert_eq!(
@@ -620,7 +646,7 @@ async fn run_unexpected_exit(unconfirmed: bool, helper_churn: HelperChurn) {
             "cwd": dir.path(),
         }))
         .unwrap();
-        tokio::time::timeout(Duration::from_secs(30), state.handle_attach(attach))
+        tokio::time::timeout(Duration::from_secs(30), attach_with_replies(&state, attach))
             .await
             .expect("recovery attach returns");
         let replacement_id = tokio::time::timeout(Duration::from_secs(30), async {
@@ -829,7 +855,7 @@ async fn attach_rechecks_the_fence_after_a_competing_resume_is_cancelled() {
     .unwrap();
     let attach_task = {
         let state = state.clone();
-        tokio::spawn(async move { state.handle_attach(attach).await })
+        tokio::spawn(async move { attach_with_replies(&state, attach).await })
     };
     tokio::time::timeout(Duration::from_secs(30), reached.notified())
         .await
@@ -858,19 +884,15 @@ async fn attach_rechecks_the_fence_after_a_competing_resume_is_cancelled() {
     assert!(create_task.await.unwrap_err().is_cancelled());
     while rx.try_recv().is_ok() {}
     release.notify_one();
-    tokio::time::timeout(Duration::from_secs(30), attach_task)
+    let frames = tokio::time::timeout(Duration::from_secs(30), attach_task)
         .await
         .expect("attach returns after cancellation")
         .expect("attach task");
-    let frames: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
-        .map(|raw| serde_json::from_str(&raw).unwrap())
-        .collect();
     assert!(
         frames
             .iter()
-            .any(|frame| frame["type"] == "freshAgent.event"
-                && frame["event"]["type"] == "freshAgent.error"
-                && frame["event"]["code"] == "SESSION_RESERVED"),
+            .any(|frame| frame["type"] == "freshAgent.attach.failed"
+                && frame["code"] == "SESSION_RESERVED"),
         "attach must observe the newly installed fence: {frames:?}"
     );
     assert_eq!(
@@ -962,7 +984,7 @@ async fn crash_recovery_rechecks_the_fence_after_a_competing_resume_is_cancelled
     .unwrap();
     let attach_task = {
         let state = state.clone();
-        tokio::spawn(async move { state.handle_attach(attach).await })
+        tokio::spawn(async move { attach_with_replies(&state, attach).await })
     };
     tokio::time::timeout(Duration::from_secs(30), reached.notified())
         .await
@@ -991,19 +1013,15 @@ async fn crash_recovery_rechecks_the_fence_after_a_competing_resume_is_cancelled
     assert!(create_task.await.unwrap_err().is_cancelled());
     while rx.try_recv().is_ok() {}
     release.notify_one();
-    tokio::time::timeout(Duration::from_secs(30), attach_task)
+    let frames = tokio::time::timeout(Duration::from_secs(30), attach_task)
         .await
         .expect("crash recovery returns after cancellation")
         .expect("attach task");
-    let frames: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
-        .map(|raw| serde_json::from_str(&raw).unwrap())
-        .collect();
     assert!(
         frames
             .iter()
-            .any(|frame| frame["type"] == "freshAgent.event"
-                && frame["event"]["type"] == "freshAgent.error"
-                && frame["event"]["code"] == "SESSION_RESERVED"),
+            .any(|frame| frame["type"] == "freshAgent.attach.failed"
+                && frame["code"] == "SESSION_RESERVED"),
         "crash recovery must observe the newly installed fence: {frames:?}"
     );
     assert_eq!(
@@ -1018,6 +1036,92 @@ async fn crash_recovery_rechecks_the_fence_after_a_competing_resume_is_cancelled
 #[tokio::test]
 async fn exact_not_found_confirms_the_whole_tree_before_returning() {
     run_case(Some(json!({"code":-32600,"message":"no rollout found for thread id thread-recovery-source"})), false, false).await;
+}
+
+#[tokio::test]
+async fn crash_not_found_uses_job_proof_before_minting_the_replacement() {
+    let _lock = ENV.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let root_path = dir.path().join("app-server.pid");
+    let child_path = dir.path().join("native-child.pid");
+    let child_ready = dir.path().join("native-ready.pid");
+    let waiting = dir.path().join("resume-waiting.pid");
+    let release = dir.path().join("resume-release");
+    let behavior = json!({"spawnNativeChild":true, "sidecarPidFile":root_path,
+        "nativePidFile":child_path, "nativeChildReadyFile":child_ready});
+    let _environment = fixture_environment(dir.path(), &behavior);
+    let (tx, mut rx) = tokio::sync::broadcast::channel(64);
+    let state = FreshCodexState::new(
+        Arc::new("token".into()),
+        Arc::new(tx),
+        json!({"freshAgent":{"enabled":true}}),
+    );
+    assert!(matches!(
+        state
+            .handle_create_for_native_readiness(request(dir.path()), None)
+            .await,
+        CodexCreateOutcome::Created { .. }
+    ));
+    let original_pid = read_pid(&root_path).await;
+    let original = TestProcess::open(&state, original_pid);
+    let original_child_pid = read_pid(&child_path).await;
+    let original_child = TestProcess::open(&state, original_child_pid);
+    assert_eq!(read_pid(&child_ready).await, original_child_pid);
+    original.terminate();
+    wait_exited_status(&mut rx).await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !original_child.exited()
+            || state.windows_test_notification_drain_pending(THREAD).await
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("crashed original tree and its notification drain settle");
+    let behavior = json!({"spawnNativeChild":true, "sidecarPidFile":root_path,
+        "nativePidFile":child_path, "nativeChildReadyFile":child_ready,
+        "threadStartThreadId":"windows-minted-after-job-proof",
+        "overrides":{"thread/resume":{"error":{"code":-32600,
+            "message":"no rollout found for thread id thread-recovery-source"}}},
+        "waitForResumeReleasePath":release, "resumeWaitingPath":waiting});
+    std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR", behavior.to_string());
+    let recovering = state.clone();
+    let recovery = tokio::spawn(async move { recovering.prepare_native_readiness(THREAD).await });
+    let resume_pid = read_changed_pid(&root_path, original_pid).await;
+    let resume = TestProcess::open(&state, resume_pid);
+    let resume_child_pid = read_changed_pid(&child_path, original_child_pid).await;
+    let resume_child = TestProcess::open(&state, resume_child_pid);
+    assert_eq!(
+        read_changed_pid(&child_ready, original_child_pid).await,
+        resume_child_pid
+    );
+    assert_eq!(read_pid(&waiting).await, resume_pid);
+    assert!(!resume.exited() && !resume_child.exited());
+    std::fs::write(&release, b"release").unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(30), recovery)
+        .await
+        .expect("job proof and replacement complete within a bounded recovery")
+        .unwrap();
+    let replacement_live = state
+        .live_session_incarnation("windows-minted-after-job-proof")
+        .await
+        .is_some();
+    let resumed_tree_dead = resume.exited() && resume_child.exited();
+    let launches = state.windows_test_spawn_count();
+    state.shutdown().await;
+    assert_eq!(
+        outcome.unwrap().native_session_id,
+        "windows-minted-after-job-proof"
+    );
+    assert!(
+        resumed_tree_dead,
+        "the rejected resume's exact job, including descendants, is confirmed dead"
+    );
+    assert!(replacement_live);
+    assert_eq!(
+        launches, 3,
+        "original, one failed resume, and one replacement"
+    );
 }
 
 #[tokio::test]

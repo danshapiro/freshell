@@ -53,6 +53,7 @@ use axum::{
     routing::patch,
     Json, Router,
 };
+use futures_util::FutureExt;
 use serde_json::{json, Map, Value};
 use tokio::sync::{oneshot, Mutex as TokioMutex};
 
@@ -1278,6 +1279,22 @@ type CodexStartupClaims = (
     Option<freshell_ownership::OperationTicket>,
 );
 
+/// This value exists only after exact writer death. If its requester leaves,
+/// release the proven-dead lease explicitly: the ordinary lease Drop keeps a
+/// recorded kill handle fenced and is deliberately insufficient here.
+struct CodexConfirmedStartupClaims(Option<CodexStartupClaims>);
+
+impl Drop for CodexConfirmedStartupClaims {
+    fn drop(&mut self) {
+        if let Some((lease, ticket)) = self.0.take() {
+            if let Some(mut lease) = lease {
+                lease.fail();
+            }
+            drop(ticket);
+        }
+    }
+}
+
 /// Release the exact source ticket before its watchdog hold on every exit,
 /// including cancellation of a publication task before its first poll.
 struct CodexPublicationSourceClaim<
@@ -2489,7 +2506,7 @@ impl FreshCodexState {
                 runtime_id,
             )
         });
-        let cleanup_probe = self.sidecar_cleanup_probe.get().cloned();
+        let cleanup_probe = self.effective_sidecar_cleanup_probe();
         let state = self.clone();
         let id = session_id.to_string();
         let runtime_id = runtime_id.to_string();
@@ -2545,7 +2562,7 @@ impl FreshCodexState {
                 // Never remove or kill a replacement occupying the same key.
                 match recorded {
                     Some(recorded) => codex_tree_death_escalation(
-                        recorded, runtime_id.clone(), id.clone(), cleanup_probe,
+                        recorded, id.clone(), cleanup_probe,
                     ).await,
                     None => false,
                 }
@@ -2589,7 +2606,7 @@ impl FreshCodexState {
 
     /// A confirmed missing rollout can keep its original claim for the mint
     /// fallback. On timeout the owned task retains both claims until death;
-    /// its eventual unobserved result drops them only after that proof.
+    /// its confirmed result explicitly releases the lease if not collected.
     async fn settle_unregistered_startup_retaining_claims(
         &self,
         session_id: &str,
@@ -2620,8 +2637,14 @@ impl FreshCodexState {
             // Hosted /proc proof must not race signal delivery or observe the
             // direct child as an unreaped zombie on its first attempt.
             let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
-            if !confirm_codex_tree_with_retries(recorded, id.clone(), probe, Some(unconfirmed_tx))
-                .await
+            if !confirm_codex_tree_with_retries(
+                recorded,
+                id.clone(),
+                probe.into(),
+                Some(unconfirmed_tx),
+                Some(&mut child),
+            )
+            .await
             {
                 // This is inside the owned cleanup task, never an unbounded
                 // requester wait. Preserve all evidence without more helpers.
@@ -2633,7 +2656,7 @@ impl FreshCodexState {
         });
         let mut cleanup = tokio::spawn(async move {
             let _ = guard.repair_now().await;
-            (lease_guard, guard.finish())
+            CodexConfirmedStartupClaims(Some((lease_guard, guard.finish())))
         });
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         let completion = tokio::select! {
@@ -2650,7 +2673,7 @@ impl FreshCodexState {
             }
         };
         let settled = match completion {
-            Some(Ok(Ok(claims))) => Some(claims),
+            Some(Ok(Ok(mut claims))) => claims.0.take(),
             Some(Ok(Err(error))) => {
                 tracing::error!(provider=PROVIDER, session_id, %error,
                     "freshagent.codex.unregistered_cleanup_task_failed");
@@ -9030,6 +9053,20 @@ impl FreshCodexState {
         mode: CodexStopMode,
         expected_owner: Option<&str>,
     ) -> Result<(), crate::rest_lane::RestLaneError> {
+        self.handle_stop_with_confirmation(msg, mode, expected_owner, None)
+            .await
+    }
+
+    /// Internal exact cleanup may observe the writer's proof independently of
+    /// the public stop reply. A refused or obsolete stop drops the sender;
+    /// only the granted teardown can send a positive confirmation.
+    async fn handle_stop_with_confirmation(
+        &self,
+        msg: FreshAgentKill,
+        mode: CodexStopMode,
+        expected_owner: Option<&str>,
+        mut confirmation_tx: Option<oneshot::Sender<bool>>,
+    ) -> Result<(), crate::rest_lane::RestLaneError> {
         let session_id = msg.session_id.clone();
 
         // A create receipt identifies only the incarnation it established. Capture
@@ -9596,6 +9633,14 @@ impl FreshCodexState {
             crate::session_handoff::StopResult::AlreadyGone
         };
 
+        let exact_writer_confirmed = expected_owner.is_some()
+            && removed_ownership_id.as_deref() == expected_owner
+            && matches!(
+                &teardown,
+                crate::session_handoff::StopResult::Reaped
+                    | crate::session_handoff::StopResult::AlreadyGone
+            );
+
         // kata b8ke Task 3 + focused review F2: the coordinator remains fenced until the
         // complete writer tree is confirmed dead. A direct-child exit, an incomplete
         // watcher result, or a platform without descendant evidence never earns Vacant.
@@ -9654,8 +9699,10 @@ impl FreshCodexState {
                     let session_id = session_id.clone();
                     let op_id = op_id.to_string();
                     let broadcast_tx = Arc::clone(&self.broadcast_tx);
+                    let confirmation_tx = confirmation_tx.take();
                     tokio::spawn(async move {
-                        if confirmation.await {
+                        let confirmed = confirmation.await;
+                        if confirmed {
                             let outcome = crate::ownership_lane::commit_fresh_agent_stop(
                                 &registry,
                                 PROVIDER,
@@ -9687,6 +9734,9 @@ impl FreshCodexState {
                                 outcome = "escalation_lost",
                                 failure_reason = "TEARDOWN_ESCALATION_LOST",
                                 "the Codex writer shutdown continuation was lost — the key stays fenced");
+                        }
+                        if let Some(sender) = confirmation_tx {
+                            let _ = sender.send(confirmed);
                         }
                     });
                 }
@@ -9726,8 +9776,12 @@ impl FreshCodexState {
                 crate::session_handoff::StopResult::Reaped
                 | crate::session_handoff::StopResult::AlreadyGone => {}
                 crate::session_handoff::StopResult::NotConfirmed { confirmation } => {
+                    let confirmation_tx = confirmation_tx.take();
                     tokio::spawn(async move {
-                        let _ = confirmation.await;
+                        let confirmed = confirmation.await;
+                        if let Some(sender) = confirmation_tx {
+                            let _ = sender.send(confirmed);
+                        }
                     });
                     kill_failure = Some((
                         "TEARDOWN_NOT_CONFIRMED",
@@ -9755,6 +9809,9 @@ impl FreshCodexState {
             .await;
 
         let success = !close_reported_failure && kill_failure.is_none();
+        if let Some(sender) = confirmation_tx {
+            let _ = sender.send(exact_writer_confirmed);
+        }
         self.broadcast_stop_result(
             &mode,
             &ServerMessage::FreshAgentKilled(FreshAgentKilled {
@@ -11950,21 +12007,107 @@ impl FreshCodexState {
         // Identity publication must not overwrite settings saved since stage.
         replacement_binding.settings = crate::identity_sink::SettingsUpdate::Keep;
         let state = self.clone();
+        let publication_source = self.ownership.as_ref().map(|registry| {
+            let snapshot = registry.observe(PROVIDER, old_session_id);
+            (snapshot.epoch, snapshot.generation)
+        });
         let completion = tokio::spawn(async move {
-            state
-                .complete_replacement_publication(
-                    replacement_binding,
-                    source_claim,
-                    sidecar_ownership_id,
-                )
-                .await
+            let fallback_binding = replacement_binding.clone();
+            let fallback_runtime = sidecar_ownership_id.clone();
+            let result = std::panic::AssertUnwindSafe(state.complete_replacement_publication(
+                replacement_binding,
+                source_claim,
+                sidecar_ownership_id,
+            ))
+            .catch_unwind()
+            .await;
+            match result {
+                Ok(result) => result,
+                Err(_) => {
+                    state
+                        .recover_panicked_replacement_publication(
+                            fallback_binding,
+                            fallback_runtime,
+                            publication_source,
+                            recovery_dead_state,
+                        )
+                        .await
+                }
+            }
         });
         completion.await.unwrap_or_else(|error| {
             tracing::error!(provider=PROVIDER, old_session_id, %error,
                 "freshagent.codex.replacement_completion_failed");
-            Err(EnsureAliveError::RespawnFailed(
-                "replacement publication was interrupted; retry the session".into(),
-            ))
+            Err(EnsureAliveError::Superseded(self.superseded_failure(old_session_id,
+                "replacement publication could not settle; its existing runtime ownership remains reserved")))
+        })
+    }
+
+    /// A panic cannot turn an already-Live writer into a failed launch. This
+    /// fallback belongs to the owned task even if every requester has left.
+    async fn recover_panicked_replacement_publication(
+        &self,
+        binding: crate::identity_sink::FreshAgentBindingUpsert,
+        ownership_id: String,
+        source_fence: Option<(u64, u64)>,
+        source_dead_state: Option<i64>,
+    ) -> Result<EnsureAliveOutcome, EnsureAliveError> {
+        let target = &binding.session_id;
+        let source = binding.supersedes.as_deref().expect("replacement source");
+        tracing::error!(provider=PROVIDER, session_id=%target, old_session_id=source,
+            "freshagent.codex.replacement_completion_panicked");
+        let current_target = self
+            .sessions
+            .lock()
+            .await
+            .get(target)
+            .is_some_and(|session| session.sidecar_ownership_id == ownership_id)
+            && !binding
+                .claim
+                .as_ref()
+                .zip(self.ownership.as_ref())
+                .is_some_and(|(claim, registry)| !claim.is_current(registry));
+        if !current_target {
+            return Err(EnsureAliveError::Superseded(self.superseded_failure(
+                target,
+                "replacement ownership changed while publication was interrupted",
+            )));
+        }
+        let source_changed = self.claim_dead_state_advanced(source, source_dead_state)
+            || self.identity_sink().is_some_and(|sink| {
+                // A raw Closed row still refuses publication after its
+                // timestamp was cleared. A completed old -> this target link
+                // is the valid post-apply panic case, not a close.
+                !sink.row_is_bound(PROVIDER, source)
+                    && sink.chain_terminus(PROVIDER, source).as_deref() != Some(target.as_str())
+            })
+            || source_fence.zip(self.ownership.as_ref()).is_some_and(
+                |((epoch, generation), registry)| {
+                    let current = registry.observe(PROVIDER, source);
+                    current.epoch != epoch
+                        || current.generation != generation
+                        || !matches!(current.state, freshell_ownership::OwnershipState::Vacant)
+                },
+            );
+        if source_changed {
+            return Err(self
+                .reject_replacement_publication(source, target, ownership_id, binding.claim)
+                .await);
+        }
+        // Do not re-enter the panicking metadata/naming/checkpoint operation.
+        // The staged durable target is valid; publish its minimal identity so
+        // current views can route both recovery alarms to the live writer.
+        self.broadcast_replacement_materialization(
+            ServerMessage::FreshAgentSessionMaterialized(FreshAgentSessionMaterialized {
+                previous_session_id: source.to_string(), provider: PROVIDER.into(),
+                session_id: target.clone(), session_type: SESSION_TYPE.into(),
+                session_ref: Some(SessionLocator { provider: PROVIDER.into(), session_id: target.clone() }),
+                name_ref: None, session_name: None,
+            }), target,
+            Some("The replacement is running, but its recovery publication was interrupted and could not be fully saved."),
+        );
+        Ok(EnsureAliveOutcome::Respawned {
+            new_session_id: target.clone(),
         })
     }
 
@@ -11995,55 +12138,14 @@ impl FreshCodexState {
             {
                 tracing::warn!(provider=PROVIDER, session_id=%new_thread_id,
                     old_session_id, "freshagent.codex.replacement_source_closed");
-                let state = self.clone();
-                let target = new_thread_id.clone();
-                let mut repair = crate::identity_sink::BindingWriteGuard::new(
-                    None,
-                    target_claim,
-                    self.identity_sink(),
-                );
-                repair.settle_startup_before_repair(async move {
-                    let result = state
-                        .handle_stop(
-                            FreshAgentKill {
-                                provider: freshell_protocol::AgentProvider::Codex,
-                                session_type: freshell_protocol::SessionType::Freshcodex,
-                                session_id: target.clone(),
-                                cwd: None,
-                                observed_epoch: None,
-                                observed_generation: None,
-                            },
-                            CodexStopMode::Close,
-                            Some(&ownership_id),
-                        )
-                        .await;
-                    if let Err(error) = result {
-                        tracing::warn!(provider=PROVIDER, session_id=%target, code=%error.code,
-                            "freshagent.codex.closed_replacement_stop_unconfirmed");
-                    }
-                });
-                let stop = tokio::spawn(async move {
-                    let repaired = repair.repair_now().await;
-                    if repaired {
-                        drop(repair.finish());
-                    } else {
-                        drop(repair);
-                    }
-                    repaired
-                });
-                // The owned stop remains alive if its proof takes longer.
-                // Its coordinator stop fence prevents dispatch or adoption.
-                if !matches!(
-                    tokio::time::timeout(Duration::from_secs(2), stop).await,
-                    Ok(Ok(true))
-                ) {
-                    tracing::error!(provider=PROVIDER, session_id=%new_thread_id,
-                        old_session_id, "freshagent.codex.closed_replacement_cleanup_deferred");
-                }
-                return Err(EnsureAliveError::Superseded(CodexSuperseded {
-                    message: "the original Codex session was closed during recovery; replacement startup was rejected".into(),
-                    owner: None,
-                }));
+                return Err(self
+                    .reject_replacement_publication(
+                        &old_session_id,
+                        &new_thread_id,
+                        ownership_id,
+                        target_claim,
+                    )
+                    .await);
             }
             Err(error) => {
                 tracing::error!(provider=PROVIDER, session_id=%new_thread_id,
@@ -12061,6 +12163,93 @@ impl FreshCodexState {
         Ok(EnsureAliveOutcome::Respawned {
             new_session_id: new_thread_id,
         })
+    }
+
+    /// A refused stop is not a death proof. The single owned continuation
+    /// retries the same runtime until the coordinator grants its stop, then
+    /// joins that stop's confirmation before attempting exact durable repair.
+    async fn reject_replacement_publication(
+        &self,
+        old_session_id: &str,
+        new_thread_id: &str,
+        ownership_id: String,
+        claim: Option<crate::identity_sink::BindingClaim>,
+    ) -> EnsureAliveError {
+        let state = self.clone();
+        let target = new_thread_id.to_string();
+        let source = old_session_id.to_string();
+        let cleanup = tokio::spawn(async move {
+            let mut retry_delay = Duration::from_millis(250);
+            loop {
+                let exact_target = state
+                    .sessions
+                    .lock()
+                    .await
+                    .get(&target)
+                    .is_some_and(|session| session.sidecar_ownership_id == ownership_id)
+                    && !claim
+                        .as_ref()
+                        .zip(state.ownership.as_ref())
+                        .is_some_and(|(claim, registry)| !claim.is_current(registry));
+                if !exact_target {
+                    tracing::warn!(provider=PROVIDER, session_id=%target, %ownership_id,
+                        "freshagent.codex.closed_replacement_cleanup_superseded: preserving current runtime and binding");
+                    return false;
+                }
+                let (confirmation, confirmed) = oneshot::channel();
+                let result = state
+                    .handle_stop_with_confirmation(
+                        FreshAgentKill {
+                            provider: freshell_protocol::AgentProvider::Codex,
+                            session_type: freshell_protocol::SessionType::Freshcodex,
+                            session_id: target.clone(),
+                            cwd: None,
+                            observed_epoch: None,
+                            observed_generation: None,
+                        },
+                        CodexStopMode::Close,
+                        Some(&ownership_id),
+                        Some(confirmation),
+                    )
+                    .await;
+                if matches!(confirmed.await, Ok(true)) {
+                    break;
+                }
+                tracing::warn!(provider=PROVIDER, session_id=%target, %ownership_id,
+                    stop_error=?result.err(), retry_after_ms=retry_delay.as_millis() as u64,
+                    "freshagent.codex.closed_replacement_stop_unconfirmed: retaining durable binding until exact teardown");
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(30));
+            }
+            state
+                .leases
+                .clear_binding_if_matches(PROVIDER, &source, &target, &ownership_id);
+            let mut repair =
+                crate::identity_sink::BindingWriteGuard::new(None, claim, state.identity_sink());
+            // The stop continuation above has already confirmed the writer.
+            // Arm durable repair with no remaining native cleanup to perform.
+            repair.settle_startup_before_repair(async {});
+            let repaired = repair.repair_now().await;
+            if repaired {
+                drop(repair.finish());
+            } else {
+                drop(repair);
+            }
+            repaired
+        });
+        if !matches!(
+            tokio::time::timeout(Duration::from_secs(2), cleanup).await,
+            Ok(Ok(true))
+        ) {
+            tracing::error!(
+                provider = PROVIDER,
+                session_id = new_thread_id,
+                old_session_id,
+                "freshagent.codex.closed_replacement_cleanup_deferred"
+            );
+        }
+        EnsureAliveError::Superseded(self.superseded_failure(old_session_id,
+            "the original Codex session was closed during recovery or changed ownership; replacement startup was rejected"))
     }
 
     async fn publish_replacement_materialization(
@@ -12149,6 +12338,15 @@ impl FreshCodexState {
                 "freshagent.codex.checkpoint_alias_persist_failed"
             );
         }
+        self.broadcast_replacement_materialization(materialized, new_thread_id, publication_error);
+    }
+
+    fn broadcast_replacement_materialization(
+        &self,
+        materialized: ServerMessage,
+        new_thread_id: &str,
+        publication_error: Option<&str>,
+    ) {
         self.broadcast(&materialized);
 
         // View routes follow the new id only after materialization. Keep the
@@ -15876,31 +16074,76 @@ async fn confirm_codex_tree_dead(
     }
 }
 
-/// One owner retries an exact identity a bounded number of times. Incomplete
-/// capture is immutable (including for the hosted helper), so retry cannot
-/// repair it. Returning false keeps the caller's existing ownership fence.
+/// One owner retries verifiable evidence, backing off to slow confirmation
+/// after the rapid attempts. An immutable incomplete identity cannot improve
+/// by spawning more helpers; returning false retains its ownership fence.
 fn codex_tree_death_escalation(
     recorded: crate::session_lease::CondemnedRuntimeIdentity,
-    _ownership_id: String,
     thread_id: String,
     cleanup_probe: Option<CodexSidecarCleanupProbe>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'static>> {
     Box::pin(confirm_codex_tree_with_retries(
         recorded,
         thread_id,
-        cleanup_probe,
+        cleanup_probe.into(),
+        None,
         None,
     ))
+}
+
+/// Hosted Linux cleanup needs /proc evidence; a Windows job handle itself
+/// pins the writer tree and does not depend on a Linux-shaped identity.
+enum CodexTreeDeathProof {
+    Local,
+    #[cfg(not(windows))]
+    Hosted(CodexSidecarCleanupProbe),
+    #[cfg(any(windows, test))]
+    WindowsJob(CodexSidecarCleanupProbe),
+}
+
+impl From<Option<CodexSidecarCleanupProbe>> for CodexTreeDeathProof {
+    fn from(probe: Option<CodexSidecarCleanupProbe>) -> Self {
+        match probe {
+            None => Self::Local,
+            #[cfg(windows)]
+            Some(probe) => Self::WindowsJob(probe),
+            #[cfg(not(windows))]
+            Some(probe) => Self::Hosted(probe),
+        }
+    }
+}
+
+impl CodexTreeDeathProof {
+    fn probe(&self) -> Option<CodexSidecarCleanupProbe> {
+        match self {
+            Self::Local => None,
+            #[cfg(not(windows))]
+            Self::Hosted(probe) => Some(probe.clone()),
+            #[cfg(any(windows, test))]
+            Self::WindowsJob(probe) => Some(probe.clone()),
+        }
+    }
+
+    fn can_confirm(&self, recorded: &crate::session_lease::CondemnedRuntimeIdentity) -> bool {
+        match self {
+            Self::Local => cfg!(target_os = "linux") && recorded.capture_complete,
+            #[cfg(not(windows))]
+            Self::Hosted(_) => recorded.capture_complete && recorded.start_time.is_some(),
+            #[cfg(any(windows, test))]
+            Self::WindowsJob(_) => true,
+        }
+    }
 }
 
 async fn confirm_codex_tree_with_retries(
     recorded: crate::session_lease::CondemnedRuntimeIdentity,
     thread_id: String,
-    cleanup_probe: Option<CodexSidecarCleanupProbe>,
+    proof: CodexTreeDeathProof,
     mut first_failure: Option<oneshot::Sender<()>>,
+    mut child: Option<&mut CodexChild>,
 ) -> bool {
-    const MAX_ATTEMPTS: u32 = 8;
-    if !recorded.capture_complete || (recorded.start_time.is_none() && !cfg!(windows)) {
+    const RAPID_ATTEMPTS: u32 = 8;
+    if !proof.can_confirm(&recorded) {
         tracing::error!(provider=PROVIDER, session_id=%thread_id,
             ownership_id=%recorded.ownership_id, pid=recorded.pid,
             capture_complete=recorded.capture_complete, start_time=?recorded.start_time,
@@ -15911,28 +16154,40 @@ async fn confirm_codex_tree_with_retries(
         return false;
     }
     let mut retry_delay = Duration::from_millis(250);
-    for attempt in 1..=MAX_ATTEMPTS {
+    let mut attempt = 0_u64;
+    loop {
+        attempt = attempt.saturating_add(1);
+        if let Some(child) = child.as_mut() {
+            let _ = child.try_wait();
+        }
         // Await the same helper to settlement. A requester timeout never
         // cancels it and starts a second helper over the same identity.
-        if confirm_codex_tree_dead(&recorded, cleanup_probe.clone()).await {
+        let confirmed = confirm_codex_tree_dead(&recorded, proof.probe()).await;
+        if let Some(child) = child.as_mut() {
+            let _ = child.try_wait();
+        }
+        if confirmed {
             return true;
         }
         if let Some(notice) = first_failure.take() {
             let _ = notice.send(());
         }
-        if attempt == MAX_ATTEMPTS {
+        if attempt == u64::from(RAPID_ATTEMPTS) {
             tracing::error!(provider=PROVIDER, session_id=%thread_id,
                 ownership_id=%recorded.ownership_id, pid=recorded.pid, attempt,
-                "freshagent.codex.teardown_retry_budget_exhausted: no more helper launches; exact writer ownership remains fenced");
-            return false;
+                "freshagent.codex.teardown_rapid_retry_budget_exhausted: retaining exact writer ownership with slow background confirmation");
+        }
+        if attempt >= u64::from(RAPID_ATTEMPTS) {
+            retry_delay = Duration::from_secs(300);
         }
         tracing::warn!(provider=PROVIDER, session_id=%thread_id,
             ownership_id=%recorded.ownership_id, attempt, retry_after_ms=retry_delay.as_millis() as u64,
             "freshagent.codex.teardown_confirmation_retry");
         tokio::time::sleep(retry_delay).await;
-        retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(30));
+        if attempt < u64::from(RAPID_ATTEMPTS) {
+            retry_delay = retry_delay.saturating_mul(2);
+        }
     }
-    false
 }
 
 fn clear_codex_condemned_prior_if_matching(
@@ -16372,7 +16627,6 @@ fn spawn_exit_watcher_tracking_turns(
                         .map(|recorded| {
                             codex_tree_death_escalation(
                                 recorded,
-                                ownership_id.clone(),
                                 thread_id.clone(),
                                 cleanup_probe.clone(),
                             )
@@ -16460,7 +16714,7 @@ fn spawn_exit_watcher_tracking_turns(
                         let escalation = if !confirmed && (cfg!(target_os = "linux") || cfg!(windows)) {
                             recorded.clone().map(|recorded| {
                                 let confirmation = codex_tree_death_escalation(
-                                    recorded, ownership_id.clone(), thread_id.clone(), cleanup_probe.clone(),
+                                    recorded, thread_id.clone(), cleanup_probe.clone(),
                                 );
                                 #[cfg(all(windows, feature = "test-support"))]
                                 let gate = retained_state.as_ref().and_then(|state| {

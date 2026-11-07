@@ -11,6 +11,320 @@ struct StagedCodexPublication {
     _temporary: tempfile::TempDir,
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closed_publication_retries_refused_stop_without_retiring_a_live_writer_and_preserves_source_owner(
+) {
+    let _environment = ENV_LOCK.lock().await;
+    let mut fixture = stage_codex_publication("closed-source-refused-stop").await;
+    let publication = fixture
+        .sink
+        .arm_binding_before_write_stall(PROVIDER, fixture.target);
+    fixture.release.send(()).unwrap();
+    publication
+        .entered
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap();
+    let owner = fixture.registry.observe(PROVIDER, fixture.target);
+    let attach = match fixture.registry.begin_attach_guard(
+        PROVIDER,
+        fixture.target,
+        "hold-replacement-attach",
+        Some(owner.generation),
+        "test",
+    ) {
+        freshell_ownership::AttachGuardOutcome::Armed(guard) => guard,
+        _ => panic!("live target attach guard must arm"),
+    };
+    crate::PaneIdentitySink::retire_closed(fixture.sink.as_ref(), PROVIDER, &fixture.original)
+        .await
+        .unwrap();
+    publication.release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let frame: Value =
+                serde_json::from_str(&fixture.replies.recv().await.unwrap()).unwrap();
+            if frame["type"] == "freshAgent.killed" && frame["code"] == "HANDOFF_IN_FLIGHT" {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the real attach guard refuses the exact stop");
+    let freshell_ownership::BeginOutcome::Granted { generation } = fixture.registry.begin_start(
+        PROVIDER,
+        &fixture.original,
+        freshell_ownership::RuntimeOwnerKind::Terminal,
+        "new-source-owner",
+        None,
+        "test",
+        crate::session_lease::now_epoch_ms(),
+    ) else {
+        panic!("the released source claim can obtain a new terminal owner")
+    };
+    assert_eq!(
+        fixture.registry.commit_live(
+            PROVIDER,
+            &fixture.original,
+            "new-source-owner",
+            generation,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                terminal_id: Some("new-source-terminal".into()),
+                live_session_key: None,
+                pid: None,
+                ownership_id: None
+            }
+        ),
+        freshell_ownership::CommitOutcome::Committed
+    );
+    let result = tokio::time::timeout(Duration::from_secs(5), &mut fixture.recovery)
+        .await
+        .unwrap()
+        .unwrap();
+    let row_while_refused = fixture
+        .sink
+        .states
+        .lock()
+        .unwrap()
+        .get(&(PROVIDER.into(), fixture.target.into()))
+        .copied();
+    let writer_retained = !crate::ownership_lane::partial_pid_confirmed_dead(fixture.target_pid)
+        && fixture.registry.observe(PROVIDER, fixture.target) == owner;
+    drop(attach);
+    let eventually_retired = tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            if fixture
+                .sink
+                .states
+                .lock()
+                .unwrap()
+                .get(&(PROVIDER.into(), fixture.target.into()))
+                == Some(&crate::identity_sink::FakeRowState::FailedTransition)
+                && crate::ownership_lane::partial_pid_confirmed_dead(fixture.target_pid)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+    let expected_owner = fixture.state.current_refusal_owner(&fixture.original);
+    fixture.state.shutdown().await;
+    assert_eq!(
+        row_while_refused,
+        Some(crate::identity_sink::FakeRowState::Bound),
+        "a stop refusal is not permission to retire its running writer's row"
+    );
+    assert!(writer_retained);
+    assert!(
+        eventually_retired,
+        "owned cleanup retries after the attach guard releases"
+    );
+    let Err(EnsureAliveError::Superseded(failure)) = result else {
+        panic!("expected typed close refusal: {result:?}")
+    };
+    assert_eq!(
+        failure.owner, expected_owner,
+        "the close refusal describes the current original-source owner"
+    );
+    assert!(failure.owner.is_some());
+}
+
+async fn assert_panicked_publication_preserves_visible_replacement(
+    cancel_requester: bool,
+    after_apply: bool,
+) {
+    let _environment = ENV_LOCK.lock().await;
+    let mut fixture =
+        stage_codex_publication_operation("panicked-publication-target", None, true).await;
+    let recovery_key = fixture.state.recovery_map_key(&fixture.original);
+    assert!(
+        fixture
+            .state
+            .session_recovery
+            .status(&recovery_key)
+            .await
+            .unwrap()
+            .in_flight
+    );
+    let publication = fixture
+        .sink
+        .arm_binding_before_write_stall(PROVIDER, fixture.target);
+    fixture.release.send(()).unwrap();
+    publication
+        .entered
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap();
+    let owner = fixture.registry.observe(PROVIDER, fixture.target);
+    if after_apply {
+        fixture
+            .sink
+            .panic_replacement_binding_after_apply
+            .store(true, Ordering::SeqCst);
+    } else {
+        fixture
+            .sink
+            .panic_replacement_binding
+            .store(true, Ordering::SeqCst);
+    }
+    if cancel_requester {
+        fixture.recovery.abort();
+    }
+    publication.release.send(()).unwrap();
+    let mut frames = Vec::new();
+    let visible = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let frame: Value =
+                serde_json::from_str(&fixture.replies.recv().await.unwrap()).unwrap();
+            let done = frame["event"]["code"] == "THREAD_MEMORY_LOST";
+            frames.push(frame);
+            if done {
+                break;
+            }
+        }
+    })
+    .await
+    .is_ok();
+    let result = tokio::time::timeout(Duration::from_secs(2), fixture.recovery)
+        .await
+        .unwrap();
+    let retained = fixture.state.has_live_session(fixture.target).await
+        && !crate::ownership_lane::partial_pid_confirmed_dead(fixture.target_pid)
+        && fixture.registry.observe(PROVIDER, fixture.target) == owner;
+    let repeated = fixture
+        .state
+        .ensure_session_alive_once(fixture.target, None, DeadThreadCachePolicy::Respect)
+        .await;
+    let recovery_status = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let status = fixture.state.session_recovery.status(&recovery_key).await;
+            if status.as_ref().is_none_or(|status| !status.in_flight) {
+                break status;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    fixture.state.shutdown().await;
+    assert!(visible, "owned publication must make its running replacement visible even after panic and requester cancellation: {frames:?}");
+    assert!(retained);
+    if after_apply {
+        assert_eq!(
+            crate::PaneIdentitySink::chain_terminus(
+                fixture.sink.as_ref(),
+                PROVIDER,
+                &fixture.original
+            ),
+            Some(fixture.target.into())
+        );
+        assert_eq!(
+            fixture
+                .sink
+                .states
+                .lock()
+                .unwrap()
+                .get(&(PROVIDER.into(), fixture.original.clone())),
+            Some(&crate::identity_sink::FakeRowState::Superseded)
+        );
+    }
+    assert!(recovery_status.is_none(),
+        "a successful shared recovery has no retained failure/backoff state; a publication panic must not charge its native launch: {recovery_status:?}");
+    assert!(matches!(repeated, Ok(EnsureAliveOutcome::AlreadyRunning)));
+    let materialized = frames
+        .iter()
+        .position(|f| f["type"] == "freshAgent.session.materialized")
+        .unwrap();
+    let ledger = frames
+        .iter()
+        .position(|f| f["event"]["code"] == "LEDGER_WRITE_FAILED")
+        .unwrap();
+    let memory = frames
+        .iter()
+        .position(|f| f["event"]["code"] == "THREAD_MEMORY_LOST")
+        .unwrap();
+    assert!(materialized < ledger && ledger < memory);
+    if cancel_requester {
+        assert!(result.unwrap_err().is_cancelled());
+    } else {
+        assert!(
+            matches!(result.unwrap(), Ok(EnsureAliveOutcome::Respawned { new_session_id }) if new_session_id == fixture.target)
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn panicked_publication_keeps_its_live_replacement_visible_and_returns_its_identity() {
+    assert_panicked_publication_preserves_visible_replacement(false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canceled_requester_cannot_hide_a_panicked_owned_publication() {
+    assert_panicked_publication_preserves_visible_replacement(true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn panicked_applied_publication_preserves_the_valid_link_and_writer() {
+    assert_panicked_publication_preserves_visible_replacement(false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn panicked_publication_respects_a_closed_source_even_without_its_tombstone() {
+    let _environment = ENV_LOCK.lock().await;
+    let mut fixture = stage_codex_publication("panicked-closed-source").await;
+    let publication = fixture
+        .sink
+        .arm_binding_before_write_stall(PROVIDER, fixture.target);
+    fixture.release.send(()).unwrap();
+    publication
+        .entered
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap();
+    crate::PaneIdentitySink::retire_closed(fixture.sink.as_ref(), PROVIDER, &fixture.original)
+        .await
+        .unwrap();
+    crate::PaneIdentitySink::clear_kill_tombstone(
+        fixture.sink.as_ref(),
+        PROVIDER,
+        &fixture.original,
+    )
+    .await
+    .unwrap();
+    fixture
+        .sink
+        .panic_replacement_binding
+        .store(true, Ordering::SeqCst);
+    publication.release.send(()).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), fixture.recovery)
+        .await
+        .unwrap()
+        .unwrap();
+    let target_dead = crate::ownership_lane::partial_pid_confirmed_dead(fixture.target_pid);
+    let mut materialized = false;
+    while let Ok(frame) = fixture.replies.try_recv() {
+        let frame: Value = serde_json::from_str(&frame).unwrap();
+        materialized |= frame["type"] == "freshAgent.session.materialized";
+    }
+    let target_state = fixture
+        .sink
+        .states
+        .lock()
+        .unwrap()
+        .get(&(PROVIDER.into(), fixture.target.into()))
+        .copied();
+    fixture.state.shutdown().await;
+    assert!(
+        matches!(result, Err(EnsureAliveError::Superseded(_))),
+        "panic cannot bypass the raw Closed source row: {result:?}"
+    );
+    assert!(target_dead && !materialized);
+    assert_eq!(
+        target_state,
+        Some(crate::identity_sink::FakeRowState::FailedTransition)
+    );
+}
+
 async fn stage_codex_publication(target: &'static str) -> StagedCodexPublication {
     stage_codex_publication_with_probe(target, None).await
 }
@@ -18,6 +332,14 @@ async fn stage_codex_publication(target: &'static str) -> StagedCodexPublication
 async fn stage_codex_publication_with_probe(
     target: &'static str,
     probe: Option<CodexSidecarCleanupProbe>,
+) -> StagedCodexPublication {
+    stage_codex_publication_operation(target, probe, false).await
+}
+
+async fn stage_codex_publication_operation(
+    target: &'static str,
+    probe: Option<CodexSidecarCleanupProbe>,
+    shared: bool,
 ) -> StagedCodexPublication {
     let (mut state, original, sink) = crashed_publication_fixture().await;
     if let Some(probe) = probe {
@@ -40,9 +362,15 @@ async fn stage_codex_publication_with_probe(
     let recovering = state.clone();
     let recovering_id = original.clone();
     let recovery = tokio::spawn(async move {
-        recovering
-            .ensure_session_alive_once(&recovering_id, None, DeadThreadCachePolicy::Respect)
-            .await
+        if shared {
+            recovering
+                .ensure_session_alive(&recovering_id, None, DeadThreadCachePolicy::Respect)
+                .await
+        } else {
+            recovering
+                .ensure_session_alive_once(&recovering_id, None, DeadThreadCachePolicy::Respect)
+                .await
+        }
     });
     let stage = tokio::time::timeout(
         Duration::from_secs(20),

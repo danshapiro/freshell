@@ -1345,6 +1345,8 @@ pub(crate) type FailedTransitionRepairLog = Vec<(String, String, String, u64, u6
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct FakeIdentitySink {
+    pub panic_replacement_binding: std::sync::atomic::AtomicBool,
+    pub panic_replacement_binding_after_apply: std::sync::atomic::AtomicBool,
     pub pendings: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
     pub bindings: std::sync::Mutex<Vec<FreshAgentBindingUpsert>>,
     pub settings: std::sync::Mutex<std::collections::HashMap<(String, String), FreshAgentSettings>>,
@@ -1520,6 +1522,7 @@ pub(crate) enum FakeRowState {
     Bound,
     Closed,
     FailedTransition,
+    Superseded,
 }
 
 /// Focused-ep5-r1 Finding 2 test hook: the armed orphan gate's state.
@@ -2139,6 +2142,23 @@ impl FakeIdentitySink {
     /// Lifecycle checks precede every mutation, at apply time.
     #[cfg(test)]
     fn apply_binding(&self, upsert: FreshAgentBindingUpsert) -> std::io::Result<()> {
+        let panic_after_apply = upsert
+            .supersedes
+            .as_deref()
+            .is_some_and(|id| id != upsert.session_id)
+            && self
+                .panic_replacement_binding_after_apply
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+        if upsert
+            .supersedes
+            .as_deref()
+            .is_some_and(|id| id != upsert.session_id)
+            && self
+                .panic_replacement_binding
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            panic!("injected final replacement binding panic");
+        }
         if upsert.provider == "codex" {
             if let Some(source) = upsert
                 .supersedes
@@ -2168,7 +2188,23 @@ impl FakeIdentitySink {
             return Ok(());
         }
         // ...delegated to the existing mutation body below
+        let replaced_source = panic_after_apply
+            .then(|| upsert.supersedes.clone())
+            .flatten()
+            .map(|source| (upsert.provider.clone(), source));
         self.apply_binding_mutations(upsert);
+        if let Some(source) = replaced_source {
+            // Model the real ledger's completed old-row retirement before
+            // this injected post-apply unwind becomes observable.
+            self.states
+                .lock()
+                .unwrap()
+                .insert(source, FakeRowState::Superseded);
+        }
+        assert!(
+            !panic_after_apply,
+            "injected replacement binding panic after apply"
+        );
         Ok(())
     }
     /// The mutation body of `record_binding`, minus the tombstone consult.
