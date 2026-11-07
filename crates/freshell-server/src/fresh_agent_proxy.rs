@@ -167,6 +167,23 @@ impl HostedFreshAgentProxy {
         }
     }
 
+    async fn dispatch_send_with_checkpoint_barrier(self: &Arc<Self>, message: FreshAgentSend) {
+        if message.checkpoint_intent.is_some() {
+            if let Some(barrier) = self.checkpoint_barrier.get() {
+                let proxy = Arc::clone(self);
+                let capture_send = message.clone();
+                let forward = Box::pin(async move { proxy.dispatch_send(message).await });
+                Arc::clone(barrier)
+                    .barrier_and_forward(capture_send, forward)
+                    .await;
+            } else {
+                self.dispatch_send(message).await;
+            }
+        } else {
+            self.dispatch_send(message).await;
+        }
+    }
+
     async fn dispatch_send(&self, message: FreshAgentSend) {
         let provider = message.provider;
         let session_id = message.session_id.clone();
@@ -256,7 +273,8 @@ impl HostedFreshAgentProxy {
     /// post-barrier ownership admission. The operation correlates the exact
     /// original input with the journal and asks the supervisor only for its
     /// existing host receipt.
-    async fn dispatch_send_reconcile(&self, message: FreshAgentSend) {
+    async fn dispatch_send_reconcile(self: &Arc<Self>, message: FreshAgentSend) {
+        let canonical_retry = message.clone();
         let provider = message.provider;
         let session_id = message.session_id.clone();
         let session_type = message.session_type;
@@ -307,10 +325,10 @@ impl HostedFreshAgentProxy {
                     .await;
                 classify_hosted_send_reconcile(provider, result)
             }
-            None => HostedSendOutcome::Ambiguous(hosted_send_uncertain_reason(provider)),
+            None => HostedSendReconcileOutcome::Ambiguous(hosted_send_uncertain_reason(provider)),
         };
         match outcome {
-            HostedSendOutcome::Accepted => {
+            HostedSendReconcileOutcome::Accepted => {
                 let receipt_session_id = if let Some(soul) = resolved_soul.as_ref() {
                     self.presentation_routes
                         .lock()
@@ -332,7 +350,7 @@ impl HostedFreshAgentProxy {
                     },
                 ));
             }
-            HostedSendOutcome::Refused(reason) => self.send_error(
+            HostedSendReconcileOutcome::Refused(reason) => self.send_error(
                 &provider,
                 &session_id,
                 session_type,
@@ -340,13 +358,23 @@ impl HostedFreshAgentProxy {
                 "MANAGED_FRESH_AGENT_ERROR",
                 &reason,
             ),
-            HostedSendOutcome::Ambiguous(reason) => self.send_uncertain(
+            HostedSendReconcileOutcome::Ambiguous(reason) => self.send_uncertain(
                 &provider,
                 &session_id,
                 session_type,
                 Some(public_request_id),
                 &reason,
             ),
+            HostedSendReconcileOutcome::NotJournaled => {
+                tracing::debug!(
+                    provider = %provider_wire(&provider),
+                    session_id,
+                    request_id = public_request_id,
+                    "freshagent.hosted_send_reconcile.not_journaled"
+                );
+                self.dispatch_send_with_checkpoint_barrier(canonical_retry)
+                    .await;
+            }
         }
     }
 
@@ -500,20 +528,7 @@ impl HostedFreshAgentProxy {
                 }
             }
             HostedFreshAgentCommand::Send(message) => {
-                if message.checkpoint_intent.is_some() {
-                    if let Some(barrier) = self.checkpoint_barrier.get() {
-                        let proxy = Arc::clone(&self);
-                        let capture_send = message.clone();
-                        let forward = Box::pin(async move { proxy.dispatch_send(message).await });
-                        Arc::clone(barrier)
-                            .barrier_and_forward(capture_send, forward)
-                            .await;
-                    } else {
-                        self.dispatch_send(message).await;
-                    }
-                } else {
-                    self.dispatch_send(message).await;
-                }
+                self.dispatch_send_with_checkpoint_barrier(message).await;
             }
             HostedFreshAgentCommand::SendReconcile(message) => {
                 self.dispatch_send_reconcile(message).await;
@@ -2247,6 +2262,13 @@ enum HostedSendOutcome {
     Ambiguous(String),
 }
 
+enum HostedSendReconcileOutcome {
+    Accepted,
+    Refused(String),
+    Ambiguous(String),
+    NotJournaled,
+}
+
 fn hosted_send_uncertain_reason(provider: AgentProvider) -> String {
     let prefix = if provider == AgentProvider::Codex {
         "CODEX_DELIVERY_AMBIGUOUS:"
@@ -2333,12 +2355,15 @@ fn classify_hosted_send(
 fn classify_hosted_send_reconcile(
     provider: AgentProvider,
     result: Result<CommandState, freshell_runtime_client::ClientError>,
-) -> HostedSendOutcome {
+) -> HostedSendReconcileOutcome {
     use freshell_runtime_client::ClientError;
     use freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome;
 
     match result {
-        Ok(CommandState::ProviderAcked | CommandState::Completed) => HostedSendOutcome::Accepted,
+        Ok(CommandState::ProviderAcked | CommandState::Completed) => {
+            HostedSendReconcileOutcome::Accepted
+        }
+        Ok(CommandState::Queued) => HostedSendReconcileOutcome::NotJournaled,
         Err(ClientError::Runtime {
             fresh_agent_send_diagnostic:
                 Some(freshell_runtime_protocol::FreshAgentSendDiagnostic {
@@ -2346,10 +2371,10 @@ fn classify_hosted_send_reconcile(
                     message,
                 }),
             ..
-        }) => HostedSendOutcome::Refused(
+        }) => HostedSendReconcileOutcome::Refused(
             message.unwrap_or_else(|| "The provider did not accept this message.".to_string()),
         ),
-        _ => HostedSendOutcome::Ambiguous(hosted_send_uncertain_reason(provider)),
+        _ => HostedSendReconcileOutcome::Ambiguous(hosted_send_uncertain_reason(provider)),
     }
 }
 

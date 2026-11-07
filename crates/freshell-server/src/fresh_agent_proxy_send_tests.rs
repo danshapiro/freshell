@@ -19,6 +19,30 @@ impl freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier for Checkpoint
     }
 }
 
+#[derive(Default)]
+struct FirstCheckpointWaitBarrier {
+    calls: std::sync::atomic::AtomicUsize,
+    first_waiting: tokio::sync::Notify,
+    release_first: tokio::sync::Notify,
+}
+
+impl freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier for FirstCheckpointWaitBarrier {
+    fn barrier_and_forward(
+        self: Arc<Self>,
+        _send: FreshAgentSend,
+        forward: futures_util::future::BoxFuture<'static, ()>,
+    ) -> futures_util::future::BoxFuture<'static, ()> {
+        Box::pin(async move {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                self.first_waiting.notify_one();
+                self.release_first.notified().await;
+            }
+            forward.await;
+        })
+    }
+}
+
 #[tokio::test]
 async fn receipt_reconcile_bypasses_checkpoint_barrier_and_stale_admission() {
     use std::time::Duration;
@@ -141,6 +165,117 @@ async fn receipt_reconcile_bypasses_checkpoint_barrier_and_stale_admission() {
 }
 
 #[tokio::test]
+async fn early_receipt_reconcile_retries_the_same_send_through_its_checkpoint_barrier() {
+    use std::time::Duration;
+
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("supervisor.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let mut reconcile_requests = 0;
+        let mut send_requests = 0;
+        let mut provider_inputs = 0;
+        let mut journal = std::collections::HashSet::new();
+        while send_requests < 2 {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("gateway request reaches supervisor")
+                .unwrap();
+            let envelope: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            let result = match envelope.body {
+                AdminCommand::Health => AdminResult::Health {
+                    control_epoch: 7,
+                    installation_id: InstallationId::new(),
+                },
+                AdminCommand::FreshAgentSendReconcile(request) => {
+                    reconcile_requests += 1;
+                    assert_eq!(request.text, "one original prompt");
+                    assert_eq!(
+                        request.checkpoint_logical_attempt_id.as_deref(),
+                        Some("logical-7")
+                    );
+                    AdminResult::FreshAgentCommand {
+                        state: CommandState::Queued,
+                    }
+                }
+                AdminCommand::FreshAgentSend(request) => {
+                    send_requests += 1;
+                    assert_eq!(request.text, "one original prompt");
+                    assert_eq!(
+                        request.checkpoint_logical_attempt_id.as_deref(),
+                        Some("logical-7")
+                    );
+                    if journal.insert(envelope.request_id.clone()) {
+                        provider_inputs += 1;
+                    }
+                    AdminResult::FreshAgentCommand {
+                        state: CommandState::Completed,
+                    }
+                }
+                other => panic!("unexpected supervisor command: {other:?}"),
+            };
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: envelope.request_id,
+                    result: Ok(result),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        (reconcile_requests, send_requests, provider_inputs)
+    });
+
+    let soul = SoulId::parse("reconcile-race-soul").unwrap();
+    let (proxy, mut frames) = configure_proxy(
+        &socket,
+        HashMap::from([(("codex".into(), "public-thread".into()), soul)]),
+    );
+    let barrier = Arc::new(FirstCheckpointWaitBarrier::default());
+    proxy.set_checkpoint_barrier(barrier.clone());
+    let message: FreshAgentSend = serde_json::from_value(serde_json::json!({
+        "provider":"codex", "sessionId":"public-thread", "sessionType":"freshcodex",
+        "requestId":"reconcile-race-request", "text":"one original prompt",
+        "checkpointIntent":{"logicalAttemptId":"logical-7"}
+    }))
+    .unwrap();
+
+    let original_proxy = Arc::clone(&proxy);
+    let original_message = message.clone();
+    let original = tokio::spawn(async move {
+        original_proxy
+            .handle(HostedFreshAgentCommand::Send(original_message))
+            .await;
+    });
+    tokio::time::timeout(Duration::from_secs(3), barrier.first_waiting.notified())
+        .await
+        .expect("the original send waits at checkpoint capture");
+
+    Arc::clone(&proxy)
+        .handle(HostedFreshAgentCommand::SendReconcile(message))
+        .await;
+    barrier.release_first.notify_one();
+    original.await.unwrap();
+
+    let (reconcile_requests, send_requests, provider_inputs) = server.await.unwrap();
+    assert_eq!(reconcile_requests, 1);
+    assert_eq!(
+        send_requests, 2,
+        "the resumed send and original send share the request ID"
+    );
+    assert_eq!(
+        provider_inputs, 1,
+        "the supervisor journal admits one provider input"
+    );
+    assert_eq!(barrier.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(
+        frames.try_recv().is_err(),
+        "settled sends emit no uncertain frame"
+    );
+}
+
+#[tokio::test]
 async fn codex_receipt_reconcile_keeps_old_supervisor_protocol_error_ambiguous() {
     use std::time::Duration;
 
@@ -240,8 +375,13 @@ fn receipt_reconcile_classifier_requires_a_typed_refusal() {
         classify_hosted_send_reconcile(AgentProvider::Codex, Ok(CommandState::Ambiguous));
     assert!(matches!(
         ambiguous,
-        HostedSendOutcome::Ambiguous(message)
+        HostedSendReconcileOutcome::Ambiguous(message)
             if message.starts_with("CODEX_DELIVERY_AMBIGUOUS:")
+    ));
+
+    assert!(matches!(
+        classify_hosted_send_reconcile(AgentProvider::Codex, Ok(CommandState::Queued)),
+        HostedSendReconcileOutcome::NotJournaled
     ));
 
     let refused = classify_hosted_send_reconcile(
@@ -259,7 +399,7 @@ fn receipt_reconcile_classifier_requires_a_typed_refusal() {
     );
     assert!(matches!(
         refused,
-        HostedSendOutcome::Refused(message)
+        HostedSendReconcileOutcome::Refused(message)
             if message == "the journal confirms this request was refused"
     ));
 }
