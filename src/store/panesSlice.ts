@@ -6,6 +6,7 @@ import {
   normalizeFreshAgentCheckpointOutcomes,
   normalizeFreshAgentModelEffortLevels,
   normalizeFreshAgentModelSelection,
+  normalizeFreshAgentPendingCodexSend,
   normalizeFreshAgentPendingLocalEcho,
   normalizeHandoffError,
   normalizeLaunchFailure,
@@ -204,6 +205,16 @@ function normalizePaneContent(
       : undefined
     const style = normalizeFreshAgentStyleOverride((input as { style?: unknown }).style)
     const pendingLocalEcho = normalizeFreshAgentPendingLocalEcho(rawFreshAgent.pendingLocalEcho)
+    const pendingCodexSend = input.provider === 'codex'
+      ? normalizeFreshAgentPendingCodexSend(rawFreshAgent.pendingCodexSend, pendingLocalEcho) : undefined
+    const pendingCodexUndos = input.provider === 'codex' && Array.isArray(rawFreshAgent.pendingCodexUndos)
+      ? rawFreshAgent.pendingCodexUndos.flatMap((value): NonNullable<FreshAgentPaneContent['pendingCodexUndos']> => {
+          if (!value || typeof value !== 'object' || typeof value.requestId !== 'string' || !value.requestId) return []
+          return [{ requestId: value.requestId, ...(value.protectDraft === true ? { protectDraft: true } : {}) }]
+        }) : undefined
+    const queuedMessages = input.provider === 'codex' && Array.isArray(rawFreshAgent.queuedMessages)
+      ? rawFreshAgent.queuedMessages.filter((message): message is string => typeof message === 'string' && message.length > 0)
+      : undefined
     const modelEffortLevels = normalizeFreshAgentModelEffortLevels(rawFreshAgent.modelEffortLevels)
     const freshHandoffError = normalizeHandoffError(rawFreshAgent.handoffError)
     const checkpointWorkspace = normalizeCheckpointWorkspace(rawFreshAgent.checkpointWorkspace)
@@ -295,6 +306,9 @@ function normalizePaneContent(
           settingsDismissed: input.settingsDismissed,
           showTimecodes: typeof input.showTimecodes === 'boolean' ? input.showTimecodes : undefined,
           ...(pendingLocalEcho ? { pendingLocalEcho } : {}),
+          ...(pendingCodexSend ? { pendingCodexSend } : {}),
+          ...(pendingCodexUndos?.length ? { pendingCodexUndos } : {}),
+          ...(queuedMessages?.length ? { queuedMessages } : {}),
           ...(typeof input.reconcileNotice === 'string' ? { reconcileNotice: input.reconcileNotice } : {}),
           ...(input.pendingReconcile === 'respawn' || input.pendingReconcile === 'fresh'
             ? { pendingReconcile: input.pendingReconcile }
@@ -384,6 +398,9 @@ function normalizePaneContent(
       settingsDismissed: input.settingsDismissed,
       showTimecodes: typeof input.showTimecodes === 'boolean' ? input.showTimecodes : undefined,
       ...(pendingLocalEcho ? { pendingLocalEcho } : {}),
+      ...(pendingCodexSend ? { pendingCodexSend } : {}),
+      ...(pendingCodexUndos?.length ? { pendingCodexUndos } : {}),
+      ...(queuedMessages?.length ? { queuedMessages } : {}),
       ...(typeof input.reconcileNotice === 'string' ? { reconcileNotice: input.reconcileNotice } : {}),
       ...(input.pendingReconcile === 'respawn' || input.pendingReconcile === 'fresh'
         ? { pendingReconcile: input.pendingReconcile }
@@ -2035,6 +2052,9 @@ export const panesSlice = createSlice({
         content.pendingReconcile = undefined
         content.reconcileEpoch = undefined
         content.pendingLocalEcho = undefined
+        content.pendingCodexSend = undefined
+        content.pendingCodexUndos = undefined
+        content.queuedMessages = undefined
         content.handoffError = undefined
         content.namingHandle = undefined
         content.nameRef = undefined

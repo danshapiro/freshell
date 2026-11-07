@@ -507,6 +507,28 @@ export function normalizeFreshAgentPendingLocalEcho(value: unknown): FreshAgentP
   }
 }
 
+export type FreshAgentPendingCodexSend = {
+  requestId: string
+  text: string
+  logicalAttemptId?: string
+  recovered?: boolean
+}
+
+export function normalizeFreshAgentPendingCodexSend(value: unknown, echo?: FreshAgentPendingLocalEcho): FreshAgentPendingCodexSend | undefined {
+  const record = value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown> : undefined
+  if (typeof record?.requestId === 'string' && record.requestId && typeof record.text === 'string' && record.text) {
+    return {
+      requestId: record.requestId,
+      text: record.text,
+      ...(typeof record.logicalAttemptId === 'string' && record.logicalAttemptId ? { logicalAttemptId: record.logicalAttemptId } : {}),
+      ...(record.recovered === true ? { recovered: true } : {}),
+    }
+  }
+  // Older persisted echoes had no separate dispatch reservation.
+  return echo ? { requestId: echo.requestId, text: echo.text } : undefined
+}
+
 export type FreshAgentPaneContent = {
   kind: 'fresh-agent'
   sessionType: FreshAgentSessionType
@@ -557,6 +579,12 @@ export type FreshAgentPaneContent = {
   showTimecodes?: boolean
   /** Persisted optimistic user turn that has not yet appeared in a durable provider snapshot. */
   pendingLocalEcho?: FreshAgentPendingLocalEcho
+  /** An unresolved Codex dispatch, independent of its displayed echo. */
+  pendingCodexSend?: FreshAgentPendingCodexSend
+  /** Codex undo requests awaiting their requesting-pane acknowledgments. */
+  pendingCodexUndos?: { requestId: string; protectDraft?: boolean }[]
+  /** Submitted Codex follow-ups waiting for the preceding input's boundary. */
+  queuedMessages?: string[]
   /** One-shot user-visible reconcile notice; rendered + cleared by FreshAgentView. VOLATILE. */
   reconcileNotice?: string
   /** Set by verdict folds; consumed when freshAgent.created lands. VOLATILE. */

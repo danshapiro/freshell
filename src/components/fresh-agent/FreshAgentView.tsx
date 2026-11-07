@@ -137,7 +137,7 @@ import { FreshAgentAsyncQuestionContext } from './FreshAgentItemCard.js'
 import { asyncQuestionKey, asyncQuestionDraftPrefix, asyncQuestionKeysInText, formatAsyncQuestionAnswer, type AsyncQuestionAnswerStatus } from '@/lib/fresh-agent-async-questions'
 import FreshAgentElicitationBanner from './FreshAgentElicitationBanner.js'
 import { FreshAgentTranscript, type FreshAgentTranscriptHandle, type FreshAgentTranscriptProps } from './FreshAgentTranscript'
-import { mergeFreshAgentTranscriptProjection, readTranscriptProjection } from '@/lib/fresh-agent-transcript-projection'
+import { mergeFreshAgentTranscriptProjection, readTranscriptProjection, type ProjectionMetadata } from '@/lib/fresh-agent-transcript-projection'
 import { acceptsTranscriptProjectionSnapshot, codexSnapshotRouteRevision, codexSnapshotSourceRevision, transcriptProjectionSnapshotReceived } from '@/store/freshAgentLiveSlice'
 import { FreshAgentLiveTail, liveTailShowsContent } from './FreshAgentLiveTail'
 import { useTranscriptLandings } from './useTranscriptLandings'
@@ -164,6 +164,7 @@ const BUSY_STATES = FRESH_AGENT_BUSY_STATUSES
 // ONE derivation feeds both the newest-user-row memo and the transcript's
 // turns prop, and its identity never churns on a missing snapshot.
 const EMPTY_TRANSCRIPT_TURNS: FreshAgentTurn[] = []
+const EMPTY_QUEUED_MESSAGES: string[] = []
 // Copy for the stuck-notice card (role="alert") shown while the store carries
 // the deadman's 'stuck' status; recovery actions live on the card itself.
 const FRESH_AGENT_STUCK_NOTICE_TEXT = 'Agent appears stuck — no events from the agent process for a while.'
@@ -180,6 +181,7 @@ export const FRESH_AGENT_RESERVE_RETRY_FLOOR_MS = 1_000
 export const IDLE_INCOMPLETE_MAX_RETRIES = 5
 const IDLE_INCOMPLETE_RETRY_DELAY_MS = 1_000
 const CODEX_INPUT_CONFIRMATION_WAIT_MS = 5_000
+const CODEX_PENDING_UNDO_NOTICE = 'Undo is unavailable while a message is awaiting confirmation.'
 const NATIVE_CLAIM_MAX_RETRIES = 5
 const REVEAL_REFRESH_MAX_WAIT_MS = 15_000
 const RATE_LIMIT_RETRY_MARGIN_MS = 50
@@ -296,6 +298,7 @@ type PendingSendMetadata = {
   submittedTurnId?: string
   legacyAccepted?: boolean
   deliveryAmbiguous?: boolean
+  recovered?: boolean
   /** The exact text of the freshAgent.send frame -- retained as the resend
    * payload for the lost-session retry (Task 10). Never read back from the
    * local echo. */
@@ -534,6 +537,14 @@ function codexInputObserved(turns: readonly FreshAgentTurn[], requestId: string)
     item.kind === 'text' && isRecord(item.extensions?.codex)
     && item.extensions.codex.clientId === requestId
   )))
+}
+
+function codexInputCompleted(snapshot: FreshAgentSnapshot, projection: ProjectionMetadata | undefined, requestId: string): boolean {
+  if (!projection) return false
+  return projection.nativeFinalTurnIds.some((nativeId) => {
+    const rows = new Set(projection.turnRows[nativeId] ?? [])
+    return codexInputObserved(snapshot.turns.filter((turn) => rows.has(turn.turnId)), requestId)
+  })
 }
 
 function localEchoLanded(
@@ -1315,7 +1326,16 @@ export function FreshAgentView({
   } | null>(null)
   const nativeClaimRetryRef = useRef(nativeClaimRetry)
   nativeClaimRetryRef.current = nativeClaimRetry
-  const [queuedMessages, setQueuedMessages] = useState<string[]>([])
+  const [localQueuedMessages, setLocalQueuedMessages] = useState<string[]>([])
+  const hasStoredPane = useAppSelector((state) => {
+    const layout = state.panes.layouts[tabId]
+    return Boolean(layout && findPaneContent(layout, paneId)?.kind === 'fresh-agent')
+  })
+  const usesStoredCodexQueue = paneContent.provider === 'codex' && hasStoredPane
+  const queuedMessages = usesStoredCodexQueue
+    ? paneContent.queuedMessages ?? EMPTY_QUEUED_MESSAGES
+    : localQueuedMessages
+  const localCodexSendRef = useRef<FreshAgentPaneContent['pendingCodexSend']>(undefined)
   // Reserve a turn synchronously: the provider's running event may arrive
   // after another submit. Only completion (or failure) releases the reservation.
   const outgoingTurnRef = useRef<(LocalEcho & {
@@ -1355,7 +1375,15 @@ export function FreshAgentView({
   // newest-ness derivation reads the boundary the send persisted into the
   // echo record itself, which the store's echo normalizer now keeps.
   const localEchoSendBoundaryRef = useRef<{ requestId: string; turnKeys: ReadonlySet<string> } | null>(null)
-  const pendingSendMetadataRef = useRef<Map<string, PendingSendMetadata>>(new Map())
+  const pendingSendMetadataRef = useRef<Map<string, PendingSendMetadata>>(new Map(
+    paneContent.pendingCodexSend ? [[paneContent.pendingCodexSend.requestId, {
+      text: paneContent.pendingCodexSend.text,
+      logicalAttemptId: paneContent.pendingCodexSend.logicalAttemptId,
+      recovered: paneContent.pendingCodexSend.recovered,
+      checkpointAvailabilityScope: checkpointAvailabilityScope(paneContent),
+      checkpointWorkspace: paneContent.checkpointWorkspace,
+    }]] : [],
+  ))
   // The pane's busy-epoch: advanced at every busy→idle edge of effectiveStatus
   // that SETTLES a turn. A composer send records the current epoch into its
   // pending send metadata at dispatch time, and `paneCaptureInFlight` only
@@ -1802,6 +1830,18 @@ export function FreshAgentView({
   const transcriptRef = useRef<FreshAgentTranscriptHandle | null>(null)
   const paneRootRef = useRef<HTMLDivElement | null>(null)
   paneContentRef.current = paneContent
+  const updateQueuedMessages = useCallback((update: (queue: string[]) => string[]) => {
+    const rendered = paneContentRef.current
+    const layout = appStore.getState().panes.layouts[tabId]
+    if (rendered.provider !== 'codex' || !layout) {
+      setLocalQueuedMessages(update)
+      return
+    }
+    const current = layout ? findPaneContent(layout, paneId) : null
+    if (current?.kind !== 'fresh-agent' || current.provider !== 'codex'
+      || current.createRequestId !== rendered.createRequestId) return
+    dispatch(mergePaneContent({ tabId, paneId, updates: { queuedMessages: update(current.queuedMessages ?? []) } }))
+  }, [appStore, dispatch, paneId, tabId])
   const setLocalEcho = useCallback((next: LocalEcho | null) => {
     setLocalEchoState(next)
     const current = paneContentRef.current
@@ -2558,7 +2598,7 @@ export function FreshAgentView({
     if (!after || after.createRequestId === before.createRequestId) return
     commitSnapshot(null)
     setLoadError(null)
-    setQueuedMessages([])
+    setLocalQueuedMessages([])
     setAsyncQuestionStatuses({})
     setLocalEcho(null)
     alwaysAllowToolsRef.current.clear()
@@ -2613,17 +2653,34 @@ export function FreshAgentView({
   // kata 1wxv: rollback requests mint a requestId so the requesting-sink ack
   // (composer refill) and any rollback-flagged refusal route back to THIS pane;
   // sibling clients converge through the session.rolledBack broadcast instead.
-  const pendingRollbackRef = useRef<Map<string, { direction: 'undo' | 'redo' }>>(new Map())
+  const pendingRollbackRef = useRef<Map<string, { direction: 'undo' | 'redo'; protectDraft?: boolean }>>(new Map(
+    (paneContent.pendingCodexUndos ?? []).map(({ requestId, protectDraft }) => [requestId, { direction: 'undo', protectDraft }]),
+  ))
   // Busy mirror for the advisory rollback gate: isBusy is derived far below the
   // slash-command callback, so the gate reads the ref (same idiom as
   // agentSessionStatusRef above) — always the current render's value at call time.
   const isBusyRef = useRef(false)
   const sendRollback = useCallback((direction: 'undo' | 'redo', mode: 'step' | 'toTurn', turnId?: string) => {
-    const current = paneContentRef.current
+    const rendered = paneContentRef.current
+    const layout = appStore.getState().panes.layouts[tabId]
+    const stored = layout ? findPaneContent(layout, paneId) : null
+    const current = stored?.kind === 'fresh-agent' ? stored : rendered
+    if (!isMountedRef.current || current.createRequestId !== rendered.createRequestId
+      || current.sessionId !== rendered.sessionId) return
     if (!current.sessionId || isFreshAgentLifecycleBlocked(current)) return
+    if (direction === 'undo' && current.provider === 'codex'
+      && (current.pendingLocalEcho || current.pendingCodexSend || localCodexSendRef.current || localEchoRef.current)) {
+      setNotice(CODEX_PENDING_UNDO_NOTICE)
+      return
+    }
     const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
     const requestId = nanoid()
     pendingRollbackRef.current.set(requestId, { direction })
+    if (current.provider === 'codex' && direction === 'undo') {
+      dispatch(mergePaneContent({ tabId, paneId, updates: {
+        pendingCodexUndos: [...current.pendingCodexUndos ?? [], { requestId }],
+      } }))
+    }
     // b8ke ext r21 F2: the undo/redo delayed-request fence (the r8 F5
     // send/attach discipline): the observed pair rides the frame so a
     // reconnect-replayed stale rollback landing after a crash +
@@ -2641,7 +2698,7 @@ export function FreshAgentView({
       ...(turnId ? { turnId } : {}),
       ...(fence ? { observedEpoch: fence.epoch, observedGeneration: fence.generation } : {}),
     }))
-  }, [appStore, sendFreshAgentMessage])
+  }, [appStore, dispatch, paneId, sendFreshAgentMessage, tabId])
 
   const runSlashCommand = useCallback((command: FreshAgentSlashCommand, args: string) => {
     const current = paneContentRef.current
@@ -3621,8 +3678,11 @@ export function FreshAgentView({
         // the three leaks a failed send otherwise leaves behind -- the
         // pending-metadata entry, the stale local echo (dual-write), and the
         // optimistic `running` status.
-        const failedText = pendingSendMetadataRef.current.get(failedRequestId)?.text
-        const asyncQuestionKeys = pendingSendMetadataRef.current.get(failedRequestId)?.asyncQuestionKeys
+        const failedMeta = pendingSendMetadataRef.current.get(failedRequestId)
+        const failedText = failedMeta?.text
+        const asyncQuestionKeys = failedMeta?.asyncQuestionKeys
+        const alreadyRecovered = current.provider === 'codex' && (failedMeta?.recovered
+          || (current.pendingCodexSend?.requestId === failedRequestId && current.pendingCodexSend.recovered))
         const ambiguous = current.provider === 'codex'
           && typeof sendFailure.message === 'string' && sendFailure.message.startsWith('CODEX_DELIVERY_AMBIGUOUS:')
         if (asyncQuestionKeys?.length) setAsyncQuestionStatuses((previous) => ({ ...previous, ...Object.fromEntries(asyncQuestionKeys.map((key) => [key, ambiguous ? 'ambiguous' as const : 'refused' as const])) }))
@@ -3635,7 +3695,7 @@ export function FreshAgentView({
           const echo = localEchoRef.current
           if (echo?.requestId === failedRequestId) setLocalEcho({ ...echo, deliveryUnconfirmed: true })
           requestSnapshotRefresh('poll')
-        } else pendingSendMetadataRef.current.delete(failedRequestId)
+        } else if (!alreadyRecovered) pendingSendMetadataRef.current.delete(failedRequestId)
         if (!ambiguous && outgoingTurnRef.current?.requestId === failedRequestId) {
           outgoingTurnRef.current = null
           refreshOutgoingTurn()
@@ -3643,13 +3703,18 @@ export function FreshAgentView({
         if (!ambiguous && localEchoRef.current?.requestId === failedRequestId) {
           setLocalEcho(null)
         }
+        if (!ambiguous && (current.pendingCodexSend?.requestId === failedRequestId || localCodexSendRef.current?.requestId === failedRequestId)) {
+          if (localCodexSendRef.current?.requestId === failedRequestId) localCodexSendRef.current = undefined
+          dispatch(mergePaneContent({ tabId, paneId, updates: { pendingCodexSend: undefined } }))
+          refreshOutgoingTurn()
+        }
         if (current.provider === 'opencode' && current.status === 'running') {
           dispatch(mergePaneContent({ tabId, paneId, updates: { status: 'idle' } }))
         }
         // G05 (C09): a claude send the server refused was never sent — for
         // example its session ended — so the text goes back into the
         // composer with the reason instead of vanishing with the echo.
-        if ((current.provider === 'claude' || current.provider === 'codex') && failedText) {
+        if ((current.provider === 'claude' || current.provider === 'codex') && failedText && !alreadyRecovered) {
           if (!ambiguous) composerRef.current?.restoreText(failedText)
           const failureNotice = ambiguous
             ? `Delivery uncertain (${failedRequestId}): ${sendFailureReason(sendFailure.message)}. Check the conversation before sending again.`
@@ -3707,13 +3772,29 @@ export function FreshAgentView({
       // pane-minted requestId, so foreign panes' rollback traffic never routes here.
       if (message.type === 'freshAgent.event') {
         const ack = asRollbackAck(message.event)
-        if (ack && pendingRollbackRef.current.has(ack.requestId)) {
+        const layout = appStore.getState().panes.layouts[tabId]
+        const stored = layout ? findPaneContent(layout, paneId) : null
+        const rollbackPane = stored?.kind === 'fresh-agent' ? stored : paneContentRef.current
+        const ownedCodexUndo = rollbackPane.provider !== 'codex' || !layout
+          || (rollbackPane.pendingCodexUndos ?? []).some((entry) => entry.requestId === ack?.requestId)
+        if (ack && currentEvent && locatorMatchesPane(message, rollbackPane, freshOpenCodeRouteCwdRef.current, runtimeOwnersForLocator())
+          && ownedCodexUndo && pendingRollbackRef.current.has(ack.requestId)) {
           const pending = pendingRollbackRef.current.get(ack.requestId)
           pendingRollbackRef.current.delete(ack.requestId)
+          const current = rollbackPane
+          if (current.provider === 'codex') {
+            dispatch(mergePaneContent({ tabId, paneId, updates: {
+              pendingCodexUndos: (current.pendingCodexUndos ?? []).filter((entry) => entry.requestId !== ack.requestId),
+            } }))
+          }
           if (ack.kind === 'freshAgent.rolledBack' && pending?.direction === 'undo') {
-            setLocalEcho(null) // a pending optimistic echo must not survive a rollback
+            const protectDraft = current.provider === 'codex'
+              && (pending.protectDraft || current.pendingCodexSend || current.pendingLocalEcho || localEchoRef.current)
+            if (!protectDraft) setLocalEcho(null)
             if (typeof ack.removedPromptText === 'string') {
-              composerRef.current?.replaceText(ack.removedPromptText) // decision 4: overwrite refill
+              if (protectDraft) {
+                if (ack.removedPromptText) composerRef.current?.restoreText(ack.removedPromptText)
+              } else composerRef.current?.replaceText(ack.removedPromptText)
               setNotice(UNDO_REFILL_NOTICE)
             }
           }
@@ -3724,6 +3805,13 @@ export function FreshAgentView({
           && pendingRollbackRef.current.has((message.event as { requestId: string }).requestId)
         ) {
           pendingRollbackRef.current.delete((message.event as { requestId: string }).requestId)
+          const current = rollbackPane
+          if (current.provider === 'codex') {
+            const requestId = (message.event as { requestId: string }).requestId
+            dispatch(mergePaneContent({ tabId, paneId, updates: {
+              pendingCodexUndos: (current.pendingCodexUndos ?? []).filter((entry) => entry.requestId !== requestId),
+            } }))
+          }
           // The server's supplied message is PINNED SERVER-SIDE and rendered VERBATIM —
           // BUSY_TURN carries ROLLBACK_BUSY_MESSAGE; REDO_UNAVAILABLE carries the
           // destroyed / empty / claude moved-tip copy; capability failures carry their
@@ -3898,6 +3986,7 @@ export function FreshAgentView({
     const requestSessionWasLost = agentSessionLostRef.current
     const requestOutgoingTurnId = outgoingTurnRef.current?.requestId
     const requestLocalEchoId = localEchoRef.current?.requestId
+    const requestCodexSendId = currentSnapshotPane()?.pendingCodexSend?.requestId ?? localCodexSendRef.current?.requestId
     const trigger = snapshotRefreshTriggerRef.current
     const observedClaimRetry = nativeClaimRetryRef.current
     const matchesRequestClaimRetry = (retry: typeof nativeClaimRetry) => Boolean(retry
@@ -4291,6 +4380,25 @@ export function FreshAgentView({
           retireAtEchoClearRef.current = false
         }
         setLocalEcho(null)
+      }
+      // A current idle read alone may precede forwarding at the capture
+      // barrier. Only a matching item in a final native turn settles this
+      // reservation; an independently correlated refusal settles it above.
+      const reserved = currentSnapshotPane()?.pendingCodexSend ?? localCodexSendRef.current
+      if (provider === 'codex' && reserved && reserved.requestId === requestCodexSendId
+        && snapshotAcceptedForRecovery && displaySnapshot.status === 'idle' && resolved.status === 'idle'
+        && resolved.provider === provider && resolved.sessionType === requestSessionType
+        && resolved.threadId === (requestNativeId ?? sessionId) && projectionMetadata
+        && (!appliedProjection || (appliedProjection.id === projectionMetadata.id
+          && appliedProjection.historyGeneration === projectionMetadata.historyGeneration
+          && !appliedProjection.needsResnapshot && projectionMetadata.eventRevision >= appliedProjection.eventRevision))
+        && (snapshotStatusAuthoritative || routeOnlyLocalEvidence)
+        && agentSessionStatusVersionRef.current === requestAgentSessionStatusVersion
+        && !isPaneBusyNow() && codexInputCompleted(resolved, projectionMetadata, reserved.requestId)) {
+        if (localCodexSendRef.current?.requestId === reserved.requestId) localCodexSendRef.current = undefined
+        dispatch(mergePaneContent({ tabId, paneId, updates: { pendingCodexSend: undefined } }))
+        if (outgoingTurnRef.current?.requestId === reserved.requestId) outgoingTurnRef.current = null
+        refreshOutgoingTurn()
       }
       // Task 16 (zrrj): an idle snapshot that does not yet contain the
       // just-sent turn means the durable transcript is lagging -- schedule a
@@ -5216,19 +5324,20 @@ export function FreshAgentView({
   // (per-turn icon, slash/menus, the pre-flight gate). Legacy servers emit neither
   // key, so absent is false; codex v1 is undo-only (redo stamps false server-side).
   const canRollback = !lifecycleBlocked && snapshot?.capabilities?.undo === true
+  const codexUndoBlocked = paneContent.provider === 'codex' && Boolean(localEcho || paneContent.pendingLocalEcho || paneContent.pendingCodexSend || localCodexSendRef.current)
   const canRedoNow = !lifecycleBlocked && snapshot?.capabilities?.redo === true && snapshot?.rollback?.canRedo === true
   // Pane context-menu registration: "Undo last turn"/"Redo last turn" ride the
   // pane-action registry; both still run the advisory gates at commit time.
   useEffect(() => registerFreshAgentPaneActions(paneId, {
     undo: () => sendRollback('undo', 'step'),
     redo: () => sendRollback('redo', 'step'),
-    canUndo: canRollback && !isBusy && Boolean(snapshot?.sessionId ?? paneContent.sessionId),
+    canUndo: canRollback && !codexUndoBlocked && !isBusy && Boolean(snapshot?.sessionId ?? paneContent.sessionId),
     canRedo: canRedoNow && !isBusy,
     // Capability stamps drive menu ROW PRESENCE: codex stamps redo:false
     // server-side, so its menu never offers a dead "Redo last turn" row.
     undoSupported: canRollback,
     redoSupported: snapshot?.capabilities?.redo === true,
-  }), [paneId, sendRollback, canRollback, canRedoNow, isBusy, snapshot?.sessionId, snapshot?.capabilities?.redo, paneContent.sessionId])
+  }), [paneId, sendRollback, canRollback, canRedoNow, codexUndoBlocked, isBusy, snapshot?.sessionId, snapshot?.capabilities?.redo, paneContent.sessionId])
   // Task 14: SESSION_RESERVED is a transient reservation the view re-drives
   // through -- never surfaced as a pane-level error banner.
   const sessionErrorMessage = (agentSession as { lastError?: string; lastErrorCode?: string } | undefined)?.lastErrorCode === 'SESSION_RESERVED'
@@ -5286,11 +5395,21 @@ export function FreshAgentView({
       requestSnapshotRefresh('manual')
       return
     }
-    // Continuing never sends the uncertain message. Preserve it as a draft
-    // before permitting another queued input to use the pending-echo slot.
+    // Continuing copies the uncertain message to the draft without releasing
+    // the independent reservation or resending it.
+    const current = paneContentRef.current
+    const pendingCodexSend = current.pendingCodexSend ?? localCodexSendRef.current
+    const reservation = pendingCodexSend?.requestId === echo.requestId
+      ? pendingCodexSend : { requestId: echo.requestId, text: echo.text }
     composerRef.current.restoreText(echo.text)
+    recordPendingSendMetadata(echo.requestId, { recovered: true })
     if (outgoingTurnRef.current?.requestId === echo.requestId) outgoingTurnRef.current = null
-    setLocalEcho(null)
+    setLocalEchoState(null)
+    localEchoRef.current = null
+    if (localCodexSendRef.current?.requestId === echo.requestId) localCodexSendRef.current = { ...reservation, recovered: true }
+    dispatch(mergePaneContent({ tabId, paneId, updates: {
+      pendingLocalEcho: undefined, pendingCodexSend: { ...reservation, recovered: true },
+    } }))
     unconfirmedContinueGuardRef.current = null
     setUnconfirmedContinueId(null)
     if (deliveryNoticeRef.current) {
@@ -5298,7 +5417,7 @@ export function FreshAgentView({
       setNotice(null)
     }
     refreshOutgoingTurn()
-  }, [canContinueUnconfirmed, requestSnapshotRefresh, setLocalEcho])
+  }, [canContinueUnconfirmed, dispatch, paneId, recordPendingSendMetadata, requestSnapshotRefresh, tabId])
 
   useEffect(() => {
     if (!isActivePane) return
@@ -5343,11 +5462,22 @@ export function FreshAgentView({
 
   /** Core outgoing-message path shared by direct sends and queue flushes. */
   const sendUserText = useCallback((text: string) => {
-    const current = paneContentRef.current
+    const rendered = paneContentRef.current
+    const layout = appStore.getState().panes.layouts[tabId]
+    const stored = layout ? findPaneContent(layout, paneId) : null
+    const current = stored?.kind === 'fresh-agent' ? stored : rendered
+    if (current.createRequestId !== rendered.createRequestId) return
     if (!current.sessionId || isFreshAgentLifecycleBlocked(current)) return
-    if (current.provider === 'codex' && (localEchoRef.current || current.pendingLocalEcho)) return
+    if (current.provider === 'codex' && (localEchoRef.current || current.pendingLocalEcho || current.pendingCodexSend || localCodexSendRef.current)) return
+    if (current.provider === 'codex' && layout && current.queuedMessages?.[0] !== text) return
     const requestId = nanoid()
     const logicalAttemptId = nanoid()
+    if (current.provider === 'codex' && !layout) localCodexSendRef.current = { requestId, text, logicalAttemptId }
+    if (current.provider === 'codex') {
+      for (const pending of pendingRollbackRef.current.values()) {
+        if (pending.direction === 'undo') pending.protectDraft = true
+      }
+    }
     outgoingTurnRef.current = { requestId, text, sawBusy: false, previousTurns: snapshotRef.current?.turns ?? [] }
     // A covering timer belongs to the preceding send, including when it
     // became due while hidden. The new send gets its own deadline and budget.
@@ -5412,14 +5542,48 @@ export function FreshAgentView({
       updates: {
         ...(current.provider === 'opencode' ? { status: 'running' } : {}),
         pendingLocalEcho: nextLocalEcho,
+        ...(current.provider === 'codex' ? { pendingCodexSend: { requestId, text, logicalAttemptId } } : {}),
+        ...(current.provider === 'codex' && current.pendingCodexUndos?.length
+          ? { pendingCodexUndos: current.pendingCodexUndos.map((undo) => ({ ...undo, protectDraft: true })) } : {}),
+        ...(current.provider === 'codex' ? { queuedMessages: current.queuedMessages?.slice(1) } : {}),
       },
     }))
+    if (current.provider === 'codex' && layout) {
+      // Redux subscribers can change the connection, owner, or pane during
+      // the claim. Re-check before the frame leaves, and put an unsent claim
+      // back at the head when it still belongs to this conversation.
+      const state = appStore.getState()
+      const latestLayout = state.panes.layouts[tabId]
+      const latestPane = latestLayout ? findPaneContent(latestLayout, paneId) : null
+      const latest = latestPane?.kind === 'fresh-agent' ? latestPane : undefined
+      const ownsClaim = latest?.createRequestId === current.createRequestId
+        && latest.pendingCodexSend?.requestId === requestId && latest.pendingLocalEcho?.requestId === requestId
+      const canonical = latest && resolveCanonicalPaneSession(state, latest)
+      const owner = canonical ? selectSessionRuntimeOwner(state, canonical.provider, canonical.sessionId) : undefined
+      const canDispatch = ownsClaim && latest.sessionId === current.sessionId
+        && state.connection.status === 'ready' && !isFreshAgentLifecycleBlocked(latest)
+        && !derivePaneOwnerDivergence(owner, 'fresh-agent') && !isPaneBusyNow()
+      if (!canDispatch) {
+        if (ownsClaim) {
+          setLocalEchoState(null)
+          localEchoRef.current = null
+          outgoingTurnRef.current = null
+          pendingSendMetadataRef.current.delete(requestId)
+          dispatch(mergePaneContent({ tabId, paneId, updates: {
+            pendingLocalEcho: undefined, pendingCodexSend: undefined,
+            queuedMessages: [text, ...latest.queuedMessages ?? []],
+          } }))
+          refreshOutgoingTurn()
+        }
+        return
+      }
+    }
     const latest = paneContentRef.current
     if (
       checkpointAvailabilityScope(latest) === checkpointScope
       && latest.sessionId === current.sessionId
     ) sendFreshAgentSendFrame(requestId, text, routeCwd)
-  }, [clearIdleIncompleteRetry, dispatch, paneId, publishCheckpointAvailability, recordPendingSendMetadata, sendFreshAgentSendFrame, snapshotConfirmsNoUserTurns, tabId])
+  }, [appStore, clearIdleIncompleteRetry, dispatch, isPaneBusyNow, paneId, publishCheckpointAvailability, recordPendingSendMetadata, sendFreshAgentSendFrame, snapshotConfirmsNoUserTurns, tabId])
 
   // Providers accept one active turn. Keep follow-ups until the session can
   // actually accept them, including across disconnects and provider failures.
@@ -5430,11 +5594,11 @@ export function FreshAgentView({
   useEffect(() => {
     if (isBusy || !canSend || connectionStatus !== 'ready' || isRestoring || hasRestoreFailure) return
     if (ownerDivergenceRef.current) return
-    if (paneContentRef.current.provider === 'codex' && (localEcho || paneContentRef.current.pendingLocalEcho)) return
+    if (paneContentRef.current.provider === 'codex' && (localEcho || paneContentRef.current.pendingLocalEcho || paneContentRef.current.pendingCodexSend || localCodexSendRef.current)) return
     if (outgoingTurnRef.current || queuedMessages.length === 0 || !paneContentRef.current.sessionId) return
     sendUserText(queuedMessages[0])
-    setQueuedMessages((queue) => queue.slice(1))
-  }, [agentSession?.statusVersion, canSend, connectionStatus, hasRestoreFailure, isBusy, isRestoring, localEcho, outgoingTurnVersion, ownerDivergence, queuedMessages, sendUserText])
+    if (!usesStoredCodexQueue) setLocalQueuedMessages((queue) => queue.slice(1))
+  }, [agentSession?.statusVersion, canSend, connectionStatus, hasRestoreFailure, isBusy, isRestoring, localEcho, outgoingTurnVersion, ownerDivergence, paneContent.pendingCodexSend, queuedMessages, sendUserText, usesStoredCodexQueue])
 
   // Pane-scoped auto-approval (not claude): any pending approval whose tool
   // the user marked "Always allow <Tool> in this pane" is answered at once.
@@ -5487,12 +5651,12 @@ export function FreshAgentView({
         }
         const status = result.exitCode === 0 ? '' : ` (exit ${result.exitCode})`
         const body = `I ran \`${command}\`${status} in ${cwd ?? 'the home directory'}. Output:\n\`\`\`\n${result.output || '(no output)'}\n\`\`\``
-        setQueuedMessages((queue) => [...queue, body])
+        updateQueuedMessages((queue) => [...queue, body])
       })
       .catch((error: unknown) => {
         setNotice(error instanceof Error ? `Shell command failed: ${error.message}` : 'Shell command failed')
       })
-  }, [])
+  }, [updateQueuedMessages])
 
   /** Rewind the working tree to the checkpoint taken when a user turn was
    * sent. Conversation history is untouched — this is the code half of
@@ -5827,14 +5991,27 @@ export function FreshAgentView({
               {visibleLoadError ? (
                 <FreshAgentApprovalBanner text={visibleLoadError} onDismiss={() => setLoadError(null)} />
               ) : null}
+              {revealRefreshBlocking && paneContent.provider === 'codex' && localEcho ? (
+                <section aria-label="Pending message text" className="max-h-40 overflow-auto rounded-md border border-border/70 px-3 py-2 text-sm">
+                  <pre className="whitespace-pre-wrap break-words font-sans">{localEcho.text}</pre>
+                </section>
+              ) : null}
               {paneContent.provider === 'codex' && localEcho?.deliveryUnconfirmed ? (
                 <div role="status" aria-label="Unconfirmed message"
                   className="flex flex-wrap items-center gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm">
-                  <span>This message may already have been delivered. Check the conversation before continuing. Continuing saves it as a draft and allows queued messages to send.</span>
+                  <span>This message may already have been delivered. Check the conversation before continuing. Continuing saves it as a draft; queued messages wait until this send is resolved.</span>
                   <button type="button" className="rounded border border-border/70 px-2 py-1"
-                    onClick={() => requestSnapshotRefresh('manual')}>Check conversation</button>
+                    onClick={() => snapshotDirtyRef.current ? requestRevealRefresh(true) : requestSnapshotRefresh('manual')}>Check conversation</button>
                   <button type="button" className="rounded border border-border/70 px-2 py-1"
                     disabled={!canContinueUnconfirmed} onClick={continueUnconfirmed}>Continue without confirmation</button>
+                </div>
+              ) : null}
+              {paneContent.provider === 'codex' && !localEcho && paneContent.pendingCodexSend?.recovered ? (
+                <div role="status" aria-label="Waiting for message outcome"
+                  className="flex flex-wrap items-center gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm">
+                  <span>Your message was copied to the draft. Queued messages wait until its delivery is resolved.</span>
+                  <button type="button" className="rounded border border-border/70 px-2 py-1"
+                    onClick={() => snapshotDirtyRef.current ? requestRevealRefresh(true) : requestSnapshotRefresh('manual')}>Check conversation</button>
                 </div>
               ) : null}
               {visibleClaimRetryError ? (
@@ -6087,7 +6264,7 @@ export function FreshAgentView({
                     localEcho={localEchoTurn}
                     canFork={canFork}
                     canRollback={canRollback}
-                    rollbackBusy={isBusy}
+                    rollbackBusy={isBusy || codexUndoBlocked}
                     rolledBackTurns={snapshot?.rolledBackTurns ?? []}
                     canRedo={canRedoNow}
                     redoableTurnIds={snapshot?.rollback?.redoableTurnIds}
@@ -6127,6 +6304,10 @@ export function FreshAgentView({
                     onForkFromTurn={(turnId) => sendFork(turnId)}
                     getRewindAvailability={getRewindAvailability}
                     onRollbackToTurn={(turnId) => {
+                      if (codexUndoBlocked) {
+                        setNotice(CODEX_PENDING_UNDO_NOTICE)
+                        return
+                      }
                       // The busy pre-flight gate picks copy by DIRECTION (decision 7)…
                       if (isBusy) {
                         setNotice(ROLLBACK_BUSY_UNDO_NOTICE)
@@ -6225,7 +6406,7 @@ export function FreshAgentView({
               thinking={isBusy}
               queuedMessages={queuedMessages}
               onCancelQueued={(index) => {
-                setQueuedMessages((queue) => queue.filter((_, i) => i !== index))
+                updateQueuedMessages((queue) => queue.filter((_, i) => i !== index))
               }}
               canInterrupt={canInterrupt && Boolean(paneContent.sessionId)}
               onInterrupt={sendInterrupt}
@@ -6248,7 +6429,7 @@ export function FreshAgentView({
                 if (!canSend && !isBusy) return
                 const outgoing = composeOutgoingText(text, attachmentPaths)
                 if (!outgoing) return
-                setQueuedMessages((queue) => [...queue, outgoing])
+                updateQueuedMessages((queue) => [...queue, outgoing])
               }}
             />
             <FreshAgentModelDialog
@@ -6302,6 +6483,7 @@ export function FreshAgentView({
     liveSessionKey,
     codexLiveMetadata,
     codexRetryIdentity,
+    codexUndoBlocked,
     codexSnapshotKey,
     codexSnapshotRevision,
     liveTailActive,

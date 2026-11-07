@@ -69,9 +69,12 @@ describe('Panes Persistence Integration', () => {
       requestId: 'uncertain-request', text: 'Keep this message', deliveryUnconfirmed: true,
       confirmationDeadlineMs: Date.now() + 5_000,
     }
+    const pendingCodexSend = { requestId: 'uncertain-request', text: 'Keep this message', logicalAttemptId: 'attempt-one' }
+    const pendingCodexUndos = [{ requestId: 'earlier-undo', protectDraft: true }]
+    const queuedMessages = ['Duplicate', 'Duplicate', 'Attachment\n\nAttached files (read them from disk):\n- /tmp/example.txt']
     store.dispatch(initLayout({ tabId, content: {
       kind: 'fresh-agent', provider: 'codex', sessionType: 'freshcodex', createRequestId: 'persist-uncertain',
-      status: 'idle', pendingLocalEcho,
+      status: 'idle', pendingLocalEcho, pendingCodexSend, pendingCodexUndos, queuedMessages,
     } }))
     store.dispatch(flushPersistedLayoutNow())
     resetPersistedLayoutCacheForTests()
@@ -80,7 +83,11 @@ describe('Panes Persistence Integration', () => {
     expect(loaded).toBeTruthy()
     const restored = configureStore({ reducer: { tabs: tabsReducer, panes: panesReducer } })
     restored.dispatch(hydratePanes(loaded))
-    expect((restored.getState().panes.layouts[tabId] as any).content.pendingLocalEcho).toEqual(pendingLocalEcho)
+    const restoredContent = (restored.getState().panes.layouts[tabId] as any).content
+    expect(restoredContent.pendingLocalEcho).toEqual(pendingLocalEcho)
+    expect(restoredContent.pendingCodexSend).toEqual(pendingCodexSend)
+    expect(restoredContent.pendingCodexUndos).toEqual(pendingCodexUndos)
+    expect(restoredContent.queuedMessages).toEqual(queuedMessages)
   })
 
   it.each(['managed-preparation', 'ordinary', 'owner-stamped', 'reserved'] as const)(
