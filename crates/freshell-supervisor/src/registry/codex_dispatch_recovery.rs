@@ -70,6 +70,29 @@ impl OwnedCodexDispatchRecovery {
 }
 
 impl Registry {
+    pub(crate) async fn unresolved_codex_dispatch_recovery_receipt_souls(
+        &self,
+    ) -> Result<Vec<SoulId>, RegistryError> {
+        self.run_blocking(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT DISTINCT c.soul_id FROM input_commands c
+                 JOIN souls s ON s.soul_id=c.soul_id
+                 WHERE s.desired_state='running'
+                   AND c.codex_dispatch_recovery_receipt=1
+                   AND c.state IN ('dispatching','ambiguous')
+                 ORDER BY c.soul_id",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.map(|row| {
+                let raw = row?;
+                SoulId::parse(raw)
+                    .map_err(|_| RegistryError::Integrity("invalid Codex receipt soul id".into()))
+            })
+            .collect()
+        })
+        .await
+    }
+
     pub(crate) async fn codex_dispatch_recovery_source(
         &self,
         soul_id: SoulId,
@@ -96,6 +119,100 @@ impl Registry {
             let source = load_source(&tx, installation, &soul_id, epoch, true)?;
             tx.commit()?;
             Ok(source.map(Arc::new))
+        })
+        .await
+    }
+
+    /// Retire a receipt lookup only after its original host has durably
+    /// recorded an ambiguous terminal result. The input stays ambiguous and
+    /// can never be sent again; clearing only the receipt marker lets ordinary
+    /// recovery inspect the provider store.
+    pub(crate) async fn retire_ambiguous_codex_dispatch_recovery_receipt(
+        &self,
+        source: Arc<OwnedCodexDispatchRecovery>,
+        request_id: RequestId,
+    ) -> Result<bool, RegistryError> {
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            validate_source(&tx, &source)?;
+            let changed = tx.execute(
+                "UPDATE input_commands SET codex_dispatch_recovery_receipt=0
+                 WHERE soul_id=?1 AND incarnation_id=?2 AND request_id=?3
+                   AND codex_dispatch_recovery_receipt=1 AND state='ambiguous'",
+                params![
+                    source.handle.soul_id().as_str(),
+                    source.handle.incarnation_id().as_str(),
+                    request_id.as_str(),
+                ],
+            )?;
+            if changed > 0 {
+                super::clear_command_ambiguous_recovery_block_if_settled(
+                    &tx,
+                    source.handle.soul_id(),
+                    source.handle.incarnation_id(),
+                )?;
+            }
+            tx.commit()?;
+            Ok(changed == 1)
+        })
+        .await
+    }
+
+    /// Stop waiting for receipts that never arrive after the bounded original
+    /// send budget plus a grace period. These rows remain ambiguous and are
+    /// never replayed; only their special recovery hold is retired.
+    pub(crate) async fn retire_expired_codex_dispatch_recovery_receipts(
+        &self,
+        source: Arc<OwnedCodexDispatchRecovery>,
+        cutoff_ms: i64,
+    ) -> Result<Vec<RequestId>, RegistryError> {
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            validate_source(&tx, &source)?;
+            let mut statement = tx.prepare(
+                "SELECT request_id FROM input_commands
+                 WHERE soul_id=?1 AND incarnation_id=?2
+                   AND codex_dispatch_recovery_receipt=1 AND state='ambiguous'
+                   AND updated_at<=?3
+                 ORDER BY updated_at,request_id",
+            )?;
+            let rows = statement.query_map(
+                params![
+                    source.handle.soul_id().as_str(),
+                    source.handle.incarnation_id().as_str(),
+                    cutoff_ms,
+                ],
+                |row| row.get::<_, String>(0),
+            )?;
+            let request_ids = rows
+                .map(|row| {
+                    let raw = row?;
+                    RequestId::parse(raw).map_err(|_| {
+                        RegistryError::Integrity("invalid Codex receipt request id".into())
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(statement);
+            if !request_ids.is_empty() {
+                tx.execute(
+                    "UPDATE input_commands SET codex_dispatch_recovery_receipt=0
+                     WHERE soul_id=?1 AND incarnation_id=?2
+                       AND codex_dispatch_recovery_receipt=1 AND state='ambiguous'
+                       AND updated_at<=?3",
+                    params![
+                        source.handle.soul_id().as_str(),
+                        source.handle.incarnation_id().as_str(),
+                        cutoff_ms,
+                    ],
+                )?;
+                super::clear_command_ambiguous_recovery_block_if_settled(
+                    &tx,
+                    source.handle.soul_id(),
+                    source.handle.incarnation_id(),
+                )?;
+            }
+            tx.commit()?;
+            Ok(request_ids)
         })
         .await
     }

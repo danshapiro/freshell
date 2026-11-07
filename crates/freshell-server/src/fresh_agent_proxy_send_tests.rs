@@ -19,30 +19,6 @@ impl freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier for Checkpoint
     }
 }
 
-#[derive(Default)]
-struct FirstCheckpointWaitBarrier {
-    calls: std::sync::atomic::AtomicUsize,
-    first_waiting: tokio::sync::Notify,
-    release_first: tokio::sync::Notify,
-}
-
-impl freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier for FirstCheckpointWaitBarrier {
-    fn barrier_and_forward(
-        self: Arc<Self>,
-        _send: FreshAgentSend,
-        forward: futures_util::future::BoxFuture<'static, ()>,
-    ) -> futures_util::future::BoxFuture<'static, ()> {
-        Box::pin(async move {
-            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if call == 0 {
-                self.first_waiting.notify_one();
-                self.release_first.notified().await;
-            }
-            forward.await;
-        })
-    }
-}
-
 #[tokio::test]
 async fn receipt_reconcile_bypasses_checkpoint_barrier_and_stale_admission() {
     use std::time::Duration;
@@ -165,10 +141,22 @@ async fn receipt_reconcile_bypasses_checkpoint_barrier_and_stale_admission() {
 }
 
 #[tokio::test]
-async fn early_receipt_reconcile_retries_the_same_send_through_its_checkpoint_barrier() {
+async fn not_journaled_receipt_retries_the_same_send_through_real_checkpoint_service() {
     use std::time::Duration;
 
     let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("source.txt"), "checkpoint source\n").unwrap();
+    let git = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&workspace)
+        .status()
+        .unwrap();
+    assert!(git.success(), "temporary checkpoint workspace initializes");
+
     let socket = root.path().join("supervisor.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let server = tokio::spawn(async move {
@@ -183,10 +171,10 @@ async fn early_receipt_reconcile_retries_the_same_send_through_its_checkpoint_ba
                 .unwrap();
             let envelope: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
             let result = match envelope.body {
-                AdminCommand::Health => AdminResult::Health {
+                AdminCommand::Health => Ok(AdminResult::Health {
                     control_epoch: 7,
                     installation_id: InstallationId::new(),
-                },
+                }),
                 AdminCommand::FreshAgentSendReconcile(request) => {
                     reconcile_requests += 1;
                     assert_eq!(request.text, "one original prompt");
@@ -194,9 +182,9 @@ async fn early_receipt_reconcile_retries_the_same_send_through_its_checkpoint_ba
                         request.checkpoint_logical_attempt_id.as_deref(),
                         Some("logical-7")
                     );
-                    AdminResult::FreshAgentCommand {
+                    Ok(AdminResult::FreshAgentCommand {
                         state: CommandState::Queued,
-                    }
+                    })
                 }
                 AdminCommand::FreshAgentSend(request) => {
                     send_requests += 1;
@@ -205,11 +193,18 @@ async fn early_receipt_reconcile_retries_the_same_send_through_its_checkpoint_ba
                         request.checkpoint_logical_attempt_id.as_deref(),
                         Some("logical-7")
                     );
-                    if journal.insert(envelope.request_id.clone()) {
-                        provider_inputs += 1;
-                    }
-                    AdminResult::FreshAgentCommand {
-                        state: CommandState::Completed,
+                    if send_requests == 1 {
+                        Err(RuntimeError::new(
+                            RuntimeErrorCode::HostUnreachable,
+                            "simulated loss before journal admission",
+                        ))
+                    } else {
+                        if journal.insert(envelope.request_id.clone()) {
+                            provider_inputs += 1;
+                        }
+                        Ok(AdminResult::FreshAgentCommand {
+                            state: CommandState::Completed,
+                        })
                     }
                 }
                 other => panic!("unexpected supervisor command: {other:?}"),
@@ -218,7 +213,7 @@ async fn early_receipt_reconcile_retries_the_same_send_through_its_checkpoint_ba
                 &mut stream,
                 &AdminReply {
                     request_id: envelope.request_id,
-                    result: Ok(result),
+                    result,
                 },
             )
             .await
@@ -232,46 +227,50 @@ async fn early_receipt_reconcile_retries_the_same_send_through_its_checkpoint_ba
         &socket,
         HashMap::from([(("codex".into(), "public-thread".into()), soul)]),
     );
-    let barrier = Arc::new(FirstCheckpointWaitBarrier::default());
-    proxy.set_checkpoint_barrier(barrier.clone());
+    let (checkpoint_broadcast, _) = broadcast::channel(16);
+    let checkpoint_service = Arc::new(crate::checkpoints::CheckpointService::new(
+        Arc::new(home),
+        Arc::new(checkpoint_broadcast),
+    ));
+    proxy.set_checkpoint_barrier(checkpoint_service);
     let message: FreshAgentSend = serde_json::from_value(serde_json::json!({
         "provider":"codex", "sessionId":"public-thread", "sessionType":"freshcodex",
         "requestId":"reconcile-race-request", "text":"one original prompt",
+        "cwd":workspace,
         "checkpointIntent":{"logicalAttemptId":"logical-7"}
     }))
     .unwrap();
 
-    let original_proxy = Arc::clone(&proxy);
-    let original_message = message.clone();
-    let original = tokio::spawn(async move {
-        original_proxy
-            .handle(HostedFreshAgentCommand::Send(original_message))
-            .await;
-    });
-    tokio::time::timeout(Duration::from_secs(3), barrier.first_waiting.notified())
-        .await
-        .expect("the original send waits at checkpoint capture");
+    Arc::clone(&proxy)
+        .handle(HostedFreshAgentCommand::Send(message.clone()))
+        .await;
+    let uncertain: serde_json::Value = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(1), frames.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(uncertain["type"], "error");
+    assert_eq!(uncertain["requestId"], "reconcile-race-request");
 
     Arc::clone(&proxy)
         .handle(HostedFreshAgentCommand::SendReconcile(message))
         .await;
-    barrier.release_first.notify_one();
-    original.await.unwrap();
 
     let (reconcile_requests, send_requests, provider_inputs) = server.await.unwrap();
     assert_eq!(reconcile_requests, 1);
     assert_eq!(
         send_requests, 2,
-        "the resumed send and original send share the request ID"
+        "the not-journaled retry re-enters the actual checkpointed send path"
     );
     assert_eq!(
         provider_inputs, 1,
         "the supervisor journal admits one provider input"
     );
-    assert_eq!(barrier.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     assert!(
         frames.try_recv().is_err(),
-        "settled sends emit no uncertain frame"
+        "settled retry emits no extra frame"
     );
 }
 

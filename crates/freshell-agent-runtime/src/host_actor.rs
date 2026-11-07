@@ -2659,6 +2659,13 @@ impl FreshAgentHostActor {
         match existing.state {
             CommandState::ProviderAcked | CommandState::Completed => {}
             CommandState::Cancelled => return Err(ActorError::SendRefused),
+            CommandState::Ambiguous => {
+                return Ok(DispatchResult {
+                    state: CommandState::Ambiguous,
+                    native_identity: None,
+                    codex_dispatch_recovery_source: Some(source.clone()),
+                });
+            }
             _ => return Err(ActorError::AmbiguousDispatch),
         }
         let native_identity = existing

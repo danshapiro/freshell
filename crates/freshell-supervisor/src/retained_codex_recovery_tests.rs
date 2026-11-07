@@ -90,6 +90,7 @@ struct ControlledCodex {
     receipt_queries: Arc<AtomicUsize>,
     receipt_identity_mismatch: Arc<AtomicBool>,
     receipt_refused: Arc<AtomicBool>,
+    terminal_ambiguous_receipt: Arc<AtomicBool>,
     lose_send_reply_once: Arc<AtomicBool>,
     native_prepares: Arc<AtomicUsize>,
     recovery_probes: Arc<AtomicUsize>,
@@ -207,6 +208,7 @@ impl ControlledCodex {
         let receipt_queries = Arc::new(AtomicUsize::new(0));
         let receipt_identity_mismatch = Arc::new(AtomicBool::new(false));
         let receipt_refused = Arc::new(AtomicBool::new(false));
+        let terminal_ambiguous_receipt = Arc::new(AtomicBool::new(false));
         let lose_send_reply_once = Arc::new(AtomicBool::new(false));
         let send_receipt = Arc::new(std::sync::Mutex::new(
             None::<(RequestId, NativeDispatchIdentity)>,
@@ -244,6 +246,7 @@ impl ControlledCodex {
             let receipt_queries = receipt_queries.clone();
             let receipt_identity_mismatch = receipt_identity_mismatch.clone();
             let receipt_refused = receipt_refused.clone();
+            let terminal_ambiguous_receipt = terminal_ambiguous_receipt.clone();
             let lose_send_reply_once = lose_send_reply_once.clone();
             let send_receipt = send_receipt.clone();
             let native_prepares = native_prepares.clone();
@@ -280,6 +283,7 @@ impl ControlledCodex {
                     let receipt_queries = receipt_queries.clone();
                     let receipt_identity_mismatch = receipt_identity_mismatch.clone();
                     let receipt_refused = receipt_refused.clone();
+                    let terminal_ambiguous_receipt = terminal_ambiguous_receipt.clone();
                     let lose_send_reply_once = lose_send_reply_once.clone();
                     let send_receipt = send_receipt.clone();
                     let native_prepares = native_prepares.clone();
@@ -436,33 +440,43 @@ impl ControlledCodex {
                                 }
                                 if receipt_only {
                                     receipt_queries.fetch_add(1, Ordering::SeqCst);
-                                    match send_receipt.lock().unwrap().clone() {
-                                        Some((recorded_request, mut identity))
-                                            if recorded_request == request_id =>
-                                        {
-                                            // The host commits its actor receipt
-                                            // before replying, so the accepted
-                                            // Codex process is current again.
-                                            exited.store(false, Ordering::SeqCst);
-                                            if receipt_identity_mismatch.load(Ordering::SeqCst) {
-                                                identity.previous_native_session_id =
-                                                    "foreign-receipt-source".into();
-                                            }
-                                            HostResult::FreshAgentCommand {
-                                                state: CommandState::ProviderAcked,
-                                                claude_fork: None,
-                                                native_session_id: Some(
-                                                    identity.native_session_id.clone(),
-                                                ),
-                                                native_identity: Some(identity),
-                                            }
-                                        }
-                                        _ => HostResult::FreshAgentCommand {
+                                    if terminal_ambiguous_receipt.load(Ordering::SeqCst) {
+                                        HostResult::FreshAgentCommand {
                                             state: CommandState::Ambiguous,
                                             claude_fork: None,
                                             native_session_id: None,
                                             native_identity: None,
-                                        },
+                                        }
+                                    } else {
+                                        match send_receipt.lock().unwrap().clone() {
+                                            Some((recorded_request, mut identity))
+                                                if recorded_request == request_id =>
+                                            {
+                                                // The host commits its actor receipt
+                                                // before replying, so the accepted
+                                                // Codex process is current again.
+                                                exited.store(false, Ordering::SeqCst);
+                                                if receipt_identity_mismatch.load(Ordering::SeqCst)
+                                                {
+                                                    identity.previous_native_session_id =
+                                                        "foreign-receipt-source".into();
+                                                }
+                                                HostResult::FreshAgentCommand {
+                                                    state: CommandState::ProviderAcked,
+                                                    claude_fork: None,
+                                                    native_session_id: Some(
+                                                        identity.native_session_id.clone(),
+                                                    ),
+                                                    native_identity: Some(identity),
+                                                }
+                                            }
+                                            _ => HostResult::FreshAgentCommand {
+                                                state: CommandState::Ambiguous,
+                                                claude_fork: None,
+                                                native_session_id: None,
+                                                native_identity: None,
+                                            },
+                                        }
                                     }
                                 } else {
                                     inputs.fetch_add(1, Ordering::SeqCst);
@@ -721,6 +735,7 @@ impl ControlledCodex {
             receipt_queries,
             receipt_identity_mismatch,
             receipt_refused,
+            terminal_ambiguous_receipt,
             lose_send_reply_once,
             native_prepares,
             recovery_probes,
@@ -2274,6 +2289,262 @@ async fn recovery_receipt_refusal_settles_by_id_without_browser_payload() {
     ));
     assert_eq!(fixture.inputs.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.receipt_queries.load(Ordering::SeqCst), 1);
+    fixture.peer.abort();
+}
+
+#[tokio::test]
+async fn live_codex_receipt_sweep_reconciles_without_a_browser_request() {
+    let fixture = ControlledCodex::new().await;
+    fixture.receipt_capability.store(false, Ordering::SeqCst);
+    fixture.lose_send_reply_once.store(true, Ordering::SeqCst);
+    let request_id = RequestId::parse("browser-free-live-receipt").unwrap();
+    let logical_attempt_id = Some("browser-free-live-receipt-attempt".to_string());
+    let settings = Some(freshell_runtime_protocol::FreshAgentTurnSettings {
+        cwd: Some(fixture._root.path().to_string_lossy().into_owned()),
+        model: Some("gpt-5-codex".into()),
+        ..Default::default()
+    });
+    let settings_correlation =
+        serde_json::to_vec(&(settings.as_ref(), logical_attempt_id.as_deref().unwrap())).unwrap();
+    assert_eq!(
+        fixture
+            .send_with_checkpoint(request_id.clone(), logical_attempt_id, settings,)
+            .await
+            .unwrap_err()
+            .code,
+        RuntimeErrorCode::HostUnreachable
+    );
+    fixture.receipt_capability.store(true, Ordering::SeqCst);
+
+    fixture
+        .supervisor
+        .reconcile_live_codex_dispatch_recovery_receipts_once()
+        .await
+        .expect("the periodic supervisor sweep can recover without browser state");
+
+    assert_eq!(fixture.inputs.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.receipt_queries.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture
+            .supervisor
+            .registry
+            .recorded_input_outcome(
+                fixture.soul.clone(),
+                request_id,
+                b"original public reference input",
+                Some(&settings_correlation),
+            )
+            .await
+            .unwrap(),
+        Some(InputJournalDisposition::Completed)
+    );
+    assert_eq!(
+        fixture
+            .supervisor
+            .registry
+            .recovery_context(fixture.soul.clone())
+            .await
+            .unwrap()
+            .native_session_id
+            .as_deref(),
+        Some("native-child")
+    );
+    fixture.peer.abort();
+}
+
+#[tokio::test]
+async fn terminal_ambiguous_receipt_releases_only_the_recovery_hold() {
+    use freshell_runtime_protocol::RecoveryBlockReason;
+
+    let fixture = ControlledCodex::new().await;
+    fixture.receipt_capability.store(false, Ordering::SeqCst);
+    fixture.lose_send_reply_once.store(true, Ordering::SeqCst);
+    let request_id = RequestId::parse("terminal-ambiguous-receipt").unwrap();
+    let logical_attempt_id = Some("terminal-ambiguous-receipt-attempt".to_string());
+    let settings = Some(freshell_runtime_protocol::FreshAgentTurnSettings {
+        cwd: Some(fixture._root.path().to_string_lossy().into_owned()),
+        model: Some("gpt-5-codex".into()),
+        ..Default::default()
+    });
+    let settings_correlation =
+        serde_json::to_vec(&(settings.as_ref(), logical_attempt_id.as_deref().unwrap())).unwrap();
+    assert_eq!(
+        fixture
+            .send_with_checkpoint(request_id.clone(), logical_attempt_id, settings,)
+            .await
+            .unwrap_err()
+            .code,
+        RuntimeErrorCode::HostUnreachable
+    );
+    let context = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    fixture
+        .supervisor
+        .registry
+        .mark_recovery_blocked(
+            fixture.soul.clone(),
+            None,
+            RecoveryBlockReason::CommandAmbiguous,
+            Vec::new(),
+            context.write_fence(),
+        )
+        .await
+        .unwrap();
+    fixture
+        .terminal_ambiguous_receipt
+        .store(true, Ordering::SeqCst);
+    fixture.receipt_capability.store(true, Ordering::SeqCst);
+
+    fixture
+        .supervisor
+        .reconcile_pending_codex_dispatch_recovery_receipts(&context)
+        .await
+        .unwrap();
+
+    assert_eq!(fixture.inputs.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.receipt_queries.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture
+            .supervisor
+            .registry
+            .unresolved_codex_dispatch_recovery_receipt_count(
+                fixture.soul.clone(),
+                fixture.incarnation.clone(),
+            )
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        fixture
+            .supervisor
+            .registry
+            .recorded_input_outcome(
+                fixture.soul.clone(),
+                request_id,
+                b"original public reference input",
+                Some(&settings_correlation),
+            )
+            .await
+            .unwrap(),
+        Some(InputJournalDisposition::Ambiguous)
+    );
+    assert_eq!(
+        fixture
+            .supervisor
+            .registry
+            .recovery_context(fixture.soul.clone())
+            .await
+            .unwrap()
+            .recovery_state,
+        RecoveryState::Live
+    );
+    fixture.peer.abort();
+}
+
+#[tokio::test]
+async fn stale_codex_receipt_hold_expires_without_replaying_the_input() {
+    use freshell_runtime_protocol::RecoveryBlockReason;
+
+    let fixture = ControlledCodex::new().await;
+    fixture.receipt_capability.store(false, Ordering::SeqCst);
+    fixture.lose_send_reply_once.store(true, Ordering::SeqCst);
+    let request_id = RequestId::parse("stale-codex-receipt-hold").unwrap();
+    let logical_attempt_id = Some("stale-codex-receipt-hold-attempt".to_string());
+    let settings = Some(freshell_runtime_protocol::FreshAgentTurnSettings {
+        cwd: Some(fixture._root.path().to_string_lossy().into_owned()),
+        model: Some("gpt-5-codex".into()),
+        ..Default::default()
+    });
+    let settings_correlation =
+        serde_json::to_vec(&(settings.as_ref(), logical_attempt_id.as_deref().unwrap())).unwrap();
+    assert_eq!(
+        fixture
+            .send_with_checkpoint(
+                request_id.clone(),
+                logical_attempt_id.clone(),
+                settings.clone(),
+            )
+            .await
+            .unwrap_err()
+            .code,
+        RuntimeErrorCode::HostUnreachable
+    );
+    let context = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    fixture
+        .supervisor
+        .registry
+        .mark_recovery_blocked(
+            fixture.soul.clone(),
+            None,
+            RecoveryBlockReason::CommandAmbiguous,
+            Vec::new(),
+            context.write_fence(),
+        )
+        .await
+        .unwrap();
+    rusqlite::Connection::open(fixture.supervisor.registry.database_path())
+        .unwrap()
+        .execute(
+            "UPDATE input_commands SET updated_at=0 WHERE soul_id=?1 AND request_id=?2",
+            params![fixture.soul.as_str(), request_id.as_str()],
+        )
+        .unwrap();
+
+    fixture
+        .supervisor
+        .reconcile_live_codex_dispatch_recovery_receipts_once()
+        .await
+        .unwrap();
+
+    assert_eq!(fixture.receipt_queries.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .supervisor
+            .registry
+            .unresolved_codex_dispatch_recovery_receipt_count(
+                fixture.soul.clone(),
+                fixture.incarnation.clone(),
+            )
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        fixture
+            .supervisor
+            .registry
+            .recorded_input_outcome(
+                fixture.soul.clone(),
+                request_id.clone(),
+                b"original public reference input",
+                Some(&settings_correlation),
+            )
+            .await
+            .unwrap(),
+        Some(InputJournalDisposition::Ambiguous)
+    );
+    assert_eq!(fixture.inputs.load(Ordering::SeqCst), 1);
+    let replay = fixture
+        .send_with_checkpoint(request_id, logical_attempt_id, settings)
+        .await
+        .unwrap();
+    assert!(matches!(
+        replay,
+        AdminResult::FreshAgentCommand {
+            state: CommandState::Ambiguous
+        }
+    ));
+    assert_eq!(fixture.inputs.load(Ordering::SeqCst), 1);
     fixture.peer.abort();
 }
 

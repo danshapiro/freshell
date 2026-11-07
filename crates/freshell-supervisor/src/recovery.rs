@@ -3233,6 +3233,33 @@ impl Supervisor {
         &self,
         context: &RecoveryContext,
     ) -> Result<Option<u64>, RuntimeError> {
+        let Some(source) = self
+            .registry
+            .codex_dispatch_recovery_receipt_source(context.soul_id.clone())
+            .await
+            .map_err(map_registry)?
+        else {
+            return Ok(None);
+        };
+        if !source.matches_context(context) {
+            return Ok(None);
+        }
+        let expired = self
+            .registry
+            .retire_expired_codex_dispatch_recovery_receipts(
+                Arc::clone(&source),
+                self.codex_dispatch_recovery_receipt_cutoff_ms(),
+            )
+            .await
+            .map_err(map_registry)?;
+        if !expired.is_empty() {
+            tracing::warn!(
+                soul_id = %context.soul_id,
+                incarnation_id = %context.prior_handle.incarnation_id(),
+                retired_count = expired.len(),
+                "supervisor.codex_send_receipt_wait_expired"
+            );
+        }
         let pending_count = self
             .registry
             .unresolved_codex_dispatch_recovery_receipt_count(
@@ -3245,11 +3272,13 @@ impl Supervisor {
             return Ok(None);
         }
 
-        let inspection = self
-            .backend
-            .inspect(&context.prior_handle)
-            .await
-            .map_err(map_backend)?;
+        // Receipt gating is only justified by a verified, reachable original
+        // host. If any part of that proof is inconclusive, let normal recovery
+        // classify the exact owned runtime instead of pinning the soul here.
+        let inspection = match self.backend.inspect(&context.prior_handle).await {
+            Ok(inspection) => inspection,
+            Err(_) => return Ok(None),
+        };
         match inspection.state {
             BackendRuntimeState::Exited
             | BackendRuntimeState::Dead
@@ -3259,50 +3288,35 @@ impl Supervisor {
             BackendRuntimeState::Running => {}
             BackendRuntimeState::Created
             | BackendRuntimeState::Paused
-            | BackendRuntimeState::Restarting => {
-                return Err(RuntimeError::new(
-                    RuntimeErrorCode::RecoveryBlocked,
-                    "Codex receipt host state is changing; recovery was deferred",
-                ));
-            }
+            | BackendRuntimeState::Restarting => return Ok(None),
         }
 
-        let source = self
-            .registry
-            .codex_dispatch_recovery_receipt_source(context.soul_id.clone())
-            .await
-            .map_err(map_registry)?
-            .ok_or_else(|| {
-                RuntimeError::new(
-                    RuntimeErrorCode::RecoveryBlocked,
-                    "unresolved Codex receipt no longer has a current host source",
-                )
-            })?;
-        if !source.matches_context(context) {
-            return Err(RuntimeError::new(
-                RuntimeErrorCode::RecoveryBlocked,
-                "unresolved Codex receipt host source changed; recovery was deferred",
-            ));
-        }
-
-        let host = self
+        let host = match self
             .authenticate_host(
                 context.prior_handle.incarnation_id(),
                 context.prior_handle.runtime_dir(),
             )
-            .await?;
+            .await
+        {
+            Ok(host) => host,
+            Err(_) => return Ok(None),
+        };
         if !host.capabilities.iter().any(|capability| {
             capability == freshell_runtime_protocol::HOST_CAPABILITY_CODEX_SEND_RECEIPT_V1
         }) {
             return Ok(None);
         }
-        let status = self
+        let status = match self
             .host_status(
                 context.prior_handle.incarnation_id().clone(),
                 context.prior_handle.runtime_dir(),
                 &host,
             )
-            .await?;
+            .await
+        {
+            Ok(status) => status,
+            Err(_) => return Ok(None),
+        };
         if status.host_boot_id != host.host_boot_id
             || !source.matches_host(&status.host_boot_id, status.max_execution_generation)
             || status.worker_pid.is_none()

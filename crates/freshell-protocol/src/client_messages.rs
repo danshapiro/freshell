@@ -99,10 +99,11 @@ pub enum ClientMessage {
     FreshAgentAttach(FreshAgentAttach),
     #[serde(rename = "freshAgent.send")]
     FreshAgentSend(FreshAgentSend),
-    /// Receipt-only retry for a previously dispatched hosted send. Its payload
-    /// is identical to `freshAgent.send`, but the server may only consult the
-    /// existing input journal and durable host receipt; it can never dispatch
-    /// provider input.
+    /// Reconcile an uncertain hosted send using its exact original payload.
+    /// The supervisor only consults the existing input journal and durable host
+    /// receipt; if no journal entry exists, the gateway may resubmit the same
+    /// request through the normal send path. An admitted ambiguous input is
+    /// never replayed by reconciliation.
     #[serde(rename = "freshAgent.send.reconcile")]
     FreshAgentSendReconcile(FreshAgentSend),
     #[serde(rename = "freshAgent.interrupt")]

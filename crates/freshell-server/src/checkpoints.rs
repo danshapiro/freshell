@@ -3157,7 +3157,12 @@ impl freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier for Checkpoint
                     }
                 }
                 let outcome_snapshot = outcome_rx.borrow().clone();
+                let mut retry_original = false;
                 if let Some(mut record) = outcome_snapshot {
+                    retry_original = record
+                        .request_ids
+                        .first()
+                        .is_some_and(|original| original == &request_id);
                     if !record.request_ids.iter().any(|alias| alias == &request_id)
                         && record.request_ids.len() < 16
                     {
@@ -3172,6 +3177,13 @@ impl freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier for Checkpoint
                     if finished_rx.changed().await.is_err() {
                         break;
                     }
+                }
+                if retry_original {
+                    // The original request ID is safe to replay through the
+                    // canonical input journal, which admits it at most once.
+                    // A different ID for this checkpoint attempt remains
+                    // fenced because it would represent a second input.
+                    forward.await;
                 }
                 return;
             }
@@ -3199,6 +3211,10 @@ impl freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier for Checkpoint
                         }
                         (record, false)
                     } else if record.dispatch_started {
+                        let retry_original = record
+                            .request_ids
+                            .first()
+                            .is_some_and(|original| original == &request_id);
                         if added_alias {
                             if let Err(error) = self.persist_outcome(&key, record.clone()).await {
                                 tracing::error!(
@@ -3210,9 +3226,11 @@ impl freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier for Checkpoint
                                 );
                             }
                         }
-                        // A durable dispatch fence is terminal for this logical
-                        // attempt. An explicit retry must use a new attempt ID.
-                        (record, false)
+                        // Replaying the same request ID is safe: the canonical
+                        // input journal owns duplicate suppression. A different
+                        // request ID would create a second input for this logical
+                        // attempt, so the durable checkpoint fence still blocks it.
+                        (record, retry_original)
                     } else {
                         // Persist the admission fence before forwarding. A crash
                         // after this point can lose a provider send, but cannot
@@ -6488,6 +6506,45 @@ mod tests {
         assert!(record.dispatch_started);
         assert_eq!(record.submitted_turn_id.as_deref(), Some("provider-turn-1"));
         assert!(record.request_ids.contains(&"request-2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn started_logical_attempt_retries_only_its_original_request_id() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        initialize_checkpoint_workspace(workspace.path()).await;
+        let service = checkpoint_test_service(home.path());
+
+        let (_, first_dispatches, _) = run_checkpoint_policy_send(
+            Arc::clone(&service),
+            checkpoint_policy_send(workspace.path(), "original-request", "same-attempt"),
+        )
+        .await;
+        let (_, retry_dispatches, _) = run_checkpoint_policy_send(
+            Arc::clone(&service),
+            checkpoint_policy_send(workspace.path(), "original-request", "same-attempt"),
+        )
+        .await;
+        let (_, alias_dispatches, _) = run_checkpoint_policy_send(
+            Arc::clone(&service),
+            checkpoint_policy_send(workspace.path(), "alias-request", "same-attempt"),
+        )
+        .await;
+
+        assert_eq!(first_dispatches, 1);
+        assert_eq!(
+            retry_dispatches, 1,
+            "the original request may re-enter the canonical idempotent send path"
+        );
+        assert_eq!(
+            alias_dispatches, 0,
+            "a different request ID for the same started logical attempt remains fenced"
+        );
+        let key = "\"opencode\":\"freshopencode\":review-r6-session:same-attempt";
+        let record = service.find_outcome(&key).await.unwrap().unwrap();
+        assert!(record.dispatch_started);
+        assert!(record.request_ids.contains(&"original-request".to_string()));
+        assert!(record.request_ids.contains(&"alias-request".to_string()));
     }
 
     #[tokio::test]

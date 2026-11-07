@@ -2047,6 +2047,72 @@ async fn retained_codex_send_receipt_reports_a_persisted_refusal() {
 }
 
 #[tokio::test]
+async fn retained_codex_send_receipt_reports_terminal_ambiguity_without_resending() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = FakeTransport::ambiguous("owned-native");
+    let mut initial_profile = profile(
+        FreshProvider::Codex,
+        "ambiguous-receipt-store",
+        Some("owned-native"),
+    );
+    initial_profile.runtime_variant = "codex-app-server".into();
+    let actor = FreshAgentHostActor::open(dir.path(), initial_profile, transport.clone())
+        .await
+        .unwrap();
+    let source = NativeIdentityObservation {
+        native_session_id: "owned-native".into(),
+        incarnation_id: freshell_runtime_protocol::IncarnationId::new(),
+        launch_nonce: "ambiguous-receipt-launch".into(),
+        evidence_revision: 7,
+        source: freshell_runtime_protocol::NativeIdentitySource::FreshProviderHandshake,
+        evidence_digest: "d".repeat(64),
+    };
+    let request_id = RequestId::parse("retained-ambiguous-send").unwrap();
+    assert_eq!(
+        actor
+            .dispatch_with_codex_recovery_source(
+                request_id.clone(),
+                "the provider outcome cannot be proven".into(),
+                None,
+                Some("attempt-ambiguous".into()),
+                Some(source.clone()),
+            )
+            .await
+            .unwrap_err(),
+        ActorError::AmbiguousDispatch
+    );
+    assert_eq!(transport.dispatches.load(Ordering::SeqCst), 1);
+
+    let receipt = actor
+        .codex_recovery_send_receipt(request_id.clone())
+        .await
+        .expect("a persisted terminal ambiguity is a receipt outcome");
+    assert_eq!(receipt.state, CommandState::Ambiguous);
+    assert!(receipt.native_identity.is_none());
+    assert_eq!(
+        receipt.codex_dispatch_recovery_source.as_ref(),
+        Some(&source)
+    );
+    assert_eq!(transport.dispatches.load(Ordering::SeqCst), 1);
+
+    let persisted_profile = actor.profile().await;
+    actor.stop().await.unwrap();
+    let reopened = FreshAgentHostActor::open(
+        dir.path(),
+        persisted_profile,
+        FakeTransport::new("owned-native"),
+    )
+    .await
+    .unwrap();
+    let reopened_receipt = reopened
+        .codex_recovery_send_receipt(request_id)
+        .await
+        .unwrap();
+    assert_eq!(reopened_receipt.state, CommandState::Ambiguous);
+    assert!(reopened_receipt.native_identity.is_none());
+}
+
+#[tokio::test]
 async fn pending_permission_persists_and_is_answered_exactly_once_after_gateway_restart() {
     let dir = tempfile::tempdir().unwrap();
     let transport = FakeTransport::new("thread-7");

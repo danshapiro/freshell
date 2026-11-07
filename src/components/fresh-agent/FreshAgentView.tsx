@@ -3584,15 +3584,19 @@ export function FreshAgentView({
         const current = paneContentRef.current
         const sessionRef = message.sessionRef ?? { provider: message.provider, sessionId: message.sessionId }
         const previousSnapshot = snapshotRef.current
+        const previousSessionWasPlaceholder =
+          message.previousSessionId.startsWith(`managed-${message.provider}-`)
+          || message.previousSessionId.startsWith(`fresh${message.provider}-`)
         if (
-          previousSnapshot?.threadId === message.previousSessionId
+          previousSessionWasPlaceholder
+          && previousSnapshot?.threadId === message.previousSessionId
           && previousSnapshot.provider === message.provider
           && previousSnapshot.sessionType === message.sessionType
           && snapshotAutoTitleIdentityRef.current === autoTitleIdentityRef.current
         ) {
-          // The server explicitly links this live handle to its durable ID.
-          // Keep its current snapshot visible through that verified re-key;
-          // a normal conversation switch has no such alias and stays hidden.
+          // These server-issued placeholder forms identify a live handle
+          // being re-keyed to its durable ID. Keep its snapshot visible through
+          // that transition; durable conversation switches stay hidden.
           const durableIdentity = sessionRef.provider === message.provider
             ? sessionRef.sessionId
             : preferredResumeSessionId ?? message.sessionId
@@ -5198,6 +5202,13 @@ export function FreshAgentView({
   const retainedSnapshot = useAppSelector((state) => liveSessionKey ? state.freshAgentLive?.bySession[liveSessionKey]?.retainedSnapshot : undefined)
   useEffect(() => {
     if (!retainedSnapshot) return
+    if (
+      retainedSnapshot.provider !== paneContent.provider
+      || retainedSnapshot.sessionType !== paneContent.sessionType
+      || retainedSnapshot.threadId !== snapshotThreadId
+      || !snapshotThreadId
+    ) return
+    const retainedIdentity = autoTitleIdentityRef.current
     if (retainedSnapshot.provider === 'codex') {
       const identity = snapshotHydrationIdentityRef.current
       // Retained replay supplies an initial diagnostic, but cannot outrank a
@@ -5219,6 +5230,8 @@ export function FreshAgentView({
     }
     // A provider-retained source supersedes history requests already in flight.
     snapshotRequestAuthorityRef.current.applied = ++snapshotRequestAuthorityRef.current.next
+    snapshotAutoTitleIdentityRef.current = retainedIdentity
+    setSnapshotAutoTitleIdentity(retainedIdentity)
     commitSnapshot(retainedSnapshot)
     snapshotDirtyRef.current = false
     snapshotDirtyBaseRevisionRef.current = null
@@ -5226,7 +5239,14 @@ export function FreshAgentView({
     setSnapshotRevealError(null)
     if (!hiddenRef.current) requestSnapshotRefresh('event')
     else surfaceRefreshOwedRef.current = true
-  }, [retainedSnapshot, commitSnapshot, requestSnapshotRefresh])
+  }, [
+    retainedSnapshot,
+    paneContent.provider,
+    paneContent.sessionType,
+    snapshotThreadId,
+    commitSnapshot,
+    requestSnapshotRefresh,
+  ])
   const rawCodexLiveMetadata = useAppSelector((state) => liveSessionKey ? state.freshAgentLive?.bySession[liveSessionKey]?.codexMetadata : undefined)
   const boundProjectionIdentity = useAppSelector((state) => {
     const projection = liveSessionKey ? state.freshAgentLive?.bySession[liveSessionKey]?.projection : undefined

@@ -269,10 +269,10 @@ impl HostedFreshAgentProxy {
         }
     }
 
-    /// Receipt-only recovery deliberately bypasses checkpoint capture and
-    /// post-barrier ownership admission. The operation correlates the exact
-    /// original input with the journal and asks the supervisor only for its
-    /// existing host receipt.
+    /// Reconciliation first checks the exact original input against the
+    /// journal and asks the supervisor for its existing host receipt. That
+    /// lookup bypasses checkpoint capture and post-barrier ownership admission;
+    /// only a confirmed missing journal entry re-enters the normal send path.
     async fn dispatch_send_reconcile(self: &Arc<Self>, message: FreshAgentSend) {
         let canonical_retry = message.clone();
         let provider = message.provider;

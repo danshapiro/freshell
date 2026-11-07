@@ -1312,6 +1312,14 @@ async fn dispatch_with_effects(
                             .await
                             .map_err(map_actor_error)?;
                         let after = actor.profile().await;
+                        if receipt.state == freshell_runtime_protocol::CommandState::Ambiguous {
+                            return Ok(HostResult::FreshAgentCommand {
+                                state: receipt.state,
+                                claude_fork: actor.claude_fork_recipe().await,
+                                native_session_id: None,
+                                native_identity: None,
+                            });
+                        }
                         let identity = receipt.native_identity.clone().ok_or_else(|| {
                             RuntimeError::new(
                                 RuntimeErrorCode::CommandAmbiguous,

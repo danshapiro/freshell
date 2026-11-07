@@ -12,7 +12,7 @@ import { configureStore, type Middleware } from '@reduxjs/toolkit'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { previewServerSettingsPatch, updateSettingsLocal } from '@/store/settingsSlice'
 import sessionsReducer, { applySessionsPatch, applyContextUsageExtras } from '@/store/sessionsSlice'
-import freshAgentLiveReducer from '@/store/freshAgentLiveSlice'
+import freshAgentLiveReducer, { transcriptProjectionSnapshotReceived } from '@/store/freshAgentLiveSlice'
 import freshAgentReducer, { applyRefusalFence, applyRuntimeOwner, historyPageReceived, sessionError, sessionExited, sessionInit, sessionMetadataReceived, sessionSnapshotReceived, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
 import { selectPaneOwnerFence } from '@/store/selectors/runtimeOwner'
 import tabsReducer, { closeTab, closePaneWithCleanup } from '@/store/tabsSlice'
@@ -12438,6 +12438,190 @@ describe('FreshAgentView', () => {
       sessionId: 'thread-stale-snapshot-new',
       text: 'New stale-safe title',
     }))
+  })
+
+  it('shows a matching retained snapshot while the initial history request is still pending', async () => {
+    const snapshot = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
+    const heldHistory = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValue(heldHistory.promise as any)
+    const locator = {
+      sessionType: 'freshcodex' as const,
+      provider: 'codex' as const,
+      sessionId: snapshot.threadId,
+    }
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        ...locator,
+        createRequestId: 'retained-snapshot-current',
+        sessionRef: { provider: 'codex', sessionId: snapshot.threadId },
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+    expect(screen.queryByText('Saved native Codex answer')).not.toBeInTheDocument()
+
+    const retained = {
+      ...snapshot,
+      provider: 'codex',
+      sessionType: 'freshcodex',
+      extensions: {
+        ...snapshot.extensions,
+        codex: {
+          ...snapshot.extensions?.codex,
+          projection: {
+            id: 'retained-snapshot-current-source',
+            historyGeneration: 0,
+            eventRevision: 0,
+            eventOwnedTurnIds: [],
+            nativePreviewTurnIds: [],
+            nativeFinalTurnIds: [],
+            turnRows: {},
+            turnOutputStates: {},
+          },
+        },
+      },
+    }
+    act(() => {
+      store.dispatch(transcriptProjectionSnapshotReceived({
+        ...locator,
+        snapshot: retained as any,
+        retainedSourceKey: 'retained-snapshot-current-host',
+      }))
+    })
+
+    await expectRenderedText('Saved native Codex answer')
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not carry a durable Codex snapshot across a new durable root materialization event', async () => {
+    const handlers = new Set<(message: any) => void>()
+    wsMock.onMessage.mockImplementation((handler) => {
+      handlers.add(handler)
+      return () => { handlers.delete(handler) }
+    })
+    const oldSnapshot = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
+    const nextSnapshot = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot
+      .mockResolvedValueOnce(oldSnapshot)
+      .mockImplementationOnce(() => nextSnapshot.promise as any)
+    const nextSessionId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'materialized-durable-root',
+        sessionId: oldSnapshot.threadId,
+        sessionRef: { provider: 'codex', sessionId: oldSnapshot.threadId },
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await expectRenderedText('Saved native Codex answer')
+
+    act(() => handlers.forEach((handler) => handler({
+      type: 'freshAgent.session.materialized',
+      previousSessionId: oldSnapshot.threadId,
+      sessionId: nextSessionId,
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      sessionRef: { provider: 'codex', sessionId: nextSessionId },
+    })))
+    await waitFor(() => {
+      expect(getFreshAgentPaneContent(store).sessionRef?.sessionId).toBe(nextSessionId)
+    })
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
+    expect(screen.queryByText('Saved native Codex answer')).not.toBeInTheDocument()
+
+    await act(async () => {
+      nextSnapshot.resolve({
+        threadId: nextSessionId,
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        status: 'idle',
+        turns: [],
+      })
+    })
+  })
+
+  it('carries the matching Codex snapshot across managed placeholder materialization', async () => {
+    const handlers = new Set<(message: any) => void>()
+    wsMock.onMessage.mockImplementation((handler) => {
+      handlers.add(handler)
+      return () => { handlers.delete(handler) }
+    })
+    const placeholder = 'managed-codex-pending-root'
+    const nextSessionId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+    const placeholderSnapshot = {
+      ...FreshAgentSnapshotSchema.parse(savedCodexNativeHistory),
+      threadId: placeholder,
+    }
+    const nextSnapshot = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot
+      .mockResolvedValueOnce(placeholderSnapshot)
+      .mockImplementationOnce(() => nextSnapshot.promise as any)
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'managed-placeholder-materialize',
+        sessionId: placeholder,
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await expectRenderedText('Saved native Codex answer')
+
+    act(() => handlers.forEach((handler) => handler({
+      type: 'freshAgent.session.materialized',
+      previousSessionId: placeholder,
+      sessionId: nextSessionId,
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      sessionRef: { provider: 'codex', sessionId: nextSessionId },
+    })))
+    await waitFor(() => {
+      expect(getFreshAgentPaneContent(store).sessionRef?.sessionId).toBe(nextSessionId)
+    })
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
+    expect(screen.getByText('Saved native Codex answer')).toBeInTheDocument()
+
+    await act(async () => {
+      nextSnapshot.resolve({
+        threadId: nextSessionId,
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        status: 'idle',
+        turns: [],
+      })
+    })
   })
 
   it('a late stale snapshot with user turns never titles a scoped conversation client-side', async () => {

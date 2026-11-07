@@ -94,6 +94,7 @@ pub const DEFAULT_STARTUP_RECOVERY_CONCURRENCY: usize = 4;
 const MAX_STARTUP_RECOVERY_CONCURRENCY: usize = 16;
 const DEFAULT_STARTUP_SOUL_TIMEOUT: Duration = Duration::from_secs(180);
 const DEFAULT_OBSERVER_INTERVAL: Duration = Duration::from_secs(1);
+const CODEX_RECEIPT_SWEEP_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupSoulResult {
@@ -339,6 +340,88 @@ impl Supervisor {
                 }
             }
         });
+
+        // Receipt reconciliation must not depend on the browser remaining
+        // connected. Keep it separate from the one-second runtime observer so
+        // a host control round trip cannot delay ordinary liveness checks.
+        let supervisor = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(CODEX_RECEIPT_SWEEP_INTERVAL).await;
+                if let Err(error) = supervisor
+                    .reconcile_live_codex_dispatch_recovery_receipts_once()
+                    .await
+                {
+                    append_event(
+                        &supervisor.config.lifecycle_log,
+                        "supervisor.codex_receipt_sweep.error",
+                        serde_json::json!({"error": error.message}),
+                    );
+                }
+            }
+        });
+    }
+
+    /// Periodically settle pending Codex receipts from the host journal even
+    /// when no browser is connected to trigger recovery.
+    pub(crate) async fn reconcile_live_codex_dispatch_recovery_receipts_once(
+        &self,
+    ) -> Result<(), RuntimeError> {
+        let souls = self
+            .registry
+            .unresolved_codex_dispatch_recovery_receipt_souls()
+            .await
+            .map_err(|error| {
+                RuntimeError::new(RuntimeErrorCode::RegistryFailure, error.to_string())
+            })?;
+        let concurrency = startup_concurrency_limit();
+        let timeout = self.host_command_budgets.control.saturating_mul(4);
+        for batch in souls.chunks(concurrency) {
+            let mut tasks = JoinSet::new();
+            for soul_id in batch {
+                let supervisor = self.clone();
+                let soul_id = soul_id.clone();
+                tasks.spawn(async move {
+                    let context = supervisor
+                        .registry
+                        .recovery_context(soul_id.clone())
+                        .await
+                        .map_err(|error| {
+                            RuntimeError::new(RuntimeErrorCode::RegistryFailure, error.to_string())
+                        })?;
+                    if context.desired_state != DesiredState::Running {
+                        return Ok(());
+                    }
+                    tokio::time::timeout(
+                        timeout,
+                        supervisor.reconcile_pending_codex_dispatch_recovery_receipts(&context),
+                    )
+                    .await
+                    .map_err(|_| {
+                        RuntimeError::new(
+                            RuntimeErrorCode::BackendUnavailable,
+                            "Codex receipt reconciliation timed out",
+                        )
+                    })?
+                });
+            }
+            while let Some(result) = tasks.join_next().await {
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => append_event(
+                        &self.config.lifecycle_log,
+                        "supervisor.codex_receipt_sweep.soul_failed",
+                        serde_json::json!({"error": error.message}),
+                    ),
+                    Err(error) => append_event(
+                        &self.config.lifecycle_log,
+                        "supervisor.codex_receipt_sweep.task_failed",
+                        serde_json::json!({"error": error.to_string()}),
+                    ),
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Run one bounded observation pass through the same lifecycle locks and

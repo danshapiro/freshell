@@ -2664,6 +2664,22 @@ impl Supervisor {
         }
     }
 
+    /// Ambiguous inputs wait for twice the configured send budget, one control
+    /// budget, and one observer interval before normal recovery may proceed.
+    /// This gives a slow host ample time to publish its durable receipt while
+    /// keeping a lost or unavailable actor from blocking recovery forever.
+    pub(crate) fn codex_dispatch_recovery_receipt_cutoff_ms(&self) -> i64 {
+        let grace_ms = self
+            .host_command_budgets
+            .fresh_agent
+            .as_millis()
+            .saturating_mul(2)
+            .saturating_add(self.host_command_budgets.control.as_millis())
+            .saturating_add(15_000)
+            .min(i64::MAX as u128) as i64;
+        self.registry.recovery_now_ms().saturating_sub(grace_ms)
+    }
+
     /// Reconcile unresolved Codex recovery sends directly from the durable
     /// request journal. Recovery may run after the browser that submitted the
     /// input has been reloaded or closed, so no browser payload participates.
@@ -2672,6 +2688,45 @@ impl Supervisor {
         observed_context: &RecoveryContext,
     ) -> Result<(), RuntimeError> {
         let incarnation_id = observed_context.prior_handle.incarnation_id().clone();
+        let pending_ids = self
+            .registry
+            .unresolved_codex_dispatch_recovery_receipts(
+                observed_context.soul_id.clone(),
+                incarnation_id.clone(),
+            )
+            .await
+            .map_err(map_registry)?;
+        if pending_ids.is_empty() {
+            return Ok(());
+        }
+
+        let initial_source = self
+            .registry
+            .codex_dispatch_recovery_receipt_source(observed_context.soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let Some(initial_source) = initial_source else {
+            return Ok(());
+        };
+        if !initial_source.matches_context(observed_context) {
+            return Ok(());
+        }
+        let expired = self
+            .registry
+            .retire_expired_codex_dispatch_recovery_receipts(
+                Arc::clone(&initial_source),
+                self.codex_dispatch_recovery_receipt_cutoff_ms(),
+            )
+            .await
+            .map_err(map_registry)?;
+        if !expired.is_empty() {
+            tracing::warn!(
+                soul_id = %observed_context.soul_id,
+                incarnation_id = %incarnation_id,
+                retired_count = expired.len(),
+                "supervisor.codex_send_receipt_wait_expired"
+            );
+        }
         let initial_ids = self
             .registry
             .unresolved_codex_dispatch_recovery_receipts(
@@ -2692,17 +2747,6 @@ impl Supervisor {
             return Ok(());
         }
 
-        let initial_source = self
-            .registry
-            .codex_dispatch_recovery_receipt_source(observed_context.soul_id.clone())
-            .await
-            .map_err(map_registry)?;
-        let Some(initial_source) = initial_source else {
-            return Ok(());
-        };
-        if !initial_source.matches_context(observed_context) {
-            return Ok(());
-        }
         let host = match self
             .authenticate_host(&incarnation_id, observed_context.prior_handle.runtime_dir())
             .await
@@ -2814,6 +2858,27 @@ impl Supervisor {
                         request_id = %request_id,
                         "supervisor.codex_send_receipt_reconciled_during_recovery"
                     );
+                }
+                Ok(HostResult::FreshAgentCommand {
+                    state: CommandState::Ambiguous,
+                    ..
+                }) => {
+                    let retired = self
+                        .registry
+                        .retire_ambiguous_codex_dispatch_recovery_receipt(
+                            source,
+                            request_id.clone(),
+                        )
+                        .await
+                        .map_err(map_registry)?;
+                    if retired {
+                        tracing::warn!(
+                            soul_id = %current_context.soul_id,
+                            incarnation_id = %incarnation_id,
+                            request_id = %request_id,
+                            "supervisor.codex_send_receipt_terminal_ambiguity"
+                        );
+                    }
                 }
                 Err(error)
                     if error.code != RuntimeErrorCode::CommandAmbiguous
@@ -2993,6 +3058,32 @@ impl Supervisor {
                     );
                     return Ok(CodexSendReceiptReconciliation::Ambiguous);
                 }
+            }
+            Ok(HostResult::FreshAgentCommand {
+                state: CommandState::Ambiguous,
+                ..
+            }) => {
+                let retired = self
+                    .registry
+                    .retire_ambiguous_codex_dispatch_recovery_receipt(
+                        Arc::clone(&source),
+                        request_id.clone(),
+                    )
+                    .await
+                    .map_err(map_registry)?;
+                self.log_codex_send_receipt_outcome(
+                    soul_id,
+                    request_id,
+                    &recorded_incarnation,
+                    "ambiguous",
+                    if retired {
+                        "terminal_ambiguity_receipt_committed"
+                    } else {
+                        "terminal_ambiguity_row_already_settled"
+                    },
+                    None,
+                );
+                return Ok(CodexSendReceiptReconciliation::Ambiguous);
             }
             Ok(HostResult::FreshAgentCommand { .. }) => {
                 self.log_codex_send_receipt_outcome(

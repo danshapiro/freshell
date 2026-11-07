@@ -1000,9 +1000,10 @@ export const FreshAgentSendSchema = z.object({
   ...freshAgentSendPayloadShape,
 }).superRefine(requireCheckpointSendRequestId)
 
-/** Receipt-only counterpart to `freshAgent.send`. It carries the exact same
- * correlated payload, but the server only checks the existing input journal
- * and durable host receipt; it never dispatches provider input. */
+/** Reconcile an uncertain send using its exact original correlated payload.
+ * The supervisor only checks the input journal and durable host receipt. If
+ * no journal entry exists, the gateway may resubmit the same request through
+ * the normal send path; an admitted ambiguous input is never replayed. */
 export const FreshAgentSendReconcileSchema = z.object({
   type: z.literal('freshAgent.send.reconcile'),
   ...freshAgentSendPayloadShape,
