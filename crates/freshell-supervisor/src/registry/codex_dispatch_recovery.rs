@@ -115,7 +115,9 @@ fn load_source(
          WHERE s.soul_id=?1 AND s.provider='codex' AND s.desired_state='running'
            AND i.launch_state='running' AND i.cleanup_state='none'
            AND i.host_boot_id IS NOT NULL AND i.grant_id IS NOT NULL AND s.loss_incident_id IS NULL
-           AND (s.recovery_state='live' OR (s.recovery_state='blocked' AND s.recovery_attempt_id IS NULL AND (s.recovery_reason IN (?2,?3) OR (?4 AND s.recovery_reason IN (?5,?6)))))
+           AND (s.recovery_state='live'
+                OR (s.recovery_state='blocked' AND s.recovery_attempt_id IS NULL AND (s.recovery_reason IN (?2,?3) OR (?4 AND s.recovery_reason IN (?5,?6))))
+                OR (?4 AND s.recovery_state='recovering' AND s.recovery_attempt_id IS NOT NULL))
          ORDER BY i.created_at DESC LIMIT 1",
         params![
             soul.as_str(),

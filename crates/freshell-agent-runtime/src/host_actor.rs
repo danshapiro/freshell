@@ -2631,35 +2631,31 @@ impl FreshAgentHostActor {
         .map(|result| result.state)
     }
 
-    /// Return the durable outcome for an exact retained Codex send. An absent
-    /// or unfinished record is ambiguous, a cancelled record is a definite
-    /// refusal, and this path never enters the provider transport.
+    /// Return the durable outcome for one retained Codex request ID. The
+    /// supervisor binds that ID to its exact durable input row before asking;
+    /// an absent or unfinished actor record is ambiguous, a cancelled record
+    /// is a definite refusal, and this path never enters the provider
+    /// transport or waits behind its dispatch lock.
     pub async fn codex_recovery_send_receipt(
         &self,
         request_id: RequestId,
-        text: &str,
-        settings: Option<FreshAgentTurnSettings>,
-        logical_attempt_id: Option<&str>,
     ) -> Result<DispatchResult, ActorError> {
-        let _dispatch_guard = self.dispatch_lock.lock().await;
         if self.native_identity_transition.load(Ordering::SeqCst)
             || self.stopped.load(Ordering::SeqCst)
         {
             return Err(ActorError::AmbiguousDispatch);
         }
 
-        let state = self.state.lock().await;
+        let state = self
+            .state
+            .try_lock()
+            .map_err(|_| ActorError::AmbiguousDispatch)?;
         let Some(existing) = state.commands.get(request_id.as_str()) else {
             return Err(ActorError::AmbiguousDispatch);
         };
         let Some(source) = existing.codex_dispatch_recovery_source.as_ref() else {
             return Err(ActorError::AmbiguousDispatch);
         };
-        let expected_digest =
-            fresh_agent_send_digest(text, &settings, logical_attempt_id, Some(source))?;
-        if existing.payload_digest != expected_digest {
-            return Err(ActorError::RequestConflict);
-        }
         match existing.state {
             CommandState::ProviderAcked | CommandState::Completed => {}
             CommandState::Cancelled => return Err(ActorError::SendRefused),

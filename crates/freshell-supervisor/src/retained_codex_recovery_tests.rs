@@ -440,6 +440,10 @@ impl ControlledCodex {
                                         Some((recorded_request, mut identity))
                                             if recorded_request == request_id =>
                                         {
+                                            // The host commits its actor receipt
+                                            // before replying, so the accepted
+                                            // Codex process is current again.
+                                            exited.store(false, Ordering::SeqCst);
                                             if receipt_identity_mismatch.load(Ordering::SeqCst) {
                                                 identity.previous_native_session_id =
                                                     "foreign-receipt-source".into();
@@ -1543,7 +1547,7 @@ async fn mismatched_receipt_stays_ambiguous_and_records_safe_lifecycle_event() {
 }
 
 #[tokio::test]
-async fn receipt_reconcile_does_not_create_a_missing_journal_entry() {
+async fn receipt_reconcile_distinguishes_missing_or_queued_journals_without_host_receipts() {
     let fixture = ControlledCodex::new().await;
     let request_id = RequestId::new();
 
@@ -1553,7 +1557,7 @@ async fn receipt_reconcile_does_not_create_a_missing_journal_entry() {
             .await
             .unwrap(),
         AdminResult::FreshAgentCommand {
-            state: CommandState::Ambiguous
+            state: CommandState::Queued
         }
     ));
     assert_eq!(fixture.inputs.load(Ordering::SeqCst), 0);
@@ -1567,6 +1571,39 @@ async fn receipt_reconcile_does_not_create_a_missing_journal_entry() {
         )
         .unwrap();
     assert_eq!(journal_rows, 0);
+
+    let queued_request_id = RequestId::new();
+    fixture
+        .supervisor
+        .registry
+        .begin_input(
+            fixture.soul.clone(),
+            queued_request_id.clone(),
+            b"original public reference input",
+            Some(b"null"),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        fixture
+            .reconcile_send(queued_request_id.clone(), None, None)
+            .await
+            .unwrap(),
+        AdminResult::FreshAgentCommand {
+            state: CommandState::Queued
+        }
+    ));
+    assert_eq!(fixture.inputs.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.receipt_queries.load(Ordering::SeqCst), 0);
+    let queued_state: String = Connection::open(fixture.supervisor.registry.database_path())
+        .unwrap()
+        .query_row(
+            "SELECT state FROM input_commands WHERE soul_id=?1 AND request_id=?2",
+            params![fixture.soul.as_str(), queued_request_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(queued_state, "queued");
     fixture.peer.abort();
 }
 
@@ -1984,6 +2021,9 @@ async fn receipt_reconcile_clears_a_codex_send_block() {
         .await
         .unwrap();
     fixture.receipt_capability.store(true, Ordering::SeqCst);
+    fixture
+        .receipt_identity_mismatch
+        .store(true, Ordering::SeqCst);
     let blocked = fixture
         .supervisor
         .recover(RecoverRequest {
@@ -2014,26 +2054,34 @@ async fn receipt_reconcile_clears_a_codex_send_block() {
         before_block.intent_revision
     );
 
+    fixture
+        .receipt_identity_mismatch
+        .store(false, Ordering::SeqCst);
     let reconciled = fixture
-        .reconcile_send(request_id.clone(), logical_attempt_id, settings)
+        .supervisor
+        .recover(RecoverRequest {
+            soul_id: fixture.soul.clone(),
+            trigger: RecoveryTrigger::ManualRetry,
+            expected_intent_revision: Some(before_block.intent_revision),
+            expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
+        })
         .await
-        .expect("a matching live-host receipt should settle the original send");
-    assert!(matches!(
-        reconciled,
-        AdminResult::FreshAgentCommand {
-            state: CommandState::Completed
-        }
+        .expect("Manual Retry should use the durable request ID to settle the send");
+    assert!(!matches!(
+        reconciled.probe,
+        Some(RecoveryProbe::Blocked {
+            reason: freshell_runtime_protocol::RecoveryBlockReason::CommandAmbiguous,
+            ..
+        })
     ));
-    assert_eq!(fixture.backend.stops.load(Ordering::SeqCst), 0);
-    assert_eq!(fixture.backend.creates.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.receipt_queries.load(Ordering::SeqCst), 2);
     let after = fixture
         .supervisor
         .registry
         .recovery_context(fixture.soul.clone())
         .await
         .unwrap();
-    assert_eq!(after.intent_revision, before_block.intent_revision);
-    assert_eq!(after.recovery_state, RecoveryState::Live);
+    assert!(after.intent_revision > before_block.intent_revision);
     assert_eq!(
         fixture
             .supervisor
@@ -2048,6 +2096,184 @@ async fn receipt_reconcile_clears_a_codex_send_block() {
             .unwrap(),
         Some(InputJournalDisposition::Completed)
     );
+    fixture.peer.abort();
+}
+
+#[tokio::test]
+async fn reserved_recovery_reconciles_codex_receipt_without_browser_payload() {
+    let fixture = ControlledCodex::new().await;
+    fixture.receipt_capability.store(false, Ordering::SeqCst);
+    fixture.lose_send_reply_once.store(true, Ordering::SeqCst);
+    let request_id = RequestId::parse("reserved-receipt-recovery").unwrap();
+    let logical_attempt_id = Some("reserved-receipt-recovery-attempt".to_string());
+    let settings = Some(freshell_runtime_protocol::FreshAgentTurnSettings {
+        cwd: Some(fixture._root.path().to_string_lossy().into_owned()),
+        model: Some("gpt-5-codex".into()),
+        ..Default::default()
+    });
+    let settings_correlation =
+        serde_json::to_vec(&(settings.as_ref(), logical_attempt_id.as_deref().unwrap())).unwrap();
+    assert_eq!(
+        fixture
+            .send_with_checkpoint(
+                request_id.clone(),
+                logical_attempt_id.clone(),
+                settings.clone(),
+            )
+            .await
+            .unwrap_err()
+            .code,
+        RuntimeErrorCode::HostUnreachable
+    );
+
+    let before_block = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    fixture.receipt_capability.store(true, Ordering::SeqCst);
+    fixture
+        .receipt_identity_mismatch
+        .store(true, Ordering::SeqCst);
+    let blocked = fixture
+        .supervisor
+        .recover(RecoverRequest {
+            soul_id: fixture.soul.clone(),
+            trigger: RecoveryTrigger::ManualRetry,
+            expected_intent_revision: Some(before_block.intent_revision),
+            expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        blocked.probe,
+        Some(RecoveryProbe::Blocked {
+            reason: freshell_runtime_protocol::RecoveryBlockReason::CommandAmbiguous,
+            ..
+        })
+    ));
+
+    fixture
+        .receipt_identity_mismatch
+        .store(false, Ordering::SeqCst);
+    let blocked_context = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    let reserved = fixture
+        .supervisor
+        .registry
+        .reserve_due_recovery_retry(
+            fixture.soul.clone(),
+            blocked_context.intent_revision,
+            fixture.supervisor.registry.recovery_now_ms(),
+        )
+        .await
+        .unwrap()
+        .expect("the simulated scheduled retry reserves an attempt");
+    let recovering = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    assert_eq!(recovering.recovery_state, RecoveryState::Recovering);
+    assert_eq!(recovering.recovery_attempt_id, reserved.reserved_attempt_id);
+
+    let recovered = fixture
+        .supervisor
+        .recover(RecoverRequest {
+            soul_id: fixture.soul.clone(),
+            trigger: RecoveryTrigger::ProviderExit,
+            expected_intent_revision: Some(recovering.intent_revision),
+            expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
+        })
+        .await
+        .expect("reserved recovery can reconcile its receipt by request ID");
+    assert!(!matches!(
+        recovered.probe,
+        Some(RecoveryProbe::Blocked {
+            reason: freshell_runtime_protocol::RecoveryBlockReason::CommandAmbiguous,
+            ..
+        })
+    ));
+    assert_eq!(fixture.receipt_queries.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fixture
+            .supervisor
+            .registry
+            .recorded_input_outcome(
+                fixture.soul.clone(),
+                request_id,
+                b"original public reference input",
+                Some(&settings_correlation),
+            )
+            .await
+            .unwrap(),
+        Some(InputJournalDisposition::Completed)
+    );
+    fixture.peer.abort();
+}
+
+#[tokio::test]
+async fn recovery_receipt_refusal_settles_by_id_without_browser_payload() {
+    let fixture = ControlledCodex::new().await;
+    fixture.receipt_capability.store(false, Ordering::SeqCst);
+    fixture.lose_send_reply_once.store(true, Ordering::SeqCst);
+    let request_id = RequestId::parse("refused-recovery-receipt").unwrap();
+    let logical_attempt_id = Some("refused-recovery-receipt-attempt".to_string());
+    let settings = Some(freshell_runtime_protocol::FreshAgentTurnSettings {
+        cwd: Some(fixture._root.path().to_string_lossy().into_owned()),
+        model: Some("gpt-5-codex".into()),
+        ..Default::default()
+    });
+    let settings_correlation =
+        serde_json::to_vec(&(settings.as_ref(), logical_attempt_id.as_deref().unwrap())).unwrap();
+    assert_eq!(
+        fixture
+            .send_with_checkpoint(request_id.clone(), logical_attempt_id, settings,)
+            .await
+            .unwrap_err()
+            .code,
+        RuntimeErrorCode::HostUnreachable
+    );
+
+    let context = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    fixture.receipt_capability.store(true, Ordering::SeqCst);
+    fixture.receipt_refused.store(true, Ordering::SeqCst);
+    fixture
+        .supervisor
+        .reconcile_pending_codex_dispatch_recovery_receipts(&context)
+        .await
+        .expect("the supervisor can record a typed refusal by durable request ID");
+
+    let outcome = fixture
+        .supervisor
+        .registry
+        .recorded_input_outcome(
+            fixture.soul.clone(),
+            request_id,
+            b"original public reference input",
+            Some(&settings_correlation),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        Some(InputJournalDisposition::Refused(diagnostic))
+            if diagnostic.outcome
+                == freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused
+    ));
+    assert_eq!(fixture.inputs.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.receipt_queries.load(Ordering::SeqCst), 1);
     fixture.peer.abort();
 }
 

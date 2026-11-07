@@ -3386,6 +3386,13 @@ impl Supervisor {
         {
             return Ok(None);
         }
+        self.reconcile_pending_codex_dispatch_recovery_receipts(&context)
+            .await?;
+        let context = self
+            .registry
+            .recovery_context(request.soul_id.clone())
+            .await
+            .map_err(map_registry)?;
         self.block_recovery_for_live_codex_receipt(
             &request.soul_id,
             &context,
@@ -4082,6 +4089,13 @@ impl Supervisor {
         &self,
         request: RecoverRequest,
     ) -> Result<RecoveryResult, RuntimeError> {
+        let current = self
+            .registry
+            .recovery_context(request.soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        self.reconcile_pending_codex_dispatch_recovery_receipts(&current)
+            .await?;
         if let Some((prepared, context)) = self
             .registry
             .pending_owned_replacement(request.soul_id.clone())

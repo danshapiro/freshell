@@ -1280,8 +1280,18 @@ async fn dispatch_with_effects(
                     receipt_only,
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
-                    let _native_command = state.fresh_native_command.lock().await;
                     if receipt_only {
+                        // Receipt lookup must never queue behind a provider
+                        // dispatch. A busy native operation makes this lookup
+                        // inconclusive; the supervisor can retry from its
+                        // durable request ID after that operation settles.
+                        let _native_command =
+                            state.fresh_native_command.try_lock().map_err(|_| {
+                                RuntimeError::new(
+                                    RuntimeErrorCode::CommandAmbiguous,
+                                    "Codex receipt lookup could not take the native command lane",
+                                )
+                            })?;
                         let actor = state
                             .fresh_agent
                             .lock()
@@ -1298,12 +1308,7 @@ async fn dispatch_with_effects(
                             ));
                         }
                         let receipt = actor
-                            .codex_recovery_send_receipt(
-                                request_id,
-                                &text,
-                                settings,
-                                checkpoint_logical_attempt_id.as_deref(),
-                            )
+                            .codex_recovery_send_receipt(request_id)
                             .await
                             .map_err(map_actor_error)?;
                         let after = actor.profile().await;
@@ -1342,6 +1347,7 @@ async fn dispatch_with_effects(
                             native_identity: Some(identity),
                         });
                     }
+                    let _native_command = state.fresh_native_command.lock().await;
                     ensure_fresh_native_send_authority(state).await?;
                     let actor = state
                         .fresh_agent

@@ -1,24 +1,24 @@
 use crate::{
     admission::AdmissionPolicy,
     backend::{
-        host_actor_state_dir, BackendError, CreateFailureCertainty, CreateRuntimeSpec,
-        DockerEngineBackend, RuntimeBackend,
+        host_actor_state_dir, BackendError, BackendRuntimeState, CreateFailureCertainty,
+        CreateRuntimeSpec, DockerEngineBackend, RuntimeBackend,
     },
     opencode_transfer::{OpenCodeTransferStaging, StagingLimits},
     registry::{
         stable_provider_volume_name, BackendCreatedRecord, ExecutionGrantRecord,
-        InputJournalDisposition, LaunchPreparation, PreparedLaunch, RecoveryWriteFence, Registry,
-        RegistryError, ReopenCreateEvidence,
+        InputJournalDisposition, LaunchPreparation, PreparedLaunch, RecoveryContext,
+        RecoveryWriteFence, Registry, RegistryError, ReopenCreateEvidence,
     },
 };
 use freshell_runtime_protocol::{
     host_proof, read_frame, write_frame, AdminCommand, AdminReply, AdminResult, CommandState,
-    ControlRole, Envelope, FixtureKind, FreshAgentLaunchSpec, HostBootId, HostCommand, HostReply,
-    HostResult, IncarnationId, IncidentId, LaunchResult, LaunchState, LimitApplication,
-    NativeIdentityObservation, OpenCodeTransferAction, OpenCodeTransferReadinessReceipt,
-    OpenCodeTransferResult, RecoveryProbe, RequestId, ResumeSpec, RuntimeError, RuntimeErrorCode,
-    RuntimeLimits, RuntimeMetrics, RuntimeOutputBatch, RuntimeView, SoulId, StopOutcome,
-    TerminalLaunchSpec, UpdateLimitsResult, CONTROL_PROTOCOL_VERSION,
+    ControlRole, DesiredState, Envelope, FixtureKind, FreshAgentLaunchSpec, HostBootId,
+    HostCommand, HostReply, HostResult, IncarnationId, IncidentId, LaunchResult, LaunchState,
+    LimitApplication, NativeIdentityObservation, OpenCodeTransferAction,
+    OpenCodeTransferReadinessReceipt, OpenCodeTransferResult, RecoveryProbe, RequestId, ResumeSpec,
+    RuntimeError, RuntimeErrorCode, RuntimeLimits, RuntimeMetrics, RuntimeOutputBatch, RuntimeView,
+    SoulId, StopOutcome, TerminalLaunchSpec, UpdateLimitsResult, CONTROL_PROTOCOL_VERSION,
     HOST_CAPABILITY_CODEX_SEND_RECEIPT_V1, HOST_CAPABILITY_NATIVE_READINESS_RECEIPT_V1,
 };
 use sha2::{Digest, Sha256};
@@ -2664,6 +2664,188 @@ impl Supervisor {
         }
     }
 
+    /// Reconcile unresolved Codex recovery sends directly from the durable
+    /// request journal. Recovery may run after the browser that submitted the
+    /// input has been reloaded or closed, so no browser payload participates.
+    pub(crate) async fn reconcile_pending_codex_dispatch_recovery_receipts(
+        &self,
+        observed_context: &RecoveryContext,
+    ) -> Result<(), RuntimeError> {
+        let incarnation_id = observed_context.prior_handle.incarnation_id().clone();
+        let initial_ids = self
+            .registry
+            .unresolved_codex_dispatch_recovery_receipts(
+                observed_context.soul_id.clone(),
+                incarnation_id.clone(),
+            )
+            .await
+            .map_err(map_registry)?;
+        if initial_ids.is_empty() {
+            return Ok(());
+        }
+
+        let inspection = match self.backend.inspect(&observed_context.prior_handle).await {
+            Ok(inspection) => inspection,
+            Err(_) => return Ok(()),
+        };
+        if inspection.state != BackendRuntimeState::Running {
+            return Ok(());
+        }
+
+        let initial_source = self
+            .registry
+            .codex_dispatch_recovery_receipt_source(observed_context.soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let Some(initial_source) = initial_source else {
+            return Ok(());
+        };
+        if !initial_source.matches_context(observed_context) {
+            return Ok(());
+        }
+        let host = match self
+            .authenticate_host(&incarnation_id, observed_context.prior_handle.runtime_dir())
+            .await
+        {
+            Ok(host) => host,
+            Err(_) => return Ok(()),
+        };
+        if !host
+            .capabilities
+            .iter()
+            .any(|capability| capability == HOST_CAPABILITY_CODEX_SEND_RECEIPT_V1)
+        {
+            return Ok(());
+        }
+        let status = match self
+            .host_status(
+                incarnation_id.clone(),
+                observed_context.prior_handle.runtime_dir(),
+                &host,
+            )
+            .await
+        {
+            Ok(status) => status,
+            Err(_) => return Ok(()),
+        };
+        if status.host_boot_id != host.host_boot_id
+            || !initial_source.matches_host(&status.host_boot_id, status.max_execution_generation)
+            || status.worker_pid.is_none()
+        {
+            return Ok(());
+        }
+
+        // A successful receipt settles one row. If it also advances the
+        // native root, the next iteration loads a new source fence before it
+        // queries another row. The initial row count bounds this loop.
+        for _ in initial_ids {
+            let current_context = self
+                .registry
+                .recovery_context(observed_context.soul_id.clone())
+                .await
+                .map_err(map_registry)?;
+            if current_context.desired_state != DesiredState::Running
+                || current_context.prior_handle.incarnation_id() != &incarnation_id
+            {
+                return Ok(());
+            }
+            let unresolved = self
+                .registry
+                .unresolved_codex_dispatch_recovery_receipts(
+                    current_context.soul_id.clone(),
+                    incarnation_id.clone(),
+                )
+                .await
+                .map_err(map_registry)?;
+            let Some(request_id) = unresolved.first().cloned() else {
+                return Ok(());
+            };
+            let Some(source) = self
+                .registry
+                .codex_dispatch_recovery_receipt_source(current_context.soul_id.clone())
+                .await
+                .map_err(map_registry)?
+            else {
+                return Ok(());
+            };
+            if !source.matches_context(&current_context)
+                || !source.matches_host(&status.host_boot_id, status.max_execution_generation)
+            {
+                return Ok(());
+            }
+
+            let receipt = self
+                .send_authenticated_host_command(
+                    incarnation_id.clone(),
+                    current_context.prior_handle.runtime_dir(),
+                    &host,
+                    HostCommand::FreshAgentSend {
+                        incarnation_id: incarnation_id.clone(),
+                        request_id: request_id.clone(),
+                        text: String::new(),
+                        settings: None,
+                        checkpoint_logical_attempt_id: None,
+                        codex_dispatch_recovery_source: None,
+                        receipt_only: true,
+                    },
+                )
+                .await;
+            match receipt {
+                Ok(HostResult::FreshAgentCommand {
+                    state: CommandState::ProviderAcked | CommandState::Completed,
+                    native_session_id: Some(native_session_id),
+                    native_identity: Some(identity),
+                    ..
+                }) if current_context.native_session_id.as_deref()
+                    == Some(identity.previous_native_session_id.as_str())
+                    && native_session_id == identity.native_session_id =>
+                {
+                    self.registry
+                        .record_codex_dispatch_recovery_identity(
+                            source,
+                            identity,
+                            request_id.clone(),
+                        )
+                        .await
+                        .map_err(map_registry)?;
+                    tracing::info!(
+                        soul_id = %current_context.soul_id,
+                        incarnation_id = %incarnation_id,
+                        request_id = %request_id,
+                        "supervisor.codex_send_receipt_reconciled_during_recovery"
+                    );
+                }
+                Err(error)
+                    if error.code != RuntimeErrorCode::CommandAmbiguous
+                        && error.fresh_agent_send_diagnostic.as_ref().is_some_and(|diagnostic| {
+                            diagnostic.outcome
+                                == freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused
+                        }) =>
+                {
+                    let diagnostic = error
+                        .fresh_agent_send_diagnostic
+                        .expect("refusal guard checked the diagnostic");
+                    self.registry
+                        .mark_codex_recovery_input_refused_from_receipt(
+                            source,
+                            request_id.clone(),
+                            diagnostic,
+                        )
+                        .await
+                        .map_err(map_registry)?;
+                    tracing::info!(
+                        soul_id = %current_context.soul_id,
+                        incarnation_id = %incarnation_id,
+                        request_id = %request_id,
+                        "supervisor.codex_send_refusal_reconciled_during_recovery"
+                    );
+                }
+                _ => return Ok(()),
+            }
+        }
+        Ok(())
+    }
+
     async fn reconcile_ambiguous_codex_send_receipt(
         &self,
         soul_id: &SoulId,
@@ -3281,9 +3463,10 @@ impl Supervisor {
         })
     }
 
-    /// Reconcile an already-journaled send without entering the normal send
-    /// path. `None` and queued (`Dispatch`) rows are uncertain: neither is
-    /// permission to create a journal entry or deliver provider input.
+    /// Reconcile an already-journaled send without creating a journal entry
+    /// or delivering provider input. `Queued` means the caller may safely
+    /// re-enter the canonical idempotent send path with this exact request;
+    /// only an existing dispatching/ambiguous row requires receipt lookup.
     fn fresh_agent_send_reconcile<'a>(
         &'a self,
         request_id: RequestId,
@@ -3346,7 +3529,7 @@ impl Supervisor {
                 Some(InputJournalDisposition::Refused(diagnostic)) => {
                     Err(fresh_send_refusal_error(diagnostic))
                 }
-                Some(InputJournalDisposition::Dispatch) | None => Ok(CommandState::Ambiguous),
+                Some(InputJournalDisposition::Dispatch) | None => Ok(CommandState::Queued),
             }
         })
     }
@@ -9754,6 +9937,17 @@ impl HostCommandBudgets {
     }
 
     pub(crate) fn for_command(&self, command: &HostCommand) -> Duration {
+        if matches!(
+            command,
+            HostCommand::FreshAgentSend {
+                receipt_only: true,
+                ..
+            }
+        ) {
+            // Receipt inspection reads the durable actor journal; it must
+            // settle quickly when provider dispatch is still in progress.
+            return self.control.min(Duration::from_secs(3));
+        }
         if let Some(startup) = grant_startup_budget(command) {
             return if matches!(
                 command,
@@ -10114,7 +10308,10 @@ pub(crate) fn uses_fresh_agent_command_budget(command: &HostCommand) -> bool {
         command,
         HostCommand::FreshAgentPrepareNative { .. }
             | HostCommand::FreshAgentPrepareSameRootNative { .. }
-            | HostCommand::FreshAgentSend { .. }
+            | HostCommand::FreshAgentSend {
+                receipt_only: false,
+                ..
+            }
             | HostCommand::FreshAgentNativeName { .. }
             | HostCommand::FreshAgentCompact { .. }
             | HostCommand::FreshAgentConfigure { .. }
@@ -11114,13 +11311,29 @@ mod host_command_budget_tests {
         })
         .await
         .expect_err("a silent host times out");
+        let receipt_query = send(HostCommand::FreshAgentSend {
+            incarnation_id: incarnation_id.clone(),
+            request_id: RequestId::new(),
+            text: String::new(),
+            settings: None,
+            checkpoint_logical_attempt_id: None,
+            codex_dispatch_recovery_source: None,
+            receipt_only: true,
+        })
+        .await
+        .expect_err("a silent receipt lookup keeps the short control bound");
         let control = send(HostCommand::Status {
             incarnation_id: incarnation_id.clone(),
         })
         .await
         .expect_err("a silent host times out");
 
-        for (error, budget) in [(&terminal, 300), (&fresh_agent, 700), (&control, 100)] {
+        for (error, budget) in [
+            (&terminal, 300),
+            (&fresh_agent, 700),
+            (&receipt_query, 100),
+            (&control, 100),
+        ] {
             assert_eq!(error.code, RuntimeErrorCode::HostUnreachable);
             assert!(
                 error

@@ -2832,6 +2832,36 @@ impl Registry {
         .await
     }
 
+    /// Return unresolved recovery-send IDs in dispatch order so the current
+    /// host can answer from its durable command journal without browser-held
+    /// payload, settings, or attempt metadata.
+    pub(crate) async fn unresolved_codex_dispatch_recovery_receipts(
+        &self,
+        soul_id: SoulId,
+        incarnation_id: IncarnationId,
+    ) -> Result<Vec<RequestId>, RegistryError> {
+        self.run_blocking(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT request_id FROM input_commands
+                 WHERE soul_id=?1 AND incarnation_id=?2
+                   AND codex_dispatch_recovery_receipt=1
+                   AND state IN ('dispatching','ambiguous')
+                 ORDER BY created_at,request_id",
+            )?;
+            let rows = statement
+                .query_map(params![soul_id.as_str(), incarnation_id.as_str()], |row| {
+                    row.get::<_, String>(0)
+                })?;
+            rows.map(|row| {
+                let raw = row?;
+                RequestId::parse(raw)
+                    .map_err(|_| RegistryError::Integrity("invalid input request id".into()))
+            })
+            .collect()
+        })
+        .await
+    }
+
     /// Read a terminal result without depending on current provider liveness.
     /// Queued requests still require the normal admission path before dispatch.
     pub(crate) async fn recorded_input_outcome(
@@ -3093,6 +3123,56 @@ impl Registry {
                 &tx,
                 &soul_id,
                 &incarnation_id,
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Settle one unresolved Codex recovery input from the original host's
+    /// durable refusal receipt. The receipt source and active recovery fence
+    /// are checked in the same transaction as the input-row update.
+    pub(crate) async fn mark_codex_recovery_input_refused_from_receipt(
+        &self,
+        source: Arc<OwnedCodexDispatchRecovery>,
+        request_id: RequestId,
+        diagnostic: freshell_runtime_protocol::FreshAgentSendDiagnostic,
+    ) -> Result<(), RegistryError> {
+        if !source.is_receipt_only()
+            || diagnostic.outcome
+                != freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused
+        {
+            return Err(RegistryError::InvalidState(
+                "a Codex receipt source and typed refusal are required".into(),
+            ));
+        }
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            codex_dispatch_recovery::validate_source(&tx, &source)?;
+            let changed = tx.execute(
+                "UPDATE input_commands
+                 SET state='refused',fresh_agent_send_refusal=?1,updated_at=?2
+                 WHERE soul_id=?3 AND request_id=?4 AND incarnation_id=?5
+                   AND codex_dispatch_recovery_receipt=1
+                   AND state IN ('dispatching','ambiguous')",
+                params![
+                    serde_json::to_string(&diagnostic)?,
+                    now_millis(),
+                    source.handle.soul_id().as_str(),
+                    request_id.as_str(),
+                    source.handle.incarnation_id().as_str(),
+                ],
+            )?;
+            if changed != 1 {
+                return Err(RegistryError::InvalidState(format!(
+                    "Codex recovery input {request_id} no longer matches its receipt source"
+                )));
+            }
+            clear_command_ambiguous_recovery_block_if_settled(
+                &tx,
+                source.handle.soul_id(),
+                source.handle.incarnation_id(),
             )?;
             tx.commit()?;
             Ok(())

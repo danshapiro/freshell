@@ -1892,12 +1892,7 @@ async fn retained_codex_send_receipt_can_be_read_after_a_lost_reply_without_disp
     assert_eq!(transport.dispatches.load(Ordering::SeqCst), 1);
 
     let recovered = actor
-        .codex_recovery_send_receipt(
-            request_id.clone(),
-            "the already accepted prompt",
-            None,
-            Some("attempt-7"),
-        )
+        .codex_recovery_send_receipt(request_id.clone())
         .await
         .unwrap();
     assert_eq!(recovered.state, CommandState::ProviderAcked);
@@ -1906,25 +1901,7 @@ async fn retained_codex_send_receipt_can_be_read_after_a_lost_reply_without_disp
 
     assert_eq!(
         actor
-            .codex_recovery_send_receipt(
-                request_id.clone(),
-                "different prompt",
-                None,
-                Some("attempt-7"),
-            )
-            .await
-            .unwrap_err(),
-        ActorError::RequestConflict,
-        "receipt lookup must still bind the request to its exact payload"
-    );
-    assert_eq!(
-        actor
-            .codex_recovery_send_receipt(
-                RequestId::parse("missing-retained-send-receipt").unwrap(),
-                "a prompt with no durable send record",
-                None,
-                None,
-            )
+            .codex_recovery_send_receipt(RequestId::parse("missing-retained-send-receipt").unwrap())
             .await
             .unwrap_err(),
         ActorError::AmbiguousDispatch,
@@ -1942,12 +1919,7 @@ async fn retained_codex_send_receipt_can_be_read_after_a_lost_reply_without_disp
     .await
     .unwrap();
     let recovered_after_restart = reopened
-        .codex_recovery_send_receipt(
-            request_id,
-            "the already accepted prompt",
-            None,
-            Some("attempt-7"),
-        )
+        .codex_recovery_send_receipt(request_id)
         .await
         .unwrap();
     assert_eq!(recovered_after_restart.state, CommandState::ProviderAcked);
@@ -1955,6 +1927,71 @@ async fn retained_codex_send_receipt_can_be_read_after_a_lost_reply_without_disp
         recovered_after_restart.native_identity,
         accepted.native_identity
     );
+}
+
+#[tokio::test]
+async fn retained_codex_receipt_query_does_not_wait_behind_an_in_flight_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = FakeTransport::new("native-parent");
+    let mut initial_profile = profile(
+        FreshProvider::Codex,
+        "receipt-busy-store",
+        Some("native-parent"),
+    );
+    initial_profile.runtime_variant = "codex-app-server".into();
+    *transport.dispatch_identity.lock().unwrap() = Some(NativeDispatchIdentity {
+        previous_native_session_id: "native-parent".into(),
+        native_session_id: "native-child".into(),
+        pending_naming_handle: None,
+    });
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    *transport.dispatch_gate.lock().unwrap() = Some((entered.clone(), release.clone()));
+    let source = NativeIdentityObservation {
+        native_session_id: "native-parent".into(),
+        incarnation_id: freshell_runtime_protocol::IncarnationId::new(),
+        launch_nonce: "receipt-busy-launch".into(),
+        evidence_revision: 7,
+        source: freshell_runtime_protocol::NativeIdentitySource::FreshProviderHandshake,
+        evidence_digest: "d".repeat(64),
+    };
+    let request_id = RequestId::parse("in-flight-retained-send-receipt").unwrap();
+    let actor = FreshAgentHostActor::open(dir.path(), initial_profile, transport.clone())
+        .await
+        .unwrap();
+
+    let dispatch = tokio::spawn({
+        let actor = actor.clone();
+        let request_id = request_id.clone();
+        async move {
+            actor
+                .dispatch_with_codex_recovery_source(
+                    request_id,
+                    "a provider dispatch still in progress".into(),
+                    None,
+                    Some("receipt-busy-attempt".into()),
+                    Some(source),
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified())
+        .await
+        .expect("provider dispatch reached its controlled wait");
+
+    let lookup = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        actor.codex_recovery_send_receipt(request_id),
+    )
+    .await
+    .expect("receipt lookup must not wait for provider dispatch")
+    .expect_err("an in-flight request has no settled receipt yet");
+    assert_eq!(lookup, ActorError::AmbiguousDispatch);
+    assert_eq!(transport.dispatches.load(Ordering::SeqCst), 1);
+
+    release.notify_one();
+    assert!(dispatch.await.unwrap().is_ok());
+    actor.stop().await.unwrap();
 }
 
 #[tokio::test]
@@ -1999,12 +2036,7 @@ async fn retained_codex_send_receipt_reports_a_persisted_refusal() {
     );
     assert_eq!(
         actor
-            .codex_recovery_send_receipt(
-                request_id,
-                "the provider refused this prompt",
-                None,
-                Some("attempt-refused"),
-            )
+            .codex_recovery_send_receipt(request_id)
             .await
             .unwrap_err(),
         ActorError::SendRefused,
