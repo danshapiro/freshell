@@ -5409,6 +5409,13 @@ await import(parameters.source)
         })
         .await
         .expect("only positive exact-owned confirmation may release the claim");
+        wait_for_codex_recovery_retry_eligibility(
+            state,
+            "thread-new-1",
+            1,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await;
         actor
             .dispatch(
                 RequestId::parse("new-explicit-recovery-input").unwrap(),
@@ -5453,6 +5460,34 @@ await import(parameters.source)
 
     fn native_cleanup_evidence(recorded: &CondemnedRuntimeIdentity) -> Value {
         serde_json::to_value(recorded).unwrap()
+    }
+
+    async fn wait_for_codex_recovery_retry_eligibility(
+        state: &FreshCodexState,
+        thread_id: &str,
+        expected_failed_launches: u32,
+        deadline: tokio::time::Instant,
+    ) {
+        let eligible = tokio::time::timeout_at(deadline, async {
+            loop {
+                if let Some(status) = state.recovery_status(thread_id).await {
+                    if !status.in_flight
+                        && status.failed_launches == expected_failed_launches
+                        && status.retry_after_ms.is_none()
+                        && !status.exhausted
+                    {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            eligible.is_ok(),
+            "Codex recovery did not reach a retryable state: {:?}",
+            state.recovery_status(thread_id).await
+        );
     }
 
     impl NativeCodexCleanupReadiness {
@@ -5966,6 +6001,7 @@ await import(parameters.source)
         cleanup
             .allow_and_wait(state, &original, pending, deadline)
             .await;
+        wait_for_codex_recovery_retry_eligibility(state, &original, 0, deadline).await;
         std::env::set_var(
             "FAKE_CODEX_APP_SERVER_BEHAVIOR",
             qualified_behavior(&replacement_id).to_string(),
@@ -9278,6 +9314,7 @@ await import(parameters.source)
             "CLAUDE_CONFIG_DIR",
             "FRESHELL_CLAUDE_SIDECAR",
             "FRESHELL_CLAUDE_SDK_QUERY_MODULE",
+            "FRESHELL_SIDECAR_TEST_TRANSCRIPT",
         ];
         let _restore = SnapshotProviderEnv(
             keys.iter()
@@ -9338,9 +9375,21 @@ export function query({ prompt, options }) {
         ] {
             std::env::set_var(key, value);
         }
+        let native = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let config = root.path().join(".claude");
+        let transcript = claude_transcript_path(&config, root.path(), native);
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            format!(
+                "{{\"type\":\"system\",\"sessionId\":\"{native}\",\"cwd\":\"{}\"}}\n",
+                root.path().display()
+            ),
+        )
+        .unwrap();
         let mut profile = parity_profile(FreshProvider::Claude);
         profile.cwd = root.path().to_string_lossy().into();
-        profile.native_session_id = Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into());
+        profile.native_session_id = Some(native.into());
         profile.session_ref = None;
         profile.provider_launch_context = None;
         profile.provider_secret_references.clear();
@@ -9529,8 +9578,8 @@ export function query({ prompt, options }) {
             "FRESHELL_CLAUDE_SDK_QUERY_MODULE",
             "FRESHELL_NATIVE_IDENTITY_LAUNCH",
             "FRESHELL_SIDECAR_TEST_CHECKPOINT",
-            "FRESHELL_SIDECAR_TEST_NATIVE_EXIT_DELAY",
             "FRESHELL_SIDECAR_TEST_TRANSCRIPT",
+            "FRESHELL_SIDECAR_TEST_NATIVE_EXIT_DELAY",
             "FRESHELL_SIDECAR_TEST_END_FIRST_QUERY_MARKER",
             "FRESHELL_SIDECAR_TEST_END_QUERY_TRIGGER",
             "FRESHELL_SIDECAR_TEST_NATIVE_INPUT_LOG",
@@ -9984,6 +10033,7 @@ export function query({ prompt, options }) {
             "FRESHELL_CLAUDE_SDK_QUERY_MODULE",
             "FRESHELL_NATIVE_IDENTITY_LAUNCH",
             "FRESHELL_SIDECAR_TEST_CHECKPOINT",
+            "FRESHELL_SIDECAR_TEST_TRANSCRIPT",
             "FRESHELL_SIDECAR_TEST_NATIVE_EXIT_DELAY",
             "FRESHELL_SIDECAR_TEST_CONTINUATION_FAILURE",
         ];
@@ -10000,14 +10050,21 @@ export function query({ prompt, options }) {
         ] {
             let owned = tempfile::tempdir().unwrap();
             let native = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+            let config = owned.path().join(".claude");
+            let transcript = claude_transcript_path(&config, owned.path(), native);
+            std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
             std::fs::write(
-                owned.path().join("native.jsonl"),
-                format!("{{\"type\":\"system\",\"sessionId\":\"{native}\"}}\n"),
+                &transcript,
+                format!(
+                    "{{\"type\":\"system\",\"sessionId\":\"{native}\",\"cwd\":\"{}\"}}\n",
+                    owned.path().display()
+                ),
             )
             .unwrap();
             std::env::set_var("HOME", owned.path());
             std::env::set_var("CLAUDE_HOME", owned.path().join(".claude"));
-            std::env::set_var("CLAUDE_CONFIG_DIR", owned.path().join(".claude"));
+            std::env::set_var("CLAUDE_CONFIG_DIR", &config);
+            std::env::set_var("FRESHELL_SIDECAR_TEST_TRANSCRIPT", &transcript);
             std::env::set_var(
                 "FRESHELL_CLAUDE_SIDECAR",
                 repo.join("crates/freshell-claude-sidecar/index.mjs"),
@@ -10223,6 +10280,29 @@ export function query({ prompt, options }) {
     /// A hosted claude transport running the REAL sidecar over the CLI simulator
     /// (`test/fixtures/claude-cli-sim/query.mjs`), with an isolated HOME whose
     /// CLAUDE_CONFIG_DIR holds a transcript for each id in `conversations`.
+    fn claude_project_dir(config: &std::path::Path, cwd: &std::path::Path) -> std::path::PathBuf {
+        let slug: String = cwd
+            .to_string_lossy()
+            .chars()
+            .map(|value| {
+                if value.is_ascii_alphanumeric() {
+                    value
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        config.join("projects").join(slug)
+    }
+
+    fn claude_transcript_path(
+        config: &std::path::Path,
+        cwd: &std::path::Path,
+        native_id: &str,
+    ) -> std::path::PathBuf {
+        claude_project_dir(config, cwd).join(format!("{native_id}.jsonl"))
+    }
+
     struct SimulatedClaude {
         root: tempfile::TempDir,
         project: std::path::PathBuf,
@@ -10248,18 +10328,7 @@ export function query({ prompt, options }) {
             let home = root.path().join("home");
             let workspace = root.path().join("workspace");
             let config = home.join(".claude");
-            let project_slug: String = workspace
-                .to_string_lossy()
-                .chars()
-                .map(|value| {
-                    if value.is_ascii_alphanumeric() {
-                        value
-                    } else {
-                        '-'
-                    }
-                })
-                .collect();
-            let project = config.join("projects").join(project_slug);
+            let project = claude_project_dir(&config, &workspace);
             std::fs::create_dir_all(&workspace).unwrap();
             std::fs::create_dir_all(&project).unwrap();
             for id in conversations {
@@ -10980,10 +11049,15 @@ export function query({ prompt, options }) {
                 .unwrap(),
         );
         let native = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-        let transcript = root.path().join("native.jsonl");
+        let config = root.path().join(".claude");
+        let transcript = claude_transcript_path(&config, root.path(), native);
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
         std::fs::write(
             &transcript,
-            format!("{{\"type\":\"system\",\"sessionId\":\"{native}\"}}\n"),
+            format!(
+                "{{\"type\":\"system\",\"sessionId\":\"{native}\",\"cwd\":\"{}\"}}\n",
+                root.path().display()
+            ),
         )
         .unwrap();
         std::env::set_var("FRESHELL_SIDECAR_TEST_TRANSCRIPT", &transcript);
@@ -11069,6 +11143,7 @@ export function query({ prompt, options }) {
             "FRESHELL_CLAUDE_SDK_QUERY_MODULE",
             "FRESHELL_NATIVE_IDENTITY_LAUNCH",
             "FRESHELL_SIDECAR_TEST_CHECKPOINT",
+            "FRESHELL_SIDECAR_TEST_TRANSCRIPT",
             "FRESHELL_SIDECAR_TEST_NATIVE_REQUEST_ID",
         ];
         let _restore = SnapshotProviderEnv(
@@ -11079,14 +11154,21 @@ export function query({ prompt, options }) {
         for provider in [FreshProvider::Claude, FreshProvider::Kilroy] {
             let owned = tempfile::tempdir().unwrap();
             let native = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+            let config = owned.path().join(".claude");
+            let transcript = claude_transcript_path(&config, owned.path(), native);
+            std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
             std::fs::write(
-                owned.path().join("native.jsonl"),
-                format!("{{\"type\":\"system\",\"sessionId\":\"{native}\"}}\n"),
+                &transcript,
+                format!(
+                    "{{\"type\":\"system\",\"sessionId\":\"{native}\",\"cwd\":\"{}\"}}\n",
+                    owned.path().display()
+                ),
             )
             .unwrap();
             std::env::set_var("HOME", owned.path());
             std::env::set_var("CLAUDE_HOME", owned.path().join(".claude"));
-            std::env::set_var("CLAUDE_CONFIG_DIR", owned.path().join(".claude"));
+            std::env::set_var("CLAUDE_CONFIG_DIR", &config);
+            std::env::set_var("FRESHELL_SIDECAR_TEST_TRANSCRIPT", &transcript);
             std::env::set_var(
                 "FRESHELL_CLAUDE_SIDECAR",
                 repo.join("crates/freshell-claude-sidecar/index.mjs"),
@@ -11145,7 +11227,7 @@ export function query({ prompt, options }) {
                 .await
                 .unwrap();
             current.start(&profile).await.unwrap();
-            let before = std::fs::read(owned.path().join("native.jsonl")).unwrap();
+            let before = std::fs::read(&transcript).unwrap();
             let receipt = current.resume_native_permission_recovery().await;
             let recovered = tokio::time::timeout(Duration::from_secs(3), async {
                 loop {
@@ -11174,7 +11256,7 @@ export function query({ prompt, options }) {
                 "staged recovery release cannot run twice"
             );
             assert_eq!(
-                std::fs::read(owned.path().join("native.jsonl")).unwrap(),
+                std::fs::read(&transcript).unwrap(),
                 before,
                 "parked native ask must not execute or rewrite history"
             );
@@ -11194,6 +11276,7 @@ export function query({ prompt, options }) {
             "FRESHELL_CLAUDE_SDK_QUERY_MODULE",
             "FRESHELL_NATIVE_IDENTITY_LAUNCH",
             "FRESHELL_SIDECAR_TEST_CHECKPOINT",
+            "FRESHELL_SIDECAR_TEST_TRANSCRIPT",
             "FRESHELL_SIDECAR_TEST_NATIVE_REQUEST_ID",
             "FRESHELL_SIDECAR_TEST_NATIVE_PROJECT",
         ];
@@ -11204,12 +11287,16 @@ export function query({ prompt, options }) {
         );
         for provider in [FreshProvider::Claude, FreshProvider::Kilroy] {
             let owned = tempfile::tempdir().unwrap();
+            let config = owned.path().join(".claude");
+            let project = claude_project_dir(&config, owned.path());
+            std::fs::create_dir_all(&project).unwrap();
             // Both fresh and exact-resume queries use the allocated UUID's
             // actual transcript, including the zero-message continuation.
-            std::env::set_var("FRESHELL_SIDECAR_TEST_NATIVE_PROJECT", owned.path());
+            std::env::set_var("FRESHELL_SIDECAR_TEST_NATIVE_PROJECT", &project);
+            std::env::remove_var("FRESHELL_SIDECAR_TEST_TRANSCRIPT");
             std::env::set_var("HOME", owned.path());
-            std::env::set_var("CLAUDE_HOME", owned.path().join(".claude"));
-            std::env::set_var("CLAUDE_CONFIG_DIR", owned.path().join(".claude"));
+            std::env::set_var("CLAUDE_HOME", &config);
+            std::env::set_var("CLAUDE_CONFIG_DIR", &config);
             std::env::set_var(
                 "FRESHELL_CLAUDE_SIDECAR",
                 repo.join("crates/freshell-claude-sidecar/index.mjs"),
@@ -11257,7 +11344,7 @@ export function query({ prompt, options }) {
                 uuid::Uuid::parse_str(&native).is_ok(),
                 "fresh creation allocates the actual native UUID"
             );
-            let transcript = owned.path().join(format!("{native}.jsonl"));
+            let transcript = claude_transcript_path(&config, owned.path(), &native);
             actor
                 .dispatch(
                     RequestId::parse("original-operation").unwrap(),
