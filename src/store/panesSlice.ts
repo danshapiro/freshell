@@ -210,11 +210,24 @@ function normalizePaneContent(
     const pendingCodexUndos = input.provider === 'codex' && Array.isArray(rawFreshAgent.pendingCodexUndos)
       ? rawFreshAgent.pendingCodexUndos.flatMap((value): NonNullable<FreshAgentPaneContent['pendingCodexUndos']> => {
           if (!value || typeof value !== 'object' || typeof value.requestId !== 'string' || !value.requestId) return []
-          return [{ requestId: value.requestId, ...(value.protectDraft === true ? { protectDraft: true } : {}) }]
+          const outcome = value.outcome && typeof value.outcome === 'object' ? value.outcome : undefined
+          const normalizedOutcome = outcome?.kind === 'rolledBack'
+            ? { kind: 'rolledBack' as const, ...(typeof outcome.removedPromptText === 'string' ? { removedPromptText: outcome.removedPromptText } : {}) }
+            : outcome?.kind === 'error'
+              ? { kind: 'error' as const, ...(typeof outcome.message === 'string' ? { message: outcome.message } : {}) }
+              : undefined
+          return [{ requestId: value.requestId, ...(value.protectDraft === true ? { protectDraft: true } : {}),
+            ...(normalizedOutcome ? { outcome: normalizedOutcome } : {}) }]
         }) : undefined
     const queuedMessages = input.provider === 'codex' && Array.isArray(rawFreshAgent.queuedMessages)
       ? rawFreshAgent.queuedMessages.filter((message): message is string => typeof message === 'string' && message.length > 0)
       : undefined
+    const codexInputSource = input.provider === 'codex' && typeof rawFreshAgent.codexInputSource === 'string'
+      ? rawFreshAgent.codexInputSource : undefined
+    const codexInputHold = input.provider === 'codex' && (rawFreshAgent.codexInputHold === 'source-change' || rawFreshAgent.codexInputHold === 'parent-retired')
+      ? rawFreshAgent.codexInputHold : undefined
+    const codexInputReplacementId = input.provider === 'codex' && typeof rawFreshAgent.codexInputReplacementId === 'string'
+      ? rawFreshAgent.codexInputReplacementId : undefined
     const modelEffortLevels = normalizeFreshAgentModelEffortLevels(rawFreshAgent.modelEffortLevels)
     const freshHandoffError = normalizeHandoffError(rawFreshAgent.handoffError)
     const checkpointWorkspace = normalizeCheckpointWorkspace(rawFreshAgent.checkpointWorkspace)
@@ -309,6 +322,9 @@ function normalizePaneContent(
           ...(pendingCodexSend ? { pendingCodexSend } : {}),
           ...(pendingCodexUndos?.length ? { pendingCodexUndos } : {}),
           ...(queuedMessages?.length ? { queuedMessages } : {}),
+          ...(codexInputSource ? { codexInputSource } : {}),
+          ...(codexInputHold ? { codexInputHold } : {}),
+          ...(codexInputReplacementId ? { codexInputReplacementId } : {}),
           ...(typeof input.reconcileNotice === 'string' ? { reconcileNotice: input.reconcileNotice } : {}),
           ...(input.pendingReconcile === 'respawn' || input.pendingReconcile === 'fresh'
             ? { pendingReconcile: input.pendingReconcile }
@@ -401,6 +417,9 @@ function normalizePaneContent(
       ...(pendingCodexSend ? { pendingCodexSend } : {}),
       ...(pendingCodexUndos?.length ? { pendingCodexUndos } : {}),
       ...(queuedMessages?.length ? { queuedMessages } : {}),
+      ...(codexInputSource ? { codexInputSource } : {}),
+      ...(codexInputHold ? { codexInputHold } : {}),
+      ...(codexInputReplacementId ? { codexInputReplacementId } : {}),
       ...(typeof input.reconcileNotice === 'string' ? { reconcileNotice: input.reconcileNotice } : {}),
       ...(input.pendingReconcile === 'respawn' || input.pendingReconcile === 'fresh'
         ? { pendingReconcile: input.pendingReconcile }
@@ -809,14 +828,33 @@ function buildMaterializedFreshAgentContent(
   }
   const namingIdentity = { nameRef: content.nameRef, namingHandle: content.namingHandle }
   adoptAuthoritativeConversationNameRef(namingIdentity, sessionRef, materialized.nameRef)
-  return normalizePaneContent({
+  return preserveCodexInputAcrossSourceChange(content, normalizePaneContent({
     ...content,
     ...namingIdentity,
     sessionId: materialized.sessionId,
     resumeSessionId: materialized.sessionId,
     sessionRef,
     restoreError: undefined,
-  }, content) as FreshAgentPaneContent
+  }, content)) as FreshAgentPaneContent
+}
+
+function preserveCodexInputAcrossSourceChange(previous: PaneContent, next: PaneContent): PaneContent {
+  if (previous.kind !== 'fresh-agent' || next.kind !== 'fresh-agent'
+    || previous.provider !== 'codex' || next.provider !== 'codex') return next
+  const previousSource = previous.sessionRef?.sessionId
+  const nextSource = next.sessionRef?.sessionId
+  if (!nextSource || nextSource === previousSource) return next
+  const inputSource = next.codexInputSource ?? previous.codexInputSource ?? previousSource ?? previous.sessionId
+  const hasInput = Boolean(next.pendingCodexSend || next.pendingLocalEcho || next.pendingCodexUndos?.length || next.queuedMessages?.length)
+  // A different native source can be a memory-loss replacement. Keep the
+  // old work held until the original source returns or the user reviews it.
+  if (hasInput && (!inputSource || inputSource !== nextSource)) {
+    return { ...next, codexInputHold: next.codexInputHold === 'parent-retired' ? 'parent-retired' : 'source-change' }
+  }
+  if (next.codexInputHold === 'source-change' && inputSource === nextSource) {
+    return { ...next, codexInputHold: undefined }
+  }
+  return next
 }
 
 function sessionRefsEqual(left?: { provider?: string; sessionId?: string }, right?: { provider?: string; sessionId?: string }): boolean {
@@ -1830,7 +1868,7 @@ export const panesSlice = createSlice({
         if (node.type === 'leaf') {
           if (node.id === paneId) {
             previousContentForTitle = node.content
-            const nextContent = normalizePaneContent(content, node.content)
+            const nextContent = preserveCodexInputAcrossSourceChange(node.content, normalizePaneContent(content, node.content))
             // A19: when terminal.created folds a terminalId into this pane,
             // the reconcile intent is consumed — stale respawn/fresh intent
             // must never survive past a completed create.
@@ -1931,7 +1969,8 @@ export const panesSlice = createSlice({
             previousContentForTitle = node.content
             return {
               ...node,
-              content: normalizePaneContent({ ...node.content, ...updates } as Record<string, unknown>, node.content),
+              content: preserveCodexInputAcrossSourceChange(node.content,
+                normalizePaneContent({ ...node.content, ...updates } as Record<string, unknown>, node.content)),
             }
           }
           return node
@@ -2055,6 +2094,9 @@ export const panesSlice = createSlice({
         content.pendingCodexSend = undefined
         content.pendingCodexUndos = undefined
         content.queuedMessages = undefined
+        content.codexInputSource = undefined
+        content.codexInputHold = undefined
+        content.codexInputReplacementId = undefined
         content.handoffError = undefined
         content.namingHandle = undefined
         content.nameRef = undefined

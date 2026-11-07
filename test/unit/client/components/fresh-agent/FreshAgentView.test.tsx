@@ -4,14 +4,14 @@ import savedCodexNativeHistory from '../../../../fixtures/managed-native-history
 import hostedCodexNativeHistory from '../../../../fixtures/managed-native-history/codex-hosted-live.json'
 import savedOpenCodeNativeHistory from '../../../../fixtures/managed-native-history/opencode.json'
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
-import { lazy, Suspense } from 'react'
+import { lazy, Suspense, useLayoutEffect } from 'react'
 import { render, screen, waitFor, fireEvent, createEvent, cleanup, act, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore, type Middleware } from '@reduxjs/toolkit'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { previewServerSettingsPatch, updateSettingsLocal } from '@/store/settingsSlice'
 import sessionsReducer, { applySessionsPatch, applyContextUsageExtras } from '@/store/sessionsSlice'
-import freshAgentLiveReducer from '@/store/freshAgentLiveSlice'
+import freshAgentLiveReducer, { nativeProjectionRetired } from '@/store/freshAgentLiveSlice'
 import freshAgentReducer, { applyRuntimeOwner, historyPageReceived, removeSession, sessionError, sessionExited, sessionInit, sessionMetadataReceived, sessionSnapshotReceived, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
 import { selectPaneOwnerFence } from '@/store/selectors/runtimeOwner'
 import tabsReducer, { closeTab, closePaneWithCleanup } from '@/store/tabsSlice'
@@ -5449,6 +5449,588 @@ describe('FreshAgentView', () => {
     }
   })
 
+  it('retains the complete undo outcome delivered while the Codex view is absent', async () => {
+    const route = await mountProjectionReviewRoute('review-undo-absent-outcome', false)
+    let claimRead: ReturnType<typeof createDeferred<unknown>> | undefined
+    try {
+      ;({ current: claimRead } = await prepareNativeClaim(route))
+      const prior = claimSnapshotWithCompletedNativeTurn('previous-turn', 'Previous prompt', 2)
+      const ready = FreshAgentSnapshotSchema.parse({ ...prior, capabilities: { ...prior.capabilities, undo: true } })
+      await act(async () => claimRead!.resolve(ready))
+      await expectRenderedText('Previous prompt')
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(ready)
+      act(() => getFreshAgentPaneActions('pane-1')!.undo())
+      const undo = sentFreshAgentMessages('freshAgent.undo')[0]
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      const send = (text: string) => {
+        fireEvent.change(composer, { target: { value: text } })
+        fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      }
+      send('Uncertain absent A')
+      send('Held absent B')
+      fireEvent.change(composer, { target: { value: 'Newer absent draft' } })
+      const fullPrompt = `${'Long prior prompt '.repeat(12)}\nAttached files (read them from disk):\n- /tmp/prior-complete.txt`
+      route.view.unmount()
+      act(() => route.receive({ type: 'freshAgent.event', ...route.locator, sessionId: 'foreign-session',
+        event: { type: 'freshAgent.rolledBack', requestId: undo.requestId, removedPromptText: 'Foreign prompt' } }))
+      expect(getFreshAgentPaneContent(route.store).pendingCodexUndos?.[0].outcome).toBeUndefined()
+      act(() => {
+        route.event({ type: 'freshAgent.rolledBack', requestId: undo.requestId, removedPromptText: fullPrompt })
+        route.event({ type: 'freshAgent.rolledBack', requestId: undo.requestId, removedPromptText: fullPrompt })
+      })
+      render(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue(`${fullPrompt}\nNewer absent draft`))
+      expect(getFreshAgentPaneContent(route.store).pendingLocalEcho?.text).toBe('Uncertain absent A')
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      fireEvent.click(screen.getByRole('button', { name: 'Show queued messages' }))
+      expect(screen.getByRole('list', { name: 'Queued message actions' })).toHaveTextContent('Held absent B')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      claimRead?.resolve(hostedCodexSnapshot('native-b', 'Claim'))
+    }
+  })
+
+  it('retains an owned undo outcome while Codex is waiting for a native-source announcement', async () => {
+    const route = await mountProjectionReviewRoute('review-undo-awaiting-source', false)
+    let claimRead: ReturnType<typeof createDeferred<unknown>> | undefined
+    try {
+      ;({ current: claimRead } = await prepareNativeClaim(route))
+      const prior = claimSnapshotWithCompletedNativeTurn('previous-turn', 'Previous prompt', 2)
+      const ready = FreshAgentSnapshotSchema.parse({ ...prior, capabilities: { ...prior.capabilities, undo: true } })
+      await act(async () => claimRead!.resolve(ready))
+      await expectRenderedText('Previous prompt')
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(ready)
+      act(() => getFreshAgentPaneActions('pane-1')!.undo())
+      const undo = sentFreshAgentMessages('freshAgent.undo')[0]
+      fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), { target: { value: 'Draft during source wait' } })
+      route.view.unmount()
+      act(() => route.store.dispatch(nativeProjectionRetired({ ...route.locator, awaitingNativeSessionId: 'native-c' })))
+      expect(route.store.getState().freshAgentLive.bySession['freshcodex:codex:native-b']?.awaitingNativeSessionId).toBe('native-c')
+      const fullPrompt = `${'Source-wait prompt '.repeat(12)}\n- /tmp/source-wait-attachment.txt`
+      act(() => route.event({ type: 'freshAgent.rolledBack', requestId: undo.requestId, removedPromptText: fullPrompt }))
+      expect(getFreshAgentPaneContent(route.store).pendingCodexUndos?.[0].outcome).toMatchObject({ kind: 'rolledBack', removedPromptText: fullPrompt })
+      render(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue(fullPrompt))
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      claimRead?.resolve(hostedCodexSnapshot('native-b', 'Claim'))
+    }
+  })
+
+  it('retains a rollback refusal delivered while the Codex view is absent', async () => {
+    const route = await mountProjectionReviewRoute('review-undo-absent-error', false)
+    let claimRead: ReturnType<typeof createDeferred<unknown>> | undefined
+    try {
+      ;({ current: claimRead } = await prepareNativeClaim(route))
+      const prior = claimSnapshotWithCompletedNativeTurn('previous-turn', 'Previous prompt', 2)
+      const ready = FreshAgentSnapshotSchema.parse({ ...prior, capabilities: { ...prior.capabilities, undo: true } })
+      await act(async () => claimRead!.resolve(ready))
+      await expectRenderedText('Previous prompt')
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(ready)
+      act(() => getFreshAgentPaneActions('pane-1')!.undo())
+      const undo = sentFreshAgentMessages('freshAgent.undo')[0]
+      fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), { target: { value: 'Draft alongside undo refusal' } })
+      route.view.unmount()
+      act(() => route.event({ type: 'freshAgent.error', rollback: true, requestId: undo.requestId,
+        code: 'BUSY_TURN', message: 'Undo refused while busy.' }))
+      render(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      expect(await screen.findByText('Undo refused while busy.')).toBeVisible()
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('Draft alongside undo refusal')
+      expect(getFreshAgentPaneContent(route.store).pendingCodexUndos ?? []).toEqual([])
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      claimRead?.resolve(hostedCodexSnapshot('native-b', 'Claim'))
+    }
+  })
+
+  it.each([false, true])('protects a newer draft after an earlier undo when accepted Codex input is still unclaimed (removed: %s)', async (removeQueued) => {
+    const route = await mountProjectionReviewRoute(`review-undo-before-claim-${removeQueued}`, false)
+    let claimRead: ReturnType<typeof createDeferred<unknown>> | undefined
+    try {
+      ;({ current: claimRead } = await prepareNativeClaim(route))
+      const prior = claimSnapshotWithCompletedNativeTurn('previous-turn', 'Previous prompt', 2)
+      const ready = FreshAgentSnapshotSchema.parse({ ...prior, capabilities: { ...prior.capabilities, undo: true } })
+      await act(async () => claimRead!.resolve(ready))
+      await expectRenderedText('Previous prompt')
+      act(() => getFreshAgentPaneActions('pane-1')!.undo())
+      const undo = sentFreshAgentMessages('freshAgent.undo')[0]
+      act(() => route.store.dispatch(setStatus('disconnected')))
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({ path: '/tmp/before-claim-note.txt', bytes: 4 }) }))
+      const fileInput = route.view.container.querySelector('input[type="file"]') as HTMLInputElement
+      fireEvent.change(fileInput, { target: { files: [new File(['note'], 'note.txt', { type: 'text/plain' })] } })
+      await waitFor(() => expect(within(screen.getByRole('list', { name: 'Attachments' })).getByRole('listitem')).toHaveAttribute('title', '/tmp/before-claim-note.txt'))
+      const queuedText = 'Queued before claim A\n\nAttached files (read them from disk):\n- /tmp/before-claim-note.txt'
+      fireEvent.change(composer, { target: { value: 'Queued before claim A' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      expect(getFreshAgentPaneContent(route.store).queuedMessages).toEqual([queuedText])
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+      if (removeQueued) {
+        fireEvent.click(screen.getByRole('button', { name: 'Show queued messages' }))
+        fireEvent.click(screen.getByRole('button', { name: 'Remove queued message 1' }))
+      }
+      fireEvent.change(composer, { target: { value: 'Newer before-claim draft' } })
+      const fullPrompt = `${'Earlier prompt '.repeat(12)}\n- /tmp/earlier-attachment.txt`
+      act(() => route.event({ type: 'freshAgent.rolledBack', requestId: undo.requestId, removedPromptText: fullPrompt }))
+      expect(composer).toHaveValue(`${fullPrompt}\nNewer before-claim draft`)
+      expect(getFreshAgentPaneContent(route.store).queuedMessages ?? []).toEqual(removeQueued ? [] : [queuedText])
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+    } finally {
+      cleanup()
+      vi.unstubAllGlobals()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      claimRead?.resolve(hostedCodexSnapshot('native-b', 'Claim'))
+    }
+  })
+
+  it.each([
+    { recovered: false, ambiguous: false, managed: false },
+    { recovered: true, ambiguous: false, managed: false },
+    { recovered: false, ambiguous: true, managed: false },
+    { recovered: false, ambiguous: false, managed: true },
+  ])('folds an absent-view Codex send outcome (recovered: $recovered, ambiguous: $ambiguous, managed: $managed)', async ({ recovered, ambiguous, managed }) => {
+    const route = await mountProjectionReviewRoute(`review-absent-send-${recovered}-${ambiguous}-${managed}`, false)
+    let claimRead: ReturnType<typeof createDeferred<unknown>> | undefined
+    try {
+      ;({ current: claimRead } = await prepareNativeClaim(route))
+      const ready = hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Ready for absent outcome', 2)
+      await act(async () => claimRead!.resolve(ready))
+      await expectRenderedText('Ready for absent outcome')
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(ready)
+      vi.useFakeTimers()
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      const send = (text: string) => {
+        fireEvent.change(composer, { target: { value: text } })
+        fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      }
+      send('Absent outcome A')
+      send('Absent outcome B')
+      send('Absent outcome C')
+      const first = sentFreshAgentMessages('freshAgent.send')[0]
+      if (recovered) {
+        await act(async () => { await vi.advanceTimersByTimeAsync(5_000) })
+        fireEvent.click(screen.getByRole('button', { name: 'Check conversation' }))
+        await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+        fireEvent.click(screen.getByRole('button', { name: 'Continue without confirmation' }))
+      }
+      fireEvent.change(composer, { target: { value: recovered ? 'Absent outcome A\nNewer outcome draft' : 'Newer outcome draft' } })
+      route.view.unmount()
+      act(() => route.receive({ type: 'error', code: 'INTERNAL_ERROR', requestId: 'foreign-request',
+        message: 'CODEX_TURN_START_FAILED: another request' }))
+      expect(getFreshAgentPaneContent(route.store).pendingCodexSend?.requestId).toBe(first.requestId)
+      const outcome = { type: 'error', code: 'INTERNAL_ERROR', requestId: first.requestId,
+        message: ambiguous ? 'CODEX_DELIVERY_AMBIGUOUS: reply lost' : 'CODEX_TURN_START_FAILED: not dispatched' }
+      const deliver = () => managed ? route.event({ ...outcome, type: 'freshAgent.error', gateway: { operation: 'send' } }) : route.receive(outcome)
+      act(() => { deliver(); deliver() })
+      render(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue(
+        ambiguous ? 'Newer outcome draft' : 'Absent outcome A\nNewer outcome draft',
+      )
+      expect(sentFreshAgentMessages('freshAgent.send').map((frame) => frame.text)).toEqual(
+        ambiguous ? ['Absent outcome A'] : ['Absent outcome A', 'Absent outcome B'],
+      )
+      expect(getFreshAgentPaneContent(route.store).queuedMessages).toEqual(ambiguous
+        ? ['Absent outcome B', 'Absent outcome C'] : ['Absent outcome C'])
+      if (ambiguous) expect(getFreshAgentPaneContent(route.store).pendingCodexSend?.requestId).toBe(first.requestId)
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      claimRead?.resolve(hostedCodexSnapshot('native-b', 'Claim'))
+      vi.useRealTimers()
+    }
+  })
+
+  it.each([false, true])('keeps Codex input with its parent when a fork changes identity (parent retired: %s)', async (parentRetired) => {
+    const route = await mountProjectionReviewRoute(`review-fork-input-${parentRetired}`, false)
+    let claimRead: ReturnType<typeof createDeferred<unknown>> | undefined
+    try {
+      ;({ current: claimRead } = await prepareNativeClaim(route))
+      const prior = claimSnapshotWithCompletedNativeTurn('parent-turn', 'Parent prompt', 2)
+      const ready = FreshAgentSnapshotSchema.parse({ ...prior, capabilities: { ...prior.capabilities, fork: true } })
+      await act(async () => claimRead!.resolve(ready))
+      await expectRenderedText('Parent prompt')
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(ready)
+      if (!parentRetired) {
+        fireEvent.click(screen.getAllByRole('button', { name: 'Fork conversation from here' })[0])
+        expect(sentFreshAgentMessages('freshAgent.fork')).toHaveLength(1)
+      }
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      const send = (text: string) => {
+        fireEvent.change(composer, { target: { value: text } })
+        fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      }
+      send('Parent uncertain A')
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({ path: '/tmp/parent-fork-note.txt', bytes: 4 }) }))
+      const fileInput = route.view.container.querySelector('input[type="file"]') as HTMLInputElement
+      fireEvent.change(fileInput, { target: { files: [new File(['note'], 'note.txt', { type: 'text/plain' })] } })
+      await waitFor(() => expect(within(screen.getByRole('list', { name: 'Attachments' })).getByRole('listitem')).toHaveAttribute('title', '/tmp/parent-fork-note.txt'))
+      send('Parent attachment C')
+      send('Parent held B')
+      send('Parent held B')
+      const queue = ['Parent attachment C\n\nAttached files (read them from disk):\n- /tmp/parent-fork-note.txt', 'Parent held B', 'Parent held B']
+      const first = sentFreshAgentMessages('freshAgent.send')[0]
+      act(() => route.receive({ type: 'freshAgent.forked', requestId: parentRetired ? 'foreign-request' : `review-fork-input-${parentRetired}`,
+        parentSessionId: 'native-b', sessionId: 'child-fork', sessionType: 'freshcodex', provider: 'codex',
+        ...(parentRetired ? { parentRetiredByRuntime: true } : {}) }))
+      expect(getFreshAgentPaneContent(route.store).sessionId).toBe('native-b')
+      expect(getFreshAgentPaneContent(route.store).pendingLocalEcho?.text).toBe('Parent uncertain A')
+      expect(getFreshAgentPaneContent(route.store).queuedMessages).toEqual(queue)
+      act(() => route.receive({ type: 'error', code: 'INTERNAL_ERROR', requestId: first.requestId,
+        message: 'CODEX_TURN_START_FAILED: not dispatched' }))
+      expect(sentFreshAgentMessages('freshAgent.send').every((frame) => frame.sessionId !== 'child-fork')).toBe(true)
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('Parent uncertain A')
+      if (parentRetired) {
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+        expect(getFreshAgentPaneContent(route.store).queuedMessages).toEqual(queue)
+      } else {
+        expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ sessionId: 'native-b', text: queue[0] })
+      }
+    } finally {
+      cleanup()
+      vi.unstubAllGlobals()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      claimRead?.resolve(hostedCodexSnapshot('native-b', 'Claim'))
+    }
+  })
+
+  it('saves an unconfirmed parent message as a draft before opening a retired-parent fork', async () => {
+    const route = await mountProjectionReviewRoute('review-retired-parent-recovery', false)
+    let claimRead: ReturnType<typeof createDeferred<unknown>> | undefined
+    try {
+      ;({ current: claimRead } = await prepareNativeClaim(route))
+      const ready = hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Ready before retirement', 2)
+      await act(async () => claimRead!.resolve(ready))
+      await expectRenderedText('Ready before retirement')
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(ready)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      const send = (text: string) => {
+        fireEvent.change(composer, { target: { value: text } })
+        fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      }
+      send('Retired uncertain A')
+      send('Retired queued B')
+      const first = sentFreshAgentMessages('freshAgent.send')[0]
+      fireEvent.change(composer, { target: { value: 'Newer retired draft' } })
+      act(() => route.receive({ type: 'freshAgent.forked', requestId: 'foreign-fork', parentSessionId: 'native-b',
+        sessionId: 'retired-child', sessionType: 'freshcodex', provider: 'codex', parentRetiredByRuntime: true }))
+      expect(screen.getByRole('button', { name: 'Continue after reviewing messages' })).toBeDisabled()
+      fireEvent.click(screen.getByRole('button', { name: 'Show queued messages' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Remove queued message 1' }))
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(hostedCodexProjectionSnapshot('retired-child', 'child-q', 'Child conversation', 1))
+      fireEvent.click(screen.getByRole('button', { name: 'Continue after reviewing messages' }))
+      expect(getFreshAgentPaneContent(route.store).sessionId).toBe('retired-child')
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('Retired uncertain A\nNewer retired draft')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      act(() => route.receive({ type: 'error', code: 'INTERNAL_ERROR', requestId: first.requestId,
+        message: 'CODEX_TURN_START_FAILED: old parent refusal' }))
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('Retired uncertain A\nNewer retired draft')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      claimRead?.resolve(hostedCodexSnapshot('native-b', 'Claim'))
+    }
+  })
+
+  it('keeps queued Codex text for its original native conversation after a memory-loss replacement', async () => {
+    const route = await mountProjectionReviewRoute('review-memory-loss-input', false, true)
+    let claimRead: ReturnType<typeof createDeferred<unknown>> | undefined
+    try {
+      ;({ current: claimRead } = await prepareNativeClaim(route))
+      const ready = hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Ready before source replacement', 2)
+      await act(async () => claimRead!.resolve(ready))
+      await expectRenderedText('Ready before source replacement')
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(ready)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      const send = (text: string) => {
+        fireEvent.change(composer, { target: { value: text } })
+        fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      }
+      send('Memory-loss A')
+      send('Memory-loss B')
+      send('Memory-loss B')
+      const first = sentFreshAgentMessages('freshAgent.send')[0]
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(hostedCodexProjectionSnapshot('native-c', 'replacement-q', 'Replacement conversation ready', 1))
+      act(() => route.announce('native-c'))
+      act(() => route.event({ type: 'freshAgent.error', code: 'THREAD_MEMORY_LOST',
+        message: 'The agent no longer has memory of the earlier conversation.' }))
+      act(() => route.receive({ type: 'error', code: 'INTERNAL_ERROR', requestId: first.requestId,
+        message: 'CODEX_TURN_START_FAILED: not dispatched' }))
+      act(() => route.event({ type: 'freshAgent.status', status: 'idle' }))
+      await expectRenderedText('Replacement conversation ready')
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('Memory-loss A')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      expect(getFreshAgentPaneContent(route.store).queuedMessages).toEqual(['Memory-loss B', 'Memory-loss B'])
+      expect(screen.getByRole('status', { name: 'Messages held for the original conversation' })).toBeVisible()
+      route.view.unmount()
+      render(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      expect(screen.getByRole('status', { name: 'Messages held for the original conversation' })).toBeVisible()
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      fireEvent.click(screen.getByRole('button', { name: 'Show queued messages' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Remove queued message 1' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Remove queued message 1' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Continue after reviewing messages' }))
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('Memory-loss A')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeEnabled())
+      fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), { target: { value: 'Deliberate replacement message' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+      expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Deliberate replacement message' })
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      claimRead?.resolve(hostedCodexSnapshot('native-b', 'Claim'))
+    }
+  })
+
+  it('holds queued Codex input if a create acknowledgment changes its native source', async () => {
+    const route = await mountProjectionReviewRoute('review-created-source-change', false, true)
+    let claimRead: ReturnType<typeof createDeferred<unknown>> | undefined
+    try {
+      ;({ current: claimRead } = await prepareNativeClaim(route))
+      const ready = hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Ready before create source change', 2)
+      await act(async () => claimRead!.resolve(ready))
+      await expectRenderedText('Ready before create source change')
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(ready)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      const send = (text: string) => {
+        fireEvent.change(composer, { target: { value: text } })
+        fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      }
+      send('Create source A')
+      send('Create source B')
+      const first = sentFreshAgentMessages('freshAgent.send')[0]
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(hostedCodexProjectionSnapshot('native-c', 'created-q', 'Created source ready', 1))
+      act(() => route.receive({ type: 'freshAgent.created', requestId: 'review-created-source-change',
+        sessionId: 'native-b', sessionType: 'freshcodex', provider: 'codex', runtimeProvider: 'codex',
+        sessionRef: { provider: 'codex', sessionId: 'native-c' } }))
+      act(() => route.receive({ type: 'error', code: 'INTERNAL_ERROR', requestId: first.requestId,
+        message: 'CODEX_TURN_START_FAILED: not dispatched' }))
+      act(() => route.event({ type: 'freshAgent.status', status: 'idle' }))
+      await expectRenderedText('Created source ready')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      expect(getFreshAgentPaneContent(route.store).queuedMessages).toEqual(['Create source B'])
+      expect(screen.getByRole('status', { name: 'Messages held for the original conversation' })).toBeVisible()
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      claimRead?.resolve(hostedCodexSnapshot('native-b', 'Claim'))
+    }
+  })
+
+  it('retries held Codex input when the original native conversation is restored', async () => {
+    const route = await mountProjectionReviewRoute('review-original-source-return', false, true)
+    let claimRead: ReturnType<typeof createDeferred<unknown>> | undefined
+    try {
+      ;({ current: claimRead } = await prepareNativeClaim(route))
+      const ready = hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Original source ready', 2)
+      await act(async () => claimRead!.resolve(ready))
+      await expectRenderedText('Original source ready')
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(ready)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      const send = (text: string) => {
+        fireEvent.change(composer, { target: { value: text } })
+        fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      }
+      send('Original source A')
+      send('Original source B')
+      const first = sentFreshAgentMessages('freshAgent.send')[0]
+      act(() => route.announce('native-c'))
+      expect(screen.getByRole('status', { name: 'Messages held for the original conversation' })).toBeVisible()
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(hostedCodexProjectionSnapshot('native-b', 'restored-q', 'Original source returned', 1))
+      act(() => route.announce('native-b'))
+      expect(getFreshAgentPaneContent(route.store).sessionRef?.sessionId).toBe('native-b')
+      expect(getFreshAgentPaneContent(route.store).codexInputHold).toBeUndefined()
+      act(() => route.receive({ type: 'error', code: 'INTERNAL_ERROR', requestId: first.requestId,
+        message: 'CODEX_TURN_START_FAILED: not dispatched' }))
+      expect(getFreshAgentPaneContent(route.store).pendingCodexSend).toBeUndefined()
+      act(() => route.event({ type: 'freshAgent.status', status: 'idle' }))
+      await expectRenderedText('Original source returned')
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+      expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ sessionId: 'native-b', text: 'Original source B' })
+      expect(screen.queryByRole('status', { name: 'Messages held for the original conversation' })).not.toBeInTheDocument()
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      claimRead?.resolve(hostedCodexSnapshot('native-b', 'Claim'))
+    }
+  })
+
+  it('allows a fresh Codex conversation after the old held-input state is cleared', async () => {
+    const route = await mountProjectionReviewRoute('review-held-reset-new', false, true, 'native-b', false, {
+      codexInputHold: 'source-change', codexInputSource: 'native-old', codexInputReplacementId: 'unused-child',
+    })
+    let claimRead: ReturnType<typeof createDeferred<unknown>> | undefined
+    try {
+      ;({ current: claimRead } = await prepareNativeClaim(route))
+      const ready = hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Old conversation before new', 2)
+      await act(async () => claimRead!.resolve(ready))
+      await expectRenderedText('Old conversation before new')
+      expect(screen.getByRole('status', { name: 'Messages held for the original conversation' })).toBeVisible()
+      act(() => route.store.dispatch(startNewManagedRuntimeConversation({ tabId: 'tab-1', paneId: 'pane-1' })))
+      const fresh = getFreshAgentPaneContent(route.store)
+      expect(fresh.codexInputHold).toBeUndefined()
+      expect(fresh.codexInputSource).toBeUndefined()
+      expect(fresh.codexInputReplacementId).toBeUndefined()
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(hostedCodexProjectionSnapshot('native-new', 'new-q', 'Fresh conversation ready', 1))
+      act(() => route.receive({ type: 'freshAgent.created', requestId: fresh.createRequestId, sessionId: 'native-new',
+        sessionType: 'freshcodex', provider: 'codex', runtimeProvider: 'codex', sessionRef: { provider: 'codex', sessionId: 'native-new' } }))
+      await expectRenderedText('Fresh conversation ready')
+      await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeEnabled())
+      fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), { target: { value: 'Fresh conversation input' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1))
+      expect(sentFreshAgentMessages('freshAgent.send')[0]).toMatchObject({ sessionId: 'native-new', text: 'Fresh conversation input' })
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      claimRead?.resolve(hostedCodexSnapshot('native-b', 'Claim'))
+    }
+  })
+
+  it('retries an unsent Codex claim when the store rekeys before the rendered queue effect', async () => {
+    const route = await mountProjectionReviewRoute('review-store-ahead-claim', false, true)
+    let claimRead: ReturnType<typeof createDeferred<unknown>> | undefined
+    try {
+      ;({ current: claimRead } = await prepareNativeClaim(route))
+      const ready = hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Ready before public rekey', 2)
+      await act(async () => claimRead!.resolve(ready))
+      await expectRenderedText('Ready before public rekey')
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(ready)
+      act(() => route.store.dispatch(setStatus('disconnected')))
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      fireEvent.change(composer, { target: { value: 'Rekeyed queued input' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      expect(getFreshAgentPaneContent(route.store).queuedMessages).toEqual(['Rekeyed queued input'])
+      let rekeyed = false
+      function RekeyBeforeEffects() {
+        const status = useAppSelector((state) => state.connection.status)
+        useLayoutEffect(() => {
+          if (status !== 'ready' || rekeyed) return
+          rekeyed = true
+          route.receive({ type: 'freshAgent.session.materialized', ...route.locator,
+            previousSessionId: 'native-b', sessionId: 'public-rekeyed',
+            sessionRef: { provider: 'codex', sessionId: 'native-b' } })
+        }, [status])
+        return null
+      }
+      route.view.rerender(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /><RekeyBeforeEffects /></Provider>)
+      act(() => route.store.dispatch(setStatus('ready')))
+      expect(rekeyed).toBe(true)
+      expect(getFreshAgentPaneContent(route.store).sessionId).toBe('public-rekeyed')
+      if (!sentFreshAgentMessages('freshAgent.send').length) {
+        expect(getFreshAgentPaneContent(route.store).pendingCodexSend).toBeUndefined()
+        expect(getFreshAgentPaneContent(route.store).queuedMessages).toEqual(['Rekeyed queued input'])
+      }
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1))
+      expect(sentFreshAgentMessages('freshAgent.send')[0]).toMatchObject({ sessionId: 'public-rekeyed', text: 'Rekeyed queued input' })
+      expect(getFreshAgentPaneContent(route.store).queuedMessages ?? []).toEqual([])
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      claimRead?.resolve(hostedCodexSnapshot('native-b', 'Claim'))
+    }
+  })
+
+  it('sends every remaining queued Codex entry in order across recovery and remounts', async () => {
+    const route = await mountProjectionReviewRoute('review-queue-all-wire-text', false)
+    let claimRead: ReturnType<typeof createDeferred<unknown>> | undefined
+    try {
+      ;({ current: claimRead } = await prepareNativeClaim(route))
+      const ready = hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Ready for complete queue', 2)
+      await act(async () => claimRead!.resolve(ready))
+      await expectRenderedText('Ready for complete queue')
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(ready)
+      vi.useFakeTimers()
+      let view = route.view
+      const send = (text: string) => {
+        fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), { target: { value: text } })
+        fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      }
+      send('Queue wire A')
+      send('Duplicate wire B')
+      send('Duplicate wire B')
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({ path: '/tmp/queue-wire-note.txt', bytes: 4 }) }))
+      const fileInput = view.container.querySelector('input[type="file"]') as HTMLInputElement
+      await act(async () => {
+        fireEvent.change(fileInput, { target: { files: [new File(['note'], 'note.txt', { type: 'text/plain' })] } })
+        await Promise.resolve()
+      })
+      expect(within(screen.getByRole('list', { name: 'Attachments' })).getByRole('listitem')).toHaveAttribute('title', '/tmp/queue-wire-note.txt')
+      send('Attachment wire C')
+      send('Removed wire D')
+      view.unmount()
+      view = render(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeEnabled()
+      send('Later wire E')
+      fireEvent.click(screen.getByRole('button', { name: 'Show queued messages' }))
+      const queued = screen.getByRole('list', { name: 'Queued message actions' })
+      expect(within(queued).getAllByRole('listitem').map((item) => item.textContent)).toEqual([
+        'Duplicate wire B', 'Duplicate wire B',
+        'Attachment wire C\n\nAttached files (read them from disk):\n- /tmp/queue-wire-note.txt', 'Removed wire D', 'Later wire E',
+      ])
+      fireEvent.click(screen.getByRole('button', { name: 'Remove queued message 4' }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(5_000) })
+      fireEvent.click(screen.getByRole('button', { name: 'Check conversation' }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      fireEvent.click(screen.getByRole('button', { name: 'Continue without confirmation' }))
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('Queue wire A')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      const refuse = (index: number) => {
+        const frame = sentFreshAgentMessages('freshAgent.send')[index]
+        act(() => route.receive({ type: 'error', code: 'INTERNAL_ERROR', requestId: frame.requestId,
+          message: 'CODEX_TURN_START_FAILED: not dispatched' }))
+      }
+      refuse(0)
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
+      view.unmount()
+      view = render(<Provider store={route.store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS + 1) })
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
+      refuse(0) // A duplicate old outcome must not release the new claim.
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
+      refuse(1)
+      refuse(2)
+      refuse(3)
+      expect(sentFreshAgentMessages('freshAgent.send').map((frame) => frame.text)).toEqual([
+        'Queue wire A', 'Duplicate wire B', 'Duplicate wire B',
+        'Attachment wire C\n\nAttached files (read them from disk):\n- /tmp/queue-wire-note.txt', 'Later wire E',
+      ])
+      refuse(4)
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(5)
+      expect(getFreshAgentPaneContent(route.store).queuedMessages ?? []).toEqual([])
+      expect((screen.getByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement).value).toContain('Queue wire A')
+    } finally {
+      cleanup()
+      vi.unstubAllGlobals()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      claimRead?.resolve(hostedCodexSnapshot('native-b', 'Claim'))
+      vi.useRealTimers()
+    }
+  })
+
   it('holds the Codex queue after recovery until the outstanding send is refused', async () => {
     const route = await mountProjectionReviewRoute('review-held-dispatch-boundary', false)
     let claimRead: ReturnType<typeof createDeferred<unknown>> | undefined
@@ -5552,6 +6134,51 @@ describe('FreshAgentView', () => {
       route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
       claimRead?.resolve(hostedCodexSnapshot('native-b', 'Claim'))
       vi.useRealTimers()
+    }
+  })
+
+  it('retries a claimed Codex message with an updated same-kind owner fence', async () => {
+    const route = await mountProjectionReviewRoute('review-claim-owner-generation', false)
+    let claimRead: ReturnType<typeof createDeferred<unknown>> | undefined
+    let unsubscribe: (() => void) | undefined
+    try {
+      ;({ current: claimRead } = await prepareNativeClaim(route))
+      const ready = hostedCodexProjectionSnapshot('native-b', 'claim-q', 'Ready before owner update', 2)
+      await act(async () => claimRead!.resolve(ready))
+      await expectRenderedText('Ready before owner update')
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(ready)
+      const owner = { type: 'session.runtimeOwner' as const, ...route.locator, epoch: 3, generation: 1,
+        ownerKind: 'fresh-agent' as const, transition: 'handoff-committed' as const, operationId: 'owner-before-claim' }
+      act(() => route.store.dispatch(applyRuntimeOwner(owner)))
+      const send = (text: string) => {
+        fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), { target: { value: text } })
+        fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      }
+      send('Owner fence A')
+      send('Owner fence B')
+      const first = sentFreshAgentMessages('freshAgent.send')[0]
+      let advanced = false
+      // This deliberately stages a synchronous store subscriber; it is not a
+      // claim that WebSocket callbacks interrupt a Redux dispatch.
+      unsubscribe = route.store.subscribe(() => {
+        if (!advanced && getFreshAgentPaneContent(route.store).pendingLocalEcho?.text === 'Owner fence B') {
+          advanced = true
+          route.store.dispatch(applyRuntimeOwner({ ...owner, generation: 2, operationId: 'owner-after-claim' }))
+        }
+      })
+      act(() => route.receive({ type: 'error', code: 'INTERNAL_ERROR', requestId: first.requestId,
+        message: 'CODEX_TURN_START_FAILED: not dispatched' }))
+      expect(advanced).toBe(true)
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+      expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Owner fence B', observedEpoch: 3, observedGeneration: 2 })
+      expect(sentFreshAgentMessages('freshAgent.send').filter((frame) => frame.text === 'Owner fence B')).toHaveLength(1)
+      expect(screen.queryByRole('status', { name: 'Messages held for the original conversation' })).not.toBeInTheDocument()
+    } finally {
+      unsubscribe?.()
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      route.initial.resolve(hostedCodexSnapshot('native-b', 'Initial'))
+      claimRead?.resolve(hostedCodexSnapshot('native-b', 'Claim'))
     }
   })
 

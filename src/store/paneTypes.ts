@@ -512,17 +512,25 @@ export type FreshAgentPendingCodexSend = {
   text: string
   logicalAttemptId?: string
   recovered?: boolean
+  failure?: { message?: string; code?: string }
 }
 
 export function normalizeFreshAgentPendingCodexSend(value: unknown, echo?: FreshAgentPendingLocalEcho): FreshAgentPendingCodexSend | undefined {
   const record = value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown> : undefined
+  const failure = record?.failure && typeof record.failure === 'object' && !Array.isArray(record.failure)
+    ? record.failure as Record<string, unknown> : undefined
   if (typeof record?.requestId === 'string' && record.requestId && typeof record.text === 'string' && record.text) {
     return {
       requestId: record.requestId,
       text: record.text,
       ...(typeof record.logicalAttemptId === 'string' && record.logicalAttemptId ? { logicalAttemptId: record.logicalAttemptId } : {}),
       ...(record.recovered === true ? { recovered: true } : {}),
+      ...(failure
+        ? { failure: {
+            ...(typeof failure.message === 'string' ? { message: failure.message } : {}),
+            ...(typeof failure.code === 'string' ? { code: failure.code } : {}),
+          } } : {}),
     }
   }
   // Older persisted echoes had no separate dispatch reservation.
@@ -582,9 +590,19 @@ export type FreshAgentPaneContent = {
   /** An unresolved Codex dispatch, independent of its displayed echo. */
   pendingCodexSend?: FreshAgentPendingCodexSend
   /** Codex undo requests awaiting their requesting-pane acknowledgments. */
-  pendingCodexUndos?: { requestId: string; protectDraft?: boolean }[]
+  pendingCodexUndos?: {
+    requestId: string
+    protectDraft?: boolean
+    outcome?: { kind: 'rolledBack'; removedPromptText?: string } | { kind: 'error'; message?: string }
+  }[]
   /** Submitted Codex follow-ups waiting for the preceding input's boundary. */
   queuedMessages?: string[]
+  /** Native conversation for which the outstanding Codex input was accepted. */
+  codexInputSource?: string
+  /** Input waits for the original source or the user's review. */
+  codexInputHold?: 'source-change' | 'parent-retired'
+  /** Fork to open after the user has reviewed input from its retired parent. */
+  codexInputReplacementId?: string
   /** One-shot user-visible reconcile notice; rendered + cleared by FreshAgentView. VOLATILE. */
   reconcileNotice?: string
   /** Set by verdict folds; consumed when freshAgent.created lands. VOLATILE. */

@@ -8,7 +8,8 @@ import { collectPaneEntries } from '@/lib/pane-utils'
 import { consumeCancelledCreate, consumeCreateRoute, rememberCreateRoute } from '@/lib/create-cancellation'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { KILL_FAILED_MESSAGE } from '@/lib/kill-ack'
-import { materializeFreshAgentSession as materializeFreshAgentPaneSession } from '@/store/panesSlice'
+import { materializeFreshAgentSession as materializeFreshAgentPaneSession, mergePaneContent } from '@/store/panesSlice'
+import { asRollbackAck, isRollbackErrorEvent } from '@/lib/fresh-agent-rollback'
 import { applyFreshAgentCompletion, applyFreshAgentWaiting, applyFreshAgentQuestionAvailable, observeFreshAgentSession, rekeyFreshAgentAttention } from '@/store/turnCompletionThunks'
 import { revokeFreshAgentAttention } from '@/store/turnCompletionAttention'
 import type { ObservedOwnerFence } from '@/store/selectors/runtimeOwner'
@@ -198,6 +199,9 @@ export function handleFreshAgentMessage(
   getOwnerFence?: (provider: string, sessionId: string) => ObservedOwnerFence | undefined,
 ): boolean {
   switch (msg.type) {
+    case 'error':
+      retainCodexSendFailure(dispatch, msg)
+      return false
     case 'freshAgent.created': {
       const created = msg as FreshAgentCreatedMessage
       const provider = created.provider ?? created.runtimeProvider
@@ -367,6 +371,34 @@ export function handleFreshAgentMessage(
     default:
       return false
   }
+}
+
+function retainCodexSendFailure(
+  dispatch: AppDispatch,
+  failure: Record<string, unknown>,
+  locator?: { provider: string; sessionType: string; sessionId: string },
+): void {
+  if (typeof failure.requestId !== 'string' || !failure.requestId
+    || (typeof failure.message === 'string' && failure.message.startsWith('CODEX_DELIVERY_AMBIGUOUS:'))) return
+  dispatch((innerDispatch, getState) => {
+    for (const [tabId, layout] of Object.entries(getState().panes.layouts)) {
+      if (!layout) continue
+      for (const { paneId, content } of collectPaneEntries(layout)) {
+        const pending = content.kind === 'fresh-agent' ? content.pendingCodexSend : undefined
+        if (content.kind !== 'fresh-agent' || content.provider !== 'codex'
+          || !pending || pending.requestId !== failure.requestId || pending.failure
+          || (locator && (content.provider !== locator.provider || content.sessionType !== locator.sessionType
+            || content.sessionId !== locator.sessionId))) continue
+        innerDispatch(mergePaneContent({ tabId, paneId, updates: { pendingCodexSend: {
+          ...pending,
+          failure: {
+            ...(typeof failure.code === 'string' ? { code: failure.code } : {}),
+            ...(typeof failure.message === 'string' ? { message: failure.message } : {}),
+          },
+        } } }))
+      }
+    }
+  })
 }
 
 /**
@@ -567,7 +599,39 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
   if (locator.provider === 'codex') dispatch((_innerDispatch, getState) => {
     current = isCurrentFreshAgentEvent(getState(), { ...locator, event })
   })
+
+  // The requesting pane may be unmounted while its socket remains active.
+  // A request-matched undo result belongs to that pane even when an unrelated
+  // source announcement is pending and uncorrelated transcript events wait.
+  if (locator.provider === 'codex') {
+    const ack = asRollbackAck(event)
+    const requestId = ack?.kind === 'freshAgent.rolledBack' ? ack.requestId
+      : isRollbackErrorEvent(event) && typeof event.requestId === 'string' ? event.requestId : undefined
+    if (requestId) dispatch((innerDispatch, getState) => {
+      for (const [tabId, layout] of Object.entries(getState().panes.layouts)) {
+        if (!layout) continue
+        for (const { paneId, content } of collectPaneEntries(layout)) {
+          if (content.kind !== 'fresh-agent' || content.provider !== 'codex'
+            || content.sessionType !== locator.sessionType || content.sessionId !== locator.sessionId) continue
+          const undo = content.pendingCodexUndos?.find((entry) => entry.requestId === requestId)
+          if (!undo || undo.outcome) continue
+          const outcome = ack?.kind === 'freshAgent.rolledBack'
+            ? { kind: 'rolledBack' as const, ...(typeof ack.removedPromptText === 'string' ? { removedPromptText: ack.removedPromptText } : {}) }
+            : { kind: 'error' as const, ...(typeof event.message === 'string' ? { message: event.message } : {}) }
+          innerDispatch(mergePaneContent({ tabId, paneId, updates: {
+            pendingCodexUndos: content.pendingCodexUndos?.map((entry) => entry.requestId === requestId ? { ...entry, outcome } : entry),
+          } }))
+        }
+      }
+    })
+  }
+
   if (!current) return true
+
+  if (locator.provider === 'codex' && event.type === 'freshAgent.error'
+    && isObject(event.gateway) && event.gateway.operation === 'send') {
+    retainCodexSendFailure(dispatch, event, locator)
+  }
 
   // Stream events are batched; every other event of the session first
   // applies the ones still waiting, so the store sees them in arrival order.
