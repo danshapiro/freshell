@@ -30,7 +30,7 @@ Fix and land freshell#mdmw as quickly as practical: give the 8 GiB test sandbox 
 
 ## Global Constraints
 
-1. Keep immutable approved base cbae31df487bc150c1d57ba93b63f18910ce5098 and worktree /home/dan/code/freshell/.worktrees/mdmw-sandbox-budget on branch the-usual/mdmw-sandbox-budget. Main advanced with unrelated UI changes; do not rebase this approved run or alter the older broad crash-resilience work.
+1. Keep immutable approved base cbae31df487bc150c1d57ba93b63f18910ce5098 and worktree /home/dan/code/freshell/.worktrees/mdmw-sandbox-budget. Preserve branch the-usual/mdmw-sandbox-budget and all of its commits and unique work; do not rebase, stash, reset or discard them. After a clean handback, a narrower candidate branch based on current origin/main may use this same worktree if a safe switch preserves all ignored and untracked files. Do not alter the older broad crash-resilience work.
 2. Follow repository AGENTS.md, pnpm 10.34.5, frozen installs, configured cloud backends and coordinated broad gates. Tests run in this task worktree, shared with the isolated guest where needed. Tiny generated projects are required fixtures. Do not create a source archive or an additional checkout or workspace copy as a test environment.
 3. Preserve --rm, --init, exact name/CID ownership, owner-guard and signals, cache identity/mounts/labels, early specialized dispatches, both runtime preparation/execution phases, runtime restrictions, and cleanup failure returning 1. No second lifecycle owner, retained-container framework, generic redactor, supervisor, or audit trail.
 4. Apply --cpus 2, --memory 8g, --memory-swap 16g, and --pids-limit 512 in the shared launch arguments. Total RAM-plus-swap is explicit; do not introduce a no-swap product policy. The fixed aggregate CPU quota applies to every sandbox workload, including explicit higher Cargo job counts; this change adds no CPU-limit override. Document that throughput tradeoff. The required full-suite gate must treat any resulting timeout as a failure to investigate, not a presumed baseline failure.
@@ -44,6 +44,12 @@ Fix and land freshell#mdmw as quickly as practical: give the 8 GiB test sandbox 
 12. The approved broad base gate exited 1 despite passing cloud shard verdicts; its failing phase/wrapper status remains unidentified. Later failures receive their own evidence and disposition; none is automatically pre-existing. Full-suite verification remains a separate gate.
 
 ---
+
+## Fast landing approach after main advanced
+
+Current main contains independent source changes addressing the two Codex failures observed in the later full-suite gate. Preserve the existing task branch intact, and prepare a sandbox-focused candidate on current main in the same dedicated worktree rather than merging the entire task-only Codex continuation. Carry forward the sandbox budget, diagnostics, smoke and sentinel behavior and all three required sandbox review repairs, adapting them to main's trusted cross-worktree launcher. Test main's initial Codex identity contract and genuine native replacement rather than assuming its changed parity assertion proves the earlier behavior; add the smallest required fix if an actual verification blocker remains. Individually disposition prior findings against the candidate, including findings that no longer apply because task-introduced machinery is absent.
+
+This approach does not change the recorded base for the-usual review, waive the actual-launcher cold supported-toolchain Clippy run, permit a copied local test workspace, waive the configured full-suite gate, or authorize a PR without the user's explicit approval. Preserve all existing test evidence and untracked/ignored files across the branch switch; if a safe switch cannot be established, stop and resolve that condition without forcing or discarding anything.
 
 ## File responsibilities and dependency map
 
