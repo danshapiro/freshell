@@ -12348,15 +12348,18 @@ describe('FreshAgentView', () => {
 
   it('does not title a new scoped conversation from the first message even after a stale snapshot with user turns', async () => {
     const store = createStore()
+    const nextConversationSnapshot = createDeferred<unknown>()
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
       status: 'idle',
       summary: 'Codex summary',
       capabilities: { send: true, interrupt: true, fork: true },
+      pendingApprovals: [{ requestId: 'old-snapshot-approval', toolName: 'Bash', input: { command: 'old approval command' } }],
       turns: [
         { id: 'turn-user-1', role: 'user', items: [{ id: 'item-user-1', kind: 'text', text: 'Old user turn' }] },
         { id: 'turn-assistant-1', role: 'assistant', items: [{ id: 'item-assistant-1', kind: 'text', text: 'Old assistant turn' }] },
       ],
     })
+    apiMock.getFreshAgentThreadSnapshot.mockImplementationOnce(() => nextConversationSnapshot.promise as any)
     store.dispatch(initLayout({
       tabId: 'tab-1',
       paneId: 'pane-1',
@@ -12379,6 +12382,7 @@ describe('FreshAgentView', () => {
     await waitFor(() => {
       expect(screen.getByText('Old assistant turn')).toBeInTheDocument()
     })
+    expect(screen.getByRole('button', { name: /allow tool use/i })).toBeInTheDocument()
 
     wsMock.send.mockClear()
 
@@ -12398,6 +12402,20 @@ describe('FreshAgentView', () => {
     })
     await waitFor(() => {
       expect(getFreshAgentSessionId()).toBe('thread-stale-snapshot-new')
+    })
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
+    expect(screen.queryByText('Old assistant turn')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /allow tool use/i })).not.toBeInTheDocument()
+    await act(async () => {
+      nextConversationSnapshot.resolve({
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        threadId: 'thread-stale-snapshot-new',
+        status: 'idle',
+        summary: 'New conversation',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [],
+      })
     })
 
     fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
