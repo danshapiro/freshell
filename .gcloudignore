@@ -151,8 +151,10 @@ assets/
 # artifacts, not build inputs; keep both evidence and scratch binaries local.
 /.runtime-evidence/
 /.runtime-build/
+/.runtime-provider-parity-*
 
 # Caches and temp files
+/.test-tmp/
 .eslintcache
 .cache/
 .npm/
