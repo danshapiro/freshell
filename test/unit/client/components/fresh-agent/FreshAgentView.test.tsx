@@ -23579,17 +23579,29 @@ describe('task6 gap recovery after the final frame', () => {
     apiMock.getFreshAgentThreadSnapshot.mockClear()
     apiMock.getFreshAgentThreadSnapshot.mockReturnValueOnce(held.promise).mockResolvedValue(latest)
     const patch=(afterRevision:number,revision:number)=>({type:'freshAgent.transcript.patch',sessionId:native.threadId,projectionId:'gap-source',historyGeneration:0,afterRevision,ops:[{op:'appendItem',nativeTurnId:'gap-turn',rowId:'gap-row',itemId:'gap-answer',field:'text',text:' unbased suffix',revision}]})
+    const projection = () => store.getState().freshAgentLive.bySession[`freshcodex:codex:${native.threadId}`].projection
+    vi.useFakeTimers()
     try {
       act(()=>receive(patch(4,7)))
-      await waitFor(()=>expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+      expect(projection()).toMatchObject({ eventRevision: 7, needsResnapshot: true })
+      expect(screen.getByText('Known visible prefix')).toBeVisible()
+      // Start the held recovery at the debounce boundary, independent of wall time.
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
       act(()=>receive(patch(7,8)))
       // No more transport/provider frames arrive after this final patch.
       await act(async()=>held.resolve(stale))
+      expect(projection()).toMatchObject({ eventRevision: 8, needsResnapshot: true })
+      expect(screen.getByText('Known visible prefix')).toBeVisible()
+      expect(screen.queryByText('Covered through revision seven')).not.toBeInTheDocument()
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+      vi.useRealTimers()
       await expectRenderedText('Authoritative output through the final revision eight')
       expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
-      expect(store.getState().freshAgentLive.bySession[`freshcodex:codex:${native.threadId}`].projection?.needsResnapshot).toBe(false)
+      expect(projection()).toMatchObject({ eventRevision: 8, needsResnapshot: false })
       expect(sentFreshAgentMessages('freshAgent.send')).toEqual([])
-    } finally {cleanup();await act(async()=>held.resolve(stale))}
+    } finally {vi.useRealTimers();cleanup();await act(async()=>held.resolve(stale))}
   })
 })
 
