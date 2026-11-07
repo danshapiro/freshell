@@ -1173,7 +1173,15 @@ async fn dispatch_with_effects(
                     let receipt = actor
                         .prepare_native_readiness_with_receipt(&expected_launch, &source_fence)
                         .await
-                        .map_err(map_actor_error)?;
+                        .map_err(|error| {
+                            let _ = append_event_with_secret(
+                                &state.state_dir,
+                                &state.secret,
+                                "host.native_identity.readiness_failed",
+                                fresh_agent_open_failure_data(&error),
+                            );
+                            map_actor_error(error)
+                        })?;
                     if let Some(receipt) = receipt.as_ref() {
                         commit_fresh_native_readiness_receipt(
                             state, &actor, receipt, None, None, None,
@@ -11985,6 +11993,8 @@ mod tests {
         launch: std::sync::Mutex<freshell_runtime_protocol::NativeIdentityLaunch>,
         native_session_id: std::sync::Mutex<String>,
         readiness_calls: AtomicUsize,
+        readiness_failure:
+            Option<freshell_agent_runtime::host_actor::NativeReadinessPrepareFailure>,
     }
 
     #[async_trait]
@@ -12018,8 +12028,14 @@ mod tests {
         async fn prepare_native_readiness(
             &self,
             expected_launch: &freshell_runtime_protocol::NativeIdentityLaunch,
-        ) -> Result<Option<freshell_runtime_protocol::NativeDispatchIdentity>, String> {
+        ) -> Result<
+            Option<freshell_runtime_protocol::NativeDispatchIdentity>,
+            freshell_agent_runtime::host_actor::NativeReadinessPrepareFailure,
+        > {
             self.readiness_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(failure) = self.readiness_failure.clone() {
+                return Err(failure);
+            }
             let mut launch = self.launch.lock().unwrap();
             let previous = self.native_session_id.lock().unwrap().clone();
             if &*launch != expected_launch
@@ -12415,6 +12431,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_native_readiness_failures_emit_safe_diagnostics_without_changing_reply_codes() {
+        use freshell_agent_runtime::host_actor::{
+            FreshAgentHostActor, NativeReadinessPrepareFailure,
+        };
+        use freshell_runtime_protocol::{NativeIdentityLaunch, NativeReadinessFence};
+
+        for failure in [
+            NativeReadinessPrepareFailure::Superseded,
+            NativeReadinessPrepareFailure::Failed("private provider response body".into()),
+        ] {
+            let state = test_host_state();
+            let launch = NativeIdentityLaunch {
+                incarnation_id: state.incarnation_id.clone(),
+                launch_nonce: "failed-readiness".into(),
+                evidence_revision: 12,
+                execution_generation: 1,
+                requested_native_session_id: Some("codex-native-old".into()),
+            };
+            let source_fence = NativeReadinessFence {
+                control_epoch: 0,
+                intent_revision: 7,
+                identity_revision: 3,
+                evidence_revision: launch.evidence_revision,
+                native_import_revision: 2,
+                recovery_attempt_id: None,
+                active_incarnation_id: state.incarnation_id.clone(),
+            };
+            {
+                let mut persisted = state.persisted.lock().await;
+                persisted.native_identity_launch = Some(launch.clone());
+                persisted.max_execution_generation = launch.execution_generation;
+                write_state(&state.state_dir, &persisted).unwrap();
+            }
+            let transport = Arc::new(CodexReadinessFixtureTransport {
+                launch: std::sync::Mutex::new(launch.clone()),
+                native_session_id: std::sync::Mutex::new("codex-native-old".into()),
+                readiness_calls: AtomicUsize::new(0),
+                readiness_failure: Some(failure.clone()),
+            });
+            let actor = FreshAgentHostActor::open(
+                state.state_dir.join("readiness-agent"),
+                FreshAgentProfile {
+                    naming_handle: None,
+                    collaboration_mode: None,
+                    provider: FreshProvider::Codex,
+                    runtime_variant: "codex-app-server".into(),
+                    cwd: "/workspace".into(),
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    sandbox: None,
+                    provider_store_id: "codex-store".into(),
+                    native_session_id: Some("codex-native-old".into()),
+                    plugins: None,
+                    model_selection: None,
+                    session_ref: None,
+                    provider_launch_context: None,
+                    provider_secret_references: Vec::new(),
+                },
+                transport.clone(),
+            )
+            .await
+            .unwrap();
+            *state.fresh_agent.lock().await = Some(actor.clone());
+            let error = dispatch(
+                authenticated_host_envelope(
+                    &state,
+                    HostCommand::FreshAgentPrepareNative {
+                        incarnation_id: state.incarnation_id.clone(),
+                        expected_launch: Some(launch.clone()),
+                        source_fence: Some(source_fence),
+                    },
+                ),
+                &state,
+            )
+            .await
+            .expect_err("failed readiness must refuse the authenticated command");
+            assert_eq!(error.code, RuntimeErrorCode::HostUnreachable);
+            assert_eq!(error.message, "hosted fresh-agent command failed");
+            let contents = std::fs::read_to_string(state.state_dir.join("host-lifecycle.jsonl"))
+                .unwrap_or_default();
+            assert!(!contents.contains("private provider response body"));
+            let events: Vec<serde_json::Value> = contents
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|row| row["event"] == "host.native_identity.readiness_failed")
+                .collect();
+            assert_eq!(
+                events.len(),
+                1,
+                "readiness failures need one safe lifecycle diagnostic"
+            );
+            let data = &events[0]["data"];
+            assert_eq!(data["severity"], "warn");
+            match failure {
+                NativeReadinessPrepareFailure::Superseded => {
+                    assert_eq!(data["actorErrorCategory"], "provider_start_failed");
+                    assert_eq!(
+                        data["nativeReadinessProviderStartCause"],
+                        "preparation_superseded"
+                    );
+                }
+                NativeReadinessPrepareFailure::Failed(_) => {
+                    assert_eq!(data["actorErrorCategory"], "transport");
+                    assert!(data["nativeReadinessProviderStartCause"].is_null());
+                }
+            }
+            assert_eq!(transport.readiness_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(*transport.launch.lock().unwrap(), launch);
+            assert!(actor.native_readiness_receipt().await.is_none());
+            assert!(state
+                .persisted
+                .lock()
+                .await
+                .native_readiness_receipt
+                .is_none());
+            actor.stop().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn codex_native_readiness_replays_after_committed_host_reply_is_lost() {
         let state = test_host_state();
         let launch = freshell_runtime_protocol::NativeIdentityLaunch {
@@ -12443,6 +12580,7 @@ mod tests {
             launch: std::sync::Mutex::new(launch.clone()),
             native_session_id: std::sync::Mutex::new("codex-native-old".into()),
             readiness_calls: AtomicUsize::new(0),
+            readiness_failure: None,
         });
         let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
             state.state_dir.join("readiness-agent"),
@@ -12491,6 +12629,7 @@ mod tests {
             launch: std::sync::Mutex::new(launch.clone()),
             native_session_id: std::sync::Mutex::new("codex-native-recovered".into()),
             readiness_calls: AtomicUsize::new(0),
+            readiness_failure: None,
         });
         let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
             state.state_dir.join("readiness-agent"),

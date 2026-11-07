@@ -786,21 +786,6 @@ enum OpencodeRecoveryReady {
     Resumed(Arc<OpencodeSessionCell>),
 }
 
-impl ResumeOpencodeError {
-    fn provider_failure(
-        &self,
-    ) -> (
-        &freshell_opencode::ServeError,
-        Option<&crate::ownership_lane::TerminalOwnerFields>,
-    ) {
-        match self {
-            Self::Manager(error) => (error, None),
-            Self::Superseded(error, owner) => (error, owner.as_ref()),
-            _ => unreachable!("only provider failure variants carry a serve error"),
-        }
-    }
-}
-
 impl OpencodeSession {
     /// The session's turn-derived status -- the ONE derivation every surface
     /// reporting a freshopencode session's live status must use: the
@@ -1975,6 +1960,9 @@ impl FreshOpencodeState {
     }
 
     fn claim_dead_state_advanced(&self, durable_id: &str, baseline: Option<i64>) -> bool {
+        // Match PaneLedger::commit_claim_aliased: only a newer close supersedes
+        // this attempt. An accepted claim can clear an older close marker; that
+        // change alone must not hide a genuine native failure or its budget charge.
         match (self.claim_dead_state_snapshot(durable_id), baseline) {
             (Some(current), Some(baseline)) => current > baseline,
             (Some(_), None) => true,
@@ -2483,17 +2471,22 @@ impl FreshOpencodeState {
                             );
                             return;
                         }
-                        Err(
-                            failure @ (ResumeOpencodeError::Manager(_)
-                            | ResumeOpencodeError::Superseded(_, _)),
-                        ) => {
-                            let (error, owner) = failure.provider_failure();
+                        Err(ResumeOpencodeError::Manager(error)) => {
+                            self.fail_create(
+                                &request_id,
+                                view_id,
+                                "FRESH_AGENT_CREATE_FAILED",
+                                &error.to_string(),
+                            );
+                            return;
+                        }
+                        Err(ResumeOpencodeError::Superseded(error, owner)) => {
                             self.fail_create_with_owner(
                                 &request_id,
                                 view_id,
                                 "FRESH_AGENT_CREATE_FAILED",
                                 &error.to_string(),
-                                owner,
+                                owner.as_ref(),
                             );
                             return;
                         }
@@ -2627,17 +2620,22 @@ impl FreshOpencodeState {
                     );
                     return;
                 }
-                Err(
-                    failure @ (ResumeOpencodeError::Manager(_)
-                    | ResumeOpencodeError::Superseded(_, _)),
-                ) => {
-                    let (err, owner) = failure.provider_failure();
+                Err(ResumeOpencodeError::Manager(error)) => {
+                    self.fail_create(
+                        &request_id,
+                        view_id,
+                        "FRESH_AGENT_CREATE_FAILED",
+                        &error.to_string(),
+                    );
+                    return;
+                }
+                Err(ResumeOpencodeError::Superseded(error, owner)) => {
                     self.fail_create_with_owner(
                         &request_id,
                         view_id,
                         "FRESH_AGENT_CREATE_FAILED",
-                        &err.to_string(),
-                        owner,
+                        &error.to_string(),
+                        owner.as_ref(),
                     );
                     return;
                 }
@@ -4865,15 +4863,15 @@ impl FreshOpencodeState {
                 session_id.to_string(),
             )
                 .into()),
-            Err(
-                failure @ (ResumeOpencodeError::Manager(_) | ResumeOpencodeError::Superseded(_, _)),
-            ) => {
-                let (error, owner) = failure.provider_failure();
+            Err(ResumeOpencodeError::Manager(error)) => {
+                Err(("opencode serve failure".to_string(), error.to_string()).into())
+            }
+            Err(ResumeOpencodeError::Superseded(error, owner)) => {
                 Err(crate::session_handoff::HandoffStartFailure::from((
                     "opencode serve failure".into(),
                     error.to_string(),
                 ))
-                .with_owner(owner.cloned()))
+                .with_owner(owner))
             }
             Err(ResumeOpencodeError::Reserved(owner)) => {
                 Err(crate::session_handoff::HandoffStartFailure::from((
@@ -8307,16 +8305,20 @@ impl FreshOpencodeState {
                             self.broadcast(&lost_session_frame(&msg.session_id));
                             return;
                         }
-                        Err(
-                            failure @ (ResumeOpencodeError::Manager(_)
-                            | ResumeOpencodeError::Superseded(_, _)),
-                        ) => {
-                            let (error, owner) = failure.provider_failure();
+                        Err(ResumeOpencodeError::Manager(error)) => {
+                            self.send_error(
+                                &None,
+                                "OPENCODE_ATTACH_RESUME_FAILED",
+                                &error.to_string(),
+                            );
+                            return;
+                        }
+                        Err(ResumeOpencodeError::Superseded(error, owner)) => {
                             self.send_error_with_owner(
                                 &None,
                                 "OPENCODE_ATTACH_RESUME_FAILED",
                                 &error.to_string(),
-                                owner,
+                                owner.as_ref(),
                             );
                             return;
                         }
@@ -8588,16 +8590,16 @@ impl FreshOpencodeState {
                     self.broadcast(&lost_session_frame(&msg.session_id));
                     return;
                 }
-                Err(
-                    failure @ (ResumeOpencodeError::Manager(_)
-                    | ResumeOpencodeError::Superseded(_, _)),
-                ) => {
-                    let (err, owner) = failure.provider_failure();
+                Err(ResumeOpencodeError::Manager(error)) => {
+                    self.send_error(&None, "OPENCODE_ATTACH_RESUME_FAILED", &error.to_string());
+                    return;
+                }
+                Err(ResumeOpencodeError::Superseded(error, owner)) => {
                     self.send_error_with_owner(
                         &None,
                         "OPENCODE_ATTACH_RESUME_FAILED",
-                        &err.to_string(),
-                        owner,
+                        &error.to_string(),
+                        owner.as_ref(),
                     );
                     return;
                 }
@@ -11700,7 +11702,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_resume_failure_after_supersession_preserves_the_launch_budget() {
-        for supersession in ["none", "owner", "durable-close", "cleared-close"] {
+        for supersession in [
+            "none",
+            "owner",
+            "durable-close",
+            "unchanged-close",
+            "newer-close",
+            "cleared-close",
+        ] {
             let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
             let fresh_agent = FreshAgentState::new(Arc::new("tok".into()), Arc::new(tx));
             let http = Arc::new(GatedRecoveryFailureHttp::default());
@@ -11725,9 +11734,15 @@ mod tests {
             let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
             state.set_identity_sink(sink.clone());
             let id = "ses_native_failure_supersession";
-            if supersession == "cleared-close" {
+            let prior_close = matches!(
+                supersession,
+                "unchanged-close" | "newer-close" | "cleared-close"
+            );
+            if prior_close {
                 sink.retire_closed(PROVIDER, id).await.unwrap();
             }
+            let baseline = sink.kill_tombstone_at_ms(PROVIDER, id);
+            assert_eq!(baseline.is_some(), prior_close, "{supersession}");
             let task = {
                 let state = state.clone();
                 tokio::spawn(async move {
@@ -11737,6 +11752,16 @@ mod tests {
                 })
             };
             http.wait_for_get_requests(1).await;
+            let claim = registry.observe(PROVIDER, id);
+            if supersession != "durable-close" {
+                assert!(
+                    matches!(
+                        claim.state,
+                        freshell_ownership::OwnershipState::Starting { .. }
+                    ),
+                    "{supersession}: the provider is waiting under a real claim"
+                );
+            }
             if supersession == "owner" {
                 let freshell_ownership::OwnershipState::Starting {
                     operation_id,
@@ -11748,32 +11773,70 @@ mod tests {
                 };
                 registry.fail(PROVIDER, id, &operation_id, generation, false);
                 commit_terminal_owner(&registry, id).await;
-            } else if supersession == "durable-close" {
+            } else if matches!(supersession, "durable-close" | "newer-close") {
                 sink.retire_closed(PROVIDER, id).await.unwrap();
+                let current = sink.kill_tombstone_at_ms(PROVIDER, id).unwrap();
+                assert!(
+                    baseline.is_none_or(|prior| current > prior),
+                    "{supersession}"
+                );
             } else if supersession == "cleared-close" {
-                let prior = sink.kill_tombstone_at_ms(PROVIDER, id);
                 assert_eq!(
-                    sink.commit_claim(PROVIDER, id, prior).await.unwrap(),
+                    sink.commit_claim(PROVIDER, id, baseline).await.unwrap(),
                     crate::identity_sink::ClaimCommit::Committed
                 );
+                assert_eq!(sink.kill_tombstone_at_ms(PROVIDER, id), None);
+            } else {
+                assert_eq!(sink.kill_tombstone_at_ms(PROVIDER, id), baseline);
+            }
+            if supersession != "owner" {
+                assert_eq!(registry.observe(PROVIDER, id), claim, "{supersession}");
             }
             let newer_owner = registry.observe(PROVIDER, id);
+            let close_before_reply = sink.kill_tombstone_at_ms(PROVIDER, id);
             http.release_failures();
             let result = tokio::time::timeout(Duration::from_secs(10), task)
                 .await
                 .expect("native failure settles")
                 .unwrap();
-            let provider_failed = matches!(supersession, "none" | "cleared-close");
+            let provider_failed =
+                matches!(supersession, "none" | "unchanged-close" | "cleared-close");
             if provider_failed {
-                assert!(matches!(result, Err(ResumeOpencodeError::Manager(_))));
+                assert!(
+                    matches!(result, Err(ResumeOpencodeError::Manager(_))),
+                    "{supersession}: a native failure under the same claim remains chargeable"
+                );
             } else {
                 assert!(matches!(result, Err(ResumeOpencodeError::Superseded(_, _))),
                     "{supersession} supersession remains typed even when the pending native request fails");
-                assert_eq!(registry.observe(PROVIDER, id), newer_owner);
+                if supersession == "newer-close" {
+                    assert!(
+                        matches!(
+                            registry.observe(PROVIDER, id).state,
+                            freshell_ownership::OwnershipState::Vacant
+                        ),
+                        "the close-superseded operation releases its own Starting claim"
+                    );
+                } else {
+                    assert_eq!(registry.observe(PROVIDER, id), newer_owner);
+                }
             }
+            assert_eq!(
+                sink.kill_tombstone_at_ms(PROVIDER, id),
+                close_before_reply,
+                "{supersession}: native failure cleanup preserves the durable close state"
+            );
             let status = state.recovery_status(id).await.unwrap();
-            assert_eq!(status.failed_launches, u32::from(provider_failed));
-            assert_eq!(status.retry_after_ms.is_some(), provider_failed);
+            assert_eq!(
+                status.failed_launches,
+                u32::from(provider_failed),
+                "{supersession}"
+            );
+            assert_eq!(
+                status.retry_after_ms.is_some(),
+                provider_failed,
+                "{supersession}"
+            );
             assert!(!status.exhausted && !status.in_flight);
             assert!(!state.sessions.lock().await.contains_key(id));
             assert_eq!(http.get_requests.load(Ordering::SeqCst), 1);
@@ -16586,6 +16649,11 @@ mod tests {
             &replies[0],
             ServerMessage::FreshAgentAttachFailed(failed)
                 if failed.request_id == "opencode-resume-failure"
+                    && failed.code == "INTERNAL_ERROR"
+                    && failed.message.starts_with("OPENCODE_ATTACH_RESUME_FAILED:")
+                    && failed.owner_kind.is_none()
+                    && failed.owner_epoch.is_none()
+                    && failed.owner_generation.is_none()
         ));
         assert!(rx.try_recv().is_err(), "attach failure is requester-scoped");
     }
@@ -17220,17 +17288,49 @@ mod tests {
     /// row preserved the PRIOR generation and a delayed prior-generation
     /// write could pass the ledger's comparison and replace the new
     /// owner's recovery metadata.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_handoff_target_resume_binding_carries_the_handoff_generation() {
+        use freshell_ownership::{BeginOutcome, ObservedFence, OwnershipState, RuntimeOwnerKind};
+
         let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx))
             .with_ownership(Arc::clone(&registry));
-        let (manager, _killed) = started_manager().await;
+        let (manager, killed) = started_manager().await;
         fresh_agent.set_manager_for_test(manager).await;
         let st = FreshOpencodeState::new(fresh_agent);
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         st.set_identity_sink(fake.clone());
+        commit_terminal_owner(&registry, "ses_r27_oc").await;
+        let terminal = registry.observe(PROVIDER, "ses_r27_oc");
+        let OwnershipState::Live {
+            owner: terminal_owner,
+            ..
+        } = &terminal.state
+        else {
+            panic!("the handoff starts from a real committed terminal owner");
+        };
+        assert_eq!(terminal_owner.kind, RuntimeOwnerKind::Terminal);
+        let BeginOutcome::Granted { generation } = registry.begin_handoff(
+            PROVIDER,
+            "ses_r27_oc",
+            RuntimeOwnerKind::FreshAgent,
+            "handoff-op-r27",
+            Some(ObservedFence {
+                epoch: terminal.epoch,
+                generation: terminal.generation,
+            }),
+            "test",
+            1,
+        ) else {
+            panic!("the observed terminal owner grants the fresh-agent handoff");
+        };
+        let handoff = registry.observe(PROVIDER, "ses_r27_oc");
+        assert!(matches!(&handoff.state, OwnershipState::Handoff {
+            prior: Some((prior_owner, prior_generation)), to_kind: RuntimeOwnerKind::FreshAgent,
+            operation_id, generation: claimed_generation, ..
+        } if prior_owner == terminal_owner && *prior_generation == terminal.generation
+            && operation_id == "handoff-op-r27" && *claimed_generation == generation));
         // The refresh-write gate opens on a RECOVERED settings snapshot.
         fake.settings.lock().unwrap().insert(
             ("opencode".to_string(), "ses_r27_oc".to_string()),
@@ -17242,11 +17342,34 @@ mod tests {
             },
         );
 
-        let (owner, committed_instance) = st
-            .opencode_resume_for_handoff("ses_r27_oc", None, "handoff-op-r27", 9)
+        let stall = fake.arm_binding_stall(PROVIDER, "ses_r27_oc");
+        let resuming = st.clone();
+        let resume = tokio::spawn(async move {
+            resuming
+                .opencode_resume_for_handoff("ses_r27_oc", None, "handoff-op-r27", generation)
+                .await
+        });
+        stall
+            .entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the target resume reaches its binding write under the real handoff claim");
+        assert_eq!(
+            registry.observe(PROVIDER, "ses_r27_oc"),
+            handoff,
+            "the under-ticket target retains the runner's exact claim while persisting"
+        );
+        stall.release.send(()).unwrap();
+        let (owner, committed_instance) = tokio::time::timeout(Duration::from_secs(10), resume)
             .await
+            .expect("the target resume settles after binding persistence")
+            .expect("the target resume task joins")
             .expect("the under-ticket target resume succeeds");
         assert_eq!(owner.kind, freshell_ownership::RuntimeOwnerKind::FreshAgent);
+        assert_eq!(
+            registry.observe(PROVIDER, "ses_r27_oc"),
+            handoff,
+            "only the handoff runner may commit the returned owner Live"
+        );
         // ep2-r5: the under-ticket resume carries its committed session
         // INSTANCE out with the identity — the exact `Arc` registered
         // under the durable id (the runner's post-commit rescue re-check
@@ -17263,11 +17386,14 @@ mod tests {
             "the carried handle IS the registered session instance (ep2-r5)"
         );
 
-        let bindings = fake.bindings.lock().unwrap();
-        let last = bindings
+        let last = fake
+            .bindings
+            .lock()
+            .unwrap()
             .iter()
             .rev()
             .find(|b| b.session_id == "ses_r27_oc")
+            .cloned()
             .expect("the target resume wrote its binding row");
         assert_eq!(
             last.observed_epoch,
@@ -17276,7 +17402,7 @@ mod tests {
         );
         assert_eq!(
             last.observed_generation,
-            Some(9),
+            Some(generation),
             "the handoff continuation stamps the SUPPLIED handoff generation — \
              pre-r27 it carried None (derived from its own absent ticket)"
         );
@@ -17288,7 +17414,19 @@ mod tests {
         assert_eq!(claim.provider, "opencode");
         assert_eq!(claim.session_id, "ses_r27_oc");
         assert_eq!(claim.operation_id, "handoff-op-r27");
-        assert_eq!((claim.epoch, claim.generation), (registry.boot_epoch(), 9));
+        assert_eq!(
+            (claim.epoch, claim.generation),
+            (registry.boot_epoch(), generation)
+        );
+        assert!(claim.is_current(&registry));
+        assert_eq!(registry.observe(PROVIDER, "ses_r27_oc"), handoff);
+        tokio::time::timeout(Duration::from_secs(5), st.shutdown())
+            .await
+            .expect("the fixture's shared OpenCode runtime shuts down");
+        assert!(
+            killed.load(Ordering::SeqCst),
+            "the fixture's owned fake serve is stopped"
+        );
     }
 
     /// b8ke ext r26 F4: a first-send materialization whose durable
@@ -19481,6 +19619,14 @@ mod tests {
             assert_eq!(reply["ownerKind"], "terminal");
             assert_eq!(reply["ownerEpoch"], owner.epoch);
             assert_eq!(reply["ownerGeneration"], owner.generation);
+            assert_eq!(
+                reply["code"],
+                if create {
+                    "FRESH_AGENT_CREATE_FAILED"
+                } else {
+                    "INTERNAL_ERROR"
+                }
+            );
             if !create {
                 let legacy = frames
                     .iter()
@@ -19489,6 +19635,11 @@ mod tests {
                 assert_eq!(legacy["ownerKind"], "terminal");
                 assert_eq!(legacy["ownerEpoch"], owner.epoch);
                 assert_eq!(legacy["ownerGeneration"], owner.generation);
+                assert_eq!(legacy["code"], "INTERNAL_ERROR");
+                assert!(legacy["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("OPENCODE_ATTACH_RESUME_FAILED:"));
             }
             assert_eq!(registry.observe(PROVIDER, id), owner);
             assert_eq!(state.recovery_status(id).await.unwrap().failed_launches, 0);

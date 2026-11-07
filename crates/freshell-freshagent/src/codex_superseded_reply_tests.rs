@@ -77,7 +77,7 @@ async fn assert_codex_superseded_recovery_owner_reply(route: &'static str) {
             "waitForResumeReleasePath":release,
             "appendRequestLogPath":requests,
             "overrides":{"thread/resume":{"error":{
-                "code":-32042,"message":"native resume failed after ownership changed"
+                "code":-32042,"message":"provider fixture error 437"
             }}}
         })
         .to_string(),

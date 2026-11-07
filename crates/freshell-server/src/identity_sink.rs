@@ -135,54 +135,15 @@ impl LedgerIdentitySink {
         self.authoritative_park_after_validation = Some(park);
         self
     }
-}
 
-fn now_ms() -> i64 {
-    // Match the timestamp convention main.rs already uses for ledger writes
-    // (see the boot-scan / record_binding call sites in main.rs).
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
-impl PaneIdentitySink for LedgerIdentitySink {
-    // Writes are AWAITED spawn_blocking (durable-before-answer, V8/A11) —
-    // exactly the shape terminal.rs:1589 already ships. Timestamps are taken
-    // at EVENT time (before the hop), so `updated_at` reflects event order
-    // (V8's out-of-order aggravator).
-    fn record_pending(&self, placeholder_id: &str, mode: &str, cwd: Option<&str>) -> SinkWrite {
-        let ledger = self.ledger.clone();
-        let (p, m, c) = (
-            placeholder_id.to_string(),
-            mode.to_string(),
-            cwd.map(str::to_string),
-        );
-        let now = now_ms();
-        Box::pin(async move {
-            // Delta-r3 Finding 2: fresh-agent markers carry NO spawn-time
-            // provenance. Their identity resolves through
-            // `record_fresh_agent_binding` + `delete_pending(resolves_pending)`
-            // (the upsert's own tri-state provenance, parked from the create)
-            // — never through `resolve_pending`, whose marker-stamp sourcing
-            // exists for the terminal-lineage locator/candidate lanes. Stamps
-            // here would be dead data.
-            tokio::task::spawn_blocking(move || {
-                ledger.record_pending(
-                    &p,
-                    &m,
-                    c.as_deref(),
-                    None,
-                    freshell_ws::pane_ledger::ProvenanceStamps::default(),
-                    now,
-                )
-            })
-            .await
-            .map_err(std::io::Error::other)? // JoinError (incl. closure panic) surfaces as Err
-        })
-    }
-
-    fn record_binding(&self, upsert: FreshAgentBindingUpsert) -> SinkWrite {
+    /// Staging shares the exact authority and destination-write rules with
+    /// publication, but source links and pending/rollback cleanup wait for
+    /// the caller's final write under the committed replacement owner.
+    fn record_binding_inner(
+        &self,
+        upsert: FreshAgentBindingUpsert,
+        publish_source: bool,
+    ) -> SinkWrite {
         let ledger = self.ledger.clone();
         let ownership = self.ownership.clone();
         #[cfg(test)]
@@ -340,7 +301,15 @@ impl PaneIdentitySink for LedgerIdentitySink {
                         .or(upsert.observed_generation),
                     now_ms: now,
                 };
-                ledger.record_fresh_agent_binding_claimed(&w, claim, &upsert.settings)?;
+                if publish_source {
+                    ledger.record_fresh_agent_binding_claimed(&w, claim, &upsert.settings)?;
+                } else {
+                    ledger.stage_fresh_agent_replacement_binding_claimed(
+                        &w,
+                        claim,
+                        &upsert.settings,
+                    )?;
+                }
                 // kata 1wxv Task 4 (r1 discipline): on the CLAUDE fork-adoption
                 // leg (`supersedes` = the pre-rollback durable id) the rollback
                 // row re-keys old→new inside the SAME awaited batch as the
@@ -349,7 +318,7 @@ impl PaneIdentitySink for LedgerIdentitySink {
                 // rollback-record-specific write. Scoped to provider "claude":
                 // codex's crash-respawn supersession must NOT move a marker
                 // bucket onto a memory-less mint-new thread.
-                if upsert.provider == "claude" {
+                if publish_source && upsert.provider == "claude" {
                     if let Some(old_id) = upsert.supersedes.as_deref() {
                         if old_id != upsert.session_id {
                             if let Some(payload) =
@@ -375,7 +344,7 @@ impl PaneIdentitySink for LedgerIdentitySink {
                         }
                     }
                 }
-                if let Some(p) = upsert.resolves_pending.as_deref() {
+                if let Some(p) = upsert.resolves_pending.as_deref().filter(|_| publish_source) {
                     // Cosmetic on failure: an orphaned marker is TTL-swept at 30d
                     // (V6/A15) — warn, do not fail the identity event over it.
                     if let Err(e) = ledger.delete_pending(p) {
@@ -387,6 +356,60 @@ impl PaneIdentitySink for LedgerIdentitySink {
             .await
             .map_err(std::io::Error::other)?
         })
+    }
+}
+
+fn now_ms() -> i64 {
+    // Match the timestamp convention main.rs already uses for ledger writes
+    // (see the boot-scan / record_binding call sites in main.rs).
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+impl PaneIdentitySink for LedgerIdentitySink {
+    // Writes are AWAITED spawn_blocking (durable-before-answer, V8/A11) —
+    // exactly the shape terminal.rs:1589 already ships. Timestamps are taken
+    // at EVENT time (before the hop), so `updated_at` reflects event order
+    // (V8's out-of-order aggravator).
+    fn record_pending(&self, placeholder_id: &str, mode: &str, cwd: Option<&str>) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, m, c) = (
+            placeholder_id.to_string(),
+            mode.to_string(),
+            cwd.map(str::to_string),
+        );
+        let now = now_ms();
+        Box::pin(async move {
+            // Delta-r3 Finding 2: fresh-agent markers carry NO spawn-time
+            // provenance. Their identity resolves through
+            // `record_fresh_agent_binding` + `delete_pending(resolves_pending)`
+            // (the upsert's own tri-state provenance, parked from the create)
+            // — never through `resolve_pending`, whose marker-stamp sourcing
+            // exists for the terminal-lineage locator/candidate lanes. Stamps
+            // here would be dead data.
+            tokio::task::spawn_blocking(move || {
+                ledger.record_pending(
+                    &p,
+                    &m,
+                    c.as_deref(),
+                    None,
+                    freshell_ws::pane_ledger::ProvenanceStamps::default(),
+                    now,
+                )
+            })
+            .await
+            .map_err(std::io::Error::other)? // JoinError (incl. closure panic) surfaces as Err
+        })
+    }
+
+    fn record_binding(&self, upsert: FreshAgentBindingUpsert) -> SinkWrite {
+        self.record_binding_inner(upsert, true)
+    }
+
+    fn stage_replacement_binding(&self, upsert: FreshAgentBindingUpsert) -> SinkWrite {
+        self.record_binding_inner(upsert, false)
     }
 
     fn mark_turn_interrupted(
@@ -1611,6 +1634,490 @@ mod tests {
             restarted.chain_terminus("claude", "s-a").as_deref(),
             Some("s-d")
         );
+    }
+
+    mod replacement_binding_publication {
+        use super::*;
+        use freshell_ownership::{
+            BeginOutcome, CommitOutcome, OwnerIdentity, RuntimeOwnerKind, RuntimeOwnershipRegistry,
+        };
+        use freshell_ws::pane_ledger::{BindingRow, RetiredReason, RowState};
+
+        const OLD: &str = "replacement-source";
+        const NEW: &str = "replacement-target";
+
+        struct Fixture {
+            directory: tempfile::TempDir,
+            ledger: Arc<PaneLedger>,
+            registry: Arc<RuntimeOwnershipRegistry>,
+            sink: LedgerIdentitySink,
+            source: BindingRow,
+            source_claim: BindingClaim,
+            target_claim: BindingClaim,
+            replacement: FreshAgentBindingUpsert,
+        }
+
+        fn claim(registry: &RuntimeOwnershipRegistry, id: &str) -> BindingClaim {
+            let BeginOutcome::Granted { generation } = registry.begin_start(
+                "codex",
+                id,
+                RuntimeOwnerKind::FreshAgent,
+                id,
+                None,
+                "test",
+                1,
+            ) else {
+                panic!("the fixture must own its real Starting claim");
+            };
+            BindingClaim {
+                provider: "codex".into(),
+                session_id: id.into(),
+                operation_id: id.into(),
+                epoch: registry.boot_epoch(),
+                generation,
+                kind: BindingClaimKind::Starting,
+            }
+        }
+
+        async fn fixture() -> Fixture {
+            let directory = tempfile::tempdir().unwrap();
+            let ledger = Arc::new(PaneLedger::new(Some(directory.path().to_path_buf())));
+            let registry = Arc::new(RuntimeOwnershipRegistry::new());
+            let sink = LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()));
+            let source_claim = claim(&registry, OLD);
+            let source = FreshAgentBindingUpsert {
+                provider: "codex".into(),
+                session_id: OLD.into(),
+                mode: "freshcodex".into(),
+                create_request_id: Some("source-create".into()),
+                resolves_pending: None,
+                supersedes: None,
+                name_transition: None,
+                provenance: freshell_freshagent::ProvenanceUpdate::Replace(BindProvenance {
+                    client_instance_id: Some("client".into()),
+                    device_id: Some("device".into()),
+                    tab_key: Some("tab".into()),
+                    asserted_at: 123,
+                }),
+                observed_epoch: Some(source_claim.epoch),
+                observed_generation: Some(source_claim.generation),
+                claim: Some(source_claim.clone()),
+                settings: SettingsUpdate::Replace(FreshAgentSettings {
+                    model: Some("source-model".into()),
+                    ..Default::default()
+                }),
+                genesis: freshell_freshagent::GenesisUpdate::Keep,
+            };
+            sink.record_binding(source).await.unwrap();
+            sink.record_pending("replacement-pending", "freshcodex", None)
+                .await
+                .unwrap();
+            let source = ledger.load_binding("codex", OLD).unwrap();
+            let target_claim = claim(&registry, NEW);
+            let replacement = FreshAgentBindingUpsert {
+                provider: "codex".into(),
+                session_id: NEW.into(),
+                mode: "freshcodex".into(),
+                create_request_id: None,
+                resolves_pending: Some("replacement-pending".into()),
+                supersedes: Some(OLD.into()),
+                name_transition: None,
+                provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+                observed_epoch: Some(target_claim.epoch),
+                observed_generation: Some(target_claim.generation),
+                claim: Some(target_claim.clone()),
+                settings: SettingsUpdate::Replace(FreshAgentSettings {
+                    model: Some("native-model".into()),
+                    cwd: Some("/native-workspace".into()),
+                    ..Default::default()
+                }),
+                genesis: freshell_freshagent::GenesisUpdate::Keep,
+            };
+            Fixture {
+                directory,
+                ledger,
+                registry,
+                sink,
+                source,
+                source_claim,
+                target_claim,
+                replacement,
+            }
+        }
+
+        fn terminal_takeover(registry: &RuntimeOwnershipRegistry, claim: &BindingClaim) {
+            registry.fail(
+                "codex",
+                &claim.session_id,
+                &claim.operation_id,
+                claim.generation,
+                false,
+            );
+            let BeginOutcome::Granted { generation } = registry.begin_start(
+                "codex",
+                &claim.session_id,
+                RuntimeOwnerKind::Terminal,
+                "terminal-takeover",
+                None,
+                "test",
+                2,
+            ) else {
+                panic!("terminal takeover must acquire the released claim");
+            };
+            assert_eq!(
+                registry.commit_live(
+                    "codex",
+                    &claim.session_id,
+                    "terminal-takeover",
+                    generation,
+                    OwnerIdentity {
+                        kind: RuntimeOwnerKind::Terminal,
+                        terminal_id: Some("terminal".into()),
+                        live_session_key: None,
+                        pid: None,
+                        ownership_id: None
+                    },
+                ),
+                CommitOutcome::Committed
+            );
+        }
+
+        fn assert_source_unpublished(fixture: &Fixture) {
+            assert_eq!(
+                fixture.sink.chain_terminus("codex", OLD),
+                None,
+                "staging must not redirect recovery from the source"
+            );
+            assert_eq!(
+                fixture.ledger.load_binding("codex", OLD).unwrap(),
+                fixture.source,
+                "staging and target cleanup must leave every source-row field unchanged"
+            );
+            let restarted = Arc::new(PaneLedger::new(Some(
+                fixture.directory.path().to_path_buf(),
+            )));
+            let sink = LedgerIdentitySink::new(restarted.clone(), None);
+            assert_eq!(sink.chain_terminus("codex", OLD), None);
+            assert_eq!(
+                restarted.load_binding("codex", OLD).unwrap(),
+                fixture.source
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn staged_replacement_binding_keeps_source_after_takeover_and_repair() {
+            let fixture = fixture().await;
+            fixture
+                .sink
+                .stage_replacement_binding(fixture.replacement.clone())
+                .await
+                .unwrap();
+            terminal_takeover(&fixture.registry, &fixture.source_claim);
+            let owner = fixture.registry.observe("codex", OLD);
+            fixture
+                .sink
+                .repair_failed_transition(
+                    "codex",
+                    NEW,
+                    &fixture.target_claim.operation_id,
+                    fixture.target_claim.epoch,
+                    fixture.target_claim.generation,
+                )
+                .await
+                .unwrap();
+            fixture.registry.fail(
+                "codex",
+                NEW,
+                &fixture.target_claim.operation_id,
+                fixture.target_claim.generation,
+                false,
+            );
+            assert_source_unpublished(&fixture);
+            assert_eq!(fixture.registry.observe("codex", OLD), owner);
+            let target = fixture.ledger.load_binding("codex", NEW).unwrap();
+            assert_eq!(target.state, RowState::Retired);
+            assert_eq!(target.retired_reason, Some(RetiredReason::FailedTransition));
+            assert!(fixture
+                .ledger
+                .pending_for_terminal("replacement-pending")
+                .is_some());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn staged_replacement_binding_publishes_live_target_with_inheritance_after_restart() {
+            let fixture = fixture().await;
+            fixture
+                .sink
+                .stage_replacement_binding(fixture.replacement.clone())
+                .await
+                .unwrap();
+            assert_source_unpublished(&fixture);
+            assert!(fixture
+                .ledger
+                .pending_for_terminal("replacement-pending")
+                .is_some());
+            let staged = fixture.ledger.load_binding("codex", NEW).unwrap();
+            assert_eq!(staged.create_request_id, fixture.source.create_request_id);
+            assert_eq!(
+                staged.origin_create_request_id,
+                fixture.source.origin_create_request_id
+            );
+            assert_eq!(staged.client_instance_id, fixture.source.client_instance_id);
+            assert_eq!(staged.device_id, fixture.source.device_id);
+            assert_eq!(staged.tab_key, fixture.source.tab_key);
+            assert_eq!(staged.last_attributed_at, fixture.source.last_attributed_at);
+            assert_eq!(staged.model.as_deref(), Some("native-model"));
+            let claim = &fixture.target_claim;
+            assert_eq!(
+                fixture.registry.commit_live(
+                    "codex",
+                    NEW,
+                    &claim.operation_id,
+                    claim.generation,
+                    OwnerIdentity {
+                        kind: RuntimeOwnerKind::FreshAgent,
+                        terminal_id: None,
+                        live_session_key: Some(NEW.into()),
+                        pid: None,
+                        ownership_id: Some(claim.operation_id.clone())
+                    }
+                ),
+                CommitOutcome::Committed
+            );
+            let mut publish = fixture.replacement.clone();
+            publish.claim.as_mut().unwrap().kind = BindingClaimKind::LiveFreshAgent;
+            publish.settings = SettingsUpdate::Keep;
+            fixture.sink.record_binding(publish).await.unwrap();
+            assert_eq!(
+                fixture.sink.chain_terminus("codex", OLD).as_deref(),
+                Some(NEW)
+            );
+            assert!(fixture
+                .ledger
+                .pending_for_terminal("replacement-pending")
+                .is_none());
+            let restarted = Arc::new(PaneLedger::new(Some(
+                fixture.directory.path().to_path_buf(),
+            )));
+            let sink = LedgerIdentitySink::new(restarted.clone(), None);
+            assert_eq!(sink.chain_terminus("codex", OLD).as_deref(), Some(NEW));
+            let published = restarted.load_binding("codex", NEW).unwrap();
+            assert_eq!(published.state, RowState::Bound);
+            assert_eq!(published.create_request_id, staged.create_request_id);
+            assert_eq!(
+                published.origin_create_request_id,
+                staged.origin_create_request_id
+            );
+            assert_eq!(published.client_instance_id, staged.client_instance_id);
+            assert_eq!(published.device_id, staged.device_id);
+            assert_eq!(published.tab_key, staged.tab_key);
+            assert_eq!(published.last_attributed_at, staged.last_attributed_at);
+            assert_eq!(published.model, staged.model);
+            assert_eq!(published.cwd, staged.cwd);
+            assert_eq!(
+                restarted.load_binding("codex", OLD).unwrap().retired_reason,
+                Some(RetiredReason::Superseded)
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn staged_replacement_binding_stale_final_publish_keeps_source_unchanged() {
+            let fixture = fixture().await;
+            fixture
+                .sink
+                .stage_replacement_binding(fixture.replacement.clone())
+                .await
+                .unwrap();
+            terminal_takeover(&fixture.registry, &fixture.target_claim);
+            let owner = fixture.registry.observe("codex", NEW);
+            let mut publish = fixture.replacement.clone();
+            publish.claim.as_mut().unwrap().kind = BindingClaimKind::LiveFreshAgent;
+            let error = fixture.sink.record_binding(publish).await.unwrap_err();
+            assert!(
+                error.to_string().contains("STALE_TRANSITION_BINDING"),
+                "{error}"
+            );
+            assert_source_unpublished(&fixture);
+            assert_eq!(fixture.registry.observe("codex", NEW), owner);
+        }
+
+        // This exercises the real registry and ledger publication boundary.
+        // Codex's inline orchestration is private to another crate; its own
+        // native-recovery tests must additionally prove it retains these guards.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn staged_replacement_publication_holds_source_after_waiter_cancellation() {
+            use freshell_ownership::{ObservedFence, OperationTicket, OwnershipState};
+            use std::time::Duration;
+
+            // A failed assertion must also unblock the spawn_blocking closure,
+            // so this fixture cannot strand runtime shutdown at its park.
+            struct ReleaseParkOnDrop(Arc<AuthoritativeWritePark>);
+            impl Drop for ReleaseParkOnDrop {
+                fn drop(&mut self) {
+                    self.0.release();
+                }
+            }
+
+            let fixture = fixture().await;
+            fixture
+                .sink
+                .stage_replacement_binding(fixture.replacement.clone())
+                .await
+                .unwrap();
+            fixture.registry.fail(
+                "codex",
+                OLD,
+                &fixture.source_claim.operation_id,
+                fixture.source_claim.generation,
+                false,
+            );
+            let source = fixture.registry.observe("codex", OLD);
+            assert!(matches!(source.state, OwnershipState::Vacant));
+            let operation_id = "source-publication";
+            let BeginOutcome::Granted { generation } = fixture.registry.begin_start(
+                "codex",
+                OLD,
+                RuntimeOwnerKind::FreshAgent,
+                operation_id,
+                Some(ObservedFence {
+                    epoch: source.epoch,
+                    generation: source.generation,
+                }),
+                "test",
+                2,
+            ) else {
+                panic!("publication must acquire the exact observed source generation");
+            };
+            let source_ticket = OperationTicket::new(
+                fixture.registry.clone(),
+                "codex",
+                OLD,
+                operation_id,
+                RuntimeOwnerKind::FreshAgent,
+                generation,
+                "test",
+            );
+            let source_hold = source_ticket
+                .hold_binding_write()
+                .expect("the source publication holds its exact Starting claim");
+            let held_source = fixture.registry.observe("codex", OLD);
+            let target = &fixture.target_claim;
+            assert_eq!(
+                fixture.registry.commit_live(
+                    "codex",
+                    NEW,
+                    &target.operation_id,
+                    target.generation,
+                    OwnerIdentity {
+                        kind: RuntimeOwnerKind::FreshAgent,
+                        terminal_id: None,
+                        live_session_key: Some(NEW.into()),
+                        pid: None,
+                        ownership_id: Some(target.operation_id.clone())
+                    },
+                ),
+                CommitOutcome::Committed
+            );
+            let live_target = fixture.registry.observe("codex", NEW);
+            let mut publish = fixture.replacement.clone();
+            publish.claim.as_mut().unwrap().kind = BindingClaimKind::LiveFreshAgent;
+            publish.settings = SettingsUpdate::Keep;
+            let park = AuthoritativeWritePark::new();
+            let _release_on_drop = ReleaseParkOnDrop(park.clone());
+            let publisher =
+                LedgerIdentitySink::new(fixture.ledger.clone(), Some(fixture.registry.clone()))
+                    .with_authoritative_park_after_validation(park.clone());
+            let (completed_tx, mut completed_rx) = tokio::sync::oneshot::channel();
+            let publication = tokio::spawn(async move {
+                let result = publisher.record_binding(publish).await;
+                // Preserve the source fence until the durable write settles,
+                // including when the task awaiting this owned work is canceled.
+                drop(source_ticket);
+                drop(source_hold);
+                let _ = completed_tx.send(result);
+            });
+            let waiter = tokio::spawn(publication);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !park.reached() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the final Live-claim write reaches the real sink's publication boundary");
+
+            assert_source_unpublished(&fixture);
+            assert_eq!(fixture.registry.observe("codex", NEW), live_target);
+            assert!(matches!(fixture.registry.begin_start(
+                "codex", OLD, RuntimeOwnerKind::Terminal, "competing-terminal-before-cancel",
+                None, "test", 3,
+            ), BeginOutcome::Blocked { state: OwnershipState::Starting { operation_id: held, generation: held_generation, .. }, .. }
+                if held == operation_id && held_generation == generation));
+            waiter.abort();
+            let canceled = tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(canceled.is_cancelled());
+            assert!(
+                matches!(
+                    completed_rx.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ),
+                "the owned publication is still pending after its waiter is gone"
+            );
+            assert!(
+                fixture
+                    .registry
+                    .recover_stale_starts(u64::MAX, 0)
+                    .is_empty(),
+                "the pending binding hold also prevents watchdog recovery of the source"
+            );
+            assert_eq!(fixture.registry.observe("codex", OLD), held_source);
+            assert!(matches!(fixture.registry.begin_start(
+                "codex", OLD, RuntimeOwnerKind::Terminal, "competing-terminal-after-cancel",
+                None, "test", 4,
+            ), BeginOutcome::Blocked { state: OwnershipState::Starting { operation_id: held, generation: held_generation, .. }, .. }
+                if held == operation_id && held_generation == generation));
+            assert_source_unpublished(&fixture);
+
+            park.release();
+            tokio::time::timeout(Duration::from_secs(5), completed_rx)
+                .await
+                .expect("publication survives waiter cancellation")
+                .expect("the owned publisher reports completion")
+                .expect("the final binding publishes successfully");
+            assert_eq!(
+                fixture.sink.chain_terminus("codex", OLD).as_deref(),
+                Some(NEW)
+            );
+            assert_eq!(fixture.registry.observe("codex", NEW), live_target);
+            assert!(
+                matches!(
+                    fixture.registry.observe("codex", OLD).state,
+                    OwnershipState::Vacant
+                ),
+                "the source claim releases only after publication completes"
+            );
+            assert_eq!(
+                fixture
+                    .ledger
+                    .load_binding("codex", OLD)
+                    .unwrap()
+                    .retired_reason,
+                Some(RetiredReason::Superseded)
+            );
+            assert_eq!(
+                fixture.ledger.load_binding("codex", NEW).unwrap().state,
+                RowState::Bound
+            );
+            let restarted = LedgerIdentitySink::new(
+                Arc::new(PaneLedger::new(Some(
+                    fixture.directory.path().to_path_buf(),
+                ))),
+                None,
+            );
+            assert_eq!(restarted.chain_terminus("codex", OLD).as_deref(), Some(NEW));
+        }
     }
 
     /// Claude core design §4.1: the genesis rides the binding write, survives

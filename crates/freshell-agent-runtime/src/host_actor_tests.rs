@@ -2827,6 +2827,7 @@ struct NativeReadinessTransport {
     launch: std::sync::Mutex<NativeIdentityLaunch>,
     root: std::sync::Mutex<String>,
     fault: ReadinessEvidenceFault,
+    preparation_failure: Option<NativeReadinessPrepareFailure>,
     dispatches: AtomicUsize,
     readiness_calls: AtomicUsize,
 }
@@ -2859,8 +2860,11 @@ impl FreshAgentTransport for NativeReadinessTransport {
     async fn prepare_native_readiness(
         &self,
         expected_launch: &NativeIdentityLaunch,
-    ) -> Result<Option<NativeDispatchIdentity>, String> {
+    ) -> Result<Option<NativeDispatchIdentity>, NativeReadinessPrepareFailure> {
         self.readiness_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(failure) = self.preparation_failure.clone() {
+            return Err(failure);
+        }
         if expected_launch != &self.initial_launch {
             return Err("stale readiness launch".into());
         }
@@ -4017,6 +4021,58 @@ async fn cold_codex_incomplete_store_census_refuses_replacement_before_mint() {
 }
 
 #[tokio::test]
+async fn codex_native_readiness_preparation_preserves_superseded_and_genuine_failure_categories() {
+    for failure in [
+        NativeReadinessPrepareFailure::Superseded,
+        NativeReadinessPrepareFailure::Failed("provider connection failed".into()),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let launch = readiness_launch();
+        let prior = profile(
+            FreshProvider::Codex,
+            "codex-readiness-store",
+            Some("codex-native-old"),
+        );
+        let transport = Arc::new(NativeReadinessTransport {
+            initial_launch: launch.clone(),
+            launch: std::sync::Mutex::new(launch.clone()),
+            root: std::sync::Mutex::new("codex-native-old".into()),
+            fault: ReadinessEvidenceFault::None,
+            preparation_failure: Some(failure.clone()),
+            dispatches: AtomicUsize::new(0),
+            readiness_calls: AtomicUsize::new(0),
+        });
+        let actor = FreshAgentHostActor::open(dir.path(), prior.clone(), transport.clone())
+            .await
+            .unwrap();
+        let error = actor
+            .prepare_native_readiness_with_receipt(&launch, &readiness_fence(&launch))
+            .await
+            .expect_err("failed preparation must not commit a native identity");
+        match failure {
+            NativeReadinessPrepareFailure::Superseded => {
+                let ActorError::NativeReadinessProviderStartFailed { cause, diagnostic } = error
+                else {
+                    panic!("superseded preparation lost its diagnostic category: {error:?}");
+                };
+                assert_eq!(cause.as_str(), "preparation_superseded");
+                assert_eq!(diagnostic, ProviderStartDiagnostic::NoDiagnostic);
+            }
+            NativeReadinessPrepareFailure::Failed(message) => {
+                assert_eq!(error, ActorError::Transport(message));
+            }
+        }
+        assert_eq!(actor.profile().await, prior);
+        assert!(actor.native_readiness_receipt().await.is_none());
+        assert!(actor.read_events(0, 32).await.events.is_empty());
+        assert_eq!(*transport.root.lock().unwrap(), "codex-native-old");
+        assert_eq!(*transport.launch.lock().unwrap(), launch);
+        assert_eq!(transport.readiness_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.dispatches.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
 async fn codex_native_readiness_accepts_only_the_exact_verified_root_transition_without_a_turn() {
     for fault in [
         ReadinessEvidenceFault::None,
@@ -4030,6 +4086,7 @@ async fn codex_native_readiness_accepts_only_the_exact_verified_root_transition_
             launch: std::sync::Mutex::new(launch.clone()),
             root: std::sync::Mutex::new("codex-native-old".into()),
             fault,
+            preparation_failure: None,
             dispatches: AtomicUsize::new(0),
             readiness_calls: AtomicUsize::new(0),
         });
@@ -4090,6 +4147,7 @@ async fn codex_native_readiness_checks_exact_source_evidence_before_provider_mut
         launch: std::sync::Mutex::new(launch.clone()),
         root: std::sync::Mutex::new("codex-native-unexpected".into()),
         fault: ReadinessEvidenceFault::None,
+        preparation_failure: None,
         dispatches: AtomicUsize::new(0),
         readiness_calls: AtomicUsize::new(0),
     });
@@ -4132,6 +4190,7 @@ async fn codex_readiness_receipt_binds_an_unrequested_source_root_to_exact_evide
         launch: std::sync::Mutex::new(launch.clone()),
         root: std::sync::Mutex::new("codex-native-old".into()),
         fault: ReadinessEvidenceFault::None,
+        preparation_failure: None,
         dispatches: AtomicUsize::new(0),
         readiness_calls: AtomicUsize::new(0),
     });
@@ -4169,6 +4228,7 @@ async fn codex_readiness_receipt_binds_an_unrequested_source_root_to_exact_evide
         launch: std::sync::Mutex::new(launch.clone()),
         root: std::sync::Mutex::new("codex-native-recovered".into()),
         fault: ReadinessEvidenceFault::None,
+        preparation_failure: None,
         dispatches: AtomicUsize::new(0),
         readiness_calls: AtomicUsize::new(0),
     });
@@ -4207,6 +4267,7 @@ async fn codex_native_readiness_receipt_replays_after_actor_restart_only_for_its
         launch: std::sync::Mutex::new(launch.clone()),
         root: std::sync::Mutex::new("codex-native-old".into()),
         fault: ReadinessEvidenceFault::None,
+        preparation_failure: None,
         dispatches: AtomicUsize::new(0),
         readiness_calls: AtomicUsize::new(0),
     });

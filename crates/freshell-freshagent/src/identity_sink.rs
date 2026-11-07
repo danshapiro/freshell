@@ -612,6 +612,17 @@ pub type SinkAliasClearWrite = std::pin::Pin<
 pub trait PaneIdentitySink: Send + Sync {
     fn record_pending(&self, placeholder_id: &str, mode: &str, cwd: Option<&str>) -> SinkWrite;
     fn record_binding(&self, upsert: FreshAgentBindingUpsert) -> SinkWrite;
+    /// Persist a prospective replacement without retiring its source. The
+    /// caller publishes the source link only after committing the new owner.
+    fn stage_replacement_binding(&self, mut upsert: FreshAgentBindingUpsert) -> SinkWrite {
+        upsert.resolves_pending = None;
+        if let Some(source) = upsert.supersedes.take() {
+            if upsert.provenance == ProvenanceUpdate::Inherit {
+                upsert.provenance = self.load_provenance(&upsert.provider, &source).into();
+            }
+        }
+        self.record_binding(upsert)
+    }
     /// Persist a freshclaude shutdown interruption marker on an existing
     /// bound fresh-agent row. Called only for owed live sessions and bounded
     /// by the caller during server shutdown.
@@ -1016,6 +1027,12 @@ impl BindingWriteGuard {
         F: std::future::Future<Output = ()> + Send + 'static,
     {
         self.armed = true;
+        if self.binding_hold.is_none() {
+            self.binding_hold = self
+                .ticket
+                .as_ref()
+                .and_then(|ticket| ticket.hold_binding_write());
+        }
         self.startup_cleanup = Some(Box::pin(cleanup));
     }
 

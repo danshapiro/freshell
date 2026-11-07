@@ -1391,8 +1391,8 @@ pub struct FreshAgentBindingWrite<'a> {
     /// keeps the genesis.
     pub genesis: GenesisWrite<'a>,
     /// G3 supersession (V8/A14): the OLD session id this binding replaces
-    /// (codex crash-respawn). When `Some`, the old `(provider, supersedes)`
-    /// row is retired and linked AFTER the new row persists.
+    /// (codex crash-respawn). Publishing writes retire and link the old row
+    /// AFTER the new row persists; staging only inherits its pane lineage.
     pub supersedes: Option<&'a str>,
     /// D8 provenance write policy — see [`ProvenancePolicy`] for the
     /// per-lane contract (Replace / Inherit / Clear; the Inherit merge falls
@@ -2545,7 +2545,7 @@ impl PaneLedger {
         &self,
         w: &FreshAgentBindingWrite<'_>,
     ) -> std::io::Result<()> {
-        self.record_fresh_agent_binding_inner(w, None, LedgerSettingsUpdate::FromWrite)
+        self.record_fresh_agent_binding_inner(w, None, LedgerSettingsUpdate::FromWrite, true)
     }
 
     /// Persist a binding under the server sink's already-validated exact
@@ -2558,13 +2558,37 @@ impl PaneLedger {
         claim: Option<&freshell_freshagent::BindingClaim>,
         settings: &freshell_freshagent::SettingsUpdate,
     ) -> std::io::Result<()> {
+        self.record_fresh_agent_binding_claimed_inner(w, claim, settings, true)
+    }
+
+    /// Persist a prospective replacement under its exact claim while keeping
+    /// the source row and supersession chain unchanged. `supersedes` still
+    /// supplies the pane's create lineage and attribution to the new row.
+    /// The caller publishes the source link with a normal claimed write only
+    /// after committing the replacement's Live owner.
+    pub fn stage_fresh_agent_replacement_binding_claimed(
+        &self,
+        w: &FreshAgentBindingWrite<'_>,
+        claim: Option<&freshell_freshagent::BindingClaim>,
+        settings: &freshell_freshagent::SettingsUpdate,
+    ) -> std::io::Result<()> {
+        self.record_fresh_agent_binding_claimed_inner(w, claim, settings, false)
+    }
+
+    fn record_fresh_agent_binding_claimed_inner(
+        &self,
+        w: &FreshAgentBindingWrite<'_>,
+        claim: Option<&freshell_freshagent::BindingClaim>,
+        settings: &freshell_freshagent::SettingsUpdate,
+        publish_source: bool,
+    ) -> std::io::Result<()> {
         let settings = match settings {
             freshell_freshagent::SettingsUpdate::Keep => LedgerSettingsUpdate::Keep,
             freshell_freshagent::SettingsUpdate::Replace(settings) => {
                 LedgerSettingsUpdate::Replace(settings)
             }
         };
-        self.record_fresh_agent_binding_inner(w, claim, settings)
+        self.record_fresh_agent_binding_inner(w, claim, settings, publish_source)
     }
 
     fn record_fresh_agent_binding_inner(
@@ -2572,6 +2596,7 @@ impl PaneLedger {
         w: &FreshAgentBindingWrite<'_>,
         claim: Option<&freshell_freshagent::BindingClaim>,
         settings_update: LedgerSettingsUpdate<'_>,
+        publish_source: bool,
     ) -> std::io::Result<()> {
         if let Some(claim) = claim {
             if claim.provider != w.provider || claim.session_id != w.session_id {
@@ -3028,7 +3053,7 @@ impl PaneLedger {
         };
         self.write_binding(root, &mut index, &row)?; // new bound row FIRST (pinned)
 
-        if let Some(old_id) = w.supersedes {
+        if let Some(old_id) = w.supersedes.filter(|_| publish_source) {
             if old_id != w.session_id {
                 let old_key = (w.provider.to_string(), old_id.to_string());
                 if let Some(old) = index.bindings.get(&old_key).cloned() {

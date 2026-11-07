@@ -115,6 +115,24 @@ pub struct CodexCreateRecovery {
     superseded: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CodexNativeReadinessError {
+    Superseded,
+    Failed(String),
+}
+
+impl From<String> for CodexNativeReadinessError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl From<&str> for CodexNativeReadinessError {
+    fn from(message: &str) -> Self {
+        Self::Failed(message.into())
+    }
+}
+
 impl CodexCreateRecovery {
     pub fn is_superseded(&self) -> bool {
         self.superseded
@@ -2512,6 +2530,53 @@ impl FreshCodexState {
         guard
     }
 
+    /// A successful native start can lose authority before registration. Its
+    /// writer still needs the same exact death proof as a registered startup.
+    /// The guard carries the child, lease and ticket through cancellation.
+    async fn settle_unregistered_startup(
+        &self,
+        session_id: &str,
+        startup: (Arc<CodexAppServerClient>, String, CodexChild),
+        lease_guard: Option<crate::FreshSessionLeaseGuard>,
+        ticket: Option<freshell_ownership::OperationTicket>,
+    ) {
+        let (client, ownership_id, mut child) = startup;
+        let recorded = crate::session_lease::record_condemned_runtime_identity(
+            child.id().unwrap_or(0),
+            CODEX_SIDECAR_OWNERSHIP_ENV,
+            &ownership_id,
+        );
+        self.retain_windows_guard(&ownership_id, &child);
+        retain_codex_condemned_prior_if_current(
+            &self.condemned_priors,
+            session_id,
+            recorded.clone(),
+        );
+        let state = self.clone();
+        let id = session_id.to_string();
+        let probe = self.effective_sidecar_cleanup_probe();
+        let mut guard = crate::identity_sink::BindingWriteGuard::new(ticket, None, None);
+        guard.settle_startup_before_repair(async move {
+            client.close().await;
+            let _ = child.start_kill();
+            if !codex_tree_death_escalation(recorded, ownership_id.clone(), id.clone(), probe).await
+            {
+                tracing::error!(provider=PROVIDER, session_id=%id, ownership_id=%ownership_id,
+                    "freshagent.codex.unregistered_startup_teardown_unconfirmed");
+                std::future::pending::<()>().await;
+            }
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+            crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
+            state.clear_condemned_prior_if_matching(&id, &ownership_id);
+            state.forget_windows_guard(&ownership_id);
+            if let Some(mut lease) = lease_guard {
+                lease.fail();
+            }
+        });
+        guard.repair_now().await;
+        drop(guard.finish());
+    }
+
     /// Finish teardown for a session removed by a create/resume/fork recovery
     /// path.  The caller must not release a lease or coordinator ticket until
     /// this watcher settles: `NotConfirmed` and `PlatformLimited` retain the
@@ -4151,16 +4216,21 @@ impl FreshCodexState {
                          claimed by another owner during the create window — the minted \
                          runtime is torn down (kata b8ke ext r22 F1)"
                     );
-                    client.close().await;
-                    let mut child = child;
-                    let _ = child.start_kill();
-                    reap_owned_codex_sidecars(&ownership_id);
-                    crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
-                    return self.fail_create(
+                    let failure = self.superseded_failure(&thread_id,
+                        "the minted thread id was claimed by another owner during the create; torn down");
+                    self.settle_unregistered_startup(
+                        &thread_id,
+                        (client, ownership_id, child),
+                        None,
+                        own_ticket.take(),
+                    )
+                    .await;
+                    return self.fail_create_classified(
                         &request_id,
                         view_id.as_deref(),
                         "FRESH_AGENT_CREATE_FAILED",
                         "the minted thread id was claimed by another owner during the create; torn down",
+                        Some(failure),
                     );
                 }
             }
@@ -4804,6 +4874,30 @@ impl FreshCodexState {
                 );
             }
         };
+        if self.starting_claim_superseded(&own_ticket)
+            || self.claim_dead_state_advanced(&resume_session_id, claim_dead_state)
+        {
+            let failure = self.superseded_failure(
+                &resume_session_id,
+                "session ownership or close changed during native resume",
+            );
+            self.settle_unregistered_startup(
+                &resume_session_id,
+                (client, ownership_id, child),
+                lease_guard.take(),
+                own_ticket.take(),
+            )
+            .await;
+            resume_fence.disarm();
+            return self.fail_create_classified(
+                &request_id,
+                view_id.as_deref(),
+                "FRESH_AGENT_CREATE_FAILED",
+                "native resume was superseded",
+                Some(failure),
+            );
+        }
+
         // TERM-25: never silently proceed against the wrong thread. `thread/resume`
         // answering with a different id than requested means the sidecar is sitting on a
         // thread the user did NOT ask for -- adopting it (or renaming it) would bind the
@@ -4817,14 +4911,14 @@ impl FreshCodexState {
                     "session ownership or close changed before the wrong-thread resume reply",
                 )
             });
-            client.close().await;
-            let mut child = child;
-            let _ = child.start_kill();
-            reap_owned_codex_sidecars(&ownership_id);
-            crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
-            if let Some(mut g) = lease_guard.take() {
-                g.fail();
-            }
+            self.settle_unregistered_startup(
+                &resume_session_id,
+                (client, ownership_id, child),
+                lease_guard.take(),
+                own_ticket.take(),
+            )
+            .await;
+            resume_fence.disarm();
             tracing::error!(
                 requested = %resume_session_id,
                 returned = %started.thread_id,
@@ -4898,13 +4992,14 @@ impl FreshCodexState {
                     "session ownership or close changed during claim persistence",
                 )
             });
-            client.close().await;
-            let mut child = child;
-            let _ = child.start_kill();
-            reap_owned_codex_sidecars(&ownership_id);
-            if let Some(mut g) = lease_guard.take() {
-                g.fail();
-            }
+            self.settle_unregistered_startup(
+                &thread_id,
+                (client, ownership_id, child),
+                lease_guard.take(),
+                own_ticket.take(),
+            )
+            .await;
+            resume_fence.disarm();
             return self.fail_create_classified(
                 &request_id,
                 view_id.as_deref(),
@@ -5050,16 +5145,13 @@ impl FreshCodexState {
             .get(&thread_id)
             .is_some_and(|s| !s.exited.load(Ordering::SeqCst));
         if incumbent_live {
-            client.close().await;
-            let mut child = child;
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            reap_owned_codex_sidecars(&ownership_id);
-            crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
-            // Own tree confirmed torn down -- releasing the lease is safe.
-            if let Some(mut g) = lease_guard.take() {
-                g.fail();
-            }
+            self.settle_unregistered_startup(
+                &thread_id,
+                (client, ownership_id, child),
+                lease_guard.take(),
+                own_ticket.take(),
+            )
+            .await;
             // D8 (focused-ep1-r4 Finding 1): the eviction-guard adopt also
             // re-parks/re-stamps the CURRENT connection's provenance on the
             // incumbent (this arm returns immediately, so moving `provenance`
@@ -5696,17 +5788,13 @@ impl FreshCodexState {
         let recovery = CodexCreateRecovery {
             superseded: superseded.is_some(),
         };
-        self.fail_create_with_recovery(
-            request_id,
-            view_id,
-            code,
-            message,
-            superseded.and_then(|failure| failure.owner),
-            recovery,
-        )
+        let (message, owner) = match superseded {
+            Some(failure) => (failure.message, failure.owner),
+            None => (message.to_string(), None),
+        };
+        self.fail_create_with_recovery(request_id, view_id, code, &message, owner, recovery)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn fail_create_with_recovery(
         &self,
         request_id: &str,
@@ -10135,7 +10223,7 @@ impl FreshCodexState {
     pub async fn prepare_native_readiness(
         &self,
         session_id: &str,
-    ) -> Result<CodexNativeReadiness, String> {
+    ) -> Result<CodexNativeReadiness, CodexNativeReadinessError> {
         let (sidecar_pid, sidecar_ownership_id) = {
             let sessions = self.sessions.lock().await;
             let Some(session) = sessions.get(session_id) else {
@@ -10181,7 +10269,10 @@ impl FreshCodexState {
             Err(EnsureAliveError::NotFound) => {
                 return Err("Codex readiness source is no longer tracked".into())
             }
-            Err(EnsureAliveError::RespawnFailed(_) | EnsureAliveError::Superseded(_)) => {
+            Err(EnsureAliveError::Superseded(_)) => {
+                return Err(CodexNativeReadinessError::Superseded)
+            }
+            Err(EnsureAliveError::RespawnFailed(_)) => {
                 return Err("Codex native session recovery failed".into())
             }
             Err(error @ (EnsureAliveError::Reserved(_) | EnsureAliveError::Draining)) => {
@@ -10727,12 +10818,14 @@ impl FreshCodexState {
             return self
                 .respawn_as_new_thread_after_crash(
                     session_id,
-                    cwd,
-                    model,
-                    effort,
-                    sandbox,
-                    permission_mode,
-                    collaboration_mode,
+                    CodexEffectiveSettings {
+                        cwd,
+                        model,
+                        effort,
+                        sandbox,
+                        permission_mode,
+                        collaboration_mode,
+                    },
                     lease_guard,
                     session_provenance,
                     recovery_dead_state,
@@ -10870,14 +10963,14 @@ impl FreshCodexState {
             })
         });
         if let Some(failure) = superseded {
-            client.close().await;
-            let mut child = child;
-            let _ = child.start_kill();
-            reap_owned_codex_sidecars(&ownership_id);
-            crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
-            if let Some(mut guard) = lease_guard.take() {
-                guard.fail();
-            }
+            self.settle_unregistered_startup(
+                session_id,
+                (client, ownership_id, child),
+                lease_guard.take(),
+                own_ticket.take(),
+            )
+            .await;
+            resume_fence.disarm();
             return Err(EnsureAliveError::Superseded(failure));
         }
 
@@ -10973,12 +11066,14 @@ impl FreshCodexState {
                 return self
                     .respawn_as_new_thread_after_crash(
                         session_id,
-                        cwd,
-                        model,
-                        effort,
-                        sandbox,
-                        permission_mode,
-                        collaboration_mode,
+                        CodexEffectiveSettings {
+                            cwd,
+                            model,
+                            effort,
+                            sandbox,
+                            permission_mode,
+                            collaboration_mode,
+                        },
                         lease_guard,
                         session_provenance,
                         recovery_dead_state,
@@ -11027,19 +11122,19 @@ impl FreshCodexState {
         // thread would route every subsequent send to an unrelated conversation. Reject
         // loudly instead; the caller surfaces it as a respawn failure.
         if started.thread_id != session_id {
-            client.close().await;
-            let mut child = child;
-            let _ = child.start_kill();
-            reap_owned_codex_sidecars(&ownership_id);
-            crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
+            self.settle_unregistered_startup(
+                session_id,
+                (client, ownership_id, child),
+                lease_guard.take(),
+                own_ticket.take(),
+            )
+            .await;
+            resume_fence.disarm();
             tracing::error!(
                 requested = %session_id,
                 returned = %started.thread_id,
                 "freshagent.codex.wrong_thread_resume_rejected"
             );
-            if let Some(mut g) = lease_guard.take() {
-                g.fail();
-            }
             return Err(EnsureAliveError::RespawnFailed(format!(
                 "codex thread/resume returned wrong thread id {} (requested {session_id}); \
                  refusing to adopt the wrong thread",
@@ -11362,16 +11457,10 @@ impl FreshCodexState {
     /// publication while the new sidecar starts and its binding is persisted.
     /// Retain the original runtime record until the replacement commits, then
     /// materialize the new identity for callers and their existing panes.
-    #[allow(clippy::too_many_arguments)]
     async fn respawn_as_new_thread_after_crash(
         &self,
         old_session_id: &str,
-        cwd: Option<String>,
-        model: String,
-        effort: Option<String>,
-        sandbox: Option<String>,
-        permission_mode: Option<String>,
-        collaboration_mode: Option<CodexWorkMode>,
+        mut effective: CodexEffectiveSettings,
         mut lease_guard: Option<crate::FreshSessionLeaseGuard>,
         // D8 (focused-ep1-r3): the crashed session's parked provenance, CARRIED
         // onto the mint-new record below (the identity moved; the same logical
@@ -11407,19 +11496,25 @@ impl FreshCodexState {
             .get(old_session_id)
             .map(|session| session.sidecar_ownership_id.clone());
         if let Some(failure) = source_superseded() {
+            // Entry is reached only after the old native writer was confirmed
+            // dead. Its armed kill handle must not strand a revoked lease.
+            if let Some(mut guard) = lease_guard.take() {
+                guard.fail();
+            }
             return Err(EnsureAliveError::Superseded(failure));
         }
-        let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd.as_deref()).await {
-            Ok(parts) => parts,
-            Err(err) => {
-                if let Some(mut g) = lease_guard.take() {
-                    g.fail();
+        let (client, notifs, ownership_id, child) =
+            match self.spawn_sidecar(effective.cwd.as_deref()).await {
+                Ok(parts) => parts,
+                Err(err) => {
+                    if let Some(mut g) = lease_guard.take() {
+                        g.fail();
+                    }
+                    return Err(source_superseded()
+                        .map(EnsureAliveError::Superseded)
+                        .unwrap_or(EnsureAliveError::RespawnFailed(err)));
                 }
-                return Err(source_superseded()
-                    .map(EnsureAliveError::Superseded)
-                    .unwrap_or(EnsureAliveError::RespawnFailed(err)));
-            }
-        };
+            };
         // Task 13: arm the lease's TTL tree-kill path now that the child + tag exist.
         if let Some(g) = lease_guard.as_mut() {
             if let Some(pid) = child.id() {
@@ -11429,24 +11524,23 @@ impl FreshCodexState {
 
         let started = client
             .start_thread(StartThreadParams {
-                cwd: cwd.clone(),
-                model: Some(model.clone()),
-                sandbox: sandbox.clone(),
-                approval_policy: permission_mode.clone(),
+                cwd: effective.cwd.clone(),
+                model: Some(effective.model.clone()),
+                sandbox: effective.sandbox.clone(),
+                approval_policy: effective.permission_mode.clone(),
                 // LBC-1 (kata 1wxv Task 2): every thread freshell STARTS adopts
                 // `historyMode:"paginated"`.
                 history_mode: Some(HistoryMode::Paginated),
             })
             .await;
         if let Some(failure) = source_superseded() {
-            client.close().await;
-            let mut child = child;
-            let _ = child.start_kill();
-            reap_owned_codex_sidecars(&ownership_id);
-            crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
-            if let Some(mut guard) = lease_guard.take() {
-                guard.fail();
-            }
+            self.settle_unregistered_startup(
+                old_session_id,
+                (client, ownership_id, child),
+                lease_guard.take(),
+                None,
+            )
+            .await;
             return Err(EnsureAliveError::Superseded(failure));
         }
         let started = match started {
@@ -11468,14 +11562,6 @@ impl FreshCodexState {
         };
 
         let new_thread_id = started.thread_id.clone();
-        let mut effective = CodexEffectiveSettings {
-            model,
-            effort,
-            cwd,
-            sandbox,
-            permission_mode,
-            collaboration_mode,
-        };
         effective.adopt_native(&started.effective_settings);
         let CodexEffectiveSettings {
             model,
@@ -11502,15 +11588,16 @@ impl FreshCodexState {
             crate::ownership_lane::LaneClaim::Adopt => {
                 // Unreachable on a fresh UUID in practice — honored by
                 // tearing the spawn down and answering the typed refusal.
-                client.close().await;
-                let mut child = child;
-                let _ = child.start_kill();
-                reap_owned_codex_sidecars(&ownership_id);
-                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
-                if let Some(mut g) = lease_guard.take() {
-                    g.fail();
-                }
-                return Err(EnsureAliveError::Reserved(None));
+                self.settle_unregistered_startup(
+                    old_session_id,
+                    (client, ownership_id, child),
+                    lease_guard.take(),
+                    None,
+                )
+                .await;
+                return Err(EnsureAliveError::Reserved(
+                    self.current_refusal_owner(&new_thread_id),
+                ));
             }
             crate::ownership_lane::LaneClaim::Refused(outcome) => {
                 // Unreachable on a fresh UUID in practice — honored as a
@@ -11522,14 +11609,13 @@ impl FreshCodexState {
                     "fresh_agent_respawn_refused: the ownership coordinator refused the \
                      minted-key claim (kata b8ke)"
                 );
-                client.close().await;
-                let mut child = child;
-                let _ = child.start_kill();
-                reap_owned_codex_sidecars(&ownership_id);
-                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
-                if let Some(mut g) = lease_guard.take() {
-                    g.fail();
-                }
+                self.settle_unregistered_startup(
+                    old_session_id,
+                    (client, ownership_id, child),
+                    lease_guard.take(),
+                    None,
+                )
+                .await;
                 return Err(EnsureAliveError::Reserved(
                     crate::ownership_lane::fresh_agent_owner_fields_from_outcome(
                         &self.ownership,
@@ -11712,26 +11798,29 @@ impl FreshCodexState {
         } else {
             crate::identity_sink::SettingsUpdate::Replace(settings)
         };
-        if let Err(error) = self
-            .record_codex_binding(
-                &new_thread_id,
-                None,
-                &model,
-                sandbox.as_deref(),
-                permission_mode.as_deref(),
-                effort.as_deref(),
-                cwd.as_deref(),
-                collaboration_mode,
-                Some(old_session_id),
-                None,
-                None,
-                binding_claim.as_ref().map(|claim| claim.epoch),
-                binding_claim.as_ref().map(|claim| claim.generation),
-                binding_claim.clone(),
-                Some(settings_update),
-            )
-            .await
-        {
+        let mut replacement_binding = crate::identity_sink::FreshAgentBindingUpsert {
+            provider: PROVIDER.into(),
+            session_id: new_thread_id.clone(),
+            mode: "freshcodex".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: Some(old_session_id.into()),
+            name_transition: None,
+            provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
+            observed_epoch: binding_claim.as_ref().map(|claim| claim.epoch),
+            observed_generation: binding_claim.as_ref().map(|claim| claim.generation),
+            claim: binding_claim.clone(),
+            settings: settings_update,
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
+        };
+        let staged = match self.identity_sink() {
+            Some(sink) => {
+                sink.stage_replacement_binding(replacement_binding.clone())
+                    .await
+            }
+            None => Ok(()),
+        };
+        if let Err(error) = staged {
             tracing::error!(target: "invariant",
                 provider = PROVIDER, session_id = %new_thread_id, error = %error,
                 "freshagent.codex.respawn_binding_failed: the new session is torn down"
@@ -11767,10 +11856,23 @@ impl FreshCodexState {
             });
         }
 
-        // Recheck the old key after the binding await, then commit and retire
-        // only the original map entry without another suspension in between.
+        // Reclaim the exact vacant source before committing the replacement.
+        // A point-in-time source check alone cannot fence another registry
+        // thread while the final durable old -> new link is being written.
+        let mut source_ticket = None;
         let mut sessions = self.sessions.lock().await;
         let failure = source_superseded().or_else(|| {
+            match self.begin_lane_claim_at(old_session_id,
+                &format!("{respawn_op_id}-publish-source"),
+                source_fence.map(|(epoch, generation)| freshell_ownership::ObservedFence { epoch, generation }),
+                "freshcodex/replacement-publication") {
+                crate::ownership_lane::LaneClaim::Granted(ticket) => source_ticket = Some(ticket),
+                crate::ownership_lane::LaneClaim::Unwired => {},
+                crate::ownership_lane::LaneClaim::Adopt | crate::ownership_lane::LaneClaim::Refused(_) => {
+                    return Some(self.superseded_failure(old_session_id,
+                        "source ownership changed before replacement publication"));
+                }
+            }
             self.commit_lane_claim_at(binding_guard.as_mut().expect("binding guard is present").ticket_mut(),
                 &new_thread_id, &new_thread_id, sidecar_pid).err().map(|outcome| {
                 tracing::warn!(provider = PROVIDER, session_id = %new_thread_id,
@@ -11809,6 +11911,41 @@ impl FreshCodexState {
         }
         drop(sessions);
         drop(binding_guard.take().map(|guard| guard.finish()));
+        let source_hold = source_ticket
+            .as_ref()
+            .and_then(|ticket| ticket.hold_binding_write());
+
+        // The replacement is now durable and Live. Startup cleanup must be
+        // disarmed BEFORE publishing the source link: cancellation or a final
+        // metadata error must never leave old -> a writer we just tore down.
+        if let Some(claim) = replacement_binding.claim.as_mut() {
+            claim.kind = crate::identity_sink::BindingClaimKind::LiveFreshAgent;
+        }
+        if let Some(sink) = self.identity_sink() {
+            let state = self.clone();
+            let published_id = new_thread_id.clone();
+            let source_id = old_session_id.to_string();
+            // Once Live commits, this small metadata completion belongs to the
+            // runtime, not the requester. Dropping its waiter cannot cancel it.
+            let publication = tokio::spawn(async move {
+                let _source_ticket = source_ticket;
+                let _source_hold = source_hold;
+                if let Err(error) = sink.record_binding(replacement_binding).await {
+                    tracing::error!(provider = PROVIDER, session_id = %published_id,
+                        old_session_id = %source_id, error = %error,
+                        "freshagent.codex.replacement_source_publication_failed");
+                    state.emit_fresh_agent_error(&published_id, "LEDGER_WRITE_FAILED",
+                        "The replacement is running, but its link from the previous session could not be saved.");
+                }
+            });
+            if let Err(error) = publication.await {
+                tracing::error!(provider = PROVIDER, session_id = %new_thread_id,
+                    old_session_id, error = %error,
+                    "freshagent.codex.replacement_source_publication_task_failed");
+                self.emit_fresh_agent_error(&new_thread_id, "LEDGER_WRITE_FAILED",
+                    "The replacement is running, but saving its previous-session link was interrupted.");
+            }
+        }
 
         // DIAG-01: crash recovery had to mint a fresh thread -- the durable
         // identity MOVED (old_session_id -> new_thread_id); conversation
@@ -13304,6 +13441,7 @@ impl FreshCodexState {
     /// on a real `thread/resume` attempt), so the next attempt within [`Self::dead_thread_ttl`]
     /// fails fast instead of spawning a sidecar only to re-prove what this process already
     /// knows.
+    #[cfg(test)]
     async fn mark_thread_dead(&self, thread_id: &str) {
         self.mark_thread_dead_if(thread_id, || true).await;
     }
@@ -13977,12 +14115,41 @@ impl FreshCodexState {
                     // FIX (CODEX-FIRST triage Finding 2): remember this id as genuinely gone
                     // so a later attach/snapshot-read against it fails fast instead of
                     // repeating this same spawn-resume-fail cycle.
-                    self.mark_thread_dead(thread_id).await;
+                    if !self
+                        .mark_thread_dead_if(thread_id, || {
+                            !self.binding_claim_superseded(binding_claim.as_ref())
+                                && !self.claim_dead_state_advanced(thread_id, claim_dead_state)
+                        })
+                        .await
+                    {
+                        return Err(ResumeSessionError::Superseded(self.superseded_failure(
+                            thread_id,
+                            "session ownership or close changed before recording native absence",
+                        )));
+                    }
                     return Err(ResumeSessionError::NotFound);
                 }
                 return Err(ResumeSessionError::Transient(err.to_string()));
             }
         };
+
+        if self.binding_claim_superseded(binding_claim.as_ref())
+            || self.claim_dead_state_advanced(thread_id, claim_dead_state)
+        {
+            let failure = self.superseded_failure(
+                thread_id,
+                "session ownership or close changed during native resume",
+            );
+            self.settle_unregistered_startup(
+                thread_id,
+                (client, ownership_id, child),
+                lease_guard.take(),
+                own_ticket.take(),
+            )
+            .await;
+            resume_fence.disarm();
+            return Err(ResumeSessionError::Superseded(failure));
+        }
 
         // TERM-25: never silently proceed against the wrong thread. Registering the
         // requested id against a sidecar that `thread/resume` actually put on a DIFFERENT
@@ -13998,19 +14165,19 @@ impl FreshCodexState {
                     "session ownership or close changed before the wrong-thread resume reply",
                 )
             });
-            client.close().await;
-            let mut child = child;
-            let _ = child.start_kill();
-            reap_owned_codex_sidecars(&ownership_id);
-            crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
+            self.settle_unregistered_startup(
+                thread_id,
+                (client, ownership_id, child),
+                lease_guard.take(),
+                own_ticket.take(),
+            )
+            .await;
+            resume_fence.disarm();
             tracing::error!(
                 requested = %thread_id,
                 returned = %started.thread_id,
                 "freshagent.codex.wrong_thread_resume_rejected"
             );
-            if let Some(mut g) = lease_guard.take() {
-                g.fail();
-            }
             if let Some(failure) = superseded_failure {
                 return Err(ResumeSessionError::Superseded(failure));
             }
@@ -14086,13 +14253,14 @@ impl FreshCodexState {
                     "session ownership or close changed during claim persistence",
                 )
             });
-            client.close().await;
-            let mut child = child;
-            let _ = child.start_kill();
-            reap_owned_codex_sidecars(&ownership_id);
-            if let Some(mut g) = lease_guard.take() {
-                g.fail();
-            }
+            self.settle_unregistered_startup(
+                thread_id,
+                (client, ownership_id, child),
+                lease_guard.take(),
+                own_ticket.take(),
+            )
+            .await;
+            resume_fence.disarm();
             if let Some(failure) = superseded_failure {
                 return Err(ResumeSessionError::Superseded(failure));
             }
@@ -24457,11 +24625,63 @@ pub(crate) mod tests {
             },
         );
         configure_fake_codex_cmd("{}");
+        use freshell_ownership::{BeginOutcome, CommitOutcome, OwnerIdentity, RuntimeOwnerKind};
+        let BeginOutcome::Granted {
+            generation: prior_generation,
+        } = registry.begin_start(
+            PROVIDER,
+            thread_id,
+            RuntimeOwnerKind::Terminal,
+            "prior-terminal",
+            None,
+            "test",
+            0,
+        )
+        else {
+            panic!("the prior terminal claim must grant")
+        };
+        assert_eq!(
+            registry.commit_live(
+                PROVIDER,
+                thread_id,
+                "prior-terminal",
+                prior_generation,
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("prior-terminal".into()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None
+                }
+            ),
+            CommitOutcome::Committed
+        );
+        let BeginOutcome::Granted { generation } = registry.begin_handoff(
+            PROVIDER,
+            thread_id,
+            RuntimeOwnerKind::FreshAgent,
+            "handoff-op-r27",
+            None,
+            "test",
+            1,
+        ) else {
+            panic!("the terminal-to-fresh-agent handoff must grant")
+        };
+        assert!(generation > prior_generation);
+        let handoff = registry.observe(PROVIDER, thread_id);
 
-        let owner = st
-            .resume_for_handoff(thread_id, None, "handoff-op-r27", 11)
-            .await
-            .expect("the under-ticket target resume succeeds");
+        let owner = tokio::time::timeout(
+            Duration::from_secs(15),
+            st.resume_for_handoff(thread_id, None, "handoff-op-r27", generation),
+        )
+        .await
+        .expect("the target resume is bounded")
+        .expect("the under-ticket target resume succeeds");
+        assert_eq!(
+            registry.observe(PROVIDER, thread_id),
+            handoff,
+            "the target continuation must retain its runner's exact handoff"
+        );
         assert_eq!(owner.kind, freshell_ownership::RuntimeOwnerKind::FreshAgent);
         assert_eq!(owner.live_session_key.as_deref(), Some(thread_id));
 
@@ -24479,7 +24699,7 @@ pub(crate) mod tests {
             );
             assert_eq!(
                 last.observed_generation,
-                Some(11),
+                Some(generation),
                 "the handoff continuation stamps the SUPPLIED handoff generation — \
                  pre-r27 it carried None (the under-ticket lane has no own ticket)"
             );
@@ -24491,7 +24711,10 @@ pub(crate) mod tests {
             assert_eq!(claim.provider, "codex");
             assert_eq!(claim.session_id, thread_id);
             assert_eq!(claim.operation_id, "handoff-op-r27");
-            assert_eq!((claim.epoch, claim.generation), (registry.boot_epoch(), 11));
+            assert_eq!(
+                (claim.epoch, claim.generation),
+                (registry.boot_epoch(), generation)
+            );
         }
         // Drain the bus so the shutdown's frames do not leak into other tests.
         while rx.try_recv().is_ok() {}
@@ -28679,6 +28902,10 @@ pub(crate) mod tests {
             state.shutdown().await;
         }
     }
+
+    include!("codex_recovery_publication_tests.rs");
+    include!("codex_replacement_publication_tests.rs");
+    include!("codex_claim_teardown_tests.rs");
 
     async fn assert_native_resume_failure_budget(native_reply: &str) {
         let _guard = ENV_LOCK.lock().await;
@@ -38333,7 +38560,10 @@ pub(crate) mod tests {
         .await
         .expect("readiness must not wait on provider RPC while draining")
         .expect_err("draining must refuse native readiness");
-        assert_eq!(error, CODEX_DRAIN_RESERVATION_MESSAGE);
+        assert_eq!(
+            error,
+            CodexNativeReadinessError::Failed(CODEX_DRAIN_RESERVATION_MESSAGE.into())
+        );
         assert!(
             tokio::time::timeout(Duration::from_millis(100), peer.next_frame())
                 .await

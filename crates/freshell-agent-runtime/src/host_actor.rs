@@ -214,11 +214,31 @@ pub enum NativeReadinessResumeStart {
     PriorThreadNotFound,
 }
 
-/// Closed substep classification for provider startup during cold Codex
-/// native-readiness recovery. These values are safe to retain in host
+/// Preserve lifecycle supersession separately from provider preparation failures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeReadinessPrepareFailure {
+    Superseded,
+    Failed(String),
+}
+
+impl From<String> for NativeReadinessPrepareFailure {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl From<&str> for NativeReadinessPrepareFailure {
+    fn from(message: &str) -> Self {
+        Self::Failed(message.into())
+    }
+}
+
+/// Closed substep classification for provider startup and preparation during
+/// Codex native-readiness recovery. These values are safe to retain in host
 /// lifecycle diagnostics and never contain provider output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeReadinessProviderStartCause {
+    PreparationSuperseded,
     ExactResumeValidation,
     ExactResumeAppServerStart,
     ExactResumeRpc,
@@ -239,6 +259,7 @@ pub enum NativeReadinessProviderStartCause {
 impl NativeReadinessProviderStartCause {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::PreparationSuperseded => "preparation_superseded",
             Self::ExactResumeValidation => "exact_resume_validation",
             Self::ExactResumeAppServerStart => "exact_resume_app_server_start",
             Self::ExactResumeRpc => "exact_resume_rpc",
@@ -399,7 +420,7 @@ pub trait FreshAgentTransport: Send + Sync {
     async fn prepare_native_readiness(
         &self,
         _expected_launch: &NativeIdentityLaunch,
-    ) -> Result<Option<NativeDispatchIdentity>, String> {
+    ) -> Result<Option<NativeDispatchIdentity>, NativeReadinessPrepareFailure> {
         Ok(None)
     }
     async fn start(&self, profile: &FreshAgentProfile) -> Result<TransportStart, String>;
@@ -2257,7 +2278,17 @@ impl FreshAgentHostActor {
                 .transport
                 .prepare_native_readiness(expected_launch)
                 .await
-                .map_err(ActorError::Transport)?;
+                .map_err(|error| match error {
+                    NativeReadinessPrepareFailure::Superseded => {
+                        ActorError::NativeReadinessProviderStartFailed {
+                            cause: NativeReadinessProviderStartCause::PreparationSuperseded,
+                            diagnostic: ProviderStartDiagnostic::NoDiagnostic,
+                        }
+                    }
+                    NativeReadinessPrepareFailure::Failed(message) => {
+                        ActorError::Transport(message)
+                    }
+                })?;
             if self.stopped.load(Ordering::SeqCst) {
                 return Err(ActorError::NativeIdentityMismatch);
             }

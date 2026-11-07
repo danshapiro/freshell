@@ -33,6 +33,7 @@ import {
   type NativeSyncDiagnosticSample,
 } from '../../helpers/native-name-timeout-diagnostics.js'
 import { managedLifecycleWaitMs } from '../../helpers/provider-parity-timeouts.js'
+import { isNativeReadinessDiagnosticEvent, safeNativeReadinessProviderStartCause } from '../../helpers/native-readiness-diagnostics.js'
 
 const root = path.resolve(import.meta.dirname, '../../..')
 const runFile = promisify(execFile)
@@ -971,13 +972,6 @@ tool_timeout_sec = 120
       'replacement_identity', 'before_rebind_evidence', 'rebound_receipt',
       'after_rebind_evidence', 'startup_evidence',
     ])
-    const coldRecoveryProviderStartCauses = new Set([
-      'exact_resume_validation', 'exact_resume_app_server_start', 'exact_resume_rpc',
-      'exact_resume_create_rejected', 'exact_resume_identity', 'exact_resume_settings_reapply',
-      'replacement_validation', 'replacement_app_server_start', 'replacement_thread_start',
-      'replacement_create_finalize', 'replacement_create_rejected', 'replacement_identity',
-      'unsupported',
-    ])
     const coldRecoveryProviderStartDiagnostics = new Set([
       'authentication', 'arguments', 'listener', 'configuration', 'network',
       'unclassified', 'no_diagnostic',
@@ -1051,15 +1045,12 @@ tool_timeout_sec = 120
           const events = readBoundedTail(file, 256 * 1024).split('\n').flatMap(line => {
             try { return [JSON.parse(line)] } catch { return [] }
           })
-          return events.filter(row => [
-            'host.fresh_agent.open_failed', 'host.native_identity.readiness_receipt_committed', 'host.grant_timing',
-          ].includes(row.event)).slice(-16).map(row => ({
+          return events.filter(row => isNativeReadinessDiagnosticEvent(row.event)).slice(-16).map(row => ({
             incarnationId: entry.name,
             event: row.event,
             nativeReadinessFailureStage: coldRecoveryFailureStages.has(row.data?.nativeReadinessFailureStage)
               ? row.data.nativeReadinessFailureStage : undefined,
-            nativeReadinessProviderStartCause: coldRecoveryProviderStartCauses.has(row.data?.nativeReadinessProviderStartCause)
-              ? row.data.nativeReadinessProviderStartCause : undefined,
+            nativeReadinessProviderStartCause: safeNativeReadinessProviderStartCause(row.data?.nativeReadinessProviderStartCause),
             providerStartDiagnostic: coldRecoveryProviderStartDiagnostics.has(row.data?.providerStartDiagnostic)
               ? row.data.providerStartDiagnostic : undefined,
             nativeReadinessProbeKind: coldRecoveryProbeKinds.has(row.data?.nativeReadinessProbeKind)

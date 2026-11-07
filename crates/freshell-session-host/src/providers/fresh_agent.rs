@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use freshell_agent_runtime::host_actor::{
     DispatchAck, DispatchFailure, ForkTransition, FreshAgentHostActor, FreshAgentOperation,
-    FreshAgentProfile, FreshAgentTransport, NativeDispatchIdentity,
+    FreshAgentProfile, FreshAgentTransport, NativeDispatchIdentity, NativeReadinessPrepareFailure,
     NativeReadinessProviderStartCause, NativeReadinessProviderStartFailure,
     NativeReadinessResumeStart, OperationAck, OperationFailure, OperationFailureKind,
     TransportStart,
@@ -1146,7 +1146,7 @@ impl FreshAgentTransport for HostedTransport {
     async fn prepare_native_readiness(
         &self,
         expected_launch: &NativeIdentityLaunch,
-    ) -> Result<Option<NativeDispatchIdentity>, String> {
+    ) -> Result<Option<NativeDispatchIdentity>, NativeReadinessPrepareFailure> {
         let ProviderState::Claude(state) = &self.state else {
             let ProviderState::Codex(state) = &self.state else {
                 return Ok(None);
@@ -1154,7 +1154,7 @@ impl FreshAgentTransport for HostedTransport {
             let previous_native_session_id = {
                 let identity = self.native_identity.lock().expect("native identity lock");
                 if identity.pending || identity.launch.as_ref() != Some(expected_launch) {
-                    return Err("Codex native identity launch changed before readiness".into());
+                    return Err(NativeReadinessPrepareFailure::Superseded);
                 }
                 let profile = self.profile.lock().expect("profile lock");
                 let profile_root = profile
@@ -1175,7 +1175,8 @@ impl FreshAgentTransport for HostedTransport {
             };
             let recovered = state
                 .prepare_native_readiness(&previous_native_session_id)
-                .await?;
+                .await
+                .map_err(map_codex_native_readiness_failure)?;
             let root_changed = recovered.native_session_id != previous_native_session_id;
             let next = NativeIdentityLaunch {
                 evidence_revision: expected_launch
@@ -1192,7 +1193,7 @@ impl FreshAgentTransport for HostedTransport {
             {
                 let mut identity = self.native_identity.lock().expect("native identity lock");
                 if identity.pending || identity.launch.as_ref() != Some(expected_launch) {
-                    return Err("Codex native identity changed during readiness".into());
+                    return Err(NativeReadinessPrepareFailure::Superseded);
                 }
                 identity.begin(false)?;
                 identity.acknowledge(
@@ -1289,6 +1290,7 @@ impl FreshAgentTransport for HostedTransport {
         .await
         .map_err(|_| "provider did not reobserve the current native query".to_string())?
         .map(|()| None)
+        .map_err(NativeReadinessPrepareFailure::Failed)
     }
 
     async fn restore_claude_fork_state(
@@ -2987,6 +2989,19 @@ fn create_request_for_profile(profile: &FreshAgentProfile) -> FreshAgentCreate {
     }
 }
 
+fn map_codex_native_readiness_failure(
+    failure: freshell_freshagent::codex::CodexNativeReadinessError,
+) -> NativeReadinessPrepareFailure {
+    match failure {
+        freshell_freshagent::codex::CodexNativeReadinessError::Superseded => {
+            NativeReadinessPrepareFailure::Superseded
+        }
+        freshell_freshagent::codex::CodexNativeReadinessError::Failed(message) => {
+            NativeReadinessPrepareFailure::Failed(message)
+        }
+    }
+}
+
 fn native_readiness_create_failure(
     code: &str,
     message: &str,
@@ -3783,6 +3798,54 @@ mod tests {
     include!("fresh_agent_stop_tests.rs");
 
     include!("fresh_agent_send_delivery_tests.rs");
+
+    #[test]
+    fn native_readiness_preparation_preserves_provider_supersession() {
+        use freshell_freshagent::codex::CodexNativeReadinessError;
+
+        assert_eq!(
+            map_codex_native_readiness_failure(CodexNativeReadinessError::Superseded),
+            NativeReadinessPrepareFailure::Superseded
+        );
+        assert_eq!(
+            map_codex_native_readiness_failure(CodexNativeReadinessError::Failed(
+                "provider connection failed".into()
+            )),
+            NativeReadinessPrepareFailure::Failed("provider connection failed".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_codex_readiness_rejects_superseded_launch_before_provider_mutation() {
+        for pending in [false, true] {
+            let launch = NativeIdentityLaunch {
+                incarnation_id: freshell_runtime_protocol::IncarnationId::new(),
+                launch_nonce: "readiness-preparation-source".into(),
+                evidence_revision: 1,
+                execution_generation: 1,
+                requested_native_session_id: Some("native-source".into()),
+            };
+            let fixture = native_codex_fixture(json!({"nativeIdentityLaunch":launch})).await;
+            {
+                let mut identity = fixture.transport.native_identity.lock().unwrap();
+                if pending {
+                    identity.pending = true;
+                } else {
+                    identity.launch.as_mut().unwrap().launch_nonce = "replacement-launch".into();
+                }
+            }
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                fixture.transport.prepare_native_readiness(&launch),
+            )
+            .await
+            .expect("a superseded source must be refused before provider work");
+            assert_eq!(result, Err(NativeReadinessPrepareFailure::Superseded));
+            assert!(!fixture.dir.path().join("native-boots.jsonl").exists());
+            assert!(fixture.transport.session_id.lock().await.is_none());
+            assert!(fixture.transport.profile.lock().unwrap().is_none());
+        }
+    }
 
     #[test]
     fn native_readiness_create_failure_classifies_supersession_from_recovery_metadata() {
