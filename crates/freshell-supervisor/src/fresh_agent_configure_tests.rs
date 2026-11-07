@@ -2515,7 +2515,8 @@ async fn admin_native_name_rejects_stale_authority_before_host_work_and_preserve
         }
         {
             let calls = received.lock().unwrap();
-            if scenario.starts_with("stale-") || scenario == "wrong-provider" || scenario == "busy" {
+            if scenario.starts_with("stale-") || scenario == "wrong-provider" || scenario == "busy"
+            {
                 assert!(
                     calls.is_empty(),
                     "{scenario}: no host/native work for stale authority"

@@ -13,9 +13,9 @@ use freshell_freshagent::rest_lane::{
 use freshell_protocol::session_names::NamedProvider;
 use freshell_protocol::{
     AgentProvider, ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCreateFailed,
-    FreshAgentCreated, FreshAgentEvent,
-    FreshAgentForked, FreshAgentKilled, FreshAgentRecoveryStopped, FreshAgentSend,
-    FreshAgentSessionMaterialized, ServerMessage, SessionLocator, SessionType, StringOrNumber,
+    FreshAgentCreated, FreshAgentEvent, FreshAgentForked, FreshAgentKilled,
+    FreshAgentRecoveryStopped, FreshAgentSend, FreshAgentSessionMaterialized, ServerMessage,
+    SessionLocator, SessionType, StringOrNumber,
 };
 use freshell_runtime_client::RuntimeClient;
 use freshell_runtime_protocol::{
