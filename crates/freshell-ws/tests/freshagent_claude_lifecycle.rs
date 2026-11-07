@@ -408,33 +408,18 @@ async fn a_send_to_a_dead_session_with_a_missing_transcript_gets_lost_and_a_requ
 
 // ── Boot (C10): `created` only after the CLI booted; typed boot failures ──────────
 
-/// The pid of the sidecar process of the `n`th query() the simulator ran in this rig
-/// (1-based; every query() writes a `query` row, booted or not).
-async fn query_pid(rig: &ClaudeRig, n: usize) -> i32 {
-    let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
-    loop {
-        if let Some(row) = rig.ledger_rows("query").get(n - 1) {
-            return row["pid"].as_i64().expect("the query row carries a pid") as i32;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the sidecar never made query() #{n}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
 /// The create frame's field that resumes `durable`, as the client sends it.
 fn resume_fields(durable: &str) -> Value {
     json!({ "sessionRef": { "provider": "claude", "sessionId": durable } })
 }
 
-/// A resume create of a conversation the CLI does not have is refused at create
-/// (T5): one typed `freshAgent.create.failed` with the CLI's own sentence, never a
-/// `freshAgent.created` for a session that is already dead, and no sidecar is left
-/// behind. On both rigs: the simulator, and the pinned CLI itself.
-async fn a_resume_create_of_a_missing_conversation_fails_typed(kind: RigKind) {
-    let rig = ClaudeRig::start(kind).await;
+/// Shared recovery refuses a missing conversation before launching the sidecar:
+/// one typed `freshAgent.create.failed`, no CLI query, and no created/live session.
+/// The simulator ledger observes the absence of a launch; the pinned CLI is never
+/// involved in this server-side refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resume_create_of_a_missing_conversation_fails_typed_before_launch() {
+    let rig = ClaudeRig::start(RigKind::Sim).await;
     let mut conn = rig.connect().await;
     let missing = uuid::Uuid::new_v4().to_string();
 
@@ -444,34 +429,24 @@ async fn a_resume_create_of_a_missing_conversation_fails_typed(kind: RigKind) {
     assert_eq!(answer["type"], "freshAgent.create.failed", "{answer}");
     assert_eq!(answer["code"], "CONVERSATION_NOT_FOUND", "{answer}");
     assert_eq!(
-        answer["message"],
-        format!("No conversation found with session ID: {missing}"),
+        answer["message"], "No conversation found with that session ID.",
         "{answer}"
     );
-    if kind == RigKind::Sim {
-        wait_until_gone(query_pid(&rig, 1).await).await;
-    }
 
     conn.read_for(QUIET).await;
+    assert!(
+        rig.ledger_rows("query").is_empty(),
+        "the missing conversation is refused before any CLI query"
+    );
     assert!(
         !conn
             .frames
             .iter()
             .any(|v| v["type"] == "freshAgent.created" || v["type"] == "freshAgent.event"),
-        "nothing of the refused boot reaches the client; frames: {:?}",
+        "nothing of the refused create reaches the client; frames: {:?}",
         conn.frames
     );
     assert!(!rig.fresh_claude.has_live_session(&missing).await);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_resume_create_of_a_missing_conversation_fails_typed_and_leaves_no_sidecar() {
-    a_resume_create_of_a_missing_conversation_fails_typed(RigKind::Sim).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_resume_create_of_a_missing_conversation_fails_typed_on_the_pinned_cli() {
-    a_resume_create_of_a_missing_conversation_fails_typed(RigKind::Cli).await;
 }
 
 /// A CLAUDE_CMD that is not the CLI fails the create (the pinned SDK cannot spawn
