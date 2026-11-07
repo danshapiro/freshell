@@ -383,7 +383,12 @@ impl FreshClaudeState {
                 message,
                 owner,
             } => {
-                self.send_error(request_id, code, &message);
+                self.send_request_error_with_owner(
+                    request_id,
+                    ErrorCode::InternalError,
+                    &format!("{code}: {message}"),
+                    owner.as_ref(),
+                );
                 ClaudeSendOutcome::Refused {
                     code: code.into(),
                     message,
@@ -578,19 +583,36 @@ impl FreshClaudeState {
         request_id: &Option<String>,
         error: RuntimeResumeError,
     ) {
-        let (code, message) = match error {
+        let (code, message, owner) = match error {
             RuntimeResumeError::Lost => (
                 "INVALID_SESSION_ID",
                 "The Claude conversation for this session could not be found.".into(),
+                None,
             ),
             RuntimeResumeError::Closed => (
                 "SESSION_CLOSED",
                 "This Claude session was closed. Reopen the saved session to continue.".into(),
+                None,
             ),
-            RuntimeResumeError::Unavailable { code, message, .. }
-            | RuntimeResumeError::Superseded { code, message, .. } => (code, message),
+            RuntimeResumeError::Unavailable {
+                code,
+                message,
+                owner,
+            }
+            | RuntimeResumeError::Superseded {
+                code,
+                message,
+                owner,
+            } => (code, message, owner),
         };
-        self.emit_control_error(session_id, session_type, request_id, code, &message);
+        self.emit_control_error_with_owner(
+            session_id,
+            session_type,
+            request_id,
+            code,
+            &message,
+            owner.as_ref(),
+        );
     }
 
     pub(super) fn emit_control_error(
@@ -601,7 +623,31 @@ impl FreshClaudeState {
         code: &str,
         message: &str,
     ) {
+        self.emit_control_error_with_owner(
+            session_id,
+            session_type,
+            request_id,
+            code,
+            message,
+            None,
+        );
+    }
+
+    fn emit_control_error_with_owner(
+        &self,
+        session_id: &str,
+        session_type: SessionType,
+        request_id: &Option<String>,
+        code: &str,
+        message: &str,
+        owner: Option<&crate::ownership_lane::TerminalOwnerFields>,
+    ) {
         let mut event = json!({"type":"freshAgent.error", "sessionId":session_id, "code":code, "message":message});
+        if let Some(owner) = owner {
+            event["ownerKind"] = json!(owner.owner_kind);
+            event["ownerEpoch"] = json!(owner.owner_epoch);
+            event["ownerGeneration"] = json!(owner.owner_generation);
+        }
         if let Some(request_id) = request_id {
             event["requestId"] = json!(request_id);
             event["operationReceipt"] = json!(true);

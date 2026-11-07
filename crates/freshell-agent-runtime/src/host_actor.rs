@@ -223,6 +223,7 @@ pub enum NativeReadinessProviderStartCause {
     ExactResumeAppServerStart,
     ExactResumeRpc,
     ExactResumeCreateRejected,
+    ExactResumeSuperseded,
     ExactResumeIdentity,
     ExactResumeSettingsReapply,
     ReplacementValidation,
@@ -230,6 +231,7 @@ pub enum NativeReadinessProviderStartCause {
     ReplacementThreadStart,
     ReplacementCreateFinalize,
     ReplacementCreateRejected,
+    ReplacementSuperseded,
     ReplacementIdentity,
     Unsupported,
 }
@@ -241,6 +243,7 @@ impl NativeReadinessProviderStartCause {
             Self::ExactResumeAppServerStart => "exact_resume_app_server_start",
             Self::ExactResumeRpc => "exact_resume_rpc",
             Self::ExactResumeCreateRejected => "exact_resume_create_rejected",
+            Self::ExactResumeSuperseded => "exact_resume_superseded",
             Self::ExactResumeIdentity => "exact_resume_identity",
             Self::ExactResumeSettingsReapply => "exact_resume_settings_reapply",
             Self::ReplacementValidation => "replacement_validation",
@@ -248,6 +251,7 @@ impl NativeReadinessProviderStartCause {
             Self::ReplacementThreadStart => "replacement_thread_start",
             Self::ReplacementCreateFinalize => "replacement_create_finalize",
             Self::ReplacementCreateRejected => "replacement_create_rejected",
+            Self::ReplacementSuperseded => "replacement_superseded",
             Self::ReplacementIdentity => "replacement_identity",
             Self::Unsupported => "unsupported",
         }

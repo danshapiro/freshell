@@ -1301,7 +1301,7 @@ async fn dispatch_with_effects(
                     let _native_command = state.fresh_native_command.lock().await;
                     ensure_current_fresh_native_observation(state)
                         .await
-                        .map_err(|error| {
+                        .inspect_err(|error| {
                             emit_environment_event(serde_json::json!({
                                 "severity":"warn",
                                 "event":"freshagent.session_host.fork_rejected",
@@ -1309,7 +1309,6 @@ async fn dispatch_with_effects(
                                 "reason":"native_observation_unavailable",
                                 "errorCode":error.code,
                             }));
-                            error
                         })?;
                     let actor = state
                         .fresh_agent

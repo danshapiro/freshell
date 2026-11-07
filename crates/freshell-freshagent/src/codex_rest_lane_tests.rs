@@ -5,6 +5,7 @@ use axum::http::StatusCode;
 use freshell_protocol::{AgentProvider, SessionType};
 
 include!("codex_rest_previous_delivery_tests.rs");
+include!("codex_superseded_reply_tests.rs");
 
 fn http_pane(state: FreshCodexState, id: &str) -> (axum::Router, String) {
     let api = crate::FreshAgentState::new(
@@ -1296,5 +1297,112 @@ async fn task009_rest_lane_headless_create_and_resume_publish_the_native_effecti
             json!({"model":content["model"],"cwd":content["initialCwd"],"sandbox":content["sandbox"],"permissionMode":content["permissionMode"],"collaborationMode":content["collaborationMode"],"effortIsNativeDefault":content["effortIsNativeDefault"]}),
             json!({"model":"native-effective","cwd":native_cwd,"sandbox":"read-only","permissionMode":"on-request","collaborationMode":"plan","effortIsNativeDefault":true})
         );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_and_non_recovery_create_preserve_rest_failure_contracts() {
+    let _guard = super::tests::ENV_LOCK.lock().await;
+    for mode in ["stale-adopt", "stale-resume", "stale-new", "io-new"] {
+        super::tests::configure_fake_codex_cmd(r#"{"threadStartThreadId":"rest-contract-thread"}"#);
+        let (mut state, mut bus, sink) = super::tests::state_with_sink();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::with_epoch(
+            391,
+        ));
+        state.set_ownership(registry.clone());
+        let id = "rest-contract-thread";
+        if mode == "stale-adopt" {
+            assert_eq!(
+                super::tests::create_real_fake_session(&state, &mut bus).await,
+                id
+            );
+            super::tests::vacate_codex_owner_for_map_hit(&registry, id);
+        }
+        let stall = sink.arm_binding_stall_result(PROVIDER, id, mode == "io-new");
+        let (router, _) = http_pane(state.clone(), id);
+        let body = if mode == "stale-adopt" || mode == "stale-resume" {
+            json!({"agent":"codex","sessionRef":{"provider":"codex","sessionId":id}})
+        } else {
+            json!({"agent":"codex"})
+        };
+        let request = tokio::spawn(async move { post_http(router, "/api/tabs", body).await });
+        stall.entered.recv_timeout(Duration::from_secs(15)).unwrap();
+        let mut replacement_generation = None;
+        if mode != "io-new" {
+            let claim = sink
+                .bindings
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .claim
+                .clone()
+                .unwrap();
+            registry.fail(PROVIDER, id, &claim.operation_id, claim.generation, false);
+            let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
+                PROVIDER,
+                id,
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "contract-terminal",
+                None,
+                "test",
+                0,
+            ) else {
+                panic!("the terminal replacement must acquire the released key")
+            };
+            assert_eq!(
+                registry.commit_live(
+                    PROVIDER,
+                    id,
+                    "contract-terminal",
+                    generation,
+                    freshell_ownership::OwnerIdentity {
+                        kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                        terminal_id: Some("contract-terminal".into()),
+                        live_session_key: None,
+                        pid: None,
+                        ownership_id: None
+                    }
+                ),
+                freshell_ownership::CommitOutcome::Committed
+            );
+            replacement_generation = Some(generation);
+        }
+        stall.release.send(()).unwrap();
+        let (status, body) = tokio::time::timeout(Duration::from_secs(15), request)
+            .await
+            .unwrap()
+            .unwrap();
+        let (expected_status, expected_code) = if mode == "stale-adopt" {
+            (StatusCode::CONFLICT, "STALE_CLAIM")
+        } else {
+            (StatusCode::SERVICE_UNAVAILABLE, "FRESH_AGENT_CREATE_FAILED")
+        };
+        assert_eq!(status, expected_status, "mode={mode}: {body}");
+        assert_eq!(body["code"], expected_code, "mode={mode}: {body}");
+        assert_eq!(body["retryable"], true);
+        if let Some(generation) = replacement_generation {
+            assert_eq!(
+                json!([
+                    body["ownerKind"],
+                    body["ownerEpoch"],
+                    body["ownerGeneration"]
+                ]),
+                json!(["terminal", 391, generation]),
+                "mode={mode}: {body}"
+            );
+        }
+        assert!(!body.to_string().contains("RECOVERY_SUPERSEDED"));
+        if mode == "stale-new" || mode == "io-new" {
+            assert!(
+                state
+                    .session_recovery
+                    .status(&state.recovery_map_key(id))
+                    .await
+                    .is_none(),
+                "fresh creates do not enter shared recovery"
+            );
+        }
+        state.shutdown().await;
     }
 }

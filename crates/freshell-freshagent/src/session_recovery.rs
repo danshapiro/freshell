@@ -50,7 +50,7 @@ impl<E> RecoveryAttemptFailure<E> {
         }
     }
 
-    /// A stop or newer lifecycle superseded a successful provider start.
+    /// A stop or newer lifecycle invalidated this provider operation's result.
     /// It must preserve the previous failure budget without delaying a retry.
     pub fn superseded(error: E) -> Self {
         Self {
@@ -258,9 +258,10 @@ impl<T, E> SessionRecoveryMap<T, E> {
     }
 
     /// Join or start one recovery operation after checking current authority
-    /// whenever admission would return a cached failure or start a new
-    /// operation. Existing in-flight and successful-cohort joiners bypass the
-    /// check so they can consume the operation that already owns `Starting`.
+    /// for every admission after an operation has settled, including a late
+    /// join to its cohort. Only joins to an in-flight operation bypass the check:
+    /// they consume the operation that already owns `Starting`. Requesters that
+    /// were admitted before settlement keep that operation's result.
     /// A preflight refusal is requester-scoped and never changes the retry
     /// budget or starts provider work.
     pub async fn run_with_requester_preflight<F, Fut, P>(

@@ -172,10 +172,18 @@ impl FreshClaudeState {
                 return None;
             }
             Err(crate::session_recovery::RecoveryFailure::Attempt(
-                recovery::RuntimeResumeError::Unavailable { code, message, .. }
-                | recovery::RuntimeResumeError::Superseded { code, message, .. },
+                recovery::RuntimeResumeError::Unavailable {
+                    code,
+                    message,
+                    owner,
+                }
+                | recovery::RuntimeResumeError::Superseded {
+                    code,
+                    message,
+                    owner,
+                },
             )) => {
-                attach_error(&reply, &msg, &previous, code, message);
+                attach_error_with_owner(&reply, &msg, &previous, code, message, owner.as_ref());
                 return None;
             }
             Err(crate::session_recovery::RecoveryFailure::Panicked) => {
@@ -315,12 +323,30 @@ fn attach_error(
     code: &str,
     message: &str,
 ) {
+    attach_error_with_owner(reply, msg, session_id, code, message, None);
+}
+
+fn attach_error_with_owner(
+    reply: &FrameSink,
+    msg: &FreshAgentAttach,
+    session_id: &str,
+    code: &str,
+    message: &str,
+    owner: Option<&crate::ownership_lane::TerminalOwnerFields>,
+) {
     tracing::warn!(target: "freshell_freshagent::claude", provider = PROVIDER,
         session_id, code, "freshagent.claude.attach_refused");
+    let mut event =
+        json!({"type":"freshAgent.error", "sessionId":session_id, "code":code, "message":message});
+    if let Some(owner) = owner {
+        event["ownerKind"] = json!(owner.owner_kind);
+        event["ownerEpoch"] = json!(owner.owner_epoch);
+        event["ownerGeneration"] = json!(owner.owner_generation);
+    }
     reply(ServerMessage::FreshAgentEvent(FreshAgentEvent {
         provider: PROVIDER.into(),
         session_id: session_id.into(),
         session_type: session_type_str(msg.session_type).into(),
-        event: json!({"type":"freshAgent.error", "sessionId":session_id, "code":code, "message":message}),
+        event,
     }));
 }

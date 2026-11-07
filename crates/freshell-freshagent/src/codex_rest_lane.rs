@@ -197,6 +197,7 @@ impl FreshAgentRestLane for CodexRestLane {
                 message,
                 retryable,
                 owner,
+                ..
             } => Err(failure(code, message, retryable, owner)),
         }
     }
