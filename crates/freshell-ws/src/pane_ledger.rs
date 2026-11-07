@@ -2566,6 +2566,9 @@ impl PaneLedger {
     /// supplies the pane's create lineage and attribution to the new row.
     /// The caller publishes the source link with a normal claimed write only
     /// after committing the replacement's Live owner.
+    /// The destination remains a normal recovery row after restart: absent
+    /// source publication can also mean a valid replacement whose final
+    /// metadata write failed, so boot cannot infer that this target failed.
     pub fn stage_fresh_agent_replacement_binding_claimed(
         &self,
         w: &FreshAgentBindingWrite<'_>,
@@ -2622,6 +2625,43 @@ impl PaneLedger {
         let mut index = self.guard();
 
         let key = (w.provider.to_string(), w.session_id.to_string());
+        if let Some(source_id) = w
+            .supersedes
+            .filter(|source_id| publish_source && *source_id != w.session_id)
+        {
+            let source_key = (w.provider.to_string(), source_id.to_string());
+            let source = index.bindings.get(&source_key);
+            let closed = source.is_some_and(|row| {
+                row.state == RowState::Retired && row.retired_reason == Some(RetiredReason::Closed)
+            }) || index.kill_tombstones.get(&source_key).is_some_and(|fence| {
+                fence.scope.is_none()
+                    && matches!(
+                        classify_kill_tombstone(
+                            fence.at_ms,
+                            source.map(|row| (row.state, row.updated_at)),
+                            w.now_ms,
+                        ),
+                        KillTombstoneVerdict::Dominant | KillTombstoneVerdict::Fresh
+                    )
+            });
+            if closed {
+                // A no-stamp stop may have observed Vacant before publication
+                // claimed the source. Its later durable close must still win
+                // here, including when the close's row projection failed.
+                // Refuse before refreshing the valid replacement or linking
+                // the explicitly closed source to it.
+                tracing::warn!(
+                    target: "freshell_ws::pane_ledger",
+                    provider = %w.provider,
+                    source_session_id = %source_id,
+                    replacement_session_id = %w.session_id,
+                    "pane_ledger_replacement_refused_closed_source: explicit close prevents source publication"
+                );
+                return Err(std::io::Error::other(
+                    "CLOSED_REPLACEMENT_SOURCE: the source session was explicitly closed; replacement publication is refused",
+                ));
+            }
+        }
         if let Some(claim) = claim {
             let scope = FailedTransitionScope {
                 provider: claim.provider.clone(),

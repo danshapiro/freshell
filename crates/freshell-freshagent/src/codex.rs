@@ -1273,6 +1273,30 @@ enum CodexTeardownSettlement {
     PlatformLimited,
 }
 
+/// Release the exact source ticket before its watchdog hold on every exit,
+/// including cancellation of a publication task before its first poll.
+struct CodexPublicationSourceClaim {
+    ticket: Option<freshell_ownership::OperationTicket>,
+    hold: Option<freshell_ownership::BindingWriteHold>,
+}
+
+impl CodexPublicationSourceClaim {
+    fn new(ticket: freshell_ownership::OperationTicket) -> Self {
+        let hold = ticket.hold_binding_write();
+        Self {
+            ticket: Some(ticket),
+            hold,
+        }
+    }
+}
+
+impl Drop for CodexPublicationSourceClaim {
+    fn drop(&mut self) {
+        drop(self.ticket.take());
+        drop(self.hold.take());
+    }
+}
+
 /// The wedged-sidecar quiet deadman (the shared [`crate::quiet_deadman`]
 /// state machine). While a turn is in flight (the turn-in-flight latch
 /// armed), a window is armed; if no lane-visible push notification feeds it
@@ -2532,14 +2556,16 @@ impl FreshCodexState {
 
     /// A successful native start can lose authority before registration. Its
     /// writer still needs the same exact death proof as a registered startup.
-    /// The guard carries the child, lease and ticket through cancellation.
+    /// A bounded first attempt may settle it inline. Otherwise the guard moves
+    /// the child, lease and ticket to detached fenced cleanup so request locks
+    /// and shared-recovery admission never wait for an unavailable death proof.
     async fn settle_unregistered_startup(
         &self,
         session_id: &str,
         startup: (Arc<CodexAppServerClient>, String, CodexChild),
         lease_guard: Option<crate::FreshSessionLeaseGuard>,
         ticket: Option<freshell_ownership::OperationTicket>,
-    ) {
+    ) -> bool {
         let (client, ownership_id, mut child) = startup;
         let recorded = crate::session_lease::record_condemned_runtime_identity(
             child.id().unwrap_or(0),
@@ -2555,15 +2581,26 @@ impl FreshCodexState {
         let state = self.clone();
         let id = session_id.to_string();
         let probe = self.effective_sidecar_cleanup_probe();
+        let (unconfirmed_tx, mut unconfirmed_rx) = oneshot::channel();
         let mut guard = crate::identity_sink::BindingWriteGuard::new(ticket, None, None);
         guard.settle_startup_before_repair(async move {
             client.close().await;
             let _ = child.start_kill();
-            if !codex_tree_death_escalation(recorded, ownership_id.clone(), id.clone(), probe).await
-            {
-                tracing::error!(provider=PROVIDER, session_id=%id, ownership_id=%ownership_id,
-                    "freshagent.codex.unregistered_startup_teardown_unconfirmed");
-                std::future::pending::<()>().await;
+            let mut first_failure = Some(unconfirmed_tx);
+            let mut retry_delay = Duration::from_millis(250);
+            loop {
+                // Reap a dead direct child before the hosted identity helper
+                // examines /proc. An unreaped zombie must not strand the
+                // helper's writer-tree proof or retain this dispatch forever.
+                let _ = child.try_wait();
+                if confirm_codex_tree_dead(&recorded, probe.clone()).await {
+                    break;
+                }
+                if let Some(notice) = first_failure.take() {
+                    let _ = notice.send(());
+                }
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(30));
             }
             let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
             crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
@@ -2573,8 +2610,23 @@ impl FreshCodexState {
                 lease.fail();
             }
         });
-        guard.repair_now().await;
-        drop(guard.finish());
+        let confirmed = tokio::select! {
+            biased;
+            result = tokio::time::timeout(Duration::from_secs(2), guard.repair_now()) => {
+                matches!(result, Ok(true))
+            }
+            _ = &mut unconfirmed_rx => false,
+        };
+        if confirmed {
+            drop(guard.finish());
+        } else {
+            tracing::warn!(provider=PROVIDER, session_id,
+                "freshagent.codex.unregistered_startup_teardown_deferred: requester released while exact writer ownership remains fenced");
+            // Drop resumes the SAME owned cleanup future, retaining the child,
+            // lease, ticket and watchdog hold until positive confirmation.
+            drop(guard);
+        }
+        confirmed
     }
 
     /// Finish teardown for a session removed by a create/resume/fork recovery
@@ -5145,13 +5197,23 @@ impl FreshCodexState {
             .get(&thread_id)
             .is_some_and(|s| !s.exited.load(Ordering::SeqCst));
         if incumbent_live {
-            self.settle_unregistered_startup(
-                &thread_id,
-                (client, ownership_id, child),
-                lease_guard.take(),
-                own_ticket.take(),
-            )
-            .await;
+            if !self
+                .settle_unregistered_startup(
+                    &thread_id,
+                    (client, ownership_id, child),
+                    lease_guard.take(),
+                    own_ticket.take(),
+                )
+                .await
+            {
+                return self.fail_create_with_owner(
+                    &request_id,
+                    view_id.as_deref(),
+                    "SESSION_RESERVED",
+                    "The previous Codex startup is still stopping; retry this session.",
+                    self.current_refusal_owner(&thread_id),
+                );
+            }
             // D8 (focused-ep1-r4 Finding 1): the eviction-guard adopt also
             // re-parks/re-stamps the CURRENT connection's provenance on the
             // incumbent (this arm returns immediately, so moving `provenance`
@@ -10244,7 +10306,7 @@ impl FreshCodexState {
                             && stamp.owner.ownership_id.as_deref()
                                 == Some(sidecar_ownership_id.as_str())
                     })
-                    .ok_or_else(|| "Codex readiness ownership changed".to_string())?;
+                    .ok_or(CodexNativeReadinessError::Superseded)?;
             Some(freshell_ownership::ObservedFence {
                 epoch: stamp.epoch,
                 generation: stamp.generation,
@@ -11859,14 +11921,14 @@ impl FreshCodexState {
         // Reclaim the exact vacant source before committing the replacement.
         // A point-in-time source check alone cannot fence another registry
         // thread while the final durable old -> new link is being written.
-        let mut source_ticket = None;
+        let mut source_claim = None;
         let mut sessions = self.sessions.lock().await;
         let failure = source_superseded().or_else(|| {
             match self.begin_lane_claim_at(old_session_id,
                 &format!("{respawn_op_id}-publish-source"),
                 source_fence.map(|(epoch, generation)| freshell_ownership::ObservedFence { epoch, generation }),
                 "freshcodex/replacement-publication") {
-                crate::ownership_lane::LaneClaim::Granted(ticket) => source_ticket = Some(ticket),
+                crate::ownership_lane::LaneClaim::Granted(ticket) => source_claim = Some(CodexPublicationSourceClaim::new(ticket)),
                 crate::ownership_lane::LaneClaim::Unwired => {},
                 crate::ownership_lane::LaneClaim::Adopt | crate::ownership_lane::LaneClaim::Refused(_) => {
                     return Some(self.superseded_failure(old_session_id,
@@ -11911,41 +11973,42 @@ impl FreshCodexState {
         }
         drop(sessions);
         drop(binding_guard.take().map(|guard| guard.finish()));
-        let source_hold = source_ticket
-            .as_ref()
-            .and_then(|ticket| ticket.hold_binding_write());
-
         // The replacement is now durable and Live. Startup cleanup must be
         // disarmed BEFORE publishing the source link: cancellation or a final
         // metadata error must never leave old -> a writer we just tore down.
         if let Some(claim) = replacement_binding.claim.as_mut() {
             claim.kind = crate::identity_sink::BindingClaimKind::LiveFreshAgent;
         }
-        if let Some(sink) = self.identity_sink() {
-            let state = self.clone();
+        // Identity publication must not overwrite settings saved since stage.
+        replacement_binding.settings = crate::identity_sink::SettingsUpdate::Keep;
+        let publication_error = if let Some(sink) = self.identity_sink() {
             let published_id = new_thread_id.clone();
             let source_id = old_session_id.to_string();
             // Once Live commits, this small metadata completion belongs to the
             // runtime, not the requester. Dropping its waiter cannot cancel it.
             let publication = tokio::spawn(async move {
-                let _source_ticket = source_ticket;
-                let _source_hold = source_hold;
-                if let Err(error) = sink.record_binding(replacement_binding).await {
+                let _source_claim = source_claim;
+                let result = sink.record_binding(replacement_binding).await;
+                if let Err(error) = &result {
                     tracing::error!(provider = PROVIDER, session_id = %published_id,
                         old_session_id = %source_id, error = %error,
                         "freshagent.codex.replacement_source_publication_failed");
-                    state.emit_fresh_agent_error(&published_id, "LEDGER_WRITE_FAILED",
-                        "The replacement is running, but its link from the previous session could not be saved.");
                 }
+                result
             });
-            if let Err(error) = publication.await {
-                tracing::error!(provider = PROVIDER, session_id = %new_thread_id,
-                    old_session_id, error = %error,
-                    "freshagent.codex.replacement_source_publication_task_failed");
-                self.emit_fresh_agent_error(&new_thread_id, "LEDGER_WRITE_FAILED",
-                    "The replacement is running, but saving its previous-session link was interrupted.");
+            match publication.await {
+                Ok(Ok(())) => None,
+                Ok(Err(_)) => Some("The replacement is running, but its link from the previous session could not be saved."),
+                Err(error) => {
+                    tracing::error!(provider = PROVIDER, session_id = %new_thread_id,
+                        old_session_id, error = %error,
+                        "freshagent.codex.replacement_source_publication_task_failed");
+                    Some("The replacement is running, but saving its previous-session link was interrupted.")
+                }
             }
-        }
+        } else {
+            None
+        };
 
         // DIAG-01: crash recovery had to mint a fresh thread -- the durable
         // identity MOVED (old_session_id -> new_thread_id); conversation
@@ -12028,6 +12091,12 @@ impl FreshCodexState {
             );
         }
         self.broadcast(&materialized);
+
+        // View routes follow the new id only after materialization. Keep the
+        // final write result until that routing boundary so the alarm arrives.
+        if let Some(message) = publication_error {
+            self.emit_fresh_agent_error(&new_thread_id, "LEDGER_WRITE_FAILED", message);
+        }
 
         // P1.13 §2.6b (Task 6): memory loss must be user-visible, not server-log-only.
         // Emitted AFTER the materialized broadcast above -- the frozen client re-keys
@@ -28906,6 +28975,8 @@ pub(crate) mod tests {
     include!("codex_recovery_publication_tests.rs");
     include!("codex_replacement_publication_tests.rs");
     include!("codex_claim_teardown_tests.rs");
+    include!("codex_cleanup_liveness_tests.rs");
+    include!("codex_publication_routing_tests.rs");
 
     async fn assert_native_resume_failure_budget(native_reply: &str) {
         let _guard = ENV_LOCK.lock().await;
