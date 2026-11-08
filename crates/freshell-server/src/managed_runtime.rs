@@ -564,6 +564,27 @@ impl ServerManagedRuntimeController {
 }
 
 impl ManagedTerminalController for ServerManagedRuntimeController {
+    fn owns_native_session<'a>(
+        &'a self,
+        provider: &'a str,
+        session_id: &'a str,
+    ) -> ManagedTerminalFuture<'a, Result<bool, String>> {
+        Box::pin(async move {
+            // Do not hydrate/adopt, reconcile, register facades, or filter by
+            // lifecycle: a stopped or recovering soul still owns its history.
+            let views = self
+                .client
+                .inventory()
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(views.iter().any(|view| {
+                (view.provider.as_deref() == Some(provider)
+                    || view.terminal_mode.as_deref() == Some(provider))
+                    && (view.native_session_id.as_deref() == Some(session_id)
+                        || view.terminal_resume_session_id.as_deref() == Some(session_id))
+            }))
+        })
+    }
     fn lifecycle_observation<'a>(
         &'a self,
         terminal: &'a ManagedTerminalDescriptor,
@@ -1861,6 +1882,102 @@ mod tests {
     }
     pub(super) mod transitions {
         include!("tests/managed_recovery_transition_tests.rs");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_owner_inventory_covers_all_states_without_hydrating_or_mutating() {
+        use freshell_runtime_protocol::*;
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("native-owner.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let inventory = Arc::new(tokio::sync::Mutex::new(Ok(Vec::<RuntimeView>::new())));
+        let reply = Arc::clone(&inventory);
+        let installation_id = InstallationId::new();
+        let (shutdown, mut stop) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            loop {
+                let mut peer = tokio::select! {
+                    _ = &mut stop => break,
+                    accepted = listener.accept() => accepted.unwrap().0,
+                };
+                let request: Envelope<AdminCommand> = read_frame(&mut peer).await.unwrap();
+                let result = match request.body {
+                    AdminCommand::Health => Ok(AdminResult::Health {
+                        control_epoch: 1,
+                        installation_id: installation_id.clone(),
+                    }),
+                    AdminCommand::Inventory => {
+                        reply.lock().await.clone().map(AdminResult::Inventory)
+                    }
+                    other => panic!("native ownership inspection must be read-only: {other:?}"),
+                };
+                write_frame(
+                    &mut peer,
+                    &AdminReply {
+                        request_id: request.request_id,
+                        result,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let controller = ServerManagedRuntimeController {
+            client: RuntimeClient::new(&socket, "owned-native-inspection"),
+            recovery: Arc::new(ManagedRecoveryState::default()),
+        };
+        for (launch, desired, recovery, identity_field) in [
+            ("running", "running", "live", "nativeSessionId"),
+            ("stopped", "stopped", "lost", "nativeSessionId"),
+            (
+                "running",
+                "running",
+                "recovering",
+                "terminalResumeSessionId",
+            ),
+        ] {
+            let mut value = serde_json::json!({
+                "soulId":SoulId::new(),"incarnationId":IncarnationId::new(),
+                "launchState":launch,"cleanupState":"none","intentRevision":1,"executionGeneration":1,
+                "provider":"opencode","terminalMode":"opencode", "terminalId":"other-key-terminal",
+                "terminalCreateRequestId":"other-create-key","desiredState":desired,"recoveryState":recovery,
+            });
+            value[identity_field] = serde_json::json!("ses_owned_original");
+            *inventory.lock().await = Ok(vec![serde_json::from_value(value).unwrap()]);
+            assert_eq!(
+                controller
+                    .owns_native_session("opencode", "ses_owned_original")
+                    .await,
+                Ok(true)
+            );
+            assert_eq!(
+                controller
+                    .owns_native_session("opencode", "ses_not_owned")
+                    .await,
+                Ok(false)
+            );
+            assert_eq!(
+                controller
+                    .owns_native_session("claude", "ses_owned_original")
+                    .await,
+                Ok(false)
+            );
+        }
+        *inventory.lock().await = Err(RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            "owned inventory unavailable",
+        ));
+        assert!(controller
+            .owns_native_session("opencode", "ses_owned_original")
+            .await
+            .is_err());
+        assert!(
+            controller.recovery.slots.lock().await.is_empty(),
+            "read-only ownership query hydrated recovery slots"
+        );
+        shutdown.send(()).unwrap();
+        task.await.unwrap();
     }
 
     #[cfg(unix)]

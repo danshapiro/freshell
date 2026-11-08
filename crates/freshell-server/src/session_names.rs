@@ -185,7 +185,6 @@ pub(crate) const MAX_NATIVE_READS: u32 = 6;
 pub(crate) const MAX_NATIVE_LIFECYCLE_BUSY_DEFERRALS: u32 = 6;
 #[cfg(any(feature = "managed-runtime-v1", test))]
 const NATIVE_LIFECYCLE_BUSY_RETRY_BASE_MS: i64 = 1_000;
-#[cfg(any(feature = "managed-runtime-v1", test))]
 pub(crate) const NATIVE_LIFECYCLE_BUSY_COOLDOWN_MS: i64 = 60_000;
 /// Task 3: cycle 2 becomes ready at least this long after a cycle-1 failure.
 const NATIVE_CYCLE_RETRY_1_MS: i64 = 5_000;
@@ -4478,9 +4477,20 @@ fn record_native_lifecycle_busy(
     }
 }
 
+fn confirmation_read_window_exhausted_after_contention(state: &NativeWriteState) -> bool {
+    state.status == NativeSyncStatus::Unsynced
+        && state.confirmation_pending_receipt.is_some()
+        && state.lifecycle_busy_deferrals > 0
+        && state.reads_consumed >= MAX_NATIVE_READS
+}
+
 fn begin_native_lifecycle_busy_window(state: &mut NativeWriteState) {
     if state.lifecycle_busy_deferrals >= MAX_NATIVE_LIFECYCLE_BUSY_DEFERRALS {
         state.lifecycle_busy_deferrals = 0;
+        state.reads_consumed = 0;
+    } else if confirmation_read_window_exhausted_after_contention(state) {
+        // This earlier cooldown replenishes only physical reads. It does not
+        // refund any real refusal or the acknowledged write's cycle/receipt.
         state.reads_consumed = 0;
     }
 }
@@ -4528,7 +4538,14 @@ fn fold_native_outcome_decision(
         exhausted: bool,
         cycles_consumed: u32,
     ) {
-        if exhausted {
+        if confirmation_read_window_exhausted_after_contention(state) {
+            // Real pre-reads can exhaust this contention window before the
+            // refusal-count cap is reached. Preserve the acknowledged write
+            // and global cycle count; after the existing cooldown, only its
+            // full-fenced confirmation claim receives a fresh read window.
+            state.settled = false;
+            state.next_due = Some(now.saturating_add(NATIVE_LIFECYCLE_BUSY_COOLDOWN_MS));
+        } else if exhausted {
             // Exhaustion is FINAL for this revision.
             state.settled = true;
             state.next_due = None;

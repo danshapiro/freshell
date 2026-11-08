@@ -70,16 +70,226 @@ struct SourceRootBinding {
 
 type StageError = Box<dyn std::error::Error>;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct NativeValidationRequest {
     descriptor_file: PathBuf,
+    #[serde(default)]
+    payload_file: Option<PathBuf>,
     database_file: PathBuf,
     root_session_id: String,
     session_id: String,
     info_file: PathBuf,
     page_files: Vec<PathBuf>,
     export_file: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NativeSelectionRequest {
+    descriptor_file: PathBuf,
+    payload_file: PathBuf,
+    root_session_id: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeSelection {
+    root_session_id: String,
+    graph_digest: String,
+    sessions: Vec<NativeSessionSelection>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeSessionSelection {
+    session_id: String,
+    message_count: u64,
+}
+
+// Qualification needs only IDs and finite page bounds. Ignore native bodies,
+// assets and snapshot bytes while streaming; production import validates all
+// of them separately. Never reconstruct legacy manifest rows from this index.
+#[derive(Deserialize)]
+struct SelectionValues {
+    session_id: Option<freshell_sessions::opencode_transfer::SerializedSqlValue>,
+    parent_id: Option<freshell_sessions::opencode_transfer::SerializedSqlValue>,
+}
+#[derive(Deserialize)]
+struct SelectionRow {
+    table: String,
+    key: Vec<freshell_sessions::opencode_transfer::SerializedSqlValue>,
+    values: SelectionValues,
+}
+#[derive(Default)]
+struct SelectionRows {
+    count: usize,
+    parents: std::collections::BTreeMap<String, Option<String>>,
+    messages: std::collections::BTreeMap<String, u64>,
+}
+impl<'de> serde::Deserialize<'de> for SelectionRows {
+    fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+        struct Rows;
+        impl<'de> serde::de::Visitor<'de> for Rows {
+            type Value = SelectionRows;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("the complete transfer row array")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut rows: A,
+            ) -> Result<Self::Value, A::Error> {
+                use freshell_sessions::opencode_transfer::SerializedSqlValue;
+                use serde::de::Error;
+                let mut selected = SelectionRows::default();
+                while let Some(row) = rows.next_element::<SelectionRow>()? {
+                    selected.count += 1;
+                    if row.table == "session" {
+                        let [SerializedSqlValue::Text { value: id }] = row.key.as_slice() else {
+                            return Err(A::Error::custom("native session key differs"));
+                        };
+                        let parent = match row.values.parent_id {
+                            None | Some(SerializedSqlValue::Null) => None,
+                            Some(SerializedSqlValue::Text { value }) => Some(value),
+                            _ => return Err(A::Error::custom("native parent identity differs")),
+                        };
+                        if selected.parents.insert(id.clone(), parent).is_some()
+                            || selected.parents.len() > 50_000
+                        {
+                            return Err(A::Error::custom(
+                                "native session selection repeats or exceeds its bound",
+                            ));
+                        }
+                    } else if row.table == "message" {
+                        let Some(SerializedSqlValue::Text { value: session }) =
+                            row.values.session_id
+                        else {
+                            return Err(A::Error::custom("native message session missing"));
+                        };
+                        *selected.messages.entry(session).or_default() += 1;
+                        if selected.messages.len() > 50_000 {
+                            return Err(A::Error::custom(
+                                "native message selection exceeds its bound",
+                            ));
+                        }
+                    }
+                }
+                Ok(selected)
+            }
+        }
+        decoder.deserialize_seq(Rows)
+    }
+}
+#[derive(Deserialize)]
+struct SelectionPayload {
+    version: u32,
+    root_session_id: String,
+    rows: SelectionRows,
+}
+
+struct SelectionReader<R> {
+    inner: R,
+    sha: sha2::Sha256,
+    bytes: u64,
+}
+impl<R: std::io::Read> std::io::Read for SelectionReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        use sha2::Digest;
+        let size = self.inner.read(buffer)?;
+        self.sha.update(&buffer[..size]);
+        self.bytes += size as u64;
+        Ok(size)
+    }
+}
+
+fn read_native_selection(request: &NativeSelectionRequest) -> Result<NativeSelection, StageError> {
+    use freshell_sessions::opencode_transfer::OpenCodeTransferManifest;
+    use sha2::Digest;
+    use std::io::{BufReader, Read};
+    private_file(&request.descriptor_file)?;
+    private_file(&request.payload_file)?;
+    let descriptor: OpenCodeTransferDescriptor =
+        serde_json::from_reader(File::open(&request.descriptor_file)?)?;
+    descriptor.validate().map_err(|error| error.message)?;
+    let manifest: OpenCodeTransferManifest = serde_json::from_str(&descriptor.manifest_json)?;
+    if !matches!(manifest.version, 1 | 2)
+        || descriptor.root_session_id != request.root_session_id
+        || manifest.root_session_id != request.root_session_id
+        || manifest.generation != descriptor.source_generation
+        || manifest.provider_schema != descriptor.provider_schema
+        || manifest.source_store_id != descriptor.source_store_id
+        || manifest.source_schema_fingerprint != descriptor.source_schema_fingerprint
+        || manifest.migration_journal_fingerprint != descriptor.migration_journal_fingerprint
+        || descriptor.files.len() != 1
+        || descriptor.files[0].relative_path != "payload.json"
+        || manifest.payload_bytes != descriptor.files[0].size_bytes
+        || manifest.payload_sha256 != descriptor.files[0].sha256
+        || descriptor.total_bytes != manifest.payload_bytes
+        || manifest.payload_bytes > 8 * 1024 * 1024 * 1024
+        || descriptor.bundle_sha256
+            != opencode_transfer_bundle_digest(&descriptor.manifest_json, &descriptor.files)
+    {
+        return Err("native descriptor/payload binding differs".into());
+    }
+    if manifest.version == 2 {
+        let mut unsigned = manifest.clone();
+        unsigned.generation.clear();
+        if hex::encode(sha2::Sha256::digest(serde_json::to_vec(&unsigned)?)) != manifest.generation
+        {
+            return Err("native manifest generation differs".into());
+        }
+    }
+    let mut reader = SelectionReader {
+        inner: File::open(&request.payload_file)?.take(manifest.payload_bytes + 1),
+        sha: sha2::Sha256::new(),
+        bytes: 0,
+    };
+    let payload: SelectionPayload = {
+        let mut decoder = serde_json::Deserializer::from_reader(BufReader::new(&mut reader));
+        let payload = SelectionPayload::deserialize(&mut decoder)?;
+        decoder.end()?;
+        payload
+    };
+    if reader.bytes != manifest.payload_bytes
+        || hex::encode(reader.sha.finalize()) != manifest.payload_sha256
+        || payload.version != manifest.version
+        || payload.root_session_id != request.root_session_id
+        || payload.rows.count != manifest.row_count
+        || !payload.rows.parents.contains_key(&request.root_session_id)
+    {
+        return Err("native complete payload selection differs".into());
+    }
+    let mut children = std::collections::BTreeMap::<_, Vec<_>>::new();
+    for (id, parent) in &payload.rows.parents {
+        if let Some(parent) = parent {
+            children.entry(parent).or_default().push(id);
+        }
+    }
+    let mut closure = std::collections::BTreeSet::new();
+    let mut pending = vec![&request.root_session_id];
+    while let Some(id) = pending.pop() {
+        if closure.insert(id.clone()) {
+            if let Some(descendants) = children.get(id) {
+                pending.extend(descendants.iter().copied());
+            }
+        }
+    }
+    if closure.len() != payload.rows.parents.len()
+        || payload.rows.messages.keys().any(|id| !closure.contains(id))
+    {
+        return Err("native payload contains an unselected session".into());
+    }
+    Ok(NativeSelection {
+        root_session_id: request.root_session_id.clone(),
+        graph_digest: descriptor.source_generation,
+        sessions: closure
+            .into_iter()
+            .map(|session_id| NativeSessionSelection {
+                message_count: payload.rows.messages.get(&session_id).copied().unwrap_or(0),
+                session_id,
+            })
+            .collect(),
+    })
 }
 
 // This validator consumes one native message at a time. The installed store
@@ -213,6 +423,105 @@ impl<'de> serde::de::Visitor<'de> for NativeExport<'_> {
     }
 }
 fn validate_native_artifacts(request: &NativeValidationRequest) -> Result<(), StageError> {
+    validate_native_requests(
+        std::slice::from_ref(request),
+        NativeValidationScope::OneSession,
+    )
+}
+
+fn validate_native_batch(requests: &[NativeValidationRequest]) -> Result<(), StageError> {
+    validate_native_requests(requests, NativeValidationScope::CompleteGraph)
+}
+
+enum NativeValidationScope {
+    OneSession,
+    CompleteGraph,
+}
+
+fn validate_native_requests(
+    requests: &[NativeValidationRequest],
+    scope: NativeValidationScope,
+) -> Result<(), StageError> {
+    let first = requests
+        .first()
+        .ok_or("native artifact selection is empty")?;
+    if requests.len() > 50_000
+        || requests.iter().any(|request| {
+            request.descriptor_file != first.descriptor_file
+                || request.payload_file != first.payload_file
+                || request.database_file != first.database_file
+                || request.root_session_id != first.root_session_id
+        })
+    {
+        return Err("native batch source binding differs".into());
+    }
+    if requests
+        .iter()
+        .map(|request| &request.session_id)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        != requests.len()
+    {
+        return Err("native batch session selection repeats".into());
+    }
+    private_file(&first.descriptor_file)?;
+    let descriptor: serde_json::Value =
+        serde_json::from_reader(File::open(&first.descriptor_file)?)?;
+    let manifest: serde_json::Value = serde_json::from_str(
+        descriptor["manifestJson"]
+            .as_str()
+            .ok_or("native manifest missing")?,
+    )?;
+    let selection = if manifest["version"] == 2 {
+        Some(read_native_selection(&NativeSelectionRequest {
+            descriptor_file: first.descriptor_file.clone(),
+            payload_file: first
+                .payload_file
+                .clone()
+                .ok_or("native v2 payload required")?,
+            root_session_id: first.root_session_id.clone(),
+        })?)
+    } else {
+        None
+    };
+    if matches!(scope, NativeValidationScope::CompleteGraph) {
+        let expected = if let Some(selection) = &selection {
+            selection
+                .sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+        } else {
+            manifest["rows"]
+                .as_array()
+                .ok_or("native selection missing")?
+                .iter()
+                .filter(|row| row["table"] == "session")
+                .map(|row| {
+                    row["key"][0]["value"]
+                        .as_str()
+                        .ok_or("native session identity missing")
+                })
+                .collect::<Result<std::collections::BTreeSet<_>, _>>()?
+        };
+        let supplied = requests
+            .iter()
+            .map(|request| request.session_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if supplied != expected {
+            return Err("native batch does not cover the complete selected graph".into());
+        }
+    }
+    for request in requests {
+        validate_native_artifact(request, selection.as_ref())?;
+    }
+    Ok(())
+}
+
+fn validate_native_artifact(
+    request: &NativeValidationRequest,
+    selection: Option<&NativeSelection>,
+) -> Result<(), StageError> {
     use serde::de::DeserializeSeed;
     use std::io::BufReader;
     for file in std::iter::once(&request.descriptor_file)
@@ -235,13 +544,23 @@ fn validate_native_artifacts(request: &NativeValidationRequest) -> Result<(), St
             .as_str()
             .ok_or("native manifest missing")?,
     )?;
-    if descriptor["rootSessionId"] != request.root_session_id
-        || !manifest["rows"]
+    let selected = if manifest["version"] == 2 {
+        selection.is_some_and(|selection| {
+            selection.root_session_id == request.root_session_id
+                && descriptor["sourceGeneration"] == selection.graph_digest
+                && selection
+                    .sessions
+                    .iter()
+                    .any(|session| session.session_id == request.session_id)
+        })
+    } else {
+        manifest["rows"]
             .as_array()
             .ok_or("native selection missing")?
             .iter()
             .any(|row| row["table"] == "session" && row["key"][0]["value"] == request.session_id)
-    {
+    };
+    if descriptor["rootSessionId"] != request.root_session_id || !selected {
         return Err("native original root/session selection differs".into());
     }
     let db = rusqlite::Connection::open_with_flags(
@@ -249,6 +568,15 @@ fn validate_native_artifacts(request: &NativeValidationRequest) -> Result<(), St
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
     db.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; BEGIN")?;
+    if manifest["version"] == 2 {
+        let in_current_closure: bool = db.query_row(
+            "WITH RECURSIVE selected(id) AS (SELECT id FROM session WHERE id=?1 UNION SELECT child.id FROM session child JOIN selected parent ON child.parent_id=parent.id) SELECT EXISTS(SELECT 1 FROM selected WHERE id=?2)",
+            [&request.root_session_id, &request.session_id], |row| row.get(0),
+        )?;
+        if !in_current_closure {
+            return Err("native installed root/session selection differs".into());
+        }
+    }
     // Historical006's largest native message data is 17MB, largest part 230KB.
     // 128MiB per projected message retains headroom while refusing unsupported
     // individual records before allocating them. This is not a full-graph cap.
@@ -336,6 +664,7 @@ fn native_artifact_validator_compares_full_parts_and_requires_complete_eof() {
     let message = json!({"info":{"id":"msg_one","sessionID":"ses_one","role":"user","time":{"created":1}},"parts":[{"id":"prt_one","messageID":"msg_one","sessionID":"ses_one","type":"text","text":"original"}]});
     let request = NativeValidationRequest {
         descriptor_file: base.join("descriptor.json"),
+        payload_file: None,
         database_file,
         root_session_id: "ses_one".into(),
         session_id: "ses_one".into(),
@@ -356,6 +685,10 @@ fn native_artifact_validator_compares_full_parts_and_requires_complete_eof() {
     )
     .unwrap();
     assert!(validate_native_artifacts(&request).is_ok());
+    assert!(
+        validate_native_batch(std::slice::from_ref(&request)).is_ok(),
+        "a complete legacy native batch remains supported"
+    );
     let omitted_info = json!({"id":"ses_one"});
     fs::write(
         &request.info_file,
@@ -430,6 +763,213 @@ fn native_artifact_validator_compares_full_parts_and_requires_complete_eof() {
     );
 }
 
+#[test]
+#[cfg(unix)]
+fn native_validator_reads_current_producer_payload_without_manifest_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = directory.path();
+    let workspace = base.join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let reference = workspace.join("owned.txt");
+    fs::write(&reference, "owned immutable reference").unwrap();
+    let file_url = format!("file://{}", reference.display());
+    let source_path = base.join("source.db");
+    let source = rusqlite::Connection::open(&source_path).unwrap();
+    source
+        .execute_batch(freshell_sessions::opencode_transfer::pinned_destination_schema_sql())
+        .unwrap();
+    for migration in freshell_sessions::opencode_transfer::pinned_destination_migration_ids() {
+        source
+            .execute(
+                "INSERT INTO migration (id,time_completed) VALUES (?1,0)",
+                [migration],
+            )
+            .unwrap();
+    }
+    source.execute("INSERT INTO project (id,worktree,time_created,time_updated,sandboxes) VALUES ('project-native',?1,1,1,'{}')", [workspace.to_str().unwrap()]).unwrap();
+    for (id, parent) in [
+        ("ses_one", None),
+        ("ses_child", Some("ses_one")),
+        ("ses_outside", None),
+    ] {
+        source.execute("INSERT INTO session (id,project_id,parent_id,slug,directory,title,version,time_created,time_updated) VALUES (?1,'project-native',?2,?1,?3,?1,'1.18.21',1,1)", rusqlite::params![id,parent,workspace.to_str().unwrap()]).unwrap();
+        source.execute("INSERT INTO message (id,session_id,time_created,time_updated,data) VALUES (?1,?2,1,1,?3)", rusqlite::params![format!("msg_{id}"), id,json!({"role":"user","time":{"created":1}}).to_string()]).unwrap();
+        source.execute("INSERT INTO part (id,message_id,session_id,time_created,time_updated,data) VALUES (?1,?2,?3,1,1,?4)", rusqlite::params![format!("prt_{id}"),format!("msg_{id}"),id,json!({"type":"text","text":"complete original"}).to_string()]).unwrap();
+        source.execute("INSERT INTO part (id,message_id,session_id,time_created,time_updated,data) VALUES (?1,?2,?3,1,1,?4)", rusqlite::params![format!("prt_file_{id}"),format!("msg_{id}"),id,json!({"type":"file","url":file_url,"mime":"text/plain","filename":"owned.txt"}).to_string()]).unwrap();
+    }
+    drop(source);
+    let request = StageRequest {
+        candidate_sha: "a".repeat(40),
+        image_digest: format!("sha256:{}", "b".repeat(64)),
+        source_database: source_path,
+        root_session_id: "ses_one".into(),
+        extraction_root: base.join("extractions"),
+        workspace_path: workspace,
+        descriptor_file: base.join("descriptor.json"),
+        payload_file: base.join("payload.json"),
+        destination_store_id: "native-reader-store".into(),
+        destination_database: base.join("provider/.local/share/opencode/opencode.db"),
+        provider_home: base.join("provider"),
+        provider_uid: unsafe { libc::geteuid() },
+        provider_gid: unsafe { libc::getegid() },
+        receipt_file: base.join("export.json"),
+        current_projection: false,
+        source_snapshot: None,
+        import_capacity_ceiling_bytes: None,
+    };
+    let inventory = prepare_export_inventory(&request).unwrap();
+    let exported = run_request("export", &request, Some(&inventory)).unwrap();
+    let descriptor: OpenCodeTransferDescriptor =
+        serde_json::from_reader(File::open(&request.descriptor_file).unwrap()).unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&descriptor.manifest_json).unwrap();
+    assert_eq!(manifest["version"], 2);
+    assert_eq!(manifest["asset_count"], 1);
+    assert_eq!(
+        exported["evidence"]["assetCount"], manifest["asset_count"],
+        "current compact assets must retain their true export/read count"
+    );
+    assert!(
+        manifest.get("rows").is_none(),
+        "use the real compact producer, never padded legacy rows"
+    );
+    import_bundle_payload(
+        &descriptor,
+        File::open(&request.payload_file).unwrap(),
+        &request.destination_database,
+        &request.workspace_path,
+    )
+    .unwrap();
+    let native = NativeValidationRequest {
+        descriptor_file: request.descriptor_file.clone(),
+        payload_file: Some(request.payload_file.clone()),
+        database_file: request.destination_database,
+        root_session_id: "ses_one".into(),
+        session_id: "ses_child".into(),
+        info_file: base.join("info.json"),
+        page_files: vec![base.join("page.json")],
+        export_file: base.join("native-export.json"),
+    };
+    let info = json!({"id":"ses_child"});
+    let message = json!({"info":{"id":"msg_ses_child","sessionID":"ses_child","role":"user","time":{"created":1}},"parts":[{"id":"prt_ses_child","messageID":"msg_ses_child","sessionID":"ses_child","type":"text","text":"complete original"},{"id":"prt_file_ses_child","messageID":"msg_ses_child","sessionID":"ses_child","type":"file","url":file_url,"mime":"text/plain","filename":"owned.txt"}]});
+    write_private(&native.info_file, &serde_json::to_vec(&info).unwrap()).unwrap();
+    write_private(
+        &native.page_files[0],
+        &serde_json::to_vec(&json!([message.clone()])).unwrap(),
+    )
+    .unwrap();
+    write_private(
+        &native.export_file,
+        &serde_json::to_vec(&json!({"info":info,"messages":[message.clone()]})).unwrap(),
+    )
+    .unwrap();
+    let actual = validate_native_artifacts(&native);
+    assert!(
+        actual.is_ok(),
+        "current genuine producer must reach native validation: {actual:?}"
+    );
+    let mut root_native = native.clone();
+    root_native.session_id = "ses_one".into();
+    root_native.info_file = base.join("root-info.json");
+    root_native.page_files = vec![base.join("root-page.json")];
+    root_native.export_file = base.join("root-native-export.json");
+    let root_info = json!({"id":"ses_one"});
+    let mut root_message = message.clone();
+    root_message["info"]["id"] = json!("msg_ses_one");
+    root_message["info"]["sessionID"] = json!("ses_one");
+    root_message["parts"][0]["id"] = json!("prt_ses_one");
+    root_message["parts"][0]["messageID"] = json!("msg_ses_one");
+    root_message["parts"][0]["sessionID"] = json!("ses_one");
+    root_message["parts"][1]["id"] = json!("prt_file_ses_one");
+    root_message["parts"][1]["messageID"] = json!("msg_ses_one");
+    root_message["parts"][1]["sessionID"] = json!("ses_one");
+    write_private(
+        &root_native.info_file,
+        &serde_json::to_vec(&root_info).unwrap(),
+    )
+    .unwrap();
+    write_private(
+        &root_native.page_files[0],
+        &serde_json::to_vec(&json!([root_message.clone()])).unwrap(),
+    )
+    .unwrap();
+    write_private(
+        &root_native.export_file,
+        &serde_json::to_vec(&json!({"info":root_info,"messages":[root_message]})).unwrap(),
+    )
+    .unwrap();
+    assert!(validate_native_batch(&[native.clone(), root_native.clone()]).is_ok());
+    assert!(
+        validate_native_artifacts(&root_native).is_ok(),
+        "single-session validation remains supported"
+    );
+    assert!(
+        validate_native_batch(std::slice::from_ref(&root_native)).is_err(),
+        "a complete native batch cannot omit the entire selected child session"
+    );
+    fs::write(&root_native.page_files[0], b"[]").unwrap();
+    assert!(
+        validate_native_batch(&[native.clone(), root_native]).is_err(),
+        "every session in the native batch must have complete pages"
+    );
+    assert!(
+        validate_native_batch(&[native.clone(), native.clone()]).is_err(),
+        "repeated sessions cannot pad a native batch"
+    );
+    let selection = read_native_selection(&NativeSelectionRequest {
+        descriptor_file: native.descriptor_file.clone(),
+        payload_file: request.payload_file.clone(),
+        root_session_id: native.root_session_id.clone(),
+    })
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&selection).unwrap()["sessions"],
+        json!([{"sessionId":"ses_child","messageCount":1},{"sessionId":"ses_one","messageCount":1}])
+    );
+    let mut mixed_batch = native.clone();
+    mixed_batch.root_session_id = "ses_outside".into();
+    assert!(
+        validate_native_batch(&[native.clone(), mixed_batch]).is_err(),
+        "one batch cannot substitute another original source/root"
+    );
+    let mut wrong = native.clone();
+    wrong.session_id = "ses_outside".into();
+    assert!(
+        validate_native_artifacts(&wrong).is_err(),
+        "unselected native root must refuse"
+    );
+    wrong = native.clone();
+    wrong.root_session_id = "ses_child".into();
+    assert!(
+        validate_native_artifacts(&wrong).is_err(),
+        "substituted original root must refuse"
+    );
+    fs::write(&native.page_files[0], b"[]").unwrap();
+    assert!(
+        validate_native_artifacts(&native).is_err(),
+        "complete compact payload cannot excuse missing native messages"
+    );
+    fs::write(
+        &native.page_files[0],
+        serde_json::to_vec(&json!([message])).unwrap(),
+    )
+    .unwrap();
+    let payload = fs::read(&request.payload_file).unwrap();
+    let mutated = String::from_utf8(payload.clone())
+        .unwrap()
+        .replace("complete original", "modified original");
+    assert_eq!(mutated.len(), payload.len());
+    fs::write(&request.payload_file, mutated).unwrap();
+    assert!(
+        validate_native_artifacts(&native).is_err(),
+        "valid JSON with changed history bytes must refuse"
+    );
+    fs::write(&request.payload_file, &payload[..payload.len() - 1]).unwrap();
+    assert!(
+        validate_native_artifacts(&native).is_err(),
+        "truncated genuine payload must refuse"
+    );
+}
+
 struct ImportCapacityCeiling(u64);
 impl DestinationCapacityProvider for ImportCapacityCeiling {
     fn available_bytes(&self, directory: &Path) -> std::io::Result<u64> {
@@ -481,13 +1021,32 @@ fn run_with_arguments(args: &[String]) -> Result<(), StageError> {
         return Err("required fixed stage and private request file".into());
     }
     private_file(Path::new(&args[3]))?;
-    if args[1] == "native" {
-        let request: NativeValidationRequest = serde_json::from_reader(File::open(&args[3])?)?;
-        validate_native_artifacts(&request)?;
+    if args[1] == "selection" {
+        let request: NativeSelectionRequest = serde_json::from_reader(File::open(&args[3])?)?;
         println!(
             "{}",
-            json!({"status":"complete","sessionId":request.session_id})
+            serde_json::to_string(&read_native_selection(&request)?)?
         );
+        return Ok(());
+    }
+    if args[1] == "native" {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum NativeRequests {
+            Single(Box<NativeValidationRequest>),
+            Batch(Vec<NativeValidationRequest>),
+        }
+        let result = match serde_json::from_reader(File::open(&args[3])?)? {
+            NativeRequests::Single(request) => {
+                validate_native_artifacts(&request)?;
+                json!({"status":"complete","sessionId":request.session_id})
+            }
+            NativeRequests::Batch(requests) => {
+                validate_native_batch(&requests)?;
+                json!({"status":"complete","validatedSessionCount":requests.len()})
+            }
+        };
+        println!("{result}");
         return Ok(());
     }
     #[derive(Deserialize)]
@@ -695,7 +1254,12 @@ fn run_request(
                 opencode_transfer_bundle_digest(&descriptor.manifest_json, &descriptor.files);
             descriptor.validate().map_err(|error| error.message)?;
             write_private(&request.descriptor_file, &serde_json::to_vec(&descriptor)?)?;
-            json!({"stage":"export", "rootSessionId":manifest.root_session_id, "sourceStoreId":manifest.source_store_id, "graphDigest":manifest.generation, "rowCount":manifest.row_count,"assetCount":manifest.assets.len(),"savedSnapshotSummary":freshell_sessions::opencode_transfer::saved_snapshot_summary(manifest),"payloadBytes":manifest.payload_bytes,"descriptorReference":request.descriptor_file})
+            let native_selection = read_native_selection(&NativeSelectionRequest {
+                descriptor_file: request.descriptor_file.clone(),
+                payload_file: request.payload_file.clone(),
+                root_session_id: request.root_session_id.clone(),
+            })?;
+            json!({"nativeSelection":native_selection,"stage":"export", "rootSessionId":manifest.root_session_id, "sourceStoreId":manifest.source_store_id, "graphDigest":manifest.generation, "rowCount":manifest.row_count,"assetCount":manifest.assets.len(),"savedSnapshotSummary":freshell_sessions::opencode_transfer::saved_snapshot_summary(manifest),"payloadBytes":manifest.payload_bytes,"descriptorReference":request.descriptor_file})
         }
         "import" | "read" => {
             private_file(&request.descriptor_file)?;

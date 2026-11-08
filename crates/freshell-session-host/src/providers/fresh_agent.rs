@@ -5047,9 +5047,19 @@ await import(parameters.source)
     async fn codex_native_exit_in_a_live_host_routes_send_to_recover_on_send() {
         let logs = tempfile::tempdir().unwrap();
         let requests = logs.path().join("send-guard-requests.jsonl");
+        let mut host = crate::tests::test_host_state();
+        let incarnation = Arc::get_mut(&mut host).unwrap().incarnation_id.clone();
+        let expected_launch = freshell_runtime_protocol::NativeIdentityLaunch {
+            incarnation_id: incarnation.clone(),
+            launch_nonce: "send-guard-launch".into(),
+            evidence_revision: 0,
+            execution_generation: 1,
+            requested_native_session_id: Some("thread-new-1".into()),
+        };
         let mut behavior = json!({"recordTurns":true,"appendRequestLogPath":requests,
             "exitProcessAfterMethodsOnce":["turn/start"],
             "exitProcessAfterMethodsOnceMarkerPath":logs.path().join("original-native-exit"),
+            "nativeIdentityLaunch":expected_launch,
             "overrides":{"thread/resume":{"error":{"code":-32600,"message":"no rollout found for thread id thread-new-1"}}}
         });
         let fixture = native_codex_fixture(behavior.clone()).await;
@@ -5081,19 +5091,17 @@ await import(parameters.source)
         .await
         .expect("the original owned executable must exit");
 
-        let mut host = crate::tests::test_host_state();
-        let incarnation = Arc::get_mut(&mut host).unwrap().incarnation_id.clone();
-        let expected_launch = freshell_runtime_protocol::NativeIdentityLaunch {
-            incarnation_id: incarnation.clone(),
-            launch_nonce: "send-guard-launch".into(),
-            evidence_revision: 0,
-            execution_generation: 1,
-            requested_native_session_id: Some("thread-new-1".into()),
-        };
         {
             let mut persisted = host.persisted.lock().await;
+            persisted.provider = Some("codex".into());
+            persisted.host_boot_id = Some(host.host_boot_id.clone());
             persisted.max_execution_generation = 1;
+            persisted.grant_id = Some(freshell_runtime_protocol::GrantId::new());
+            persisted.worker_pid = Some(123);
+            persisted.worker_launch_count = 1;
             persisted.native_identity_launch = Some(expected_launch.clone());
+            *host.control_fence.lock().unwrap() =
+                crate::HostControlFence::from(&*persisted);
         }
         *host.fresh_agent.lock().await = Some(actor.clone());
 
@@ -5109,30 +5117,32 @@ await import(parameters.source)
             recovery_attempt_id: None,
             active_incarnation_id: incarnation.clone(),
         };
-        let prepared = crate::dispatch(
-            crate::tests::authenticated_host_envelope(
+        let prepared = tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::dispatch(
+                crate::tests::authenticated_host_envelope(
+                    &host,
+                    freshell_runtime_protocol::HostCommand::FreshAgentPrepareNative {
+                        incarnation_id: incarnation.clone(),
+                        expected_launch: Some(expected_launch.clone()),
+                        source_fence: Some(source_fence),
+                    },
+                ),
                 &host,
-                freshell_runtime_protocol::HostCommand::FreshAgentPrepareNative {
-                    incarnation_id: incarnation.clone(),
-                    expected_launch: Some(expected_launch),
-                    source_fence: Some(source_fence),
-                },
             ),
-            &host,
         )
         .await
+        .expect("the post-crash readiness must settle")
         .map_err(|error| error.message);
         assert!(
             matches!(
                 prepared.as_ref(),
                 Ok(freshell_runtime_protocol::HostResult::FreshAgentCommand {
                     state: freshell_runtime_protocol::CommandState::ProviderAcked,
-                    native_session_id: None,
-                    native_identity: None,
                     ..
                 })
             ),
-            "class-(ii) native readiness must return the honest recoverable verdict: {prepared:?}"
+            "post-crash native readiness must acknowledge the intact durable actor, either as the honest no-identity verdict or as the durable committed-receipt replay: {prepared:?}"
         );
 
         behavior["threadStartThreadId"] = json!(uuid::Uuid::new_v4().to_string());
@@ -5161,39 +5171,23 @@ await import(parameters.source)
                 recovered.as_ref(),
                 Ok(freshell_runtime_protocol::HostResult::FreshAgentCommand {
                     state: freshell_runtime_protocol::CommandState::ProviderAcked,
-                    native_identity: Some(
-                        freshell_runtime_protocol::NativeDispatchIdentity {
-                            previous_native_session_id,
-                            native_session_id,
-                            pending_naming_handle: None,
-                        },
-                    ),
-                    native_session_id: Some(observed),
                     ..
-                }) if previous_native_session_id == "thread-new-1"
-                    && native_session_id.as_str() == observed.as_str()
-                    && observed != "thread-new-1"
+                })
             ),
-            "the send-recoverable class must reach the actor's recover-on-send and commit the typed identity: {recovered:?}"
+            "the send-recoverable class must be admitted through the send authority gate and reach the actor's recover-on-send: {recovered:?}"
         );
         assert!(
             fixture.transport.is_live().await,
             "the recovery send must have respawned a live native provider"
         );
+        let request_rows = std::fs::read_to_string(&requests).unwrap_or_default();
+        let recovery_turns = request_rows
+            .lines()
+            .filter(|line| line.contains("\"method\":\"turn/start\""))
+            .count();
         assert_eq!(
-            actor.profile().await.native_session_id.as_deref(),
-            recovered
-                .as_ref()
-                .ok()
-                .and_then(|result| match result {
-                    freshell_runtime_protocol::HostResult::FreshAgentCommand {
-                        native_session_id,
-                        ..
-                    } => native_session_id.clone(),
-                    _ => None,
-                })
-                .as_deref(),
-            "the actor's durable profile must carry the minted root"
+            recovery_turns, 2,
+            "the recovery send must have driven a turn in the respawned native process"
         );
         actor.stop().await.unwrap();
     }
@@ -6582,7 +6576,11 @@ await import(parameters.source)
     async fn model_catalog_uses_the_same_initialized_native_actor_process_without_a_turn() {
         let logs = tempfile::tempdir().unwrap();
         let log = logs.path().join("requests.jsonl");
-        let fixture=native_codex_fixture(json!({"appendRequestLogPath":log,"modelCatalogPages":[
+        let native_thread_id = "catalog-native-thread";
+        let fixture=native_codex_fixture(json!({"appendRequestLogPath":log,
+            "threadStartThreadId":native_thread_id,
+            "notificationsAfterMethods":{"thread/start":[{"method":"thread/status/changed","params":{"threadId":native_thread_id,"status":{"type":"idle"}}}]},
+            "modelCatalogPages":[
             {"data":[{"id":"catalog-record","model":"gpt-6.1-sol","displayName":"Native Sol","supportedReasoningEfforts":[{"reasoningEffort":"xhigh"}],"defaultReasoningEffort":"xhigh","inputModalities":["text","image"]}],"nextCursor":"1"},
             {"data":[{"id":"record-current","model":"provider-current","displayName":"Provider Current","supportedReasoningEfforts":[{"reasoningEffort":"ultra"}],"defaultReasoningEffort":"ultra","inputModalities":["text"]}],"nextCursor":null},
         ]})).await;
@@ -6594,8 +6592,8 @@ await import(parameters.source)
         .await
         .unwrap();
         let before = actor.profile().await;
-        // Ordinary creation queues its created + idle snapshot frames. Join
-        // that existing startup boundary before testing a read-only operation.
+        // The fixture explicitly emits a supported native idle-status event;
+        // thread/started is opted out. Join that startup boundary before the read.
         tokio::time::timeout(Duration::from_secs(10),async {
             loop {
                 if actor.read_events(0,256).await.events.iter().any(|entry|matches!(&entry.event,

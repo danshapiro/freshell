@@ -9,11 +9,31 @@
 
 use freshell_codex::durability::default_server_instance_id;
 use freshell_codex::sidecar_store::{
-    codex_sidecar_store, proc_cmdline, proc_starttime, CodexSidecarRecord, SidecarLane,
-    SidecarRecordState, SIDECAR_RECORD_VERSION,
+    codex_sidecar_store, proc_cmdline, proc_starttime, CodexSidecarRecord, CodexSidecarStore,
+    SidecarLane, SidecarRecordState, SIDECAR_RECORD_VERSION,
 };
+use std::sync::Arc;
 
 const PROVIDER: &str = "freshcodex";
+
+/// Proof that this spawn successfully recorded its early process identity.
+/// Carry the exact row/store forward instead of mistaking a failed reread for
+/// the documented untracked fallback during endpoint publication.
+pub(crate) struct SpawnedSidecarRecord {
+    store: Arc<CodexSidecarStore>,
+    record: CodexSidecarRecord,
+}
+
+impl SpawnedSidecarRecord {
+    pub(crate) fn record_announced_endpoint(mut self, ws_url: &str) -> Result<(), String> {
+        self.record.ws_url = ws_url.to_string();
+        self.record.updated_at = now_millis();
+        self.store.write(&self.record).map_err(|error| {
+            tracing::error!(event="freshagent.sidecar.endpoint_write_failed", provider=PROVIDER, ownership_id=%self.record.ownership_id, pid=self.record.pid, %error, "The owned sidecar endpoint could not be recorded");
+            "owned sidecar endpoint could not be recorded".to_string()
+        })
+    }
+}
 
 /// Poll budget for `/proc/<pid>` evidence right after spawn. The fork/exec
 /// window closes in milliseconds, but between fork() and execve()
@@ -37,18 +57,20 @@ fn now_millis() -> i64 {
 /// produce a tracked survivor). Never fails the spawn: no store, an unreadable
 /// identity, or an io error are all logged loudly and leave today's
 /// kill-on-drop-only posture in place for that child.
-pub(crate) async fn record_spawned_sidecar(ownership_id: &str, pid: u32, ws_url: &str) {
+pub(crate) async fn record_spawned_sidecar(
+    ownership_id: &str,
+    pid: u32,
+    ws_url: &str,
+) -> Option<SpawnedSidecarRecord> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (ownership_id, pid, ws_url);
-        return; // /proc identity evidence is Linux-only
+        return None; // /proc identity evidence is Linux-only
     }
 
-    let Some(store) = codex_sidecar_store() else {
-        return;
-    };
+    let store = codex_sidecar_store()?;
     if !store.is_enabled() {
-        return;
+        return None;
     }
     if pid == 0 {
         tracing::warn!(
@@ -56,7 +78,7 @@ pub(crate) async fn record_spawned_sidecar(ownership_id: &str, pid: u32, ws_url:
             ownership_id,
             "freshagent.sidecar.track_skipped: no pid"
         );
-        return;
+        return None;
     }
 
     // Pre-exec /proc mirrors our own argv; accept evidence only after it
@@ -101,7 +123,7 @@ pub(crate) async fn record_spawned_sidecar(ownership_id: &str, pid: u32, ws_url:
             pid,
             "freshagent.sidecar.track_skipped: /proc identity evidence unavailable within budget"
         );
-        return;
+        return None;
     };
 
     let now = now_millis();
@@ -127,15 +149,19 @@ pub(crate) async fn record_spawned_sidecar(ownership_id: &str, pid: u32, ws_url:
                 ownership_id,
                 pid,
                 "freshagent.sidecar.tracked"
-            )
+            );
+            Some(SpawnedSidecarRecord { store, record })
         }
-        Err(err) => tracing::warn!(
-            provider = PROVIDER,
-            ownership_id,
-            pid,
-            error = %err,
-            "freshagent.sidecar.track_write_failed"
-        ),
+        Err(err) => {
+            tracing::warn!(provider = PROVIDER, ownership_id, pid, error = %err, "freshagent.sidecar.track_write_failed");
+            // A parent-directory fsync can fail after the row's rename.
+            // Preserve the untracked fallback while removing only this
+            // attempted startup row; enrichment also rejects placeholders.
+            if let Err(error) = store.remove(ownership_id) {
+                tracing::warn!(event="freshagent.sidecar.incomplete_track_cleanup_failed", provider=PROVIDER, ownership_id, pid, %error, "The process-only startup record could not be removed");
+            }
+            None
+        }
     }
 }
 
@@ -175,6 +201,10 @@ pub(crate) fn enrich_record_session_id(ownership_id: &str, thread_id: &str) {
     else {
         return; // never tracked (disabled store / skipped write) — fine
     };
+    if record.ws_url == freshell_codex::sidecar_startup::REQUESTED_LISTEN_URL {
+        tracing::warn!(event="freshagent.sidecar.placeholder_enrichment_refused", provider=PROVIDER, ownership_id, session_id=%thread_id, "A process-only startup record cannot become resumable before endpoint publication");
+        return;
+    }
     if record.session_id.as_deref() == Some(thread_id) {
         return;
     }

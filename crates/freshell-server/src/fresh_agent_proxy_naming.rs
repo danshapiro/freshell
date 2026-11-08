@@ -31,6 +31,34 @@ impl HostedCodexNameBackend {
         target: NativeNameTarget,
         operation: Operation,
     ) -> Result<Reply, NativeClassified> {
+        let budget = std::time::Duration::from_millis(
+            freshell_codex::app_server::NATIVE_METADATA_READ_TIMEOUT_MS,
+        );
+        let deadline = tokio::time::Instant::now() + budget;
+        let deadline_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(i64::MAX as u128) as i64
+            + budget.as_millis() as i64;
+        tokio::time::timeout_at(
+            deadline,
+            self.invoke_until(target, operation, deadline_unix_ms),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(NativeClassified::Ambiguous(
+                "managed Codex naming deadline expired".into(),
+            ))
+        })
+    }
+
+    async fn invoke_until(
+        &self,
+        target: NativeNameTarget,
+        operation: Operation,
+        deadline_unix_ms: i64,
+    ) -> Result<Reply, NativeClassified> {
         let NativeLocation::Codex {
             codex_home,
             native_thread_id: Some(native_id),
@@ -95,6 +123,7 @@ impl HostedCodexNameBackend {
                 codex_home: codex_home.clone(),
                 operation,
                 expected_control_epoch: None,
+                deadline_unix_ms: Some(deadline_unix_ms),
             })
             .await
             .map_err(|error| {

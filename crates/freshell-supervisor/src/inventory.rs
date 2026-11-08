@@ -381,13 +381,13 @@ impl Supervisor {
                                 )
                                 .await
                             {
-                                Ok(status) => {
-                                    if handle.fresh_agent().is_some_and(|agent| {
-                                        !crate::registry::deterministic_fresh_agent_fixture(
-                                            view.provider.as_deref().unwrap_or_default(),
-                                            agent,
-                                        )
-                                    }) && classify_fresh_provider_exit(
+                                 Ok(status) => {
+                                     if handle.fresh_agent().is_some_and(|agent| {
+                                         !crate::registry::deterministic_fresh_agent_fixture(
+                                             view.provider.as_deref().unwrap_or_default(),
+                                             agent,
+                                         )
+                                     }) && classify_fresh_provider_exit(
                                         handle
                                             .fresh_agent()
                                             .map(|agent| agent.provider.as_str())
@@ -430,6 +430,25 @@ impl Supervisor {
                                         None
                                     } else if status.exited {
                                         Some(RecoveryTrigger::ProviderExit)
+                                    } else if host.is_retained_v1() {
+                                        // Retained-v1 hosts keep the original history: an
+                                        // owner mismatch on a live host is a takeover
+                                        // signal, not a dead provider — verify the
+                                        // terminal owner before trusting the status.
+                                        match supervisor
+                                            .verify_retained_terminal_owner_status(&handle, &host, &status)
+                                            .await
+                                        {
+                                            Ok(()) => None,
+                                            Err(error) => {
+                                                append_event(
+                                                    &supervisor.config.lifecycle_log,
+                                                    "supervisor.runtime_observer.retained_owner_changed",
+                                                    serde_json::json!({"severity":"warning","soulId":view.soul_id,"errorCode":error.code,"message":error.message}),
+                                                );
+                                                Some(RecoveryTrigger::HostUnreachable)
+                                            }
+                                        }
                                     } else {
                                         if view.provider.as_deref() != Some("shell")
                                             && !matches!(

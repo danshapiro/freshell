@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { WebSocketServer } from 'ws'
+import { WebSocket, WebSocketServer } from 'ws'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import fs from 'node:fs'
@@ -120,6 +120,8 @@ function parseListenUrl(argv) {
 }
 
 function loadBehavior() {
+  const fileIndex = process.argv.indexOf('--fixture-behavior-file')
+  if (fileIndex !== -1) return JSON.parse(fs.readFileSync(process.argv[fileIndex + 1], 'utf8'))
   const raw = process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR
   if (!raw) return {}
   return JSON.parse(raw)
@@ -620,6 +622,42 @@ function recordInputFileReads(method, params) {
 
 const listenUrl = parseListenUrl(process.argv.slice(2))
 const behavior = loadBehavior()
+// Opt-in observations only. No listener, retry, or startup control flow is changed.
+const diagnosticLogPath = process.env.FAKE_CODEX_APP_SERVER_DIAGNOSTIC_LOG
+let diagnosticSequence = 0
+let diagnosticConnectionSequence = 0
+let diagnosticListenUrl = null
+function diagnosticEvent(event, detail = {}) {
+  if (!diagnosticLogPath) return
+  try {
+    fs.appendFileSync(diagnosticLogPath, JSON.stringify({
+      severity: event === 'process.uncaught_exception' ? 'error' : 'info',
+      event,
+      sequence: ++diagnosticSequence,
+      timestamp: new Date().toISOString(),
+      monotonicNs: process.hrtime.bigint().toString(),
+      pid: process.pid,
+      ppid: process.ppid,
+      sidecarOwnershipId: process.env.FRESHELL_CODEX_SIDECAR_ID ?? null,
+      requestedListenUrl: listenUrl,
+      listenUrl: diagnosticListenUrl,
+      home: process.env.FRESHELL_HOME ?? process.env.HOME ?? null,
+      codexHome: getCodexHome(),
+      cwd: process.cwd(),
+      ...detail,
+    }) + '\n')
+  } catch (error) {
+    process.stderr.write(JSON.stringify({ severity: 'warn', event: 'fixture_diagnostics_write_failed', message: error.message }) + '\n')
+  }
+}
+diagnosticEvent('process.started', { argv: process.argv.slice(2) })
+if (diagnosticLogPath) {
+  // Monitor only: adding an ordinary error handler would suppress Node's exit.
+  process.on('uncaughtExceptionMonitor', (error) => {
+    diagnosticEvent('process.uncaught_exception', { code: error.code ?? null, message: error.message })
+  })
+  process.on('exit', (exitCode) => diagnosticEvent('process.exited', { exitCode }))
+}
 if (process.env.FAKE_CODEX_APP_SERVER_ARG_LOG) {
   fs.writeFileSync(process.env.FAKE_CODEX_APP_SERVER_ARG_LOG, JSON.stringify({
     argv: process.argv.slice(2),
@@ -650,6 +688,47 @@ const port = Number(url.port)
 const portFile = process.env.FAKE_CODEX_APP_SERVER_PORT_FILE
 if (portFile && port !== 0) {
   throw new Error('FAKE_CODEX_APP_SERVER_PORT_FILE requires --listen ws://127.0.0.1:0')
+}
+
+// Controlled startup adversary: a separate owned fixture takes the released
+// explicit port before this process binds. Port-zero launches instead receive
+// independent kernel assignments. The rival never writes our stderr pipe.
+if (behavior.startupCompetingListener) {
+  const rival = behavior.startupCompetingListener
+  fs.mkdirSync(rival.home, { recursive: true })
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), '--listen', listenUrl], {
+    env: {
+      ...process.env,
+      HOME: rival.home,
+      FRESHELL_HOME: rival.home,
+      CODEX_HOME: path.join(rival.home, '.codex'),
+      FRESHELL_CODEX_SIDECAR_ID: rival.ownershipId,
+      FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
+        appendRequestLogPath: rival.requestsPath,
+        waitForThreadStartReleasePath: rival.releasePath,
+        threadStartThreadId: 'foreign-startup-thread',
+      }),
+      FAKE_CODEX_APP_SERVER_DIAGNOSTIC_LOG: rival.eventsPath,
+      FAKE_CODEX_APP_SERVER_LISTENER_READY_FILE: rival.readyPath,
+    },
+    stdio: 'ignore',
+  })
+  child.unref()
+  const deadline = Date.now() + 10_000
+  while (!fs.existsSync(rival.readyPath)) {
+    if (Date.now() > deadline) throw new Error('competing fixture did not report its listener')
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  const ready = JSON.parse(fs.readFileSync(rival.readyPath, 'utf8'))
+  // One known controller establishes an exact baseline. An extra initialize
+  // means the real Freshell startup connected to this foreign fixture.
+  const warmup = new WebSocket(ready.url)
+  await new Promise((resolve, reject) => {
+    warmup.once('error', reject)
+    warmup.once('open', () => warmup.send(JSON.stringify({ id: 'owned-rival-warmup', method: 'initialize', params: {} })))
+    warmup.once('message', () => resolve())
+  })
+  warmup.close()
 }
 
 let nativeChild
@@ -732,7 +811,27 @@ const wss = portFile
       fs.writeFileSync(portFile, `${address.port}\n`, 'utf8')
     })
   : new WebSocketServer({ host, port })
+wss.once('listening', () => {
+  const address = wss.address()
+  process.stderr.write(`codex app-server (WebSockets)\n  listening on: ws://${host}:${address.port}\n`)
+})
+if (process.env.FAKE_CODEX_APP_SERVER_LISTENER_READY_FILE) {
+  wss.once('listening', () => {
+    const address = wss.address()
+    fs.writeFileSync(process.env.FAKE_CODEX_APP_SERVER_LISTENER_READY_FILE, JSON.stringify({ pid: process.pid, url: `ws://${host}:${address.port}` }))
+  })
+}
+if (diagnosticLogPath) {
+  wss.on('listening', () => {
+    const address = wss.address()
+    if (address && typeof address !== 'string') {
+      diagnosticListenUrl = `ws://${host}:${address.port}`
+    }
+    diagnosticEvent('listener.ready')
+  })
+}
 const watches = new Map()
+const notificationOptOuts = new WeakMap()
 const activeThreadIds = new Set()
 // kata 1wxv (LBC-1): thread/revert is paginated-only. Threads THIS process
 // started with historyMode:"paginated" on thread/start land here; any other
@@ -750,7 +849,7 @@ function broadcastNotification(method, params) {
     params,
   })
   for (const client of wss.clients) {
-    if (client.readyState === 1) {
+    if (client.readyState === 1 && !notificationOptOuts.get(client)?.has(method)) {
       client.send(payload)
     }
   }
@@ -794,7 +893,7 @@ function appendThreadOperation(method, params, result) {
     method,
     threadId,
     params,
-    listenUrl: portFile ? `ws://${host}:${wss.address().port}` : listenUrl,
+    listenUrl: `ws://${host}:${wss.address().port}`,
     sidecarOwnershipId: process.env.FRESHELL_CODEX_SIDECAR_ID ?? null,
     pid: process.pid,
     at: new Date().toISOString(),
@@ -873,7 +972,16 @@ function claimCrossProcessCloseSocketOnce(method) {
   return claimCrossProcessOnce(behavior.closeSocketAfterMethodsOnceMarkerPath, `close-socket:${method}`)
 }
 
-wss.on('connection', (socket) => {
+wss.on('connection', (socket, request) => {
+  const diagnosticConnectionId = ++diagnosticConnectionSequence
+  diagnosticEvent('connection.opened', {
+    connectionId: diagnosticConnectionId,
+    peerAddress: request.socket.remoteAddress,
+    peerPort: request.socket.remotePort,
+  })
+  if (diagnosticLogPath) {
+    socket.on('close', (code) => diagnosticEvent('connection.closed', { connectionId: diagnosticConnectionId, code }))
+  }
   let initialized = false
   let initializedNotification = false
   const pendingClientRequests = new Map()
@@ -918,6 +1026,11 @@ wss.on('connection', (socket) => {
       return
     }
     const method = message.method
+    if (method === 'initialize') {
+      const methods = message.params?.capabilities?.optOutNotificationMethods
+      notificationOptOuts.set(socket, new Set(Array.isArray(methods) ? methods.filter((name) => typeof name === 'string') : []))
+    }
+    diagnosticEvent('rpc.request', { connectionId: diagnosticConnectionId, id: message.id, method, params: message.params })
     if (behavior.appendRequestLogPath) {
       fs.appendFileSync(behavior.appendRequestLogPath, JSON.stringify({ method, params: message.params, codexHome: getCodexHome(), cwd: process.cwd(), ...(behavior.requestLogContext ? { context: behavior.requestLogContext } : {}) }) + '\n')
     }
@@ -1081,6 +1194,18 @@ wss.on('connection', (socket) => {
       appendThreadOperation(method, message.params, result)
       maybeWriteRolloutForMethod(method, message.params)
       recordInputFileReads(method, message.params)
+      if (method === 'thread/resume') {
+        const thread = result?.thread || getThreadHandle(message.params?.threadId || 'thread-new-1')
+        if (!activeThreadIds.has(thread.id)) {
+          // Native 0.164 cold resume loads the runtime and publishes its Idle
+          // status before answering. An already-loaded resume has no new edge.
+          activeThreadIds.add(thread.id)
+          broadcastNotification('thread/status/changed', {
+            threadId: thread.id,
+            status: { type: 'idle' },
+          })
+        }
+      }
       socket.send(JSON.stringify({
         id: message.id,
         result,
@@ -1239,13 +1364,6 @@ wss.on('connection', (socket) => {
         broadcastNotification('thread/reverted', {
           threadId: message.params?.threadId,
           beforeTurnId: message.params?.beforeTurnId,
-        })
-      }
-      if (method === 'thread/resume') {
-        const thread = result?.thread || getThreadHandle(message.params?.threadId || 'thread-new-1')
-        activeThreadIds.add(thread.id)
-        broadcastNotification('thread/started', {
-          thread,
         })
       }
       if (method === 'fs/watch') {

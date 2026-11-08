@@ -1701,10 +1701,29 @@ struct LegacyExpectedTerminalConfig<'a> {
 fn known_legacy_opencode_profile(
     handle: &OwnedRuntimeHandle,
     tmpfs: &BTreeMap<String, String>,
+    expected: &BTreeMap<String, String>,
 ) -> bool {
     let mut legacy = runtime_tmpfs(Some("opencode"));
     legacy.remove("/run/freshell-private");
-    known_legacy_opencode_identity(handle) && tmpfs == &legacy
+    if known_legacy_opencode_identity(handle) && tmpfs == &legacy {
+        return true;
+    }
+    // The next v1 profile added context-owned MCP inputs and a private
+    // directory with mode 0700. Its recorded home masks and all other
+    // mount options must still match exactly; no new policy is inferred.
+    if known_legacy_terminal_digest(handle)
+        && handle.terminal().is_some_and(|terminal| {
+            terminal.mode == "opencode" && terminal.provider_launch_context.is_some()
+        })
+    {
+        let mut context_profile = expected.clone();
+        context_profile.insert(
+            "/run/freshell-private".into(),
+            "rw,noexec,nosuid,nodev,size=16m,mode=0700".into(),
+        );
+        return tmpfs == &context_profile;
+    }
+    false
 }
 fn known_legacy_opencode_identity(handle: &OwnedRuntimeHandle) -> bool {
     handle.launch_policy().is_none()
@@ -1716,11 +1735,25 @@ fn known_legacy_opencode_identity(handle: &OwnedRuntimeHandle) -> bool {
                 && terminal.opencode_adoption.is_none()
         })
 }
+fn known_legacy_terminal_digest(handle: &OwnedRuntimeHandle) -> bool {
+    handle.launch_policy().is_none()
+        && handle.fresh_agent().is_none()
+        && handle.terminal().is_some_and(|terminal| {
+            matches!(terminal.mode.as_str(), "shell" | "opencode")
+                && terminal.opencode_transfer.is_none()
+                && terminal.opencode_transfer_attempt_id.is_none()
+                && terminal.opencode_adoption.is_none()
+                && terminal
+                    .provider_launch_context
+                    .as_ref()
+                    .is_none_or(|context| context.prepared_inputs.is_none())
+        })
+}
 fn verify_saved_immutable_digest(handle: &OwnedRuntimeHandle) -> Result<(), BackendError> {
     if immutable_digest_from_handle(handle)? == handle.immutable_config_digest() {
         return Ok(());
     }
-    if known_legacy_opencode_identity(handle) {
+    if known_legacy_terminal_digest(handle) {
         // Exact serializer/order from7dbc7ef6, terminal-only/no transfer;
         // retain its saved bytes and never infer a newer profile over it.
         let legacy = LegacyExpectedTerminalConfig {
@@ -1986,7 +2019,8 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
         .get("Tmpfs")
         .and_then(Value::as_object)
         .is_some_and(|object| object.len() == actual_tmpfs.len());
-    let exact_legacy = tmpfs_well_formed && known_legacy_opencode_profile(handle, &actual_tmpfs);
+    let exact_legacy =
+        tmpfs_well_formed && known_legacy_opencode_profile(handle, &actual_tmpfs, &expected_tmpfs);
     let policy_mismatch = !tmpfs_well_formed || (actual_tmpfs != expected_tmpfs && !exact_legacy);
 
     let mounts = value
@@ -2676,6 +2710,141 @@ pub(crate) mod tests {
             None,
         ).unwrap()},"HostConfig":{"NetworkMode":"bridge","PidMode":"","Privileged":false,"CapAdd":["CHOWN","SETUID","SETGID"],"Tmpfs":tmpfs},"Mounts":[{"Source":binary,"Destination":"/runtime/freshell-session-host","RW":false},{"Source":runtime_dir,"Destination":"/run/freshell","RW":true},{"Name":handle.provider_volume_name(),"Destination":"/home/freshell/provider","RW":true},{"Source":workspace,"Destination":workspace,"RW":true}]});
         (root, handle, inspection)
+    }
+
+    #[test]
+    fn retained_legacy_opencode_context_keeps_its_exact_0700_private_mount() {
+        const CHILD: &str = "FRESHELL_RETAINED_CONTEXT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status=std::process::Command::new("/usr/bin/timeout").args(["--kill-after=1s","20s"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact","backend::tests::retained_legacy_opencode_context_keeps_its_exact_0700_private_mount","--nocapture"])
+                .env(CHILD,"1").status().unwrap();
+            assert!(status.success(), "owned context inspection failed");
+            return;
+        }
+        let (root, original, mut inspection) = retained_opencode_fixture();
+        let capabilities = root.path().join("mcp-capabilities");
+        std::fs::create_dir(&capabilities).unwrap();
+        std::env::set_var("FRESHELL_RUNTIME_CAPABILITY_DIR", &capabilities);
+        let mut terminal = original.terminal().unwrap().clone();
+        terminal.provider_launch_context = Some(freshell_runtime_protocol::ProviderLaunchContext {
+            prepared_inputs: None,
+            config: Vec::new(),
+            preparation: freshell_runtime_protocol::ProviderPreparation::Opencode {
+                project_config: Vec::new(),
+                tui_config: None,
+                tui_source: None,
+                inline_config: false,
+            },
+            mcp_capability: Some(freshell_runtime_protocol::McpCapabilityReference {
+                grant_id: "grant-retained".into(),
+                endpoint: "http://host.docker.internal:4000".into(),
+                provider_relative_path: ".freshell/mcp-capability.json".into(),
+                host_gateway_address: None,
+            }),
+        });
+        let encoded=format!("{{\"image_ref\":{},\"installation_id\":{},\"soul_id\":{},\"incarnation_id\":{},\"host_binary_path\":{},\"runtime_dir\":{},\"limits\":{},\"terminal\":{},\"fresh_agent\":null,\"provider_volume_name\":{}}}",serde_json::to_string(original.image_ref()).unwrap(),serde_json::to_string(&original.installation_id()).unwrap(),serde_json::to_string(&original.soul_id()).unwrap(),serde_json::to_string(&original.incarnation_id()).unwrap(),serde_json::to_string(&original.host_binary_path()).unwrap(),serde_json::to_string(original.runtime_dir()).unwrap(),serde_json::to_string(&original.requested_limits()).unwrap(),serde_json::to_string(&terminal).unwrap(),serde_json::to_string(original.provider_volume_name()).unwrap());
+        let saved = format!("sha256:{:x}", Sha256::digest(encoded));
+        let handle = OwnedRuntimeHandle::from_registry(
+            original.installation_id().clone(),
+            original.soul_id().clone(),
+            original.provider_store_id().into(),
+            original.incarnation_id().clone(),
+            original.launch_nonce().clone(),
+            original.daemon_id().clone(),
+            original.container_id().into(),
+            original.image_ref().into(),
+            original.runtime_dir().into(),
+            original.host_binary_path().into(),
+            saved.clone(),
+            original.requested_limits(),
+            None,
+            Some(terminal),
+            None,
+            original.provider_volume_name().into(),
+        );
+        inspection["HostConfig"]["Tmpfs"]["/run/freshell-private"] =
+            json!("rw,noexec,nosuid,nodev,size=16m,mode=0700");
+        let mounts = docker::terminal_mounts_for_adoption(handle.terminal().unwrap()).unwrap();
+        inspection["Mounts"].as_array_mut().unwrap().extend([
+            json!({"Source":mounts.provider_user_root.unwrap(),"Destination":"/run/freshell-private/user-provider","RW":false}),
+            json!({"Source":mounts.mcp_capability_file.unwrap(),"Destination":"/run/freshell/mcp-capability.json","RW":false}),
+        ]);
+        assert!(
+            verify_saved_immutable_digest(&handle).is_ok(),
+            "the historical codec includes every saved context field"
+        );
+        assert!(
+            verify_inspect_config(&handle, &inspection).is_ok(),
+            "the exact prior private mount remains owned"
+        );
+        assert_eq!(handle.immutable_config_digest(), saved);
+        inspection["HostConfig"]["Tmpfs"]["/run/freshell-private"] =
+            json!("rw,noexec,nosuid,nodev,size=32m,mode=0700");
+        assert!(matches!(
+            verify_inspect_config(&handle, &inspection),
+            Err(BackendError::PolicyMismatch(_))
+        ));
+        inspection["HostConfig"]["Tmpfs"]["/run/freshell-private"] =
+            json!("rw,noexec,nosuid,nodev,size=16m,mode=0700");
+        inspection["Mounts"]
+            .as_array_mut()
+            .unwrap()
+            .last_mut()
+            .unwrap()["RW"] = json!(true);
+        assert!(
+            verify_inspect_config(&handle, &inspection).is_err(),
+            "legacy context cannot make its capability mount writable"
+        );
+    }
+
+    #[test]
+    fn retained_legacy_shell_keeps_its_verified_historical_digest() {
+        let (_root, original, mut inspection) = retained_opencode_fixture();
+        let mut terminal = original.terminal().unwrap().clone();
+        terminal.mode = "shell".into();
+        terminal.program = "/bin/sh".into();
+        terminal.args.clear();
+        let encoded=format!("{{\"image_ref\":{},\"installation_id\":{},\"soul_id\":{},\"incarnation_id\":{},\"host_binary_path\":{},\"runtime_dir\":{},\"limits\":{},\"terminal\":{},\"fresh_agent\":null,\"provider_volume_name\":{}}}",serde_json::to_string(original.image_ref()).unwrap(),serde_json::to_string(&original.installation_id()).unwrap(),serde_json::to_string(&original.soul_id()).unwrap(),serde_json::to_string(&original.incarnation_id()).unwrap(),serde_json::to_string(&original.host_binary_path()).unwrap(),serde_json::to_string(original.runtime_dir()).unwrap(),serde_json::to_string(&original.requested_limits()).unwrap(),serde_json::to_string(&terminal).unwrap(),serde_json::to_string(original.provider_volume_name()).unwrap());
+        let saved = format!("sha256:{:x}", Sha256::digest(encoded));
+        let handle = OwnedRuntimeHandle::from_registry(
+            original.installation_id().clone(),
+            original.soul_id().clone(),
+            original.provider_store_id().into(),
+            original.incarnation_id().clone(),
+            original.launch_nonce().clone(),
+            original.daemon_id().clone(),
+            original.container_id().into(),
+            original.image_ref().into(),
+            original.runtime_dir().into(),
+            original.host_binary_path().into(),
+            saved.clone(),
+            original.requested_limits(),
+            None,
+            Some(terminal),
+            None,
+            original.provider_volume_name().into(),
+        );
+        inspection["HostConfig"]["Tmpfs"] =
+            serde_json::to_value(runtime_tmpfs(Some("shell"))).unwrap();
+        assert!(
+            verify_saved_immutable_digest(&handle).is_ok(),
+            "a prior-accepted shell must retain its exact saved digest"
+        );
+        assert!(verify_inspect_config(&handle, &inspection).is_ok());
+        assert_eq!(handle.immutable_config_digest(), saved);
+        assert!(
+            verify_saved_immutable_digest(&handle.clone().with_launch_policy(Some(
+                freshell_runtime_protocol::RuntimeLaunchPolicy::ProviderVolumeV1
+            )))
+            .is_err()
+        );
+        inspection["Mounts"][0]["RW"] = json!(true);
+        assert!(
+            verify_inspect_config(&handle, &inspection).is_err(),
+            "historical serialization must not weaken physical ownership"
+        );
     }
 
     #[test]

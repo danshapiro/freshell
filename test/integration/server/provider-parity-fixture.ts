@@ -146,13 +146,14 @@ function freshTrace(record: any, route: 'direct' | 'managed'): ProviderVisibleTr
 }
 
 export async function runProviderParityFixture(repoRoot: string, eventsTarget?: string): Promise<ProviderParityReceipt> {
-  // dist is ignored, traversable and unshadowed by the sandbox's cache mounts.
-  // Rootless Docker maps the guest UID separately; only this run's synthetic
-  // output directory needs cross-UID writes. Private input directories stay sealed.
+  // Existing distribution output can be private. The checkout is already
+  // readable by the sandbox; give only this owned synthetic output directory
+  // cross-UID writes, outside the sandbox's overlaid dependency/cache mounts.
   const sandboxed = process.env.FRESHELL_RUST_TEST_SANDBOX === '1'
-  const base = sandboxed ? path.join(repoRoot, 'dist') : os.tmpdir()
-  fs.mkdirSync(base, { recursive: true })
-  const directory = fs.mkdtempSync(path.join(base, 'freshell-provider-parity-'))
+  const prefix = sandboxed
+    ? path.join(repoRoot, '.runtime-provider-parity-')
+    : path.join(os.tmpdir(), 'freshell-provider-parity-')
+  const directory = fs.mkdtempSync(prefix)
   try {
     if (sandboxed) fs.chmodSync(directory, 0o777)
     await run('cargo', ['test', '-p', 'freshell-session-host', 'direct_and_hosted_provider_transport_operations_have_matching_rows'], repoRoot, directory)

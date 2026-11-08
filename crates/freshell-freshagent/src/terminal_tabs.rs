@@ -1387,6 +1387,91 @@ async fn spawn_terminal_pane_with_handoff_and_admission(
     let (mut resume_session_id, accepted_session_ref, session_ref_locator_present) =
         derive_resume_identity(body, &mode)?;
 
+    if let Some(session_id) = resume_session_id
+        .clone()
+        .filter(|_| use_managed_runtime && mode == "opencode")
+    {
+        let original_cwd = cwd.as_deref().map(std::path::PathBuf::from);
+        let selected_id = session_id.clone();
+        let verified_host_source = tokio::task::spawn_blocking(move || {
+            crate::locate_host_opencode_restore(&selected_id, original_cwd.as_deref()).is_ok()
+        })
+        .await
+        .unwrap_or(false);
+        if verified_host_source {
+            match registry
+                .managed_owns_native_session("opencode", &session_id)
+                .await
+            {
+                // The managed route remains authoritative, including a
+                // non-running owner or a different original create key.
+                Ok(true) => {}
+                absence => {
+                    tracing::info!(
+                        event = "terminal.rest.host_opencode_restore_refused",
+                        provider = "opencode",
+                        transport = "rest",
+                        reason = if absence == Ok(false) {
+                            "verified_original_host_history"
+                        } else {
+                            "managed_inventory_unavailable"
+                        },
+                        "Original host OpenCode history requires its terminal-tab resume route"
+                    );
+                    return Err(fail_json_code(StatusCode::CONFLICT, "RESTORE_UNAVAILABLE",
+                        "This saved OpenCode conversation uses its original host history. Restore it through its terminal tab.".into(),
+                    ).into());
+                }
+            }
+        }
+    }
+
+    if let Some(session_id) = resume_session_id
+        .clone()
+        .filter(|_| use_managed_runtime && mode == "claude")
+    {
+        let original_cwd = cwd.as_deref().map(std::path::PathBuf::from);
+        let verified_host_source = tokio::task::spawn_blocking(move || {
+            crate::locate_host_claude_restore(&session_id, original_cwd.as_deref()).is_ok()
+        })
+        .await
+        .unwrap_or(false);
+        if verified_host_source {
+            tracing::info!(
+                event = "terminal.rest.host_claude_restore_refused",
+                provider = "claude",
+                transport = "rest",
+                reason = "verified_original_host_history",
+                "Original host Claude history requires its terminal-tab resume route"
+            );
+            return Err(fail_json_code(
+                    StatusCode::CONFLICT,
+                    "RESTORE_UNAVAILABLE",
+                    "This saved Claude conversation uses its original host history. Restore it through its terminal tab.".into(),
+                ).into());
+        }
+    }
+
+    if let Some(session_id) = resume_session_id.as_deref().filter(|_| mode == "codex") {
+        if freshell_codex::sidecar_reconcile::codex_sidecar_reconciler()
+            .is_some_and(|reconciler| reconciler.has_verified_terminal_session(session_id))
+        {
+            tracing::info!(
+                event = "terminal.rest.retained_codex_refused",
+                provider = %mode,
+                session_id,
+                transport = "rest",
+                reason = "verified_retained_terminal_owner",
+                "Retained Codex terminal restore requires its existing WebSocket terminal tab"
+            );
+            return Err(fail_json_code(
+                StatusCode::CONFLICT,
+                "RESTORE_UNAVAILABLE",
+                "This saved agent is already running. Restore its existing terminal tab to continue it.".into(),
+            ).into());
+        }
+    }
+
     // Door 3 (resume-validation): gate the cached resume id on disk existence
     // BEFORE the amplifier ensure_session below (or the re-stub would
     // resurrect the stale dir) and before CliLaunchInputs is built.
@@ -2577,6 +2662,7 @@ async fn settle_gated_create(
                 model: model.as_deref(),
                 sandbox: sandbox.as_deref(),
                 approval_policy: permission_mode.as_deref(),
+                require_retained_sidecar: false,
                 sidecar_context: setup.sidecar_context.clone(),
             };
             match freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
@@ -7437,9 +7523,19 @@ if (args.includes('app-server')) {{
 
     struct UnusedManagedController;
 
-    struct CapturingManagedController(std::sync::Mutex<Option<ManagedTerminalLaunch>>);
+    struct CapturingManagedController(
+        std::sync::Mutex<Option<ManagedTerminalLaunch>>,
+        std::sync::Mutex<Result<bool, String>>,
+    );
 
     impl ManagedTerminalController for CapturingManagedController {
+        fn owns_native_session<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> ManagedTerminalFuture<'a, Result<bool, String>> {
+            Box::pin(async { self.1.lock().unwrap().clone() })
+        }
         fn lookup_terminal<'a>(
             &'a self,
             _: &'a str,
@@ -7519,7 +7615,10 @@ if (args.includes('app-server')) {{
                     true,
                 ));
             let registry = state.terminal_registry.clone().unwrap();
-            let controller = Arc::new(CapturingManagedController(std::sync::Mutex::new(None)));
+            let controller = Arc::new(CapturingManagedController(
+                std::sync::Mutex::new(None),
+                std::sync::Mutex::new(Ok(false)),
+            ));
             registry.set_managed_controller(Some(controller.clone()));
             let mut body = json!({"mode":"codex", "cwd":std::env::temp_dir(), "effort":"low"});
             if let Some(model) = model {
@@ -7636,6 +7735,364 @@ if (args.includes('app-server')) {{
         > {
             Box::pin(async { Err("unexpected managed output read".into()) })
         }
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn rest_verified_host_opencode_resume_refuses_before_launch_or_new_tab() {
+        const CHILD: &str = "FRESHELL_REST_HOST_OPENCODE_REFUSAL_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "terminal_tabs::tests::rest_verified_host_opencode_resume_refuses_before_launch_or_new_tab", "--nocapture"])
+                .env(CHILD, "1").kill_on_drop(true);
+            let output = tokio::time::timeout(std::time::Duration::from_secs(45), command.output())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let owned = tempfile::tempdir().unwrap();
+        let session_id = "ses_rest_original_host";
+        let data = owned.path().join(".local/share/opencode");
+        std::fs::create_dir_all(&data).unwrap();
+        let path = data.join("opencode.db");
+        let database = rusqlite::Connection::open(&path).unwrap();
+        database.execute_batch("CREATE TABLE session(id TEXT PRIMARY KEY, directory TEXT, project_id TEXT, workspace_id TEXT, time_created INTEGER, title TEXT);").unwrap();
+        database
+            .execute(
+                "INSERT INTO session VALUES(?1,?2,'original-project',NULL,1,'original metadata')",
+                rusqlite::params![session_id, owned.path().to_str().unwrap()],
+            )
+            .unwrap();
+        drop(database);
+        std::env::set_var("HOME", owned.path());
+        for key in ["XDG_DATA_HOME", "OPENCODE_DB", "OPENCODE_TEST_HOME"] {
+            std::env::remove_var(key);
+        }
+        let before = std::fs::read(&path).unwrap();
+        let hooks = Arc::new(AtomicUsize::new(0));
+        let hook_count = hooks.clone();
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec(
+                "opencode",
+                &owned.path().join("argv"),
+            )]))
+            .with_resume_probe(probe_answering(
+                freshell_platform::resume_gate::ResumeExistence::Present,
+                true,
+            ))
+            .with_terminal_created_hook(Arc::new(move |_| {
+                hook_count.fetch_add(1, Ordering::SeqCst);
+            }));
+        let registry = state.terminal_registry.clone().unwrap();
+        let controller = Arc::new(CapturingManagedController(
+            std::sync::Mutex::new(None),
+            std::sync::Mutex::new(Ok(false)),
+        ));
+        registry.set_managed_controller(Some(controller.clone()));
+        let mut events = state.broadcast_tx.subscribe();
+        for (native_owner, expected_status, expect_managed_launch) in [
+            (Ok(false), StatusCode::CONFLICT, false),
+            (
+                Err("owned unavailable inventory".into()),
+                StatusCode::CONFLICT,
+                false,
+            ),
+            (Ok(true), StatusCode::BAD_REQUEST, true),
+        ] {
+            *controller.1.lock().unwrap() = native_owner;
+            *controller.0.lock().unwrap() = None;
+            let (status, body) = post(
+                app(state.clone()),
+                "/api/tabs",
+                json!({
+                    "mode":"opencode", "cwd":owned.path(),
+                    "sessionRef":{"provider":"opencode","sessionId":session_id}
+                }),
+                true,
+            )
+            .await;
+            assert_eq!(status, expected_status, "{body}");
+            if !expect_managed_launch {
+                assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
+            }
+            assert_eq!(
+                controller.0.lock().unwrap().is_some(),
+                expect_managed_launch,
+                "verified original host/managed ownership routing changed"
+            );
+            assert!(state.tabs.lock().unwrap().is_empty());
+            assert!(state.terminal_panes.lock().unwrap().is_empty());
+            assert!(registry.directory().is_empty());
+            assert!(
+                matches!(
+                    events.try_recv(),
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                ),
+                "failed or refused restore emitted an event"
+            );
+            assert_eq!(hooks.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "metadata-only decision changed original native DB"
+            );
+        }
+        registry.kill_all();
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn rest_verified_host_claude_resume_refuses_before_launch_or_new_tab() {
+        const CHILD: &str = "FRESHELL_REST_HOST_CLAUDE_REFUSAL_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "terminal_tabs::tests::rest_verified_host_claude_resume_refuses_before_launch_or_new_tab", "--nocapture"])
+                .env(CHILD, "1").kill_on_drop(true);
+            let output = tokio::time::timeout(std::time::Duration::from_secs(45), command.output())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let owned = tempfile::tempdir().unwrap();
+        let session_id = "11111111-2222-4333-8444-555566667777";
+        let config = owned.path().join(".claude");
+        let project = config.join("projects/native-project");
+        std::fs::create_dir_all(&project).unwrap();
+        let transcript = project.join(format!("{session_id}.jsonl"));
+        let bytes = format!(
+            "{}\n",
+            json!({"type":"user","sessionId":session_id,"cwd":owned.path(),"message":{"content":"owned original history"}})
+        );
+        std::fs::write(&transcript, &bytes).unwrap();
+        std::env::set_var("HOME", owned.path());
+        std::env::set_var("CLAUDE_CONFIG_DIR", &config);
+        std::env::remove_var("CLAUDE_HOME");
+        let before = std::fs::metadata(&transcript).unwrap();
+        let hooks = Arc::new(AtomicUsize::new(0));
+        let hook_count = hooks.clone();
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec(
+                "claude",
+                &owned.path().join("argv"),
+            )]))
+            .with_resume_probe(probe_answering(
+                freshell_platform::resume_gate::ResumeExistence::Present,
+                true,
+            ))
+            .with_terminal_created_hook(Arc::new(move |_| {
+                hook_count.fetch_add(1, Ordering::SeqCst);
+            }));
+        let registry = state.terminal_registry.clone().unwrap();
+        let controller = Arc::new(CapturingManagedController(
+            std::sync::Mutex::new(None),
+            std::sync::Mutex::new(Ok(false)),
+        ));
+        registry.set_managed_controller(Some(controller.clone()));
+        let mut events = state.broadcast_tx.subscribe();
+        let (status, body) = post(app(state.clone()), "/api/tabs", json!({"mode":"claude","cwd":owned.path(),"sessionRef":{"provider":"claude","sessionId":session_id}}), true).await;
+        let attempted_launch = controller.0.lock().unwrap().is_some();
+        let no_tabs = state.tabs.lock().unwrap().is_empty();
+        let no_panes = state.terminal_panes.lock().unwrap().is_empty();
+        let no_terminals = registry.directory().is_empty();
+        let no_events = matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        );
+        let after = std::fs::metadata(&transcript).unwrap();
+        registry.kill_all();
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
+        assert!(
+            !attempted_launch,
+            "original host history must not be sent to an empty managed store"
+        );
+        assert!(
+            no_tabs && no_panes && no_terminals && no_events,
+            "refusal must precede tab/process/event side effects"
+        );
+        assert_eq!(hooks.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read_to_string(&transcript).unwrap(), bytes);
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn rest_restore_of_verified_retained_codex_refuses_without_claim_or_side_effects() {
+        // The reconciler is process-global. Keep this real-process fixture in
+        // its own libtest child so it cannot replace another test's owner.
+        const CHILD: &str = "FRESHELL_REST_RETAINED_CODEX_REFUSAL_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "terminal_tabs::tests::rest_restore_of_verified_retained_codex_refuses_without_claim_or_side_effects", "--nocapture"])
+                .env(CHILD, "1").kill_on_drop(true);
+            let output = tokio::time::timeout(std::time::Duration::from_secs(45), command.output())
+                .await
+                .expect("owned REST fixture must settle")
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use freshell_codex::sidecar_reconcile::{set_codex_sidecar_reconciler, SidecarReconciler};
+        use freshell_codex::sidecar_store::{
+            proc_cmdline, proc_starttime, CodexSidecarRecord, CodexSidecarStore, SidecarLane,
+            SidecarRecordState, SIDECAR_RECORD_VERSION,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let owned = tempfile::tempdir().unwrap();
+        let mut process = tokio::process::Command::new("/bin/sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = process.id().unwrap();
+        let (start, cmdline) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let expected = vec!["/bin/sleep".to_string(), "60".to_string()];
+            loop {
+                if let (Some(start), Some(argv)) =
+                    (proc_starttime(pid as i32), proc_cmdline(pid as i32))
+                {
+                    if argv == expected {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        if proc_starttime(pid as i32) == Some(start)
+                            && proc_cmdline(pid as i32).as_ref() == Some(&argv)
+                        {
+                            break (start, argv);
+                        }
+                    }
+                }
+                assert!(
+                    process.try_wait().unwrap().is_none(),
+                    "owned process exited before readiness"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("owned sleep must exec before recording process identity");
+        let session_id = "owned-rest-retained-native-thread";
+        let record = CodexSidecarRecord {
+            record_version: SIDECAR_RECORD_VERSION,
+            ownership_id: "codex-sidecar-owned-rest-retained".into(),
+            pid,
+            starttime: start,
+            cmdline,
+            ws_url: "ws://127.0.0.1:9".into(),
+            session_id: Some(session_id.into()),
+            terminal_id: Some("prior-owned-rest-terminal".into()),
+            server_instance_id: "prior-owned-server".into(),
+            created_at: 1,
+            updated_at: 2,
+            state: SidecarRecordState::Retained {
+                reason: "server-shutdown".into(),
+            },
+            lane: Some(SidecarLane::TerminalPane),
+        };
+        let store = Arc::new(CodexSidecarStore::new(owned.path().join("records")));
+        store.write(&record).unwrap();
+        let before = store.load_all();
+        assert_eq!(
+            before,
+            vec![record.clone()],
+            "owned durable record must be readable before reconciliation"
+        );
+        let (reconciler, _) = SidecarReconciler::boot_reconcile(store.clone());
+        let reconciler = Arc::new(reconciler);
+        assert!(reconciler.has_verified_terminal_session(session_id));
+        set_codex_sidecar_reconciler(reconciler.clone());
+
+        let hooks = Arc::new(AtomicUsize::new(0));
+        let hook_count = hooks.clone();
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![managed_codex_cli_spec()]))
+            .with_resume_probe(probe_answering(
+                freshell_platform::resume_gate::ResumeExistence::Present,
+                true,
+            ))
+            .with_terminal_created_hook(Arc::new(move |_| {
+                hook_count.fetch_add(1, Ordering::SeqCst);
+            }));
+        let registry = state.terminal_registry.clone().unwrap();
+        let controller = Arc::new(CapturingManagedController(
+            std::sync::Mutex::new(None),
+            std::sync::Mutex::new(Ok(false)),
+        ));
+        registry.set_managed_controller(Some(controller.clone()));
+        let mut events = state.broadcast_tx.subscribe();
+        let (status, body) = post(
+            app(state.clone()),
+            "/api/tabs",
+            json!({
+                "mode":"codex", "cwd":owned.path(),
+                "sessionRef":{"provider":"codex","sessionId":session_id},
+            }),
+            true,
+        )
+        .await;
+
+        // Collect observations and clean only this fixture before assertions,
+        // including on the pre-fix path that tries a managed replacement.
+        let attempted_launch = controller.0.lock().unwrap().is_some();
+        let same_process = proc_starttime(pid as i32) == Some(start);
+        let after = store.load_all();
+        let unclaimed = reconciler.unclaimed_len();
+        let remains_discoverable = reconciler.has_verified_terminal_session(session_id);
+        let no_tabs = state.tabs.lock().unwrap().is_empty();
+        let no_panes = state.terminal_panes.lock().unwrap().is_empty();
+        let no_terminals = registry.directory().is_empty();
+        let no_events = matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        );
+        process.start_kill().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), process.wait())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["status"], json!("error"), "{body}");
+        assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
+        assert!(
+            !attempted_launch,
+            "REST must not launch a replacement for a retained native owner"
+        );
+        assert!(
+            same_process && remains_discoverable,
+            "the exact existing process must remain discoverable"
+        );
+        assert_eq!(
+            after, before,
+            "REST must not rewrite or remove the durable record"
+        );
+        assert_eq!(unclaimed, 1, "REST must never consume the terminal's claim");
+        assert!(
+            no_tabs && no_panes && no_terminals && no_events,
+            "refusal must have no tab, pane, terminal or broadcast side effects"
+        );
+        assert_eq!(hooks.load(Ordering::SeqCst), 0, "no terminal-created hook");
     }
 
     #[tokio::test]

@@ -214,6 +214,7 @@ impl Host {
             fresh_agent: Some(Box::new(launch)),
             resume_spec: None,
             native_identity_launch: None,
+            native_readiness_recovery: None,
             provider_path_inputs: Default::default(),
             dispatch_budget_ms: None,
         }
@@ -460,6 +461,7 @@ async fn opencode_transfer_retry_requires_selected_config_before_advancing_prefl
         fresh_agent: None,
         resume_spec: None,
         native_identity_launch: None,
+        native_readiness_recovery: None,
         provider_path_inputs: Default::default(),
         dispatch_budget_ms: None,
     };

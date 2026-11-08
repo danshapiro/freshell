@@ -91,6 +91,17 @@ function rig(): ManagedRuntimeBrowserRig {
   return browser
 }
 
+function cleanupRigWithRetainedBuild() {
+  const browser = rig()
+  child.execFileSync.mockImplementation((program: string, args: string[]) => {
+    if (program === 'docker' && (args[0] === 'ps' || args.join(' ') === 'volume ls --format {{.Name}}')) return ''
+    throw new Error(`unexpected cleanup command: ${program} ${args.join(' ')}`)
+  })
+  fs.mkdirSync(browser.runtime.buildDir, { recursive: true })
+  fs.writeFileSync(path.join(browser.runtime.buildDir, 'retained-build'), 'owned evidence')
+  return { browser, cleanup: vi.spyOn(browser.runtime, 'cleanup') }
+}
+
 describe('runtime synchronous subprocess watchdogs', () => {
   it.each(['running-state', 'removal', 'logs', 'image-lookup'] as const)(
     'does not turn an interrupted Docker probe into a negative answer: %s', operation => {
@@ -293,24 +304,40 @@ describe('runtime synchronous subprocess watchdogs', () => {
   })
 
   it('retains web-server cleanup failure while still settling the managed runtime', async () => {
-    const browser = rig()
+    const { browser, cleanup } = cleanupRigWithRetainedBuild()
     const error = timedOut()
-    child.execFileSync.mockImplementation((program: string, args: string[]) => {
-      if (program === 'docker' && (args[0] === 'ps' || args.join(' ') === 'volume ls --format {{.Name}}')) return ''
-      throw new Error(`unexpected cleanup command: ${program} ${args.join(' ')}`)
-    })
-    const stopWeb = vi.fn().mockRejectedValueOnce(error).mockResolvedValue(undefined)
-    const killWeb = vi.fn().mockResolvedValue(undefined)
-    browser.web = { stop: stopWeb, kill: killWeb } as unknown as typeof browser.web
-    fs.mkdirSync(browser.runtime.buildDir, { recursive: true })
-    fs.writeFileSync(path.join(browser.runtime.buildDir, 'retained-build'), 'owned evidence')
-    const cleanup = vi.spyOn(browser.runtime, 'cleanup')
+    const stop = vi.fn().mockRejectedValueOnce(error).mockResolvedValueOnce(undefined)
+    const kill = vi.fn().mockResolvedValue(undefined)
+    browser.web = { stop, kill } as unknown as typeof browser.web
     const result = await browser.stop()
-    expect(killWeb).toHaveBeenCalledExactlyOnceWith('SIGKILL')
-    expect(stopWeb).toHaveBeenCalledTimes(2)
+    expect(stop).toHaveBeenCalledTimes(2)
+    expect(kill).toHaveBeenCalledExactlyOnceWith('SIGKILL')
+    expect(stop.mock.invocationCallOrder[0]).toBeLessThan(kill.mock.invocationCallOrder[0])
+    expect(kill.mock.invocationCallOrder[0]).toBeLessThan(stop.mock.invocationCallOrder[1])
     expect(cleanup).toHaveBeenCalledExactlyOnceWith([`web stop: ${error.message}`])
     expect(result.ok).toBe(false)
     expect(result.errors).toEqual([`web stop: ${error.message}`])
+    const receipt = JSON.parse(fs.readFileSync(path.join(browser.runtime.evidenceDir, 'cleanup.json'), 'utf8'))
+    expect(receipt.ok).toBe(false)
+    expect(receipt.errors).toEqual(result.errors)
+    expect(fs.readFileSync(path.join(browser.runtime.buildDir, 'retained-build'), 'utf8')).toBe('owned evidence')
+  })
+
+  it('retains both web stop and forced-kill failures with the owned cleanup evidence', async () => {
+    const { browser, cleanup } = cleanupRigWithRetainedBuild()
+    const stopError = timedOut()
+    const killError = new Error('owned web process could not be killed')
+    const stop = vi.fn().mockRejectedValue(stopError)
+    const kill = vi.fn().mockRejectedValue(killError)
+    browser.web = { stop, kill } as unknown as typeof browser.web
+
+    const result = await browser.stop()
+
+    expect(stop).toHaveBeenCalledTimes(1)
+    expect(kill).toHaveBeenCalledExactlyOnceWith('SIGKILL')
+    expect(result.ok).toBe(false)
+    expect(result.errors).toEqual([`web stop: ${stopError.message}`, `web stop: ${killError.message}`])
+    expect(cleanup).toHaveBeenCalledExactlyOnceWith(result.errors)
     const receipt = JSON.parse(fs.readFileSync(path.join(browser.runtime.evidenceDir, 'cleanup.json'), 'utf8'))
     expect(receipt.ok).toBe(false)
     expect(receipt.errors).toEqual(result.errors)

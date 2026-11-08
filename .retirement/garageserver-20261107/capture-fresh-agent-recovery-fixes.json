@@ -1,0 +1,818 @@
+{
+  "purpose": "Source preservation for permanent garageserver retirement; unfinished source is not a tested release.",
+  "original_worktree": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes",
+  "original_branch": "refs/heads/the-usual/fresh-agent-recovery-fixes",
+  "original_head": "ee54ee43472b989e3de809f4b4bee65e30d6ffb6",
+  "entries": [
+    {
+      "status": "M ",
+      "path": ".gitignore"
+    },
+    {
+      "status": "M ",
+      "path": "Cargo.lock"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-agent-runtime/examples/opencode_restoration_rehearsal.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-agent-runtime/src/host_actor.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-codex/src/launch_lifecycle.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-codex/src/launch_plan.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-codex/src/lib.rs"
+    },
+    {
+      "status": "A ",
+      "path": "crates/freshell-codex/src/retained_sidecar.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-codex/src/runtime_select.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-codex/src/sidecar_reconcile.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-codex/src/sidecar_reconcile_tests.rs"
+    },
+    {
+      "status": "A ",
+      "path": "crates/freshell-codex/src/sidecar_startup.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-codex/src/sidecar_store.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-codex/tests/launch_lifecycle.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-freshagent/Cargo.toml"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-freshagent/src/codex.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-freshagent/src/codex_sidecar_tracking.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-freshagent/src/codex_sidecar_tracking_tests.rs"
+    },
+    {
+      "status": "A ",
+      "path": "crates/freshell-freshagent/src/host_claude_restore.rs"
+    },
+    {
+      "status": "A ",
+      "path": "crates/freshell-freshagent/src/host_opencode_restore.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-freshagent/src/lib.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-freshagent/src/terminal_tabs.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-runtime-protocol/src/fresh_agent_ops.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-server/src/fresh_agent_proxy_naming.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-server/src/fresh_agent_proxy_tests.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-server/src/managed_runtime.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-server/src/network.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-server/src/session_name_native_tests.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-server/src/session_names.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-server/tests/codex_model_catalog.rs"
+    },
+    {
+      "status": "A ",
+      "path": "crates/freshell-session-host/src/codex_dispatch_recovery_tests.rs"
+    },
+    {
+      "status": "UU",
+      "path": "crates/freshell-session-host/src/main.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-session-host/src/providers/codex.rs"
+    },
+    {
+      "status": "MM",
+      "path": "crates/freshell-session-host/src/providers/fresh_agent.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-session-host/tests/provider_startup_retry.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-supervisor/src/backend.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-supervisor/src/fresh_agent_configure_tests.rs"
+    },
+    {
+      "status": "UU",
+      "path": "crates/freshell-supervisor/src/inventory.rs"
+    },
+    {
+      "status": "MM",
+      "path": "crates/freshell-supervisor/src/recovery.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-supervisor/src/registry.rs"
+    },
+    {
+      "status": "A ",
+      "path": "crates/freshell-supervisor/src/registry/codex_dispatch_recovery.rs"
+    },
+    {
+      "status": "A ",
+      "path": "crates/freshell-supervisor/src/retained_host_tests.rs"
+    },
+    {
+      "status": "UU",
+      "path": "crates/freshell-supervisor/src/service.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-terminal/src/registry.rs"
+    },
+    {
+      "status": "A ",
+      "path": "crates/freshell-ws/src/host_claude_restore_tests.rs"
+    },
+    {
+      "status": "A ",
+      "path": "crates/freshell-ws/src/host_opencode_restore_tests.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-ws/src/terminal.rs"
+    },
+    {
+      "status": "M ",
+      "path": "crates/freshell-ws/tests/codex_sidecar_reattach_e2e.rs"
+    },
+    {
+      "status": "M ",
+      "path": "docs/development/managed-runtime-rollout.md"
+    },
+    {
+      "status": "M ",
+      "path": "docs/development/self-hosted-launch-runbook.md"
+    },
+    {
+      "status": "M ",
+      "path": "scripts/testing/opencode-restoration-rehearsal.ts"
+    },
+    {
+      "status": "M ",
+      "path": "scripts/update-managed-runtime.ts"
+    },
+    {
+      "status": "M ",
+      "path": "test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs"
+    },
+    {
+      "status": "UU",
+      "path": "test/integration/server/fresh-agent-parity.test.ts"
+    },
+    {
+      "status": "M ",
+      "path": "test/integration/server/provider-parity-fixture-routing.test.ts"
+    },
+    {
+      "status": "M ",
+      "path": "test/integration/server/provider-parity-fixture.ts"
+    },
+    {
+      "status": "M ",
+      "path": "test/unit/client/components/TerminalView.lifecycle.test.tsx"
+    },
+    {
+      "status": "M ",
+      "path": "test/unit/electron/run-electron-e2e.test.ts"
+    },
+    {
+      "status": "M ",
+      "path": "test/unit/tooling/managed-runtime-update.test.ts"
+    },
+    {
+      "status": "M ",
+      "path": "test/unit/tooling/testing/opencode-real-native-reader.test.ts"
+    },
+    {
+      "status": "M ",
+      "path": "test/unit/tooling/testing/runtime-native-feasibility.test.ts"
+    },
+    {
+      "status": "M ",
+      "path": "test/unit/tooling/testing/runtime-subprocess-watchdogs.test.ts"
+    }
+  ],
+  "sources": [
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/.gitignore",
+      "destination": ".gitignore",
+      "mode": "100644",
+      "oid": "80582c62ca566ea0296143bf9c7a1f2526454105",
+      "bytes": 2462
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/Cargo.lock",
+      "destination": "Cargo.lock",
+      "mode": "100644",
+      "oid": "e4ce0b46898513b4581cbddcd628f022094f6685",
+      "bytes": 166191
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-agent-runtime/examples/opencode_restoration_rehearsal.rs",
+      "destination": "crates/freshell-agent-runtime/examples/opencode_restoration_rehearsal.rs",
+      "mode": "100644",
+      "oid": "e508cb79fa47f5c9e5921ef40aa0c64e210bd3a4",
+      "bytes": 65106
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-agent-runtime/src/host_actor.rs",
+      "destination": "crates/freshell-agent-runtime/src/host_actor.rs",
+      "mode": "100644",
+      "oid": "4e6b211cabc46bf495c4209a7ea0fd9221ae77d2",
+      "bytes": 172988
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-codex/src/launch_lifecycle.rs",
+      "destination": "crates/freshell-codex/src/launch_lifecycle.rs",
+      "mode": "100644",
+      "oid": "747c7b1f6264d2fab17824a85da07c191ee88717",
+      "bytes": 82752
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-codex/src/launch_plan.rs",
+      "destination": "crates/freshell-codex/src/launch_plan.rs",
+      "mode": "100644",
+      "oid": "c6dc0c6ac3729361ff20f7132d3594bdc056d7e6",
+      "bytes": 38850
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-codex/src/lib.rs",
+      "destination": "crates/freshell-codex/src/lib.rs",
+      "mode": "100644",
+      "oid": "5771fbc843ea9082f93220c958f9dec401b64685",
+      "bytes": 5805
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-codex/src/retained_sidecar.rs",
+      "destination": "crates/freshell-codex/src/retained_sidecar.rs",
+      "mode": "100644",
+      "oid": "8d8bbbaa410c4610d5fc9fb2672e6bbe1b86b9b2",
+      "bytes": 6373
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-codex/src/runtime_select.rs",
+      "destination": "crates/freshell-codex/src/runtime_select.rs",
+      "mode": "100644",
+      "oid": "d9cbeb3305a7aef9589f4d7335b48d0868d0825c",
+      "bytes": 3809
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-codex/src/sidecar_reconcile.rs",
+      "destination": "crates/freshell-codex/src/sidecar_reconcile.rs",
+      "mode": "100644",
+      "oid": "4e0c29f9039fa6ff030fdfb8964acf2ead06d3ca",
+      "bytes": 35700
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-codex/src/sidecar_reconcile_tests.rs",
+      "destination": "crates/freshell-codex/src/sidecar_reconcile_tests.rs",
+      "mode": "100644",
+      "oid": "f4aea7546ebbe8a11112a99305eb58724f0c40d8",
+      "bytes": 33400
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-codex/src/sidecar_startup.rs",
+      "destination": "crates/freshell-codex/src/sidecar_startup.rs",
+      "mode": "100644",
+      "oid": "406a79bc2b0139bd3905470eb4da804a37b401f0",
+      "bytes": 8248
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-codex/src/sidecar_store.rs",
+      "destination": "crates/freshell-codex/src/sidecar_store.rs",
+      "mode": "100644",
+      "oid": "4a2c074e0a29da59e65b33ebb0fabeb567d7c1a4",
+      "bytes": 19587
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-codex/tests/launch_lifecycle.rs",
+      "destination": "crates/freshell-codex/tests/launch_lifecycle.rs",
+      "mode": "100644",
+      "oid": "9d8702128cde2c075a7f387d0fab6ca8b9ca76cc",
+      "bytes": 100049
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-freshagent/Cargo.toml",
+      "destination": "crates/freshell-freshagent/Cargo.toml",
+      "mode": "100644",
+      "oid": "8120b4b3174c777ecc59498d79c966b4b2b9d67a",
+      "bytes": 7741
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-freshagent/src/codex.rs",
+      "destination": "crates/freshell-freshagent/src/codex.rs",
+      "mode": "100644",
+      "oid": "5b12c1135424114db42df9b9674a2f9d02b1e5c3",
+      "bytes": 1750834
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-freshagent/src/codex_sidecar_tracking.rs",
+      "destination": "crates/freshell-freshagent/src/codex_sidecar_tracking.rs",
+      "mode": "100644",
+      "oid": "2b3da59628fbb59a3c5e1ce08ce61b7693609979",
+      "bytes": 9255
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-freshagent/src/codex_sidecar_tracking_tests.rs",
+      "destination": "crates/freshell-freshagent/src/codex_sidecar_tracking_tests.rs",
+      "mode": "100644",
+      "oid": "3cdc1ece83fe14ee7c687a1d3f1d1a79c500abc4",
+      "bytes": 34945
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-freshagent/src/host_claude_restore.rs",
+      "destination": "crates/freshell-freshagent/src/host_claude_restore.rs",
+      "mode": "100644",
+      "oid": "306827d386506b395fbbd9720d6e31816dd337d3",
+      "bytes": 9724
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-freshagent/src/host_opencode_restore.rs",
+      "destination": "crates/freshell-freshagent/src/host_opencode_restore.rs",
+      "mode": "100644",
+      "oid": "6a622e3660e8bc554bdb447dfc005bf83e97a720",
+      "bytes": 9558
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-freshagent/src/lib.rs",
+      "destination": "crates/freshell-freshagent/src/lib.rs",
+      "mode": "100644",
+      "oid": "3671da9438b3ffef65a1cd71def7baba65143e0e",
+      "bytes": 572665
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-freshagent/src/terminal_tabs.rs",
+      "destination": "crates/freshell-freshagent/src/terminal_tabs.rs",
+      "mode": "100644",
+      "oid": "4e7e0fc09a466c5937e66f818e2a3bda13c39925",
+      "bytes": 476578
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-runtime-protocol/src/fresh_agent_ops.rs",
+      "destination": "crates/freshell-runtime-protocol/src/fresh_agent_ops.rs",
+      "mode": "100644",
+      "oid": "55d4707cd2572f5310445c0e1b7934bf5c0a3435",
+      "bytes": 4725
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-server/src/fresh_agent_proxy_naming.rs",
+      "destination": "crates/freshell-server/src/fresh_agent_proxy_naming.rs",
+      "mode": "100644",
+      "oid": "b09900c771aae27dcf3eb1130de328680263c8d2",
+      "bytes": 9157
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-server/src/fresh_agent_proxy_tests.rs",
+      "destination": "crates/freshell-server/src/fresh_agent_proxy_tests.rs",
+      "mode": "100644",
+      "oid": "e7e56b93e4a94e096f026e9da9aaa6cf5fb2e807",
+      "bytes": 280410
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-server/src/managed_runtime.rs",
+      "destination": "crates/freshell-server/src/managed_runtime.rs",
+      "mode": "100644",
+      "oid": "9fe676de8e92915c012d83a73d07e3e5a6c7846c",
+      "bytes": 160240
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-server/src/network.rs",
+      "destination": "crates/freshell-server/src/network.rs",
+      "mode": "100644",
+      "oid": "99987f619520e76165b9d5fe0eb4f16b0ef7ed99",
+      "bytes": 184404
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-server/src/session_name_native_tests.rs",
+      "destination": "crates/freshell-server/src/session_name_native_tests.rs",
+      "mode": "100644",
+      "oid": "aaf4c8dab9129870db68a9d30f763bcf526ff332",
+      "bytes": 217301
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-server/src/session_names.rs",
+      "destination": "crates/freshell-server/src/session_names.rs",
+      "mode": "100644",
+      "oid": "7eadb8141dad3d9e49b5cbd53912a1d6409cc447",
+      "bytes": 221661
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-server/tests/codex_model_catalog.rs",
+      "destination": "crates/freshell-server/tests/codex_model_catalog.rs",
+      "mode": "100644",
+      "oid": "0bc8dd79757dd07c17dc4e14d20ac868c9562328",
+      "bytes": 21208
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-session-host/src/codex_dispatch_recovery_tests.rs",
+      "destination": "crates/freshell-session-host/src/codex_dispatch_recovery_tests.rs",
+      "mode": "100644",
+      "oid": "0c6338cb0944479f00a5fb9b50ae13f5a1b58ac4",
+      "bytes": 10537
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-session-host/src/main.rs",
+      "destination": "crates/freshell-session-host/src/main.rs",
+      "mode": "100644",
+      "oid": "35d3a5e3be8e037d5c6b94586ea02f31edf81257",
+      "bytes": 1114012
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-session-host/src/providers/codex.rs",
+      "destination": "crates/freshell-session-host/src/providers/codex.rs",
+      "mode": "100644",
+      "oid": "22d72d612f7fda901629b21e770bb6672b84e535",
+      "bytes": 24376
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-session-host/src/providers/fresh_agent.rs",
+      "destination": "crates/freshell-session-host/src/providers/fresh_agent.rs",
+      "mode": "100644",
+      "oid": "23e72712b26e6935b756c7e70d2f5dafb6bf4cc1",
+      "bytes": 603631
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-session-host/tests/provider_startup_retry.rs",
+      "destination": "crates/freshell-session-host/tests/provider_startup_retry.rs",
+      "mode": "100644",
+      "oid": "6bb314133b856898c6d56836796db461c4c6070a",
+      "bytes": 19920
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-supervisor/src/backend.rs",
+      "destination": "crates/freshell-supervisor/src/backend.rs",
+      "mode": "100644",
+      "oid": "d23d002718973e7ddf5ad039216ac8e774355604",
+      "bytes": 184653
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-supervisor/src/fresh_agent_configure_tests.rs",
+      "destination": "crates/freshell-supervisor/src/fresh_agent_configure_tests.rs",
+      "mode": "100644",
+      "oid": "30f49b5b37bb2a8ac4ff622836484b33c46c498e",
+      "bytes": 108816
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-supervisor/src/inventory.rs",
+      "destination": "crates/freshell-supervisor/src/inventory.rs",
+      "mode": "100644",
+      "oid": "b44a02d1b4e3802355e86b29a6cba3665e473597",
+      "bytes": 56390
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-supervisor/src/recovery.rs",
+      "destination": "crates/freshell-supervisor/src/recovery.rs",
+      "mode": "100644",
+      "oid": "27b6a63845634505d6b47259124d8ed88920a9ef",
+      "bytes": 635099
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-supervisor/src/registry.rs",
+      "destination": "crates/freshell-supervisor/src/registry.rs",
+      "mode": "100644",
+      "oid": "a7c465137c77bc40dd51832670f0acccf0a288e4",
+      "bytes": 666586
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-supervisor/src/registry/codex_dispatch_recovery.rs",
+      "destination": "crates/freshell-supervisor/src/registry/codex_dispatch_recovery.rs",
+      "mode": "100644",
+      "oid": "9e91b4682885a346af5f64cdaa5ae545d9e454d7",
+      "bytes": 8529
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-supervisor/src/retained_host_tests.rs",
+      "destination": "crates/freshell-supervisor/src/retained_host_tests.rs",
+      "mode": "100644",
+      "oid": "dedfc3aa5ea172a42bc60091a79a5c7068ad1d8a",
+      "bytes": 31477
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-supervisor/src/service.rs",
+      "destination": "crates/freshell-supervisor/src/service.rs",
+      "mode": "100644",
+      "oid": "8ed1f5cbc005900b5169b2d76230cfb82a83afec",
+      "bytes": 774718
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-terminal/src/registry.rs",
+      "destination": "crates/freshell-terminal/src/registry.rs",
+      "mode": "100644",
+      "oid": "494be47f5ad7645bb934c2558a6c57a57944f7b2",
+      "bytes": 687483
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-ws/src/host_claude_restore_tests.rs",
+      "destination": "crates/freshell-ws/src/host_claude_restore_tests.rs",
+      "mode": "100644",
+      "oid": "0cdbe67032cf77765caad9848be3ac09c2bb42e3",
+      "bytes": 17213
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-ws/src/host_opencode_restore_tests.rs",
+      "destination": "crates/freshell-ws/src/host_opencode_restore_tests.rs",
+      "mode": "100644",
+      "oid": "401b131c7995e6ee7ba77c39997e3692135c745e",
+      "bytes": 23320
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-ws/src/terminal.rs",
+      "destination": "crates/freshell-ws/src/terminal.rs",
+      "mode": "100644",
+      "oid": "bbc4cd184871905f85dd453a590dc28190f33fa7",
+      "bytes": 810793
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-ws/tests/codex_sidecar_reattach_e2e.rs",
+      "destination": "crates/freshell-ws/tests/codex_sidecar_reattach_e2e.rs",
+      "mode": "100644",
+      "oid": "eb14c5cb43663940acae4693c850f777290d4185",
+      "bytes": 75864
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/docs/development/managed-runtime-rollout.md",
+      "destination": "docs/development/managed-runtime-rollout.md",
+      "mode": "100644",
+      "oid": "9c69e838431637bace9e54d8af08bb1489a11018",
+      "bytes": 32064
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/docs/development/self-hosted-launch-runbook.md",
+      "destination": "docs/development/self-hosted-launch-runbook.md",
+      "mode": "100644",
+      "oid": "95d9ae569c58e1be2514b464bd50d814d17195bd",
+      "bytes": 13900
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/scripts/testing/opencode-restoration-rehearsal.ts",
+      "destination": "scripts/testing/opencode-restoration-rehearsal.ts",
+      "mode": "100644",
+      "oid": "128140753a5f4482e0a592d4a9709b04cd4edcd8",
+      "bytes": 35803
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/scripts/update-managed-runtime.ts",
+      "destination": "scripts/update-managed-runtime.ts",
+      "mode": "100644",
+      "oid": "b93b490f55c0477e7e6d3eef1914af65883e1361",
+      "bytes": 127421
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs",
+      "destination": "test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs",
+      "mode": "100644",
+      "oid": "832c12f7cc7dae1f619bb755d7711d54fbc9764a",
+      "bytes": 60442
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/test/integration/server/fresh-agent-parity.test.ts",
+      "destination": "test/integration/server/fresh-agent-parity.test.ts",
+      "mode": "100644",
+      "oid": "01ddd482cf1a9ccceb09c906b85c8625952010cf",
+      "bytes": 143026
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/test/integration/server/provider-parity-fixture-routing.test.ts",
+      "destination": "test/integration/server/provider-parity-fixture-routing.test.ts",
+      "mode": "100644",
+      "oid": "85a7ee7de6ed0c37fe6583fb997b27423f65fea2",
+      "bytes": 5106
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/test/integration/server/provider-parity-fixture.ts",
+      "destination": "test/integration/server/provider-parity-fixture.ts",
+      "mode": "100644",
+      "oid": "746265b73c6ec0d42129a404e39d8ad1432e94ce",
+      "bytes": 10165
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/test/unit/client/components/TerminalView.lifecycle.test.tsx",
+      "destination": "test/unit/client/components/TerminalView.lifecycle.test.tsx",
+      "mode": "100644",
+      "oid": "6ef04354a54e63c477ab8a0dc52232fdf05398e9",
+      "bytes": 728463
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/test/unit/electron/run-electron-e2e.test.ts",
+      "destination": "test/unit/electron/run-electron-e2e.test.ts",
+      "mode": "100644",
+      "oid": "84a24d98fc2e86d08516b497ff3e1f4fe7002825",
+      "bytes": 4782
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/test/unit/tooling/managed-runtime-update.test.ts",
+      "destination": "test/unit/tooling/managed-runtime-update.test.ts",
+      "mode": "100644",
+      "oid": "cd41ab6f8caf369e20c14c5137498c504c649c9a",
+      "bytes": 120625
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/test/unit/tooling/testing/opencode-real-native-reader.test.ts",
+      "destination": "test/unit/tooling/testing/opencode-real-native-reader.test.ts",
+      "mode": "100644",
+      "oid": "eca00f92df0af38dad470d90cb05b2807df29483",
+      "bytes": 13718
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/test/unit/tooling/testing/runtime-native-feasibility.test.ts",
+      "destination": "test/unit/tooling/testing/runtime-native-feasibility.test.ts",
+      "mode": "100644",
+      "oid": "f40a4791f99438d82eb6a3a6de8a4162999b4c5c",
+      "bytes": 331268
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/test/unit/tooling/testing/runtime-subprocess-watchdogs.test.ts",
+      "destination": "test/unit/tooling/testing/runtime-subprocess-watchdogs.test.ts",
+      "mode": "100644",
+      "oid": "8927921b96c05e388eadd6684ea4afa48a4f31f7",
+      "bytes": 17263
+    },
+    {
+      "blob": "5060bb55a5569c2cac37dcd5e6fbfddd45e79d8f",
+      "destination": ".retirement/garageserver-20261107/index-stage-1/crates/freshell-session-host/src/main.rs",
+      "mode": "100644",
+      "oid": "5060bb55a5569c2cac37dcd5e6fbfddd45e79d8f",
+      "bytes": 1057725,
+      "original_path": "crates/freshell-session-host/src/main.rs",
+      "index_stage": "1"
+    },
+    {
+      "blob": "cf45503feacf795c842d5508be8bdb87ac5715b7",
+      "destination": ".retirement/garageserver-20261107/index-stage-2/crates/freshell-session-host/src/main.rs",
+      "mode": "100644",
+      "oid": "cf45503feacf795c842d5508be8bdb87ac5715b7",
+      "bytes": 1113381,
+      "original_path": "crates/freshell-session-host/src/main.rs",
+      "index_stage": "2"
+    },
+    {
+      "blob": "4cfee85d88b9266cb706e0a670fe4cfa5c6fc70c",
+      "destination": ".retirement/garageserver-20261107/index-stage-3/crates/freshell-session-host/src/main.rs",
+      "mode": "100644",
+      "oid": "4cfee85d88b9266cb706e0a670fe4cfa5c6fc70c",
+      "bytes": 1060828,
+      "original_path": "crates/freshell-session-host/src/main.rs",
+      "index_stage": "3"
+    },
+    {
+      "blob": "b604e0add6ce89cc3ee45bd358c1059155cc9a44",
+      "destination": ".retirement/garageserver-20261107/index-stage-0/crates/freshell-session-host/src/providers/fresh_agent.rs",
+      "mode": "100644",
+      "oid": "b604e0add6ce89cc3ee45bd358c1059155cc9a44",
+      "bytes": 603697,
+      "original_path": "crates/freshell-session-host/src/providers/fresh_agent.rs",
+      "index_stage": "0"
+    },
+    {
+      "blob": "9807eaab117533b6bfb133b3d0771d0bb9d2f36c",
+      "destination": ".retirement/garageserver-20261107/index-stage-1/crates/freshell-supervisor/src/inventory.rs",
+      "mode": "100644",
+      "oid": "9807eaab117533b6bfb133b3d0771d0bb9d2f36c",
+      "bytes": 36868,
+      "original_path": "crates/freshell-supervisor/src/inventory.rs",
+      "index_stage": "1"
+    },
+    {
+      "blob": "6021ee835655c7f67490d5b9a76465c92a766fea",
+      "destination": ".retirement/garageserver-20261107/index-stage-2/crates/freshell-supervisor/src/inventory.rs",
+      "mode": "100644",
+      "oid": "6021ee835655c7f67490d5b9a76465c92a766fea",
+      "bytes": 54941,
+      "original_path": "crates/freshell-supervisor/src/inventory.rs",
+      "index_stage": "2"
+    },
+    {
+      "blob": "29beaeece9706fbe28276f7454e32035808acd1a",
+      "destination": ".retirement/garageserver-20261107/index-stage-3/crates/freshell-supervisor/src/inventory.rs",
+      "mode": "100644",
+      "oid": "29beaeece9706fbe28276f7454e32035808acd1a",
+      "bytes": 37823,
+      "original_path": "crates/freshell-supervisor/src/inventory.rs",
+      "index_stage": "3"
+    },
+    {
+      "blob": "2ab55bcc12e26eb8a2fd5319b9f4284691127a48",
+      "destination": ".retirement/garageserver-20261107/index-stage-0/crates/freshell-supervisor/src/recovery.rs",
+      "mode": "100644",
+      "oid": "2ab55bcc12e26eb8a2fd5319b9f4284691127a48",
+      "bytes": 635073,
+      "original_path": "crates/freshell-supervisor/src/recovery.rs",
+      "index_stage": "0"
+    },
+    {
+      "blob": "f012b9d30e3b6e6c362337d34fbcc7a73e8da090",
+      "destination": ".retirement/garageserver-20261107/index-stage-1/crates/freshell-supervisor/src/service.rs",
+      "mode": "100644",
+      "oid": "f012b9d30e3b6e6c362337d34fbcc7a73e8da090",
+      "bytes": 739393,
+      "original_path": "crates/freshell-supervisor/src/service.rs",
+      "index_stage": "1"
+    },
+    {
+      "blob": "fe57fcb73c1aee0ce41ef765e9ba0fe6eda8bdcb",
+      "destination": ".retirement/garageserver-20261107/index-stage-2/crates/freshell-supervisor/src/service.rs",
+      "mode": "100644",
+      "oid": "fe57fcb73c1aee0ce41ef765e9ba0fe6eda8bdcb",
+      "bytes": 766326,
+      "original_path": "crates/freshell-supervisor/src/service.rs",
+      "index_stage": "2"
+    },
+    {
+      "blob": "3bf0cd37aeceaa5af08a540aa1620eb0dc820572",
+      "destination": ".retirement/garageserver-20261107/index-stage-3/crates/freshell-supervisor/src/service.rs",
+      "mode": "100644",
+      "oid": "3bf0cd37aeceaa5af08a540aa1620eb0dc820572",
+      "bytes": 753028,
+      "original_path": "crates/freshell-supervisor/src/service.rs",
+      "index_stage": "3"
+    },
+    {
+      "blob": "ed4f0314beec60a4410793465502cd16943f86da",
+      "destination": ".retirement/garageserver-20261107/index-stage-1/test/integration/server/fresh-agent-parity.test.ts",
+      "mode": "100644",
+      "oid": "ed4f0314beec60a4410793465502cd16943f86da",
+      "bytes": 131016,
+      "original_path": "test/integration/server/fresh-agent-parity.test.ts",
+      "index_stage": "1"
+    },
+    {
+      "blob": "6e4a12750533c08286fb16d3835266afea0ba6ad",
+      "destination": ".retirement/garageserver-20261107/index-stage-2/test/integration/server/fresh-agent-parity.test.ts",
+      "mode": "100644",
+      "oid": "6e4a12750533c08286fb16d3835266afea0ba6ad",
+      "bytes": 136542,
+      "original_path": "test/integration/server/fresh-agent-parity.test.ts",
+      "index_stage": "2"
+    },
+    {
+      "blob": "c7fa2c0db0f2e85240f7903dc19301b5bb3152da",
+      "destination": ".retirement/garageserver-20261107/index-stage-3/test/integration/server/fresh-agent-parity.test.ts",
+      "mode": "100644",
+      "oid": "c7fa2c0db0f2e85240f7903dc19301b5bb3152da",
+      "bytes": 137500,
+      "original_path": "test/integration/server/fresh-agent-parity.test.ts",
+      "index_stage": "3"
+    }
+  ]
+}

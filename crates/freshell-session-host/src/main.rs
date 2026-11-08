@@ -1,5 +1,7 @@
 mod claude_source_observation;
 mod codex_activity;
+#[cfg(test)]
+mod codex_dispatch_recovery_tests;
 mod command_journal;
 mod control;
 mod native_auth_reader;
@@ -882,6 +884,8 @@ async fn dispatch_with_effects(
                     "provider-store-probe-v1".into(),
                     "opencode-adoption-observation-v1".into(),
                     "native-identity-observation-v1".into(),
+                    "fresh-agent-native-readiness-v1".into(),
+                    "fresh-agent-codex-dispatch-recovery-v1".into(),
                     HOST_CAPABILITY_NATIVE_READINESS_RECEIPT_V1.into(),
                     "grant-v1".into(),
                     "stop-v1".into(),
@@ -1263,11 +1267,7 @@ async fn dispatch_with_effects(
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
                     let _native_command = state.fresh_native_command.lock().await;
-                    ensure_current_fresh_native_observation_routed(
-                        state,
-                        NativeObservationRoute::RecoverableOnSend,
-                    )
-                    .await?;
+                    ensure_fresh_native_send_authority(state).await?;
                     let actor = state
                         .fresh_agent
                         .lock()
@@ -1293,6 +1293,8 @@ async fn dispatch_with_effects(
                     // launch's evidence revision; without this commit every
                     // strict follow-up operation (question resolution,
                     // capture) is refused against the stale launch binding.
+                    // The commit is a no-op unless the durable actor's native
+                    // root actually transitioned.
                     commit_fresh_native_transition(
                         state,
                         &actor,
@@ -3512,16 +3514,55 @@ async fn codex_native_exit_is_send_recoverable(
         == FreshProviderExitClass::CodexSendRecoverable
 }
 
-/// Which native-observation guard behavior a handler enforces.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum NativeObservationRoute {
-    /// Refuse whenever the current native observation is unavailable — the
-    /// pre-existing behavior of every guarded handler.
-    Strict,
-    /// Additionally route a codex native exit in a live host (host process
-    /// and durable actor intact, native session dead) to the actor's
-    /// recover-on-send instead of refusing with NATIVE_IDENTITY_UNOBSERVED.
-    RecoverableOnSend,
+async fn ensure_fresh_native_send_authority(state: &HostState) -> Result<(), RuntimeError> {
+    let persisted = state.persisted.lock().await.clone();
+    if current_native_observation(state, &persisted)
+        .await
+        .is_some()
+    {
+        return Ok(());
+    }
+    let actor = state.fresh_agent.lock().await.clone();
+    if let (Some(launch), Some(actor)) = (persisted.native_identity_launch.as_ref(), actor) {
+        if let Some(evidence) = actor.codex_dispatch_recovery_evidence().await {
+            let profile = actor.profile().await;
+            let bound = persisted.provider.as_deref() == Some("codex")
+                && persisted.grant_id.is_some()
+                && persisted.host_boot_id.as_ref() == Some(&state.host_boot_id)
+                && launch.incarnation_id == state.incarnation_id
+                && launch.execution_generation == persisted.max_execution_generation
+                && launch
+                    .requested_native_session_id
+                    .as_ref()
+                    .is_none_or(|root| profile.native_session_id.as_ref() == Some(root))
+                && evidence["launch"] == serde_json::json!(launch)
+                && profile.native_session_id.as_deref() == evidence["nativeSessionId"].as_str()
+                && state
+                    .fresh_agent
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &actor));
+            if bound {
+                ensure_grant_running(
+                    state,
+                    persisted.max_control_epoch,
+                    persisted.max_execution_generation,
+                )?;
+                append_event_with_secret(
+                    &state.state_dir,
+                    &state.secret,
+                    "host.native_input.recovery_bound",
+                    serde_json::json!({"severity":"info", "incarnationId":state.incarnation_id,
+                        "executionGeneration":persisted.max_execution_generation,
+                        "nativeSessionId":profile.native_session_id}),
+                )
+                .ok();
+                return Ok(());
+            }
+        }
+    }
+    ensure_current_fresh_native_observation(state).await
 }
 
 async fn commit_fresh_native_readiness_receipt(
@@ -3662,13 +3703,6 @@ async fn commit_fresh_native_readiness_receipt_with_persisted(
 }
 
 async fn ensure_current_fresh_native_observation(state: &HostState) -> Result<(), RuntimeError> {
-    ensure_current_fresh_native_observation_routed(state, NativeObservationRoute::Strict).await
-}
-
-async fn ensure_current_fresh_native_observation_routed(
-    state: &HostState,
-    route: NativeObservationRoute,
-) -> Result<(), RuntimeError> {
     let persisted = state.persisted.lock().await.clone();
     // The typed deterministic transport exists only in the explicit fixture
     // build. Its counters never certify native mode readiness.
@@ -3706,26 +3740,6 @@ async fn ensure_current_fresh_native_observation_routed(
             && current.max_execution_generation == persisted.max_execution_generation
             && current_native_observation(state, &current).await.is_some()
         {
-            return Ok(());
-        }
-        // gc1p Fix B1: a codex native exit inside this live host is
-        // send-recoverable. The mint path itself proves ownership through
-        // the durable actor's journal (the task010 owned-tree discipline),
-        // so routing the send to the actor's recover-on-send never writes
-        // into an identity this host cannot prove it owns.
-        if route == NativeObservationRoute::RecoverableOnSend
-            && codex_native_exit_is_send_recoverable(&actor).await
-        {
-            append_event_with_secret(
-                &state.state_dir,
-                &state.secret,
-                "host.native_input.send_recoverable_route",
-                serde_json::json!({"severity":"info","incarnationId":state.incarnation_id,
-                    "executionGeneration":persisted.max_execution_generation,
-                    "controlEpoch":persisted.max_control_epoch,
-                    "reason":"CODEX_NATIVE_EXIT_SEND_RECOVERABLE"}),
-            )
-            .ok();
             return Ok(());
         }
     }

@@ -300,6 +300,16 @@ fn retained_host_features_known(host: &crate::service::AuthenticatedHost) -> boo
                 .any(|capability| capability == required)
         })
 }
+
+fn pre_native_terminal(context: &RecoveryContext) -> bool {
+    context
+        .terminal
+        .as_ref()
+        .is_some_and(|terminal| terminal.mode == context.provider)
+        && context.fresh_agent.is_none()
+        && context.fixture.is_none()
+        && context.native_identity_launch.is_none()
+}
 fn retained_status_observed(
     context: &RecoveryContext,
     host: &crate::service::AuthenticatedHost,
@@ -2117,6 +2127,169 @@ impl Supervisor {
         );
     }
 
+    pub(crate) async fn verify_retained_terminal_owner(
+        &self,
+        handle: &crate::registry::OwnedRuntimeHandle,
+        host: &crate::service::AuthenticatedHost,
+    ) -> Result<(), RuntimeError> {
+        if !host.is_retained_v1() {
+            return Ok(());
+        }
+        let status = self
+            .host_status(handle.incarnation_id().clone(), handle.runtime_dir(), host)
+            .await?;
+        self.verify_retained_terminal_owner_status(handle, host, &status)
+            .await
+    }
+
+    pub(crate) async fn verify_retained_terminal_owner_status(
+        &self,
+        handle: &crate::registry::OwnedRuntimeHandle,
+        host: &crate::service::AuthenticatedHost,
+        status: &crate::service::HostStatus,
+    ) -> Result<(), RuntimeError> {
+        let context = self
+            .registry
+            .recovery_context(handle.soul_id().clone())
+            .await
+            .map_err(map_registry)?;
+        if context.prior_handle.incarnation_id() != handle.incarnation_id()
+            || context.prior_handle.runtime_dir() != handle.runtime_dir()
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::OwnershipMismatch,
+                "retained terminal owner changed before control dispatch",
+            ));
+        }
+        self.validate_retained_terminal_status(&context, host, status)
+            .await
+    }
+
+    async fn observe_retained_terminal(
+        &self,
+        context: &RecoveryContext,
+        host: &crate::service::AuthenticatedHost,
+    ) -> Result<crate::service::HostStatus, RuntimeError> {
+        let status = self
+            .host_status(
+                context.prior_handle.incarnation_id().clone(),
+                context.prior_handle.runtime_dir(),
+                host,
+            )
+            .await?;
+        self.validate_retained_terminal_status(context, host, &status)
+            .await?;
+        Ok(status)
+    }
+
+    async fn validate_retained_terminal_status(
+        &self,
+        context: &RecoveryContext,
+        host: &crate::service::AuthenticatedHost,
+        status: &crate::service::HostStatus,
+    ) -> Result<(), RuntimeError> {
+        if !host.is_retained_v1() || !pre_native_terminal(context) {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::UnsupportedOperation,
+                "legacy continuation requires an already accepted pre-native terminal",
+            ));
+        }
+        if !host.confirms_status_boot(status)
+            || status.exited
+            || status.worker_pid.is_none_or(|pid| pid == 0)
+            || status.worker_launch_count == 0
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::RecoveryBlocked,
+                "retained terminal has no confirmed worker in its authenticated host boot",
+            ));
+        }
+        if matches!((&context.native_session_id,&status.native_session_id),(Some(expected),Some(observed)) if expected!=observed)
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::RecoveryWrongIdentity,
+                "retained terminal reported another native identity",
+            ));
+        }
+        self.registry
+            .verify_retained_terminal_continuation(
+                context.soul_id.clone(),
+                context.prior_handle.incarnation_id().clone(),
+                status.host_boot_id.clone(),
+                status.max_execution_generation,
+                context.write_fence(),
+            )
+            .await
+            .map_err(map_registry)?;
+        Ok(())
+    }
+
+    async fn publish_reattachment(
+        &self,
+        soul_id: SoulId,
+        handle: &ReattachHandle,
+        protocol_version: u32,
+        fence: RecoveryWriteFence,
+    ) -> Result<(), RuntimeError> {
+        if protocol_version == 1 {
+            let context = self
+                .registry
+                .recovery_context(soul_id.clone())
+                .await
+                .map_err(map_registry)?;
+            if context.write_fence() != fence
+                || context.prior_handle.incarnation_id() != &handle.incarnation_id
+                || context.prior_handle.container_id() != handle.container_id
+            {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::StaleIntentRevision,
+                    "retained terminal owner or intent changed before continuation",
+                ));
+            }
+            let host = self
+                .authenticate_host(&handle.incarnation_id, context.prior_handle.runtime_dir())
+                .await?;
+            let status = self.observe_retained_terminal(&context, &host).await?;
+            if status.host_boot_id != handle.host_boot_id {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::HostAuthenticationFailed,
+                    "retained terminal host boot changed before continuation",
+                ));
+            }
+            self.registry
+                .mark_retained_terminal_live(
+                    soul_id.clone(),
+                    handle.incarnation_id.clone(),
+                    status.host_boot_id.clone(),
+                    status.max_execution_generation,
+                    fence,
+                )
+                .await
+                .map_err(map_registry)?;
+            crate::service::append_event(
+                &self.config.lifecycle_log,
+                "supervisor.retained_terminal.continued",
+                serde_json::json!({"severity":"info","soulId":soul_id,"incarnationId":handle.incarnation_id,
+                    "hostBootId":status.host_boot_id,"executionGeneration":status.max_execution_generation,
+                    "protocolVersion":1,"nativeProofCaptured":false}),
+            );
+            return Ok(());
+        }
+        self.registry
+            .mark_recovery_live(soul_id.clone(), handle.incarnation_id.clone(), fence)
+            .await
+            .map_err(map_registry)?;
+        let owned = self
+            .registry
+            .owned_handle(handle.incarnation_id.clone())
+            .await
+            .map_err(map_registry)?;
+        self.complete_pending_provider_preparation(&owned).await?;
+        self.release_pending_native_permissions_after_live(soul_id, handle.incarnation_id.clone())
+            .await?;
+        Ok(())
+    }
+
     async fn probe_recovery_context(
         &self,
         context: &mut RecoveryContext,
@@ -2169,6 +2342,17 @@ impl Supervisor {
                 .await
             {
                 Ok(host) => {
+                    if host.is_retained_v1() {
+                        return Ok(match self.observe_retained_terminal(context, &host).await {
+                            Ok(status) => live_reattach_probe(context, &status, 1),
+                            Err(error) => blocked(
+                                RecoveryPath::Reattach,
+                                RecoveryBlockReason::ProviderUnavailable,
+                                &error.message,
+                                Some(2_000),
+                            ),
+                        });
+                    }
                     if context.provider != "shell"
                         && context.fixture.is_none()
                         && !retained_host_features_known(&host)
@@ -2283,7 +2467,11 @@ impl Supervisor {
                             self.capture_live_resume_evidence(context, &host, &status)
                                 .await;
                         }
-                        return Ok(live_reattach_probe(context, &status));
+                        return Ok(live_reattach_probe(
+                            context,
+                            &status,
+                            CONTROL_PROTOCOL_VERSION,
+                        ));
                     }
                     if context.provider == "shell" {
                         return Ok(shell_terminal_end_probe(context));
@@ -2315,7 +2503,7 @@ impl Supervisor {
                                 "nativeSessionId": context.native_session_id,
                             }),
                         );
-                        return Ok(live_reattach_probe(context, &status));
+                        return Ok(live_reattach_probe(context, &status, CONTROL_PROTOCOL_VERSION));
                     }
                     let candidate = match resume_catalog::exact_resume_candidate(
                         &*context,
@@ -2402,6 +2590,15 @@ impl Supervisor {
                         context.provider != "shell"
                             && context.fixture.is_none()
                             && !deterministic_fresh_fixture(context),
+                    ));
+                }
+                Err(error) if pre_native_terminal(context) => {
+                    *transient = TransientRecoveryFailure::from_runtime(&error);
+                    return Ok(blocked(
+                        RecoveryPath::Reattach,
+                        RecoveryBlockReason::ProviderUnavailable,
+                        &error.message,
+                        Some(2_000),
                     ));
                 }
                 Err(_)
@@ -3516,24 +3713,15 @@ impl Supervisor {
         Box<dyn std::future::Future<Output = Result<RecoveryResult, RuntimeError>> + Send + '_>,
     > {
         match probe.clone() {
-            RecoveryProbe::ReattachReady { handle, .. } => Box::pin(async move {
-                self.registry
-                    .mark_recovery_live(
-                        request.soul_id.clone(),
-                        handle.incarnation_id.clone(),
-                        observed_context.write_fence(),
-                    )
-                    .await
-                    .map_err(map_registry)?;
-                let owned = self
-                    .registry
-                    .owned_handle(handle.incarnation_id.clone())
-                    .await
-                    .map_err(map_registry)?;
-                self.complete_pending_provider_preparation(&owned).await?;
-                self.release_pending_native_permissions_after_live(
+            RecoveryProbe::ReattachReady {
+                handle,
+                protocol_version,
+            } => Box::pin(async move {
+                self.publish_reattachment(
                     request.soul_id.clone(),
-                    handle.incarnation_id.clone(),
+                    &handle,
+                    protocol_version,
+                    observed_context.write_fence(),
                 )
                 .await?;
                 Ok(RecoveryResult {
@@ -4627,6 +4815,27 @@ impl Supervisor {
                 .preserve_nonloss_probe(soul_id, trigger, final_probe, context.write_fence())
                 .await;
         }
+        // Keep certificate construction and cleanup out of the polling frame
+        // that revalidates the host. Otherwise its large owned state remains
+        // on the stack while that final probe decodes a host reply.
+        Box::pin(self.certify_observed_loss(
+            soul_id,
+            trigger,
+            definitive_probe,
+            final_probe,
+            context,
+        ))
+        .await
+    }
+
+    async fn certify_observed_loss(
+        &self,
+        soul_id: SoulId,
+        trigger: RecoveryTrigger,
+        definitive_probe: RecoveryProbe,
+        final_probe: RecoveryProbe,
+        context: RecoveryContext,
+    ) -> Result<RecoveryResult, RuntimeError> {
         let path_evidence = match self
             .collect_loss_path_evidence(&context, &final_probe)
             .await
@@ -4911,22 +5120,12 @@ impl Supervisor {
         fence: RecoveryWriteFence,
     ) -> Result<RecoveryResult, RuntimeError> {
         match probe.clone() {
-            RecoveryProbe::ReattachReady { handle, .. } => {
-                self.registry
-                    .mark_recovery_live(soul_id.clone(), handle.incarnation_id.clone(), fence)
-                    .await
-                    .map_err(map_registry)?;
-                let owned = self
-                    .registry
-                    .owned_handle(handle.incarnation_id.clone())
-                    .await
-                    .map_err(map_registry)?;
-                self.complete_pending_provider_preparation(&owned).await?;
-                self.release_pending_native_permissions_after_live(
-                    soul_id,
-                    handle.incarnation_id.clone(),
-                )
-                .await?;
+            RecoveryProbe::ReattachReady {
+                handle,
+                protocol_version,
+            } => {
+                self.publish_reattachment(soul_id, &handle, protocol_version, fence)
+                    .await?;
                 Ok(RecoveryResult {
                     outcome: RecoveryOutcome::Reattached,
                     view: self.view_for(&handle.incarnation_id).await?,
@@ -5223,6 +5422,12 @@ impl Supervisor {
                             Some(2_000),
                         )
                     })?;
+                if host.is_retained_v1() {
+                    return Err(match self.observe_retained_terminal(context,&host).await {
+                        Ok(status)=>live_reattach_probe(context,&status,1),
+                        Err(error)=>blocked(RecoveryPath::Reattach,RecoveryBlockReason::ProviderUnavailable,&error.message,Some(2_000)),
+                    });
+                }
                 if context.provider!="shell" && context.fixture.is_none() && !retained_host_features_known(&host) {
                     return Err(blocked(RecoveryPath::Reattach,RecoveryBlockReason::CapabilityPending,"retained_host_capability_unknown",Some(2000)));
                 }
@@ -6189,6 +6394,7 @@ fn codex_readiness_probe_qualified(
 fn live_reattach_probe(
     context: &RecoveryContext,
     status: &crate::service::HostStatus,
+    protocol_version: u32,
 ) -> RecoveryProbe {
     if status.worker_pid.is_none() {
         return blocked(
@@ -6204,7 +6410,7 @@ fn live_reattach_probe(
             host_boot_id: status.host_boot_id.clone(),
             container_id: context.prior_handle.container_id().to_string(),
         },
-        protocol_version: CONTROL_PROTOCOL_VERSION,
+        protocol_version,
     }
 }
 

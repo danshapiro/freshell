@@ -99,6 +99,12 @@ pub trait CodexLaunchRuntime: Send + Sync {
         generation: u64,
     ) -> BoxFuture<'_, Result<(), String>>;
 
+    /// Complete a borrowed retained owner's transfer only after the create's
+    /// final coordinator settlement. Ordinary freshly-owned runtimes no-op.
+    fn commit_ownership(&self) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Task 4: note the codex session/thread id once it is known — resume
     /// launches at plan time, fresh launches when the proxy captures the
     /// thread candidate. Default no-op: only runtimes with a durable sidecar
@@ -283,6 +289,14 @@ impl CodexLaunchSidecar {
         self.assert_adoptable().await?;
         self.planner_active.lock().unwrap().remove(&self.id);
         Ok(())
+    }
+
+    async fn commit_ownership(&self) -> Result<(), String> {
+        let inner = self.inner.lock().await;
+        if inner.shutdown_started {
+            return Err(CODEX_SIDECAR_NOT_ADOPTABLE_MESSAGE.to_string());
+        }
+        self.runtime.commit_ownership().await
     }
 
     /// Task 10 server-shutdown retention: close the proxy (its listener dies
@@ -864,6 +878,21 @@ impl CodexTerminalLaunchManager {
         let _ = launch.sidecar.shutdown().await;
     }
 
+    /// The terminal's coordinator claim has won. Until this point a retained
+    /// runtime is still borrowed and failed creation must return its custody.
+    pub async fn commit_ownership(&self, terminal_id: &str) -> Result<(), String> {
+        let sidecar = self
+            .adopted
+            .lock()
+            .unwrap()
+            .get(terminal_id)
+            .map(|entry| entry.sidecar.clone());
+        match sidecar {
+            Some(sidecar) => sidecar.commit_ownership().await,
+            None => Err("The created Codex terminal exited before ownership committed.".into()),
+        }
+    }
+
     /// [`Self::discard`] for sync contexts (RAII Drop guards): fire-and-forget
     /// the sidecar teardown on the runtime. Same best-effort semantics —
     /// teardown errors are swallowed; the create failure the caller is
@@ -1033,6 +1062,38 @@ struct SpawnedSidecar {
     record: Option<CodexSidecarRecord>,
 }
 
+/// A detached child is still startup-owned until its endpoint and record are
+/// committed. Tokio configures kill-on-drop on Command, so this guard covers
+/// cancellation without changing the retained child's eventual drop policy.
+struct StartingChild(Option<tokio::process::Child>);
+
+impl StartingChild {
+    fn commit(mut self) -> tokio::process::Child {
+        self.0.take().expect("startup child is live")
+    }
+}
+
+impl std::ops::Deref for StartingChild {
+    type Target = tokio::process::Child;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("startup child is live")
+    }
+}
+
+impl std::ops::DerefMut for StartingChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().expect("startup child is live")
+    }
+}
+
+impl Drop for StartingChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.start_kill();
+        }
+    }
+}
+
 /// The real [`CodexLaunchRuntime`]: spawns `codex -c features.apps=false app-server
 /// --listen ws://127.0.0.1:<port>` (argv/env from
 /// [`crate::launch_plan::codex_sidecar_spawn_spec`], ownership-tagged for the `/proc`
@@ -1149,36 +1210,6 @@ fn unix_millis() -> i64 {
         .unwrap_or(0)
 }
 
-/// Allocate a loopback ephemeral port (`allocateLocalhostPort`-shaped: bind
-/// `127.0.0.1:0`, read the assigned port, release). Never a fixed port. Shared
-/// sidecar-spawn mechanics (S5.d.1 unification; also `freshell-freshagent`'s spawn).
-pub fn allocate_loopback_port() -> Result<u16, String> {
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
-        .map_err(|error| format!("loopback port allocation failed: {error}"))?;
-    let port = listener
-        .local_addr()
-        .map_err(|error| format!("loopback port allocation failed: {error}"))?
-        .port();
-    drop(listener);
-    Ok(port)
-}
-
-/// Drain the child's piped stdout/stderr to a sink so verbose app-server logs never
-/// back-pressure it. Shared sidecar-spawn mechanics (S5.d.1 unification; also
-/// `freshell-freshagent`'s spawn).
-pub fn drain_child_io(child: &mut tokio::process::Child) {
-    if let Some(mut stdout) = child.stdout.take() {
-        tokio::spawn(async move {
-            let _ = tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await;
-        });
-    }
-    if let Some(mut stderr) = child.stderr.take() {
-        tokio::spawn(async move {
-            let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
-        });
-    }
-}
-
 impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
     fn ensure_ready(
         &self,
@@ -1192,10 +1223,9 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
                 });
             }
 
-            let port = allocate_loopback_port()?;
-            let ws_url = format!("ws://127.0.0.1:{port}");
+            let ws_url = crate::sidecar_startup::REQUESTED_LISTEN_URL;
             let ownership_id = mint_ownership_id();
-            let spec = codex_sidecar_spawn_spec(&ws_url, &ownership_id, &self.sidecar_context);
+            let spec = codex_sidecar_spawn_spec(ws_url, &ownership_id, &self.sidecar_context);
 
             let command = self.resolved_command();
             let mut parts = command.split_whitespace();
@@ -1226,28 +1256,39 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
             // non-Linux identity can never be /proc-verified, so a detached
             // sidecar there would be untracked AND unreapable.
             let detach = cfg!(target_os = "linux") && self.store.is_enabled();
+            // Until the owned endpoint and durable row exist, cancellation
+            // must still kill this exact child. Retention is armed below.
+            cmd.kill_on_drop(!detach);
             if detach {
-                cmd.kill_on_drop(false);
                 // `tokio::process::Command::process_group` is Unix-only, so
                 // the call must stay cfg-gated even though detach is
                 // Linux-only today — keeps any non-Unix build compiling.
                 #[cfg(unix)]
                 cmd.process_group(0);
-            } else {
-                cmd.kill_on_drop(true);
             }
 
             #[cfg(target_os = "linux")]
             if self.sidecar_context.provider_exec_profile {
                 crate::managed_launch::check_command(cmd.as_std())?;
             }
-            let mut child = cmd
+            let child = cmd
                 .spawn()
                 .map_err(|error| format!("codex app-server spawn failed ({command}): {error}"))?;
-            drain_child_io(&mut child);
+            let mut child = StartingChild(Some(child));
+            let mut startup_output = crate::sidecar_startup::drain_child_output(&mut child);
 
             // Wait for the listener: probe-dial until accepted or the budget expires.
             let deadline = tokio::time::Instant::now() + self.start_budget;
+            let ws_url = match startup_output.wait_for_endpoint(deadline).await {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    let _ = child.start_kill();
+                    reap_owned_codex_sidecars(&ownership_id);
+                    self.scrub_record(&ownership_id);
+                    tracing::warn!(event="codex.sidecar.endpoint_unavailable", ownership_id=%ownership_id, "The owned Codex endpoint was not announced");
+                    return Err(error.to_string());
+                }
+            };
             loop {
                 // A6 fix (V3 bounded-hold audit, reports/V3-bounded-holds.md §A6): the 45s
                 // SIDECAR_START_BUDGET was only checked in the Err arm — an
@@ -1271,6 +1312,16 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
                 {
                     Ok(Ok((probe, _))) => {
                         drop(probe);
+                        if child
+                            .try_wait()
+                            .map_err(|error| error.to_string())?
+                            .is_some()
+                        {
+                            self.scrub_record(&ownership_id);
+                            return Err(
+                                "codex app-server exited after announcing its endpoint".into()
+                            );
+                        }
                         break;
                     }
                     // Failed probe and stalled-handshake probe take the SAME path:
@@ -1292,7 +1343,10 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
                     self.scrub_record(&ownership_id);
                     return Err(format!("codex app-server WS never came up: {probe_error}"));
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep_until(
+                    deadline.min(tokio::time::Instant::now() + Duration::from_millis(100)),
+                )
+                .await;
             }
 
             // Persist the durable record for TRACKED spawns (Task 3): the
@@ -1364,6 +1418,8 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
                 }
             }
 
+            // No await separates retention arming from state publication.
+            let child = child.commit();
             *state = Some(SpawnedSidecar {
                 ws_url: ws_url.clone(),
                 ownership_id,
@@ -1646,6 +1702,74 @@ mod tests {
             child.try_wait().expect("try_wait exact child").is_some(),
             "the exact child must be confirmed stopped before returning failure"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cancelling_endpoint_wait_reaps_only_the_unpublished_startup_child() {
+        struct OwnedPid(u32, u64);
+        impl Drop for OwnedPid {
+            fn drop(&mut self) {
+                if proc_starttime(self.0 as i32) == Some(self.1) {
+                    unsafe {
+                        libc::kill(self.0 as libc::pid_t, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pending.pid");
+        let script = dir.path().join("pending.mjs");
+        std::fs::write(&script, format!(
+            "import fs from 'node:fs';fs.writeFileSync({},String(process.pid));setInterval(()=>{{}},1000);",
+            serde_json::to_string(&pid_file).unwrap(),
+        )).unwrap();
+        let store = Arc::new(CodexSidecarStore::new(dir.path().to_path_buf()));
+        let runtime = Arc::new(SpawnedCodexAppServerRuntime::with_command_and_store(
+            format!("node {}", script.display()),
+            store.clone(),
+        ));
+        let mut unrelated = tokio::process::Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let copy = runtime.clone();
+        let pending = tokio::spawn(async move { copy.ensure_ready(None).await });
+        let pid = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_file)
+                    .unwrap_or_default()
+                    .parse::<u32>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the owned child reaches its pending announcement phase");
+        let _cleanup = OwnedPid(
+            pid,
+            proc_starttime(pid as i32).expect("pending child is live"),
+        );
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while proc_starttime(pid as i32).is_some() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("cancellation reaps the exact unpublished child");
+        assert!(runtime.child_pid().await.is_none());
+        assert!(store.load_all().is_empty(), "no endpoint was published");
+        assert!(
+            unrelated.try_wait().unwrap().is_none(),
+            "unrelated child remains live"
+        );
+        unrelated.start_kill().unwrap();
+        unrelated.wait().await.unwrap();
     }
 
     #[tokio::test]

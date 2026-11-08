@@ -36,6 +36,88 @@ use crate::sidecar_test_support::{
 };
 
 #[test]
+fn terminal_routing_checks_current_process_evidence_without_consuming_its_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&dir);
+    let child = spawn_own_sleep_child();
+    let record = CodexSidecarRecord {
+        terminal_id: Some("prior-terminal".into()),
+        ..record_for_child("codex-sidecar-owned-routing", child.0.id(), Some(SESSION))
+    };
+    store.write(&record).unwrap();
+    let (reconciler, _) = SidecarReconciler::boot_reconcile(store);
+    assert!(reconciler.has_verified_terminal_session(SESSION));
+    assert!(!reconciler.has_verified_terminal_session("unrelated-native-session"));
+    assert_eq!(
+        reconciler.unclaimed_len(),
+        1,
+        "routing is a read, not a claim"
+    );
+    {
+        let mut held = reconciler.held.lock().unwrap();
+        held.get_mut(&record.ownership_id).unwrap().starttime += 1;
+    }
+    assert!(
+        !reconciler.has_verified_terminal_session(SESSION),
+        "routing must re-verify the live incarnation instead of trusting a cached native id"
+    );
+    assert!(
+        proc_starttime(child.0.id() as i32).is_some(),
+        "routing never signals the inspected process"
+    );
+}
+
+#[tokio::test]
+async fn required_retained_readiness_failure_preserves_process_record_and_claim() {
+    for drop_before_probe in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir);
+        let child = spawn_own_sleep_child();
+        let record = CodexSidecarRecord {
+            terminal_id: Some("prior-terminal".into()),
+            ws_url: "ws://127.0.0.1:0".into(),
+            ..record_for_child(
+                "codex-sidecar-owned-refused-probe",
+                child.0.id(),
+                Some(SESSION),
+            )
+        };
+        store.write(&record).unwrap();
+        let (reconciler, _) = SidecarReconciler::boot_reconcile(store.clone());
+        let reconciler = Arc::new(reconciler);
+        let plan =
+            crate::launch_plan::plan_codex_launch(&crate::launch_plan::CodexLaunchPlanInput {
+                resume_session_id: Some(SESSION),
+                require_retained_sidecar: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let runtime =
+            crate::runtime_select::select_codex_runtime(Some(&reconciler), Some(&store), &plan)
+                .await;
+        if !drop_before_probe {
+            assert!(runtime.ensure_ready(None).await.is_err());
+            runtime.shutdown().await.unwrap();
+        }
+        drop(runtime);
+        assert_eq!(
+            store.load_all(),
+            vec![record.clone()],
+            "refusal/cancellation must never rewrite the prior owner"
+        );
+        assert!(
+            reconciler.has_verified_terminal_session(SESSION),
+            "refusal/cancellation must return the original claim"
+        );
+        assert_eq!(
+            proc_starttime(child.0.id() as i32),
+            Some(record.starttime),
+            "readiness failure must never reap the existing process"
+        );
+    }
+}
+
+#[test]
 fn boot_reconcile_prunes_dead_and_mismatched_records() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = store_in(&dir);

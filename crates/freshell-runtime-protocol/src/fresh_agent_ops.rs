@@ -98,8 +98,8 @@ pub enum FreshAgentNativeNameOperation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FreshAgentNativeNameError {
-    /// The per-soul lifecycle fence was held; the request was refused before
-    /// any host/native operation was dispatched and may be retried freshly.
+    /// Supervisor-only refusal before any host/native operation was dispatched.
+    /// Host replies cannot use this variant as no-dispatch evidence.
     LifecycleBusy,
     Unavailable {
         message: String,
@@ -138,4 +138,8 @@ pub struct FreshAgentNativeNameRequest {
     pub operation: FreshAgentNativeNameOperation,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_control_epoch: Option<u64>,
+    /// Absolute caller budget, including inventory, admission and host work.
+    /// The supervisor also imposes its own monotonic upper bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_unix_ms: Option<i64>,
 }

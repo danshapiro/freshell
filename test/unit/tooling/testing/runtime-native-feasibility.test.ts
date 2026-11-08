@@ -1145,17 +1145,27 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
       expect(code, stderr).toBe(0)
     }
   }, 15000)
-  it.each(['missing-native-id', 'wrong-resume-root'])('does not turn a Codex parity %s response into a current exact native acknowledgement', async fault => {
+  it.for(['missing-native-id', 'wrong-resume-root'] as const)('does not turn a Codex parity %s response into a current exact native acknowledgement', { timeout: 15000 }, async (fault, { signal }) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'parity-codex-refusal-'))
     const server = new WebSocketServer({ host: '127.0.0.1', port: 0 })
     await new Promise<void>(resolve => server.once('listening', resolve))
     const requests: any[] = []
+    let resolveNativeSocket!: () => void
+    let rejectNativeSocket!: (reason: unknown) => void
+    const nativeSocketClosed = new Promise<void>((resolve, reject) => { resolveNativeSocket = resolve; rejectNativeSocket = reject })
     const requested = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-    server.on('connection', socket => socket.on('message', bytes => {
-      const request = JSON.parse(bytes.toString()); requests.push(request)
-      if (request.id) socket.send(JSON.stringify({ id: request.id, result: request.method.startsWith('thread/')
-        ? { thread: fault === 'missing-native-id' ? {} : { id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' } } : {} }))
-    }))
+    server.on('connection', socket => {
+      let nativeRequestSeen = false
+      // Join the native request's socket lifecycle. The outer process close
+      // below is the final fence for acknowledgement/artifact writers.
+      socket.once('close', () => { if (nativeRequestSeen) resolveNativeSocket() })
+      socket.on('message', bytes => {
+        const request = JSON.parse(bytes.toString()); requests.push(request)
+        if (request.method.startsWith('thread/')) nativeRequestSeen = true
+        if (request.id) socket.send(JSON.stringify({ id: request.id, result: request.method.startsWith('thread/')
+          ? { thread: fault === 'missing-native-id' ? {} : { id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' } } : {} }))
+      })
+    })
     const fixture = prepareCodexTerminalFixture(directory, 'parity')
     const child = spawn(process.execPath, [fixture, '--remote', `ws://127.0.0.1:${(server.address() as any).port}`,
       ...(fault === 'wrong-resume-root' ? ['resume', requested] : [])], {
@@ -1163,23 +1173,68 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
     })
     let output = '', stderr = ''
     child.stdout.on('data', chunk => { output += String(chunk) }); child.stderr.on('data', chunk => { stderr += String(chunk) })
-    const finished = new Promise<number | null>((resolve, reject) => { child.once('exit', resolve); child.once('error', reject) })
+    // close also joins the outer parity process's forwarded stdout/stderr;
+    // its identity callback can still run after the native socket closes.
+    const finished = new Promise<number | null>(resolve => {
+      child.once('error', rejectNativeSocket)
+      child.once('close', code => {
+        // This server records a request before answering it. A valid consumed
+        // response therefore cannot belong to a child with no thread request.
+        if (!requests.some(row => row.method.startsWith('thread/'))) {
+          rejectNativeSocket(new Error(`Codex parity process closed before any native thread request (exit ${code}): ${stderr.slice(-4096)}`))
+        }
+        resolve(code)
+      })
+    })
+    const endInput = () => {
+      if (!child.stdin.writableEnded && !child.stdin.destroyed) child.stdin.end()
+    }
+    let rejectAborted!: (reason: unknown) => void
+    const aborted = new Promise<never>((_resolve, reject) => { rejectAborted = reject })
+    const onAbort = () => {
+      let reason: unknown = signal.reason
+      try {
+        endInput()
+        for (const socket of server.clients) socket.terminate()
+      } catch (error) { reason = error }
+      try {
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+      } catch (error) { reason = error }
+      rejectNativeSocket(reason)
+      rejectAborted(reason)
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    if (signal.aborted) onAbort()
+    // Join both channels without assuming which close callback is observed
+    // first. EOF supplies no user turn, and follows the socket witness.
+    const completed = Promise.all([nativeSocketClosed.then(endInput), finished])
     try {
-      await vi.waitFor(() => expect(requests.filter(row => row.method.startsWith('thread/')), stderr).toHaveLength(1))
+      const [, code] = await Promise.race([completed, aborted])
+      expect(requests.filter(row => row.method.startsWith('thread/')), stderr).toHaveLength(1)
       expect(requests.find(row => row.method.startsWith('thread/'))).toMatchObject({ method: fault === 'missing-native-id' ? 'thread/start' : 'thread/resume',
         params: fault === 'missing-native-id' ? { cwd: directory } : { threadId: requested, cwd: directory } })
-      if (fault === 'wrong-resume-root') await vi.waitFor(() => expect(stderr).toContain('resumed wrong session'))
+      if (fault === 'wrong-resume-root') expect(stderr).toContain('resumed wrong session')
       expect(output).not.toContain('codex: session ')
       expect(fs.existsSync(path.join(directory, '.codex/sessions'))).toBe(false)
       expect(requests.some(row => row.method === 'turn/start')).toBe(false)
-    } finally {
-      child.stdin.end(); const code = await finished
-      for (const socket of server.clients) socket.terminate()
-      await new Promise<void>(resolve => server.close(() => resolve()))
-      fs.rmSync(directory, { recursive: true, force: true })
       expect(code, stderr).toBe(fault === 'wrong-resume-root' ? 1 : 0)
+    } finally {
+      try {
+        try {
+          endInput()
+          for (const socket of server.clients) socket.terminate()
+        } finally {
+          // Keep cancellation armed while joining the exact child. Observe a
+          // witness rejection even if cleanup was the first failing operation.
+          await Promise.allSettled([nativeSocketClosed, completed, finished])
+          await new Promise<void>(resolve => server.close(() => resolve()))
+        }
+      } finally {
+        signal.removeEventListener('abort', onAbort)
+        fs.rmSync(directory, { recursive: true, force: true })
+      }
     }
-  }, 15000)
+  })
   it.each(['same-workspace-alias', 'different-directory'])('resolves only the actual directory identity of an owned native workspace alias (%s)', async fault => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-load-fault-alias-'))
     const workspace = path.join(directory, 'owned-workspace'), alias = path.join(directory, 'native-cwd')

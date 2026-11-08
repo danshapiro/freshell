@@ -71,6 +71,13 @@ use freshell_protocol::{
 use freshell_terminal::registry::{ManagedTerminalInputError, ManagedTerminalLaunch};
 use freshell_terminal::{build_child_env_from_process, FrameSink};
 
+#[cfg(all(test, unix))]
+#[path = "host_claude_restore_tests.rs"]
+mod host_claude_restore_tests;
+#[cfg(all(test, unix))]
+#[path = "host_opencode_restore_tests.rs"]
+mod host_opencode_restore_tests;
+
 use crate::WsState;
 
 #[cfg(test)]
@@ -3240,6 +3247,7 @@ async fn plan_codex_managed_launch(
     state: &WsState,
     setup: &CodexManagedLaunchSetup,
     resume_session_id: Option<&str>,
+    require_retained_sidecar: bool,
     class: freshell_codex::launch_lifecycle::LaunchClass,
     cancel: Option<&mut tokio::sync::watch::Receiver<bool>>,
 ) -> Result<freshell_codex::launch_lifecycle::CodexTerminalLaunch, PlanLaunchError> {
@@ -3254,6 +3262,7 @@ async fn plan_codex_managed_launch(
         model: plan_model.as_deref(),
         sandbox: plan_sandbox.as_deref(),
         approval_policy: plan_approval.as_deref(),
+        require_retained_sidecar,
         sidecar_context: setup.sidecar_context.clone(),
     };
     let manager = freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global();
@@ -3676,6 +3685,14 @@ pub(crate) struct LaunchPrep {
 /// extracted, so there is no error path.
 fn managed_runtime_mode(mode: &str) -> bool {
     mode == "shell" || freshell_agent_runtime::managed_provider_enabled(mode)
+}
+
+fn has_verified_codex_terminal_sidecar(mode: &str, session_id: Option<&str>) -> bool {
+    mode == "codex"
+        && session_id.is_some_and(|session_id| {
+            freshell_codex::sidecar_reconcile::codex_sidecar_reconciler()
+                .is_some_and(|reconciler| reconciler.has_verified_terminal_session(session_id))
+        })
 }
 
 fn managed_opencode_endpoint(
@@ -4710,6 +4727,9 @@ impl Drop for PreparedCodexLaunch {
 /// Everything a restore-class create computes BEFORE the spawn-gate permit.
 pub(crate) struct PreparedLaunch {
     pub prep: LaunchPrep,
+    /// A prior host-owned agent stays on its existing runtime through a
+    /// managed upgrade. Planning is deferred until create ownership settles.
+    pub require_retained_codex: bool,
     /// Some(..) ONLY when a resume session id was derived; None means
     /// "not planned pre-gate" and handle_create plans on-permit inline.
     pub codex_launch: Option<PreparedCodexLaunch>,
@@ -4768,7 +4788,9 @@ async fn gate_wire_resume(
                     "opencode" => state.fresh_opencode.has_live_session(sid).await,
                     _ => false,
                 };
-            registry_row_live || fresh_agent_live
+            registry_row_live
+                || fresh_agent_live
+                || has_verified_codex_terminal_sidecar(mode, Some(sid))
         }
     };
     if candidate_is_live {
@@ -5136,6 +5158,8 @@ pub(crate) async fn prepare_launch(
     // disagree).
     let mode = create.mode.clone();
     let mut prep = derive_launch_prep(create, &mode);
+    let require_retained_codex = managed_runtime_v1
+        && has_verified_codex_terminal_sidecar(&mode, prep.resume_session_id.as_deref());
     // Resume-validation door 1, codex leg (reconciled with #589): codex
     // restore-class planning happens OFF-permit right below, so the
     // disk-existence gate for codex WIRE ids must run before it — a
@@ -5175,7 +5199,9 @@ pub(crate) async fn prepare_launch(
     let managed_flag =
         std::env::var(freshell_codex::launch_plan::FRESHELL_CODEX_MANAGED_LAUNCH_ENV).ok();
     // The managed session host plans its own Codex app-server and proxy.
-    // Only a legacy web-owned launch needs a plan before the spawn gate.
+    // A retained host owner is claimed only after handle_create's ownership
+    // guards and spawn-gate wait. Cancelling a queued restore must leave its
+    // existing agent unclaimed and alive.
     let codex_launch = if !managed_runtime_v1
         && prep.resume_session_id.is_some()
         && codex_create_uses_managed_launch(&mode, managed_flag.as_deref())
@@ -5203,6 +5229,7 @@ pub(crate) async fn prepare_launch(
             state,
             &setup,
             prep.resume_session_id.as_deref(),
+            false,
             freshell_codex::launch_lifecycle::LaunchClass::Restore,
             Some(cancel),
         )
@@ -5218,6 +5245,7 @@ pub(crate) async fn prepare_launch(
     };
     Ok(PreparedLaunch {
         prep,
+        require_retained_codex,
         codex_launch,
         resume_gate,
     })
@@ -5308,13 +5336,18 @@ pub(crate) async fn handle_create(
     // the TOP so `prepared_codex`'s Drop guard is alive across EVERY
     // pre-plan early return below (keyed-create adopt, D8 lease, rate
     // limit, unknown mode, claude ladder, D7 guard, opencode port).
-    let (prep, mut prepared_codex, prepared_resume_gate) = match prepared {
+    let (prep, mut prepared_codex, prepared_resume_gate, prepared_retained_codex) = match prepared {
         // p.codex_launch is None for non-codex modes AND for the A4
         // fresh-plan exclusion (no derived resume session id) — the None
         // arm of the plan site below then plans on-permit, byte-identical
         // to today.
-        Some(p) => (Some(p.prep), p.codex_launch, p.resume_gate),
-        None => (None, None, None),
+        Some(p) => (
+            Some(p.prep),
+            p.codex_launch,
+            p.resume_gate,
+            p.require_retained_codex,
+        ),
+        None => (None, None, None, false),
     };
     // Single-flight create-dedupe (reconciliation design §5.4, the council's
     // two-tab double-respawn blocker): on `paneReconcileV1` connections ONLY,
@@ -6057,8 +6090,41 @@ pub(crate) async fn handle_create(
     // Managed create retries must be payload-identical across web-process
     // replacement, so their terminal and stream IDs derive from the pane's
     // durable createRequestId. Other creates retain their existing IDs.
-    let use_managed_runtime =
-        state.registry.managed_runtime_connection(conn_id) && managed_runtime_mode(&mode);
+    let managed_runtime_v1 = state.registry.managed_runtime_connection(conn_id);
+    let require_retained_codex = prepared_retained_codex
+        || (managed_runtime_v1
+            && has_verified_codex_terminal_sidecar(
+                &mode,
+                create_session_locator(&create)
+                    .as_ref()
+                    .map(|locator| locator.session_id.as_str()),
+            ));
+    // A restored host Claude conversation is not part of a newly allocated
+    // soul volume. First allow the existing managed-descriptor adoption below;
+    // if none exists, require exact original host-store authority before using
+    // the ordinary host ownership/lifecycle. Fresh managed creates are unchanged.
+    let require_host_claude_restore = managed_runtime_v1
+        && mode == "claude"
+        && (create.restore == Some(true)
+            || create_session_locator(&create)
+                .is_some_and(|locator| is_canonical_claude_session_id(&locator.session_id)));
+    let require_host_opencode_restore = managed_runtime_v1
+        && mode == "opencode"
+        && (create.restore == Some(true)
+            || create_session_locator(&create)
+                .is_some_and(|locator| locator.session_id.starts_with("ses_")));
+    let use_managed_runtime = managed_runtime_v1
+        && managed_runtime_mode(&mode)
+        && !require_retained_codex
+        && !require_host_claude_restore
+        && !require_host_opencode_restore;
+    if require_retained_codex {
+        tracing::info!(
+            event = "terminal.create.retained_codex",
+            request_id = %create.request_id,
+            "Reusing a verified host-owned Codex agent during managed restore"
+        );
+    }
     let host_os = host_os_live();
     let is_wsl = is_wsl_env_live();
     let shell = map_shell(create.shell);
@@ -6472,6 +6538,82 @@ pub(crate) async fn handle_create(
             .await;
         }
     }
+
+    let host_claude_restore_source = if require_host_claude_restore {
+        let session_id = resume_session_id.clone().unwrap_or_default();
+        let requested_cwd = create.cwd.as_deref().map(std::path::PathBuf::from);
+        let selected = spawn_blocking_in_span(move || {
+            freshell_freshagent::locate_host_claude_restore(&session_id, requested_cwd.as_deref())
+        })
+        .await
+        .unwrap_or(Err(freshell_freshagent::HostClaudeRestoreError::Unreadable));
+        match selected {
+            Ok(source) => {
+                resolved_cwd = Some(source.cwd.to_string_lossy().into_owned());
+                tracing::info!(event = "terminal.create.host_claude_restore",
+                    request_id = %create.request_id, session_id = ?resume_session_id,
+                    config_root = %source.config_root.display(),
+                    "Restoring the verified original host Claude conversation");
+                Some(source)
+            }
+            Err(reason) => {
+                tracing::warn!(event = "terminal.create.host_claude_restore_refused",
+                    request_id = %create.request_id, reason = reason.reason(),
+                    "Original host Claude conversation could not be verified");
+                return send_create_error(out, ErrorCode::RestoreUnavailable,
+                    "The original Claude conversation could not be verified on this host. No replacement was started.".into(),
+                    &create.request_id).await;
+            }
+        }
+    } else {
+        None
+    };
+
+    let host_opencode_restore_source = if require_host_opencode_restore {
+        let session_id = resume_session_id.clone().unwrap_or_default();
+        if session_id.is_empty() {
+            return send_create_error(out, ErrorCode::RestoreUnavailable,
+                "The saved OpenCode conversation has no native identity. No replacement was started.".into(),
+                &create.request_id).await;
+        }
+        if state
+            .registry
+            .managed_owns_native_session("opencode", &session_id)
+            .await
+            != Ok(false)
+        {
+            return send_create_error(out, ErrorCode::RestoreUnavailable,
+                "The managed owner of this OpenCode conversation could not be ruled out. No host replacement was started.".into(),
+                &create.request_id).await;
+        }
+        let requested_cwd = create.cwd.as_deref().map(std::path::PathBuf::from);
+        let selected = spawn_blocking_in_span(move || {
+            freshell_freshagent::locate_host_opencode_restore(&session_id, requested_cwd.as_deref())
+        })
+        .await
+        .unwrap_or(Err(
+            freshell_freshagent::HostOpenCodeRestoreError::Unreadable,
+        ));
+        match selected {
+            Ok(source) => {
+                resolved_cwd = Some(source.cwd.to_string_lossy().into_owned());
+                tracing::info!(event = "terminal.create.host_opencode_restore",
+                    request_id = %create.request_id, session_id = ?resume_session_id,
+                    "Restoring the verified original host OpenCode conversation");
+                Some(source)
+            }
+            Err(reason) => {
+                tracing::warn!(event = "terminal.create.host_opencode_restore_refused",
+                    request_id = %create.request_id, reason = reason.reason(),
+                    "Original host OpenCode conversation could not be verified");
+                return send_create_error(out, ErrorCode::RestoreUnavailable,
+                    "The original OpenCode conversation could not be verified on this host. No replacement was started.".into(),
+                    &create.request_id).await;
+            }
+        }
+    } else {
+        None
+    };
 
     // b8ke ext r7 F2: the LEARNED-identity PRE-SPAWN claim. Every
     // resume/create path retains coordinator authority through the spawn:
@@ -6973,7 +7115,8 @@ pub(crate) async fn handle_create(
     let (codex_setup, codex_launch) = match prepared_pair {
         Some((setup, launch)) => (Some(setup), Some(launch)),
         None if !use_managed_runtime
-            && codex_create_uses_managed_launch(&mode, managed_flag.as_deref()) =>
+            && (require_retained_codex
+                || codex_create_uses_managed_launch(&mode, managed_flag.as_deref())) =>
         {
             let setup = match build_codex_managed_launch_setup(
                 terminal_id.clone(),
@@ -6999,6 +7142,7 @@ pub(crate) async fn handle_create(
                 state,
                 &setup,
                 resume_session_id.as_deref(),
+                require_retained_codex,
                 freshell_codex::launch_lifecycle::LaunchClass::Interactive,
                 None,
             )
@@ -7165,7 +7309,15 @@ pub(crate) async fn handle_create(
             None,
         ),
     };
-    let child_env = build_child_env_from_process(&spec);
+    let mut child_env = build_child_env_from_process(&spec);
+    if let Some(source) = host_claude_restore_source.as_ref() {
+        // Keep original host HOME and explicitly select the root that supplied
+        // this conversation, including the existing CLAUDE_HOME fallback.
+        child_env.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            source.config_root.to_string_lossy().into_owned(),
+        );
+    }
 
     // Exit hook: built by `build_pty_exit_hook` (see its doc comment for the
     // reference anchors) so the auto-resume respawn seam (Task 4) reuses the
@@ -7285,7 +7437,27 @@ pub(crate) async fn handle_create(
     // every non-negotiating connection retain the legacy local spawn path.
     // PIN2_PTY_SPAWN_ANCHOR: either the local PTY spawn OR the supervisor's
     // host-owned PTY makes the preallocated identity observable.
+    #[cfg(all(test, unix))]
+    host_claude_restore_tests::before_source_revalidation(&create.request_id, &terminal_id);
+    #[cfg(all(test, unix))]
+    host_opencode_restore_tests::before_source_revalidation(&create.request_id, &terminal_id);
+    // A managed claim that appeared during MCP preparation must not authorize
+    // a second host writer. The ordinary native-session ownership claim stays
+    // held across this check and the existing atomic registry create/settle.
+    let host_opencode_owner_absent = if host_opencode_restore_source.is_some() {
+        state
+            .registry
+            .managed_owns_native_session(
+                "opencode",
+                resume_session_id.as_deref().unwrap_or_default(),
+            )
+            .await
+            == Ok(false)
+    } else {
+        true
+    };
     let mut provider_preparation_failure = None;
+    let mut host_restore_failure = None;
     let create_result: std::io::Result<()> = if use_managed_runtime {
         let managed = ManagedTerminalLaunch {
             spec: spec.clone(),
@@ -7331,7 +7503,20 @@ pub(crate) async fn handle_create(
         let spawn_resume_session_id = resume_session_id.clone();
         let spawn_create_request_id = create.request_id.clone();
         match spawn_blocking_in_span(move || {
-            registry.create(
+            if let Some(source) = host_claude_restore_source {
+                source
+                    .revalidate()
+                    .map_err(|reason| ("claude", reason.reason()))?;
+            }
+            if let Some(source) = host_opencode_restore_source {
+                if !host_opencode_owner_absent {
+                    return Err(("opencode", "managed_native_owner_not_absent"));
+                }
+                source
+                    .revalidate(&child_env)
+                    .map_err(|reason| ("opencode", reason.reason()))?;
+            }
+            Ok::<_, (&'static str, &'static str)>(registry.create(
                 &spawn_spec,
                 &child_env,
                 spawn_terminal_id,
@@ -7341,11 +7526,18 @@ pub(crate) async fn handle_create(
                 Some(&spawn_create_request_id),
                 None,
                 on_exit,
-            )
+            ))
         })
         .await
         {
-            Ok(res) => res,
+            Ok(Ok(res)) => res,
+            Ok(Err((provider, reason))) => {
+                tracing::warn!(event = "terminal.create.host_restore_refused",
+                    request_id = %create.request_id, provider, reason,
+                    "Original host conversation changed before its owned spawn");
+                host_restore_failure = Some(provider);
+                Err(std::io::Error::other("original host conversation changed"))
+            }
             Err(join_err) => Err(std::io::Error::other(format!(
                 "terminal spawn task panicked: {join_err}"
             ))),
@@ -7417,6 +7609,16 @@ pub(crate) async fn handle_create(
                 .await;
         }
         cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
+        if let Some(provider) = host_restore_failure {
+            let label = if provider == "claude" {
+                "Claude"
+            } else {
+                "OpenCode"
+            };
+            return send_create_error(out, ErrorCode::RestoreUnavailable,
+                format!("The original {label} conversation changed before restoration. No replacement was started."),
+                &create.request_id).await;
+        }
         let label = mode_label(&mode, cli.as_ref());
         let env_var = state
             .cli_commands
@@ -7965,6 +8167,17 @@ pub(crate) async fn handle_create(
         }
     }
 
+    if require_retained_codex {
+        if let Err(message) = freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+            .commit_ownership(&terminal_id)
+            .await
+        {
+            state.registry.kill(&terminal_id);
+            return send_create_error(out, ErrorCode::PtySpawnFailed, message, &create.request_id)
+                .await;
+        }
+    }
+
     // Unified agent names (Task 2): the scoped-create naming admission —
     // BEFORE the frame acknowledges creation, so the pane content and the
     // identity/registry rows never observable precede the name binding. A
@@ -8373,6 +8586,7 @@ pub async fn respawn_agent_terminal(
                 state,
                 setup,
                 resume_session_id.as_deref(),
+                false,
                 freshell_codex::launch_lifecycle::LaunchClass::Interactive,
                 None,
             )
