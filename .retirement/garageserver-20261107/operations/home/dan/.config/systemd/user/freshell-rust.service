@@ -1,0 +1,25 @@
+[Unit]
+Description=Freshell Rust server on garageserver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/code/freshell
+ExecStart=%h/code/freshell/target/release/freshell-server
+Environment=PORT=3001
+Environment=FRESHELL_BIND_HOST=0.0.0.0
+Environment=PATH=%h/.local/bin:%h/.nvm/versions/node/v22.21.1/bin:/usr/local/bin:/usr/bin:/bin
+Environment=FRESHELL_CLAUDE_NODE=%h/.nvm/versions/node/v22.21.1/bin/node
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=15
+# SAFE-11: signal ONLY the main process on stop — the server's graceful
+# shutdown reaps what it owns and deliberately RETAINS adopted Codex
+# sidecars; a control-group kill would slaughter them. Matches
+# installers/systemd/freshell-rust.service.
+KillMode=process
+UMask=0077
+
+[Install]
+WantedBy=default.target

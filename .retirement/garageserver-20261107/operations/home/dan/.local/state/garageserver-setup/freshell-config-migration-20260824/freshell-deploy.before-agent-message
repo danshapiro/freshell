@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo=${FRESHELL_REPO:-/home/dan/code/freshell}
+service=freshell-rust.service
+health_url=http://127.0.0.1:3001/api/health
+log_dir=${FRESHELL_HOME:-$HOME/.freshell}/logs
+log_file=$log_dir/deploy.jsonl
+
+mkdir -p "$log_dir"
+
+json_escape() {
+  local value=$1
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\n'/\\n}
+  printf '%s' "$value"
+}
+
+log_event() {
+  local severity=$1 event=$2 status=$3 detail=${4:-}
+  local timestamp commit branch
+  timestamp=$(date --utc +%Y-%m-%dT%H:%M:%SZ)
+  commit=$(git -C "$repo" rev-parse HEAD 2>/dev/null || printf unknown)
+  branch=$(git -C "$repo" branch --show-current 2>/dev/null || printf unknown)
+  printf '{"timestamp":"%s","severity":"%s","event":"%s","status":"%s","commit":"%s","branch":"%s","detail":"%s"}\n' \
+    "$timestamp" "$(json_escape "$severity")" "$(json_escape "$event")" \
+    "$(json_escape "$status")" "$(json_escape "$commit")" \
+    "$(json_escape "$branch")" "$(json_escape "$detail")" >>"$log_file"
+}
+
+fail() {
+  local message=$1
+  log_event error deploy failed "$message"
+  printf 'ERROR: %s\n' "$message" >&2
+  exit 1
+}
+
+load_toolchain() {
+  if [[ -s "$HOME/.profile" ]]; then
+    # shellcheck disable=SC1090
+    . "$HOME/.profile"
+  fi
+  command -v node >/dev/null || fail 'node is unavailable in this shell'
+  command -v cargo >/dev/null || fail 'cargo is unavailable in this shell'
+}
+
+require_main() {
+  local branch
+  branch=$(git -C "$repo" branch --show-current)
+  [[ "$branch" == main ]] || fail "deployment requires the main checkout; current branch is $branch"
+}
+
+build_client() {
+  printf '%s\n' 'Building the production client...'
+  npm run typecheck:client
+  npm run build:client
+}
+
+wait_for_health() {
+  local attempt
+  for attempt in $(seq 1 60); do
+    if curl -fsS --max-time 2 "$health_url" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+show_status() {
+  systemctl --user --no-pager --full status "$service" || true
+  if curl -fsS --max-time 2 "$health_url" >/dev/null; then
+    printf '\nHealth check passed: %s\n' "$health_url"
+  else
+    printf '\nHealth check failed: %s\n' "$health_url" >&2
+    return 1
+  fi
+}
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  freshell-deploy status
+  freshell-deploy client
+  freshell-deploy server APPROVED
+
+client rebuilds dist/client in place; the running Rust server serves it from
+disk, so only a browser hard-refresh is needed.
+
+server builds the client and Rust server, then restarts the supervised service.
+The literal APPROVED argument is mandatory because restarting disconnects live
+Freshell terminals and sessions briefly.
+USAGE
+}
+
+mode=${1:-status}
+approval=${2:-}
+
+cd "$repo"
+case "$mode" in
+  status)
+    show_status
+    ;;
+  client)
+    load_toolchain
+    require_main
+    log_event info deploy started client
+    build_client
+    log_event info deploy completed client
+    printf '%s\n' 'Client deployment complete. Hard-refresh the browser.'
+    ;;
+  server)
+    [[ "$approval" == APPROVED ]] || fail 'server deployment requires: freshell-deploy server APPROVED'
+    load_toolchain
+    require_main
+    log_event info deploy started server
+    build_client
+    printf '%s\n' 'Building the production Rust server...'
+    cargo build --locked --release -p freshell-server
+    systemctl --user restart "$service"
+    if ! wait_for_health; then
+      journalctl --user -u "$service" -n 80 --no-pager >&2 || true
+      fail 'service did not become healthy after restart'
+    fi
+    log_event info deploy completed server
+    printf '%s\n' 'Server deployment complete and healthy.'
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    usage >&2
+    fail "unknown mode: $mode"
+    ;;
+esac

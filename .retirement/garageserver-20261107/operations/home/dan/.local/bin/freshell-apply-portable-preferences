@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""Apply dandesktop's curated portable Freshell preferences to this server."""
+
+import json
+import os
+import shutil
+import tempfile
+from pathlib import Path
+
+
+CONFIG = Path.home() / ".freshell" / "config.json"
+BACKUP = Path.home() / ".freshell" / "config.json.pre-portable-settings-20260825"
+SEED = {
+    "terminal": {
+        "fontSize": 19,
+        "fontFamily": "Consolas",
+    },
+    "panes": {
+        "tabBarRows": 10,
+    },
+    "sidebar": {
+        "width": 244,
+    },
+}
+
+
+def main() -> None:
+    for _ in range(5):
+        original = CONFIG.read_bytes()
+        config = json.loads(original)
+        config["legacyLocalSettingsSeed"] = SEED
+        updated = (json.dumps(config, indent=2) + "\n").encode()
+
+        if updated == original:
+            return
+
+        mode = CONFIG.stat().st_mode & 0o777
+        fd, temporary_name = tempfile.mkstemp(
+            prefix="config.json.portable-settings.",
+            dir=CONFIG.parent,
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(updated)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, mode)
+
+            # Preserve any concurrent Freshell write and retry against its new file.
+            if CONFIG.read_bytes() != original:
+                temporary.unlink()
+                continue
+
+            if not BACKUP.exists():
+                shutil.copy2(CONFIG, BACKUP)
+                os.chmod(BACKUP, 0o600)
+            os.replace(temporary, CONFIG)
+            return
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+    raise RuntimeError("Freshell config kept changing; portable preferences were not applied")
+
+
+if __name__ == "__main__":
+    main()

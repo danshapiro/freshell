@@ -1,0 +1,8 @@
+[Unit]
+Description=Forward Freshell LAN traffic to the local server
+After=freshell-rust.service
+
+[Service]
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:3001
+NoNewPrivileges=true
+PrivateTmp=true

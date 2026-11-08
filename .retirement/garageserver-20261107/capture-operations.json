@@ -1,0 +1,737 @@
+{
+  "purpose": "Source preservation for permanent garageserver retirement; unfinished source is not a tested release.",
+  "original_worktree": null,
+  "original_branch": null,
+  "original_head": "cbcb0726431d906355c407ed2c2859227618e1ae",
+  "entries": null,
+  "sources": [
+    {
+      "source": "/home/dan/.cache/freshell-cache-experiment/20261029T2342Z-77444e9/rust-cache-gate-harness.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.cache/freshell-cache-experiment/20261029T2342Z-77444e9/rust-cache-gate-harness.ts",
+      "mode": "100644",
+      "oid": "20ff19513a1b6e0d033216fa80c9e85557dc9d5f",
+      "bytes": 47553
+    },
+    {
+      "source": "/home/dan/.cache/freshell-disk-cleanup-20261021/audit_worktree_targets.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.cache/freshell-disk-cleanup-20261021/audit_worktree_targets.py",
+      "mode": "100644",
+      "oid": "780adf4af2f3b2e748fe167966d0753366d7affe",
+      "bytes": 3779
+    },
+    {
+      "source": "/home/dan/.cache/freshell-disk-cleanup-20261021/finish_worktree_cache_cleanup.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.cache/freshell-disk-cleanup-20261021/finish_worktree_cache_cleanup.py",
+      "mode": "100644",
+      "oid": "5663594970349fa8e2d926c0c71d5935b3f0b16d",
+      "bytes": 7135
+    },
+    {
+      "source": "/home/dan/.cache/freshell-disk-cleanup-20261021/worktree_cache_cleanup.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.cache/freshell-disk-cleanup-20261021/worktree_cache_cleanup.py",
+      "mode": "100644",
+      "oid": "5614062e91428f03c53ee8b0f6b9ffb14fab9312",
+      "bytes": 6337
+    },
+    {
+      "source": "/home/dan/.config/systemd/user/freshell-lan-proxy.service",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.config/systemd/user/freshell-lan-proxy.service",
+      "mode": "100644",
+      "oid": "3428933a72a5ca8ec638ecfe9bb78e40575c54cd",
+      "bytes": 208
+    },
+    {
+      "source": "/home/dan/.config/systemd/user/freshell-lan-proxy.socket",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.config/systemd/user/freshell-lan-proxy.socket",
+      "mode": "100644",
+      "oid": "90924ed75a871d326b3957b8112e4c316bef0567",
+      "bytes": 187
+    },
+    {
+      "source": "/home/dan/.config/systemd/user/freshell-rust.service",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.config/systemd/user/freshell-rust.service",
+      "mode": "100644",
+      "oid": "8d4093383bd357e58cf429686f29efb467b54710",
+      "bytes": 819
+    },
+    {
+      "source": "/home/dan/.config/systemd/user/freshell-rust.service.d/portable-preferences.conf",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.config/systemd/user/freshell-rust.service.d/portable-preferences.conf",
+      "mode": "100644",
+      "oid": "c1bc67e9c64e634e47a17f97706ab17d1e3af376",
+      "bytes": 80
+    },
+    {
+      "source": "/home/dan/.config/systemd/user/freshell-rust.service.d/provider-environment.conf",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.config/systemd/user/freshell-rust.service.d/provider-environment.conf",
+      "mode": "100644",
+      "oid": "3ef27b317dd07924e8f781810040ce8eba2750f6",
+      "bytes": 217
+    },
+    {
+      "source": "/home/dan/.config/systemd/user/freshell-rust.service.d/zz-ca-certificates.conf",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.config/systemd/user/freshell-rust.service.d/zz-ca-certificates.conf",
+      "mode": "100644",
+      "oid": "627d0e981d0d52365a0c733b2ed16f2841f263ee",
+      "bytes": 362
+    },
+    {
+      "source": "/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/cargo_route.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/cargo_route.py",
+      "mode": "100644",
+      "oid": "f4917fadd46822279f01b32bbe847ad9e63092b1",
+      "bytes": 4557
+    },
+    {
+      "source": "/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/compiler_route.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/compiler_route.py",
+      "mode": "100644",
+      "oid": "6dfbbcf2174606d3fc6f7dc9a6d1c3886759920b",
+      "bytes": 8652
+    },
+    {
+      "source": "/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/generic-cli/docker",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/generic-cli/docker",
+      "mode": "100755",
+      "oid": "ad4d92d78f08176241a7bdb93ee5c5b0ce12d50a",
+      "bytes": 202
+    },
+    {
+      "source": "/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/push-cli/docker",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/push-cli/docker",
+      "mode": "100755",
+      "oid": "f86e7db446f6ed8e2bed4aed52d906033ada93e0",
+      "bytes": 211
+    },
+    {
+      "source": "/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/run-final-verification.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/run-final-verification.py",
+      "mode": "100755",
+      "oid": "67b8e53501e96b76c24c87973a08cf7de074ac77",
+      "bytes": 6093
+    },
+    {
+      "source": "/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/run-focused-rust.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/run-focused-rust.py",
+      "mode": "100755",
+      "oid": "216fe0c69008fae7f801792dd2b40c2d7defee90",
+      "bytes": 3686
+    },
+    {
+      "source": "/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/runs/final-fullcheck-010/analyze-cloud.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/runs/final-fullcheck-010/analyze-cloud.py",
+      "mode": "100644",
+      "oid": "fd2b37c97d79a2d964ea6a6d9a8dcd53a67faf16",
+      "bytes": 6260
+    },
+    {
+      "source": "/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/runs/final-fullcheck-010/analyze-phase-log.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/runs/final-fullcheck-010/analyze-phase-log.py",
+      "mode": "100644",
+      "oid": "85791a16f6ffec2309946ddc61f32d409f7d5387",
+      "bytes": 5444
+    },
+    {
+      "source": "/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/runs/final-fullcheck-010/capacity-continuation.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/runs/final-fullcheck-010/capacity-continuation.py",
+      "mode": "100644",
+      "oid": "34d4f57cae96aadb7cf1130f1013ac0bad6dd258",
+      "bytes": 3948
+    },
+    {
+      "source": "/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/runs/final-fullcheck-010/launch-once-with-reserve-guard.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/runs/final-fullcheck-010/launch-once-with-reserve-guard.py",
+      "mode": "100644",
+      "oid": "edecdb8c7a63a251ea309e06c661d0e0938f4954",
+      "bytes": 2252
+    },
+    {
+      "source": "/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/runs/final-fullcheck-010/observe-resource-continuation.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/runs/final-fullcheck-010/observe-resource-continuation.py",
+      "mode": "100644",
+      "oid": "6f061318129286b5bf4a76825b0031e3e09f508d",
+      "bytes": 13378
+    },
+    {
+      "source": "/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/runs/final-fullcheck-010/sample-owned-process-policy.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/runs/final-fullcheck-010/sample-owned-process-policy.py",
+      "mode": "100644",
+      "oid": "17e13cfc5ba948c091ee0761f66036f9b08dbf18",
+      "bytes": 3026
+    },
+    {
+      "source": "/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/runs/final-fullcheck-010/settle-owned-snapshot.mjs",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/runs/final-fullcheck-010/settle-owned-snapshot.mjs",
+      "mode": "100644",
+      "oid": "449712d7f1fe3cf186360981cbf88aab2f848ed1",
+      "bytes": 2829
+    },
+    {
+      "source": "/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/runs/final-fullcheck-010/status-current.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/runs/final-fullcheck-010/status-current.py",
+      "mode": "100644",
+      "oid": "3264f0f35c395c56d702bc8a6b671b931d4e140b",
+      "bytes": 2691
+    },
+    {
+      "source": "/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/runs/final-fullcheck-010/verify-resource-closure.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/runs/final-fullcheck-010/verify-resource-closure.py",
+      "mode": "100644",
+      "oid": "1dd7b364cc2aec04c2ae1dd0cca54650c6ed7ab5",
+      "bytes": 10976
+    },
+    {
+      "source": "/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/sandbox-template.mts",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/sandbox-template.mts",
+      "mode": "100644",
+      "oid": "d536c8c8368385488c164a0ec087e51b66f77a69",
+      "bytes": 2425
+    },
+    {
+      "source": "/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/strict-fullcheck.mts",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/strict-fullcheck.mts",
+      "mode": "100644",
+      "oid": "fcaaa44368025f8676ec2a81ca016aed233d8129",
+      "bytes": 2187
+    },
+    {
+      "source": "/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/test_transport.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/test_transport.py",
+      "mode": "100644",
+      "oid": "0679f6202b91d046585a6f3a5a66fb1ba263d868",
+      "bytes": 6216
+    },
+    {
+      "source": "/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/transport_route.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.freshell-cache-fc2-46620d7db107-postfull009-20261030T1902Z-001/report/transport_route.py",
+      "mode": "100644",
+      "oid": "674f7203436a41e5508f13ff4cfb3f89270363ff",
+      "bytes": 4670
+    },
+    {
+      "source": "/home/dan/.local/bin/freshell-apply-portable-preferences",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.local/bin/freshell-apply-portable-preferences",
+      "mode": "100755",
+      "oid": "2e6ea0c33e6cb8c565d808dd3f180aadeba08e04",
+      "bytes": 1829
+    },
+    {
+      "source": "/home/dan/.local/bin/freshell-deploy",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.local/bin/freshell-deploy",
+      "mode": "100755",
+      "oid": "a8a56613ef816562452415ea067597db5b1b6e43",
+      "bytes": 4489
+    },
+    {
+      "source": "/home/dan/.local/state/freshell-observability/memory-20261103/memory-recorder.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.local/state/freshell-observability/memory-20261103/memory-recorder.py",
+      "mode": "100644",
+      "oid": "933fc6e77d81016be6e4b8bf38419fc1ca6daab4",
+      "bytes": 8991
+    },
+    {
+      "source": "/home/dan/.local/state/freshell-observability/memory-20261104/memory-recorder.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.local/state/freshell-observability/memory-20261104/memory-recorder.py",
+      "mode": "100644",
+      "oid": "933fc6e77d81016be6e4b8bf38419fc1ca6daab4",
+      "bytes": 8991
+    },
+    {
+      "source": "/home/dan/.local/state/freshell-observability/memory-20261105/memory-recorder.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.local/state/freshell-observability/memory-20261105/memory-recorder.py",
+      "mode": "100644",
+      "oid": "933fc6e77d81016be6e4b8bf38419fc1ca6daab4",
+      "bytes": 8991
+    },
+    {
+      "source": "/home/dan/.local/state/garageserver-setup/freshell-config-migration-20260824/activate-freshell-lan-migration.sh",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.local/state/garageserver-setup/freshell-config-migration-20260824/activate-freshell-lan-migration.sh",
+      "mode": "100755",
+      "oid": "e8c8541e8440513fa6a62d9b1bfe4128df69cbd0",
+      "bytes": 4641
+    },
+    {
+      "source": "/home/dan/.local/state/garageserver-setup/freshell-config-migration-20260824/freshell-deploy.before-agent-message",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.local/state/garageserver-setup/freshell-config-migration-20260824/freshell-deploy.before-agent-message",
+      "mode": "100755",
+      "oid": "d6da14dc9dde7df2c7928ce69ecea8d47b4941de",
+      "bytes": 3697
+    },
+    {
+      "source": "/home/dan/.local/state/garageserver-setup/freshell-config-migration-20260824/freshell-rust.service.prepared",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.local/state/garageserver-setup/freshell-config-migration-20260824/freshell-rust.service.prepared",
+      "mode": "100644",
+      "oid": "3a2769aa358d06a985cee700200bf2efffb4e12f",
+      "bytes": 575
+    },
+    {
+      "source": "/home/dan/.local/state/garageserver-setup/freshell-config-migration-20260824/triage-freshell-config.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.local/state/garageserver-setup/freshell-config-migration-20260824/triage-freshell-config.py",
+      "mode": "100755",
+      "oid": "55471579e60d118ff0e5478b1d58f3888887bf3b",
+      "bytes": 13814
+    },
+    {
+      "source": "/home/system/tmp/freshell-11821-config.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-11821-config.ts",
+      "mode": "100644",
+      "oid": "10bfe23d02f4f09f843782e4cecd1920ea6b8ca1",
+      "bytes": 2515
+    },
+    {
+      "source": "/home/system/tmp/freshell-11821-event.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-11821-event.ts",
+      "mode": "100644",
+      "oid": "6de2214443b24b500cd6508b94e6d0ccfd4e63cf",
+      "bytes": 1143
+    },
+    {
+      "source": "/home/system/tmp/freshell-11821-packages_opencode_src_cli_cmd_tui.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-11821-packages_opencode_src_cli_cmd_tui.ts",
+      "mode": "100644",
+      "oid": "95ffac7ea51d469fcd5574b7bbfd746cd95cc893",
+      "bytes": 9504
+    },
+    {
+      "source": "/home/system/tmp/freshell-11821-packages_opencode_src_cli_tui_worker.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-11821-packages_opencode_src_cli_tui_worker.ts",
+      "mode": "100644",
+      "oid": "4cf6b2d446b3c842c18b8567a7485a6aa7ed8ae9",
+      "bytes": 2627
+    },
+    {
+      "source": "/home/system/tmp/freshell-11821-packages_opencode_src_config_config.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-11821-packages_opencode_src_config_config.ts",
+      "mode": "100644",
+      "oid": "86238f1a844c1df3ae0c765bc787eeb05d70b165",
+      "bytes": 26924
+    },
+    {
+      "source": "/home/system/tmp/freshell-11821-packages_opencode_src_server_routes_instance_httpapi_groups_config.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-11821-packages_opencode_src_server_routes_instance_httpapi_groups_config.ts",
+      "mode": "100644",
+      "oid": "10bfe23d02f4f09f843782e4cecd1920ea6b8ca1",
+      "bytes": 2515
+    },
+    {
+      "source": "/home/system/tmp/freshell-11821-packages_opencode_src_server_routes_instance_httpapi_groups_event.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-11821-packages_opencode_src_server_routes_instance_httpapi_groups_event.ts",
+      "mode": "100644",
+      "oid": "6de2214443b24b500cd6508b94e6d0ccfd4e63cf",
+      "bytes": 1143
+    },
+    {
+      "source": "/home/system/tmp/freshell-11821-packages_opencode_src_server_routes_instance_httpapi_groups_provider.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-11821-packages_opencode_src_server_routes_instance_httpapi_groups_provider.ts",
+      "mode": "100644",
+      "oid": "3a9ae0c6d36cfe7f8583ebbdce5e504a19784a1e",
+      "bytes": 3989
+    },
+    {
+      "source": "/home/system/tmp/freshell-11821-packages_opencode_src_server_routes_instance_httpapi_groups_tui.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-11821-packages_opencode_src_server_routes_instance_httpapi_groups_tui.ts",
+      "mode": "100644",
+      "oid": "849c41630018e5189a19e7d8dc4e1d58d5902f55",
+      "bytes": 8580
+    },
+    {
+      "source": "/home/system/tmp/freshell-11821-packages_opencode_src_session_prompt.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-11821-packages_opencode_src_session_prompt.ts",
+      "mode": "100644",
+      "oid": "0f85d44f209ba792065aeb951f0bd2e12b59fae8",
+      "bytes": 64944
+    },
+    {
+      "source": "/home/system/tmp/freshell-11821-packages_opencode_src_session_revert.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-11821-packages_opencode_src_session_revert.ts",
+      "mode": "100644",
+      "oid": "03e5afd085e0181cf919de91360dd422b51e52bd",
+      "bytes": 5659
+    },
+    {
+      "source": "/home/system/tmp/freshell-11821-packages_opencode_src_session_schema.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-11821-packages_opencode_src_session_schema.ts",
+      "mode": "100644",
+      "oid": "162c2a4f45a68f910587e390901c60ca660dd5b3",
+      "bytes": 814
+    },
+    {
+      "source": "/home/system/tmp/freshell-11821-packages_opencode_src_session_session.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-11821-packages_opencode_src_session_session.ts",
+      "mode": "100644",
+      "oid": "a2a91cd47b5e854606444d1fc09fb18515fbe3b7",
+      "bytes": 35643
+    },
+    {
+      "source": "/home/system/tmp/freshell-11821-packages_opencode_src_session_summary.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-11821-packages_opencode_src_session_summary.ts",
+      "mode": "100644",
+      "oid": "6484730d0bd526289febe26014229c83f20f93b9",
+      "bytes": 5196
+    },
+    {
+      "source": "/home/system/tmp/freshell-11821-packages_opencode_src_storage_storage.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-11821-packages_opencode_src_storage_storage.ts",
+      "mode": "100644",
+      "oid": "ddbd83d7931ca7e45d22df000ccdf79075ec8ca9",
+      "bytes": 11445
+    },
+    {
+      "source": "/home/system/tmp/freshell-11821-packages_plugin_src_tui.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-11821-packages_plugin_src_tui.ts",
+      "mode": "100644",
+      "oid": "67812169475b372d67ff1629c122501ae57706c3",
+      "bytes": 16686
+    },
+    {
+      "source": "/home/system/tmp/freshell-11821-provider.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-11821-provider.ts",
+      "mode": "100644",
+      "oid": "3a9ae0c6d36cfe7f8583ebbdce5e504a19784a1e",
+      "bytes": 3989
+    },
+    {
+      "source": "/home/system/tmp/freshell-11821-tui.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-11821-tui.ts",
+      "mode": "100644",
+      "oid": "95ffac7ea51d469fcd5574b7bbfd746cd95cc893",
+      "bytes": 9504
+    },
+    {
+      "source": "/home/system/tmp/freshell-11821-worker.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-11821-worker.ts",
+      "mode": "100644",
+      "oid": "4cf6b2d446b3c842c18b8567a7485a6aa7ed8ae9",
+      "bytes": 2627
+    },
+    {
+      "source": "/home/system/tmp/freshell-1195-config.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-1195-config.ts",
+      "mode": "100644",
+      "oid": "10bfe23d02f4f09f843782e4cecd1920ea6b8ca1",
+      "bytes": 2515
+    },
+    {
+      "source": "/home/system/tmp/freshell-1195-event.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-1195-event.ts",
+      "mode": "100644",
+      "oid": "6de2214443b24b500cd6508b94e6d0ccfd4e63cf",
+      "bytes": 1143
+    },
+    {
+      "source": "/home/system/tmp/freshell-1195-packages_opencode_src_cli_cmd_tui.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-1195-packages_opencode_src_cli_cmd_tui.ts",
+      "mode": "100644",
+      "oid": "3a837ba31bb5553ad0309845737dcea9b500286a",
+      "bytes": 11214
+    },
+    {
+      "source": "/home/system/tmp/freshell-1195-packages_opencode_src_cli_tui_worker.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-1195-packages_opencode_src_cli_tui_worker.ts",
+      "mode": "100644",
+      "oid": "e6aa5163c2aa0f439382e852447211099ab1c616",
+      "bytes": 2635
+    },
+    {
+      "source": "/home/system/tmp/freshell-1195-packages_opencode_src_config_config.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-1195-packages_opencode_src_config_config.ts",
+      "mode": "100644",
+      "oid": "d24ca22d80e4e1cefa71ca393098ed59d883b624",
+      "bytes": 27730
+    },
+    {
+      "source": "/home/system/tmp/freshell-1195-packages_opencode_src_server_routes_instance_httpapi_groups_config.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-1195-packages_opencode_src_server_routes_instance_httpapi_groups_config.ts",
+      "mode": "100644",
+      "oid": "10bfe23d02f4f09f843782e4cecd1920ea6b8ca1",
+      "bytes": 2515
+    },
+    {
+      "source": "/home/system/tmp/freshell-1195-packages_opencode_src_server_routes_instance_httpapi_groups_event.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-1195-packages_opencode_src_server_routes_instance_httpapi_groups_event.ts",
+      "mode": "100644",
+      "oid": "6de2214443b24b500cd6508b94e6d0ccfd4e63cf",
+      "bytes": 1143
+    },
+    {
+      "source": "/home/system/tmp/freshell-1195-packages_opencode_src_server_routes_instance_httpapi_groups_provider.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-1195-packages_opencode_src_server_routes_instance_httpapi_groups_provider.ts",
+      "mode": "100644",
+      "oid": "3a9ae0c6d36cfe7f8583ebbdce5e504a19784a1e",
+      "bytes": 3989
+    },
+    {
+      "source": "/home/system/tmp/freshell-1195-packages_opencode_src_server_routes_instance_httpapi_groups_tui.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-1195-packages_opencode_src_server_routes_instance_httpapi_groups_tui.ts",
+      "mode": "100644",
+      "oid": "849c41630018e5189a19e7d8dc4e1d58d5902f55",
+      "bytes": 8580
+    },
+    {
+      "source": "/home/system/tmp/freshell-1195-packages_opencode_src_session_prompt.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-1195-packages_opencode_src_session_prompt.ts",
+      "mode": "100644",
+      "oid": "0f85d44f209ba792065aeb951f0bd2e12b59fae8",
+      "bytes": 64944
+    },
+    {
+      "source": "/home/system/tmp/freshell-1195-packages_opencode_src_session_revert.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-1195-packages_opencode_src_session_revert.ts",
+      "mode": "100644",
+      "oid": "03e5afd085e0181cf919de91360dd422b51e52bd",
+      "bytes": 5659
+    },
+    {
+      "source": "/home/system/tmp/freshell-1195-packages_opencode_src_session_schema.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-1195-packages_opencode_src_session_schema.ts",
+      "mode": "100644",
+      "oid": "162c2a4f45a68f910587e390901c60ca660dd5b3",
+      "bytes": 814
+    },
+    {
+      "source": "/home/system/tmp/freshell-1195-packages_opencode_src_session_session.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-1195-packages_opencode_src_session_session.ts",
+      "mode": "100644",
+      "oid": "a2a91cd47b5e854606444d1fc09fb18515fbe3b7",
+      "bytes": 35643
+    },
+    {
+      "source": "/home/system/tmp/freshell-1195-packages_opencode_src_session_summary.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-1195-packages_opencode_src_session_summary.ts",
+      "mode": "100644",
+      "oid": "6484730d0bd526289febe26014229c83f20f93b9",
+      "bytes": 5196
+    },
+    {
+      "source": "/home/system/tmp/freshell-1195-packages_opencode_src_storage_storage.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-1195-packages_opencode_src_storage_storage.ts",
+      "mode": "100644",
+      "oid": "ddbd83d7931ca7e45d22df000ccdf79075ec8ca9",
+      "bytes": 11445
+    },
+    {
+      "source": "/home/system/tmp/freshell-1195-packages_plugin_src_tui.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-1195-packages_plugin_src_tui.ts",
+      "mode": "100644",
+      "oid": "67812169475b372d67ff1629c122501ae57706c3",
+      "bytes": 16686
+    },
+    {
+      "source": "/home/system/tmp/freshell-1195-provider.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-1195-provider.ts",
+      "mode": "100644",
+      "oid": "3a9ae0c6d36cfe7f8583ebbdce5e504a19784a1e",
+      "bytes": 3989
+    },
+    {
+      "source": "/home/system/tmp/freshell-1195-tui.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-1195-tui.ts",
+      "mode": "100644",
+      "oid": "3a837ba31bb5553ad0309845737dcea9b500286a",
+      "bytes": 11214
+    },
+    {
+      "source": "/home/system/tmp/freshell-1195-worker.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-1195-worker.ts",
+      "mode": "100644",
+      "oid": "e6aa5163c2aa0f439382e852447211099ab1c616",
+      "bytes": 2635
+    },
+    {
+      "source": "/home/system/tmp/freshell-cloud-prepared-image-20261103.sh",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-cloud-prepared-image-20261103.sh",
+      "mode": "100755",
+      "oid": "24a21d836d84d0ff5defac925a1d0856d8760a47",
+      "bytes": 844
+    },
+    {
+      "source": "/home/system/tmp/freshell-flake-push.sh",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-flake-push.sh",
+      "mode": "100644",
+      "oid": "f0d51532a8d924e9f436f23a03eb9a4f682a4d3b",
+      "bytes": 927
+    },
+    {
+      "source": "/home/system/tmp/freshell-garage-base-gate-20261103.sh",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-garage-base-gate-20261103.sh",
+      "mode": "100644",
+      "oid": "8a5a589a1b6a90fe727075cba2c717037127a147",
+      "bytes": 829
+    },
+    {
+      "source": "/home/system/tmp/freshell-garage-build-image-20261103.sh",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-garage-build-image-20261103.sh",
+      "mode": "100644",
+      "oid": "38232014d407709cf3b9cfc8f3ace81efbbe83f7",
+      "bytes": 877
+    },
+    {
+      "source": "/home/system/tmp/freshell-garage-build-rust-20261103.sh",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-garage-build-rust-20261103.sh",
+      "mode": "100644",
+      "oid": "f03c4835de0df2d2122d7f20932e4d576ba928bf",
+      "bytes": 1413
+    },
+    {
+      "source": "/home/system/tmp/freshell-garage-build-web-20261103.sh",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-garage-build-web-20261103.sh",
+      "mode": "100644",
+      "oid": "5ab70b6d01a5eef9b82da612a0aaa0285e4e6b94",
+      "bytes": 828
+    },
+    {
+      "source": "/home/system/tmp/freshell-garage-prepare-20261103.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-garage-prepare-20261103.py",
+      "mode": "100644",
+      "oid": "93786cb9462a152d3bffc20cf8f81ff239976821",
+      "bytes": 1715
+    },
+    {
+      "source": "/home/system/tmp/freshell-garage-stage-frontend-6d9ay0yi.sh",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-garage-stage-frontend-6d9ay0yi.sh",
+      "mode": "100755",
+      "oid": "e07a7c153ba41860a344dd0c00eb3662b06f4189",
+      "bytes": 2605
+    },
+    {
+      "source": "/home/system/tmp/freshell-garage-stage-image-6d9ay0yi.sh",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-garage-stage-image-6d9ay0yi.sh",
+      "mode": "100755",
+      "oid": "c26326befb4acca60de893652121251531d12d6f",
+      "bytes": 2600
+    },
+    {
+      "source": "/home/system/tmp/freshell-garage-stage-prep-6d9ay0yi.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-garage-stage-prep-6d9ay0yi.py",
+      "mode": "100644",
+      "oid": "5f254f22919be555ad6ce8f62bedd1116dce27c9",
+      "bytes": 1357
+    },
+    {
+      "source": "/home/system/tmp/freshell-garage-stage-rust-6d9ay0yi.sh",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-garage-stage-rust-6d9ay0yi.sh",
+      "mode": "100755",
+      "oid": "7145525d21ea3ba9f9bbcf6f2da3111594f0921c",
+      "bytes": 1946
+    },
+    {
+      "source": "/home/system/tmp/freshell-managed-producer-46644ba19fcf4bf0b20a9b4e0359b92b/bundle/cleanup_binding.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-managed-producer-46644ba19fcf4bf0b20a9b4e0359b92b/bundle/cleanup_binding.py",
+      "mode": "100644",
+      "oid": "4a7eec668e2e17e5b82671fed6dad714179d0e98",
+      "bytes": 535
+    },
+    {
+      "source": "/home/system/tmp/freshell-managed-producer-46644ba19fcf4bf0b20a9b4e0359b92b/bundle/container-driver.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-managed-producer-46644ba19fcf4bf0b20a9b4e0359b92b/bundle/container-driver.py",
+      "mode": "100644",
+      "oid": "e78a1ffa4b01f1cf731c8f4e32263fdd2c21cb96",
+      "bytes": 12451
+    },
+    {
+      "source": "/home/system/tmp/freshell-managed-producer-46644ba19fcf4bf0b20a9b4e0359b92b/bundle/launch-runtime.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-managed-producer-46644ba19fcf4bf0b20a9b4e0359b92b/bundle/launch-runtime.py",
+      "mode": "100644",
+      "oid": "2dcb4ec4024511fce221f6f86200075a64ce39d1",
+      "bytes": 11446
+    },
+    {
+      "source": "/home/system/tmp/freshell-managed-producer-46644ba19fcf4bf0b20a9b4e0359b92b/bundle/producer_cases.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-managed-producer-46644ba19fcf4bf0b20a9b4e0359b92b/bundle/producer_cases.py",
+      "mode": "100644",
+      "oid": "72fd83406fcc04f8435b62e87a3c7fb0efcb0ff6",
+      "bytes": 9554
+    },
+    {
+      "source": "/home/system/tmp/freshell-managed-producer-46644ba19fcf4bf0b20a9b4e0359b92b/bundle/runtime_admission.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-managed-producer-46644ba19fcf4bf0b20a9b4e0359b92b/bundle/runtime_admission.py",
+      "mode": "100644",
+      "oid": "08dcf6d0a078a40f3675f7ea3eb0d2bd751c5a8a",
+      "bytes": 5964
+    },
+    {
+      "source": "/home/system/tmp/freshell-managed-producer-8cff8ca74d7249c692cdda5901d99c67/bundle/cleanup_binding.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-managed-producer-8cff8ca74d7249c692cdda5901d99c67/bundle/cleanup_binding.py",
+      "mode": "100644",
+      "oid": "4a7eec668e2e17e5b82671fed6dad714179d0e98",
+      "bytes": 535
+    },
+    {
+      "source": "/home/system/tmp/freshell-managed-producer-8cff8ca74d7249c692cdda5901d99c67/bundle/container-driver.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-managed-producer-8cff8ca74d7249c692cdda5901d99c67/bundle/container-driver.py",
+      "mode": "100644",
+      "oid": "e78a1ffa4b01f1cf731c8f4e32263fdd2c21cb96",
+      "bytes": 12451
+    },
+    {
+      "source": "/home/system/tmp/freshell-managed-producer-8cff8ca74d7249c692cdda5901d99c67/bundle/launch-runtime.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-managed-producer-8cff8ca74d7249c692cdda5901d99c67/bundle/launch-runtime.py",
+      "mode": "100644",
+      "oid": "2dcb4ec4024511fce221f6f86200075a64ce39d1",
+      "bytes": 11446
+    },
+    {
+      "source": "/home/system/tmp/freshell-managed-producer-8cff8ca74d7249c692cdda5901d99c67/bundle/producer_cases.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-managed-producer-8cff8ca74d7249c692cdda5901d99c67/bundle/producer_cases.py",
+      "mode": "100644",
+      "oid": "933d5c50d440b5f34f68f1350b61e66181e712f1",
+      "bytes": 8171
+    },
+    {
+      "source": "/home/system/tmp/freshell-managed-producer-8cff8ca74d7249c692cdda5901d99c67/bundle/runtime_admission.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-managed-producer-8cff8ca74d7249c692cdda5901d99c67/bundle/runtime_admission.py",
+      "mode": "100644",
+      "oid": "cd01b484bd799b87340654f56eceadba6d9e19e7",
+      "bytes": 5924
+    },
+    {
+      "source": "/home/system/tmp/freshell-managed-producer-ed8599a877164d44a75f2695d6c6ea87/bundle/cleanup_binding.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-managed-producer-ed8599a877164d44a75f2695d6c6ea87/bundle/cleanup_binding.py",
+      "mode": "100644",
+      "oid": "4a7eec668e2e17e5b82671fed6dad714179d0e98",
+      "bytes": 535
+    },
+    {
+      "source": "/home/system/tmp/freshell-managed-producer-ed8599a877164d44a75f2695d6c6ea87/bundle/container-driver.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-managed-producer-ed8599a877164d44a75f2695d6c6ea87/bundle/container-driver.py",
+      "mode": "100644",
+      "oid": "e78a1ffa4b01f1cf731c8f4e32263fdd2c21cb96",
+      "bytes": 12451
+    },
+    {
+      "source": "/home/system/tmp/freshell-managed-producer-ed8599a877164d44a75f2695d6c6ea87/bundle/launch-runtime.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-managed-producer-ed8599a877164d44a75f2695d6c6ea87/bundle/launch-runtime.py",
+      "mode": "100644",
+      "oid": "2dcb4ec4024511fce221f6f86200075a64ce39d1",
+      "bytes": 11446
+    },
+    {
+      "source": "/home/system/tmp/freshell-managed-producer-ed8599a877164d44a75f2695d6c6ea87/bundle/producer_cases.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-managed-producer-ed8599a877164d44a75f2695d6c6ea87/bundle/producer_cases.py",
+      "mode": "100644",
+      "oid": "72fd83406fcc04f8435b62e87a3c7fb0efcb0ff6",
+      "bytes": 9554
+    },
+    {
+      "source": "/home/system/tmp/freshell-managed-producer-ed8599a877164d44a75f2695d6c6ea87/bundle/runtime_admission.py",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-managed-producer-ed8599a877164d44a75f2695d6c6ea87/bundle/runtime_admission.py",
+      "mode": "100644",
+      "oid": "08dcf6d0a078a40f3675f7ea3eb0d2bd751c5a8a",
+      "bytes": 5964
+    },
+    {
+      "source": "/home/system/tmp/freshell-opencode-1.18.21-session.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-opencode-1.18.21-session.ts",
+      "mode": "100644",
+      "oid": "959a303dc964e97c02056ea634213b39d9da3f08",
+      "bytes": 20340
+    },
+    {
+      "source": "/home/system/tmp/freshell-opencode-1.19.5-session.ts",
+      "destination": ".retirement/garageserver-20261107/operations/home/system/tmp/freshell-opencode-1.19.5-session.ts",
+      "mode": "100644",
+      "oid": "959a303dc964e97c02056ea634213b39d9da3f08",
+      "bytes": 20340
+    }
+  ]
+}

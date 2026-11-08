@@ -1,0 +1,11 @@
+[Unit]
+Description=Freshell LAN endpoint on port 43001
+
+[Socket]
+ListenStream=0.0.0.0:43001
+ListenStream=[::]:43001
+BindIPv6Only=ipv6-only
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target
