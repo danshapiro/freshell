@@ -1,0 +1,21 @@
+{
+  "purpose": "Source preservation for permanent garageserver retirement; unfinished source is not a tested release.",
+  "original_worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/ekc6",
+  "original_branch": null,
+  "original_head": "990afc5c16c2e65da56d75c239204b49fdf2e33c",
+  "entries": [
+    {
+      "status": "??",
+      "path": "docs/plans/2026-09-06-ekc6.md"
+    }
+  ],
+  "sources": [
+    {
+      "source": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/ekc6/docs/plans/2026-09-06-ekc6.md",
+      "destination": "docs/plans/2026-09-06-ekc6.md",
+      "mode": "100644",
+      "oid": "7e4421fe0b919fa3b249bf713cf7a6eba8f16f55",
+      "bytes": 34008
+    }
+  ]
+}
