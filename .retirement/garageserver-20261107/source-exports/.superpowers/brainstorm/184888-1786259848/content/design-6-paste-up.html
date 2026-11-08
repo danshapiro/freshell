@@ -1,0 +1,1292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PASTE-UP — fresh-agent redesign comp 6 of 6</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=Caveat:wght@600&family=Courier+Prime:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet">
+<style>
+/* ================= PASTE-UP material tokens ================= */
+:root{
+  --paper:#f4f1ea;     /* newsprint ground */
+  --layer:#eae6da;     /* second layer */
+  --sheet:#fbf8f1;     /* clipping stock */
+  --ink:#17150f;
+  --muted:#6e695c;
+  --pencil:#8d8779;
+  --hi:#ffd319;        /* highlighter — key actions / selection ONLY */
+  --red:#c23a2e;       /* stamp red — approvals / stamps / destructive ONLY */
+  --amber:#d97706;     /* waiting — always a swash behind ink (5.3:1) */
+  --blue:#2f5aa8;      /* editorial blue pencil — ok / focus */
+  --clay:#c15a3c;      /* freshclaude identity */
+  --teal:#2e6f68;      /* freshopencode identity hint */
+  --graphite:#33302a;  /* freshcodex identity hint */
+  --green:#2e7a3d;     /* needs-attention dot (spec) */
+  --tape:rgba(232,210,138,.82); /* kraft tape */
+  --rule:rgba(23,21,15,.3);
+  --mono:"Courier Prime",ui-monospace,Menlo,Consolas,monospace;
+  --disp:"Archivo Black",system-ui,sans-serif;
+  --hand:"Caveat","Segoe Script",cursive;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);
+  font:400 15px/1.55 var(--mono);font-variant-numeric:tabular-nums;
+  padding:26px 24px 72px}
+code,kbd,tt,pre{font-family:var(--mono)}
+a{color:var(--blue);text-underline-offset:3px}
+button{font:inherit;color:inherit;cursor:pointer;background:none;border:none;padding:0;text-align:left}
+button:focus-visible,a:focus-visible,[tabindex]:focus-visible,details summary:focus-visible{outline:2.5px solid var(--blue);outline-offset:2px}
+.page{max-width:1440px;margin:0 auto}
+.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+section{margin-top:34px}
+h2{font:400 13px/1.3 var(--disp);letter-spacing:.12em;text-transform:uppercase;margin:0 0 2px}
+h2 .cav{letter-spacing:0;text-transform:none;font-size:19px;margin-left:8px}
+
+/* browser surfaces — themed per design */
+::selection{background:var(--hi);color:var(--ink)}
+input,textarea{caret-color:var(--red)}
+*{scrollbar-width:thin;scrollbar-color:var(--pencil) transparent}
+*::-webkit-scrollbar{width:9px;height:9px}
+*::-webkit-scrollbar-thumb{background:var(--pencil)}
+*::-webkit-scrollbar-track{background:transparent}
+
+/* captions — plain utility type, NOT design type */
+.cap{font:400 11px/1.5 system-ui,sans-serif;color:#6e695c;margin:26px 0 6px}
+.cap b{color:#57524a;font-weight:600}
+
+/* ================= shared material pieces ================= */
+/* kraft tape — torn edges via clip-path; rotation ≤0.6deg on the TAPE ONLY */
+.tape{position:absolute;width:92px;height:26px;background:var(--tape);pointer-events:none;
+  clip-path:polygon(2% 14%,7% 0,93% 3%,98% 16%,100% 84%,95% 100%,6% 97%,0 88%)}
+.tape.tl{top:-11px;left:14px;transform:rotate(-.6deg)}
+.tape.tr{top:-11px;right:14px;transform:rotate(.55deg)}
+
+/* the clipping — hairline + flat 2px ink offset (material-true print offset) */
+.clip{position:relative;background:var(--sheet);border:1px solid rgba(23,21,15,.45);
+  box-shadow:2px 2px 0 rgba(23,21,15,.9);padding:14px 18px 12px;max-width:66ch}
+/* crop-mark gaps between clippings — ruled corners, never boxes */
+.crop{display:flex;align-items:center;gap:8px;color:var(--pencil);font-size:11px;line-height:1;
+  padding:8px 2px;user-select:none;letter-spacing:.1em}
+.crop i{flex:1;border-top:1px dashed var(--rule)}
+
+/* rubber stamps — over-inked double-hit, flat, no blur */
+.stamp{font:400 10.5px/1.25 var(--disp);letter-spacing:.1em;color:var(--red);
+  text-transform:uppercase;user-select:none;text-align:center;
+  text-shadow:.5px 0 0 var(--red),0 .5px 0 var(--red)}
+.stamp.round{position:absolute;top:-18px;right:8px;width:68px;height:68px;font-size:9.5px;
+  border:1.5px solid var(--red);border-radius:50%;display:grid;place-items:center;
+  padding:6px;transform:rotate(-7deg);background:var(--sheet);
+  box-shadow:inset 0 0 0 2.5px rgba(195,58,46,.26)}
+.stamp.rect{position:absolute;top:-13px;right:10px;border:1.5px solid var(--red);font-size:9px;
+  border-radius:2px;padding:4px 7px 3px;transform:rotate(-3deg);background:var(--sheet);
+  box-shadow:inset 0 0 0 2px rgba(195,58,46,.15)}
+.soon{display:inline-block;font:400 8.5px/1.2 var(--disp);letter-spacing:.1em;color:var(--red);
+  text-transform:uppercase;border:1.25px solid var(--red);border-radius:2px;padding:2px 5px 1px;
+  transform:rotate(-2deg);vertical-align:1px;margin-left:6px;white-space:nowrap;
+  text-shadow:.4px 0 0 var(--red)}
+/* the stamp ACTS — annotated motion (see footer), honours reduced-motion */
+@media (prefers-reduced-motion:no-preference){
+  .acts{animation:stamp-act 180ms cubic-bezier(.16,1,.3,1) both}
+}
+@keyframes stamp-act{
+  0%{transform:scale(1.4) rotate(-8deg);opacity:0}
+  100%{transform:scale(1) rotate(-3deg);opacity:1}
+}
+/* hover highlighter wipe — left→right 120ms, transform only */
+.wipe{position:relative;z-index:0}
+.wipe::before{content:"";position:absolute;inset:-1px -3px;background:var(--hi);z-index:-1;
+  transform:scaleX(0);transform-origin:left center;transition:transform 120ms cubic-bezier(.16,1,.3,1)}
+.wipe:hover::before{transform:scaleX(1)}
+@media (prefers-reduced-motion:reduce){.wipe:hover::before{transform:scaleX(1);transition:none}}
+
+/* highlighter swash — key actions/selection ONLY */
+.swash{background:var(--hi);box-decoration-break:clone;-webkit-box-decoration-break:clone;padding:0 3px}
+
+/* hand annotation (Caveat ≤2 words) + hand-drawn circle */
+.cav{font:600 18px/1 var(--hand);color:var(--red);display:inline-block;transform:rotate(-2deg)}
+.circ{border:1.5px solid var(--ink);border-radius:48% 52% 55% 45%/55% 45% 52% 48%;padding:1px 10px 2px}
+
+/* status vocabulary — the only status meanings in this world */
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;vertical-align:0}
+.dot.busy{background:var(--red);box-shadow:inset 0 0 0 1.5px rgba(23,21,15,.35)}
+.dot.attn{background:var(--green);box-shadow:0 0 0 1.5px rgba(23,21,15,.4)}
+.wait{background:var(--amber);padding:0 3px;color:var(--ink)}
+.okk{color:var(--blue);font-weight:700}
+.errx{color:var(--red);position:relative}
+.errx::after{content:"";position:absolute;left:-3px;right:-3px;top:52%;height:2.5px;background:var(--red);transform:rotate(-4deg)}
+
+/* star burst — 5pt, flat, for attention */
+.burst{display:inline-grid;place-items:center;width:18px;height:18px;background:var(--hi);
+  clip-path:polygon(50% 0,62% 32%,98% 35%,70% 57%,79% 92%,50% 71%,21% 92%,30% 57%,2% 35%,38% 32%);
+  color:var(--ink);font:700 9.5px/1 var(--mono);vertical-align:-3px}
+
+/* red map pin — CSS-only */
+.pin{width:10px;height:10px;border-radius:50%;background:var(--red);position:relative;flex:none;
+  box-shadow:0 0 0 1.5px rgba(23,21,15,.25)}
+.pin::after{content:"";position:absolute;left:50%;top:9px;width:2px;height:8px;margin-left:-1px;background:var(--red)}
+
+/* ================= masthead ================= */
+.mast{position:relative;border-top:2px solid var(--ink);border-bottom:1.5px solid var(--ink);
+  padding:30px 4px 16px;margin-top:10px}
+.regp{position:absolute;font:400 18px/1 var(--mono);color:var(--muted);user-select:none}
+.regp.tl{top:-10px;left:-3px}.regp.tr{top:-10px;right:-3px}.regp.bl{bottom:-22px;left:-3px}.regp.br{bottom:-22px;right:-3px}
+.mast h1{font:400 46px/1.05 var(--disp);letter-spacing:.015em;margin:0}
+.mast .thesis{margin:12px 0 0;font-size:15.5px;max-width:66ch}
+.utility{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:baseline;margin:30px 0 0;
+  font-size:12.5px;color:var(--muted)}
+.utility a{margin-left:auto}
+
+/* ================= browser frame chrome ================= */
+.chrome{border:1.5px solid var(--ink);background:var(--layer);
+  box-shadow:2px 2px 0 rgba(23,21,15,.9)}
+.chrome .bar{display:flex;align-items:center;gap:8px;padding:7px 12px;border-bottom:1px solid var(--rule);
+  font-size:12px;color:var(--muted)}
+.chrome .bar .b{width:11px;height:11px;border-radius:50%;border:1.5px solid var(--ink);background:var(--sheet);flex:none}
+.chrome .bar .url{flex:1;max-width:420px}
+
+/* filing tabs — hand-cut tops; busy tab edged in red via backer */
+.filerow{display:flex;gap:4px;padding:8px 12px 0;background:var(--layer);border-bottom:1.5px solid var(--ink)}
+.ftabback{clip-path:polygon(7% 0,93% 0,100% 100%,0 100%);padding:1.5px 1.5px 0;background:var(--ink)}
+.ftabback.busyedge{background:var(--red)}
+.ftab{clip-path:polygon(5.5% 0,94.5% 0,100% 100%,0 100%);background:var(--sheet);
+  padding:8px 16px 7px;font-weight:700;font-size:12.5px;white-space:nowrap}
+.ftabback.mutedtab .ftab{background:var(--paper);font-weight:400;color:var(--muted)}
+.newtab{clip-path:polygon(12% 0,88% 0,100% 100%,0 100%);background:var(--layer);
+  padding:8px 14px 7px;color:var(--muted);font-weight:700}
+
+/* pane header */
+.panehead{display:flex;align-items:center;gap:10px;padding:9px 14px;border-bottom:1px solid var(--rule);
+  background:var(--sheet);flex-wrap:wrap}
+.prov{display:inline-flex;align-items:center;gap:7px;border:1.5px solid var(--ink);background:var(--paper);
+  padding:3px 9px 3px 5px;font-weight:700;font-size:12.5px}
+.prov .sq{width:13px;height:13px;background:var(--clay);border:1px solid rgba(23,21,15,.4);flex:none}
+.ptitle{font-weight:700}
+.pstate{color:var(--muted);font-size:13px}
+.pcost{border:1.5px solid var(--ink);background:var(--sheet);padding:2px 8px;font-size:12.5px;font-weight:700}
+.pico{position:relative;border:1.5px solid var(--ink);background:var(--paper);width:32px;height:32px;
+  display:inline-grid;place-items:center;font-size:14px}
+.pico .bdg{position:absolute;top:-8px;right:-8px;background:var(--red);color:var(--sheet);
+  font:700 10px/1 var(--mono);padding:2px 5px;border:1px solid var(--sheet)}
+.idgrp{margin-left:auto;display:flex;gap:8px;align-items:center}
+
+/* status line */
+.statusline{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:center;padding:7px 14px;
+  border-bottom:1.5px solid var(--ink);background:var(--paper);font-size:12.5px}
+.statusline .sep{color:var(--pencil)}
+.meter{display:inline-block;width:74px;height:10px;border:1.5px solid var(--ink);vertical-align:-2px;position:relative;background:var(--sheet)}
+.meter i{position:absolute;inset:1px auto 1px 1px;width:57%;background:var(--hi)}
+
+/* body split */
+.split{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:22px;padding:18px 16px 14px;
+  background:var(--paper)}
+.transcript{min-width:0}
+
+/* transcript labels & affordances */
+.tlabel{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;font-size:12.5px;
+  color:var(--muted);margin-bottom:8px}
+.tlabel .who{color:var(--ink);font-weight:700;font-size:13.5px}
+.tlabel .time{letter-spacing:.05em}
+.tacts{margin-left:auto;display:flex;gap:10px;font-size:12px;color:var(--muted)}
+.tacts a{color:var(--muted);text-decoration:underline dotted;text-underline-offset:3px}
+.sig{font:600 15px/1 var(--hand);color:var(--blue);transform:rotate(-2deg);display:inline-block;margin-right:4px}
+p.body{margin:0 0 10px;max-width:62ch}
+p.body:last-child{margin-bottom:0}
+
+/* thinking block */
+details.think{margin:6px 0 0}
+details.think summary{cursor:pointer;list-style:none;display:inline-flex;gap:8px;align-items:center;
+  color:var(--muted);font-style:italic;font-size:13.5px}
+details.think summary::-webkit-details-marker{display:none}
+details.think summary::before{content:"—";color:var(--pencil)}
+details.think[open] summary::before{content:"↓";color:var(--pencil)}
+details.think .tinner{border-left:2px solid var(--rule);margin:8px 0 2px 2px;padding:4px 12px;
+  color:var(--muted);font-style:italic;font-size:13.5px;max-width:60ch}
+
+/* tool call file boxes — 1.5px single-weight border, stamp in corner */
+.tool{position:relative;border:1.5px solid var(--ink);background:var(--sheet);padding:12px 14px;margin:12px 0}
+.tool>summary,.tool .tres{padding-right:92px}
+.tool>summary{cursor:pointer;list-style:none;display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+.tool>summary::-webkit-details-marker{display:none}
+.tool .tname{font-weight:700}
+.tool .targ{color:var(--muted);font-size:13px}
+.tool .tres{font-size:12.5px;margin:10px 0 0;color:var(--ink);border-top:1px dashed var(--rule);padding-top:8px}
+.tool .openhint{font-size:11px;color:var(--muted);margin-left:auto}
+
+/* diff — the marked-up proof */
+.proofframe{border:1px solid var(--rule);margin:10px 0 2px;background:var(--paper)}
+.proofline{position:relative;display:flex;gap:10px;padding:2.5px 12px;border-bottom:1px dashed var(--rule);
+  font-size:13.5px;overflow-wrap:anywhere}
+.proofline:last-child{border-bottom:none}
+.proofline .g{flex:none;width:1em;color:var(--muted)}
+.proofline.del .l{color:var(--red);text-decoration:line-through;text-decoration-thickness:2px;
+  text-decoration-color:var(--red)}
+.proofline.add .l{color:var(--ink);text-decoration:underline solid var(--red) 2px;text-underline-offset:4px}
+.proofline .annotate{margin-left:auto;flex:none;color:var(--pencil);font-size:11.5px;user-select:none}
+.proofline .annotate:hover{color:var(--blue)}
+
+/* settled strip — hand-tallied */
+.settled{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:10px;
+  border-top:2px solid var(--ink);padding-top:8px;font-size:12.5px;color:var(--muted)}
+.settled .tally{letter-spacing:3px;color:var(--ink)}
+
+/* approval card — the FRONT PAGE */
+.authz{border:2.5px solid var(--ink);background:var(--sheet);box-shadow:2px 2px 0 rgba(23,21,15,.9);
+  padding:20px 20px 18px;position:relative;max-width:62ch}
+.authz h3{font:400 26px/1.1 var(--disp);letter-spacing:.02em;margin:0 0 4px}
+.authz .ahrow{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.telegram{border:1.5px solid var(--ink);background:var(--paper);padding:10px 14px;margin:12px 0 6px;
+  font-weight:700;letter-spacing:.06em;overflow-wrap:anywhere}
+.reason{font-size:13.5px;color:var(--ink);margin:6px 0 0}
+.warning{display:flex;gap:9px;align-items:center;color:var(--red);font-weight:700;font-size:13.5px;margin-top:8px}
+.authbtns{display:flex;gap:14px;flex-wrap:wrap;margin-top:16px;align-items:stretch}
+.astamp{border-radius:50%;border:2.5px solid var(--red);color:var(--red);font:400 13px/1.25 var(--disp);
+  letter-spacing:.08em;text-transform:uppercase;min-width:108px;min-height:108px;padding:12px;
+  display:grid;place-items:center;text-align:center;background:var(--sheet);
+  text-shadow:.6px 0 0 var(--red),0 .6px 0 var(--red);box-shadow:inset 0 0 0 3px rgba(195,58,46,.22);
+  transform:rotate(-3deg)}
+.astamp.rect{border-radius:3px;min-height:56px;min-width:0;padding:14px 16px;transform:rotate(-3deg)}
+.adeny{position:relative;border:2.5px solid var(--ink);background:var(--paper);font:700 14px/1 var(--mono);
+  letter-spacing:.1em;text-transform:uppercase;padding:0 24px;min-height:56px;display:grid;place-items:center}
+.adeny>span{position:relative;z-index:1;background:inherit;padding:0 8px}
+.adeny::before,.adeny::after{content:"";position:absolute;left:6px;right:6px;top:50%;height:3.5px;
+  background:var(--red)}
+.adeny::before{transform:rotate(9deg)}
+.adeny::after{transform:rotate(-9deg)}
+/* subscription slip — AskUserQuestion */
+.subslip{position:relative;border:1.5px solid var(--ink);background:var(--sheet);
+  box-shadow:2px 2px 0 rgba(23,21,15,.9);padding:18px 18px 14px;max-width:62ch}
+.subslip .sliphead{font:400 11px/1.2 var(--disp);letter-spacing:.14em;text-transform:uppercase;
+  color:var(--muted);display:flex;gap:8px;align-items:center}
+.subslip .q{font-weight:700;font-size:15.5px;margin:8px 0 10px;max-width:56ch}
+.opt{position:relative;display:flex;align-items:center;gap:10px;min-height:24px;padding:4px 0;font-size:14px;cursor:pointer}
+.opt .tick{width:17px;height:17px;flex:none;border:1.5px solid var(--ink);display:grid;place-items:center;
+  font-weight:700;font-size:13px;background:var(--paper)}
+.opt.sel .tick{background:var(--hi)}
+.opt input{position:absolute;opacity:0}
+.otherln{display:flex;gap:10px;align-items:baseline;color:var(--muted);font-size:14px;margin-top:2px}
+.otherln .rule{flex:1;border-bottom:1.5px solid var(--ink);min-height:22px}
+.slipfoot{display:flex;align-items:center;gap:12px;margin-top:12px}
+
+/* compaction card */
+.compactcard{position:relative;border:1.5px dashed var(--ink);background:var(--paper);
+  padding:12px 16px;max-width:62ch;font-size:13.5px}
+
+/* web search card */
+.webcard{position:relative;border:1.5px solid var(--ink);background:var(--sheet);
+  box-shadow:2px 2px 0 rgba(23,21,15,.9);padding:12px 16px;max-width:62ch;font-size:13.5px}
+.webcard .wh{font:400 10.5px/1.2 var(--disp);letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+.webcard .srcs{margin-top:6px;display:flex;gap:8px;flex-wrap:wrap}
+.webcard .src{border:1px solid var(--ink);background:var(--paper);padding:2px 8px;font-size:12px}
+
+/* queued slips */
+.queuebar{position:relative;display:flex;gap:10px;flex-wrap:wrap;align-items:center;
+  border:1.5px solid var(--ink);border-bottom:none;background:var(--layer);padding:9px 14px 7px;
+  max-width:66ch}
+.qslip{position:relative;background:var(--sheet);border:1px solid rgba(23,21,15,.45);
+  box-shadow:2px 2px 0 rgba(23,21,15,.9);padding:5px 8px 5px 10px;font-size:13px;
+  display:inline-flex;gap:8px;align-items:center;transform:rotate(-.4deg)}
+.qslip:nth-child(3){transform:rotate(.35deg)}
+.qslip .rm{color:var(--red);font-weight:700}
+.qslip .rmlab{color:var(--muted);font-size:11px}
+
+/* streaming state */
+.stcaret{display:inline-block;width:9px;height:17px;background:var(--red);vertical-align:-3px}
+.livestrip{display:flex;align-items:center;gap:10px;border:1.5px solid var(--ink);background:var(--paper);
+  padding:8px 12px;margin-top:10px;font-size:13px;flex-wrap:wrap}
+.spin{width:14px;height:14px;flex:none;border:2px solid var(--ink);border-right-color:transparent;
+  border-radius:50%;background:var(--sheet);position:relative}
+.stopbtn{background:var(--ink);color:var(--paper);padding:5px 16px;font-weight:700;font-size:12px;
+  letter-spacing:.08em;border:2px solid var(--ink)}
+
+/* composer — the galley strip */
+.composer{position:relative;border-top:2px solid var(--ink);background:var(--layer);padding:12px 14px 10px}
+.galley{position:relative;background:var(--sheet);border:1.5px solid var(--ink);
+  box-shadow:2px 2px 0 rgba(23,21,15,.9);padding:10px 12px 8px}
+.galley textarea{display:block;width:100%;border:none;background:transparent;resize:none;
+  font:400 15px/1.55 var(--mono);color:var(--ink);padding:0 0 6px;
+  background-image:none;border-bottom:1.5px solid var(--ink)}
+.galley textarea:focus{outline:none;border-bottom-color:var(--blue)}
+.galley textarea:focus-visible{outline:2.5px solid var(--blue);outline-offset:2px}
+.atchrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding-top:8px}
+.atchip{display:inline-flex;gap:6px;align-items:center;border:1px solid var(--ink);background:var(--paper);
+  padding:3px 9px;font-size:12.5px}
+.atchip .ic{color:var(--blue)}
+.comprow{display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap}
+.cbtn{border:1.5px solid var(--ink);background:var(--paper);min-height:36px;min-width:36px;
+  display:inline-grid;place-items:center;padding:4px 10px;font-size:14px}
+.cbtn .lbl{font-size:12px}
+.sendbtn{font:400 13px/1 var(--disp);letter-spacing:.1em;color:var(--red);text-transform:uppercase;
+  border:2px solid var(--red);border-radius:2px;padding:12px 18px;background:var(--sheet);
+  text-shadow:.5px 0 0 var(--red),0 .5px 0 var(--red);transform:rotate(-2deg);
+  box-shadow:inset 0 0 0 2px rgba(195,58,46,.15)}
+.hintline{font-size:11.5px;color:var(--muted);margin-top:7px}
+
+/* scroll affordances */
+.jumpchip{position:relative;display:inline-block;border:1.5px solid var(--ink);background:var(--sheet);
+  box-shadow:2px 2px 0 rgba(23,21,15,.9);padding:5px 12px;font-size:12.5px;margin:0 auto}
+.jumpwrap{display:flex;justify-content:center}
+.newpill{position:sticky;bottom:14px;margin-left:auto;display:block;width:max-content;
+  border:1.5px solid var(--ink);background:var(--hi);box-shadow:2px 2px 0 rgba(23,21,15,.9);
+  padding:6px 16px;font-weight:700;font-size:13px;z-index:3}
+
+/* ================= pasteboard rail ================= */
+.rail{background:var(--layer);border-left:1.5px dashed var(--rule);padding:4px 0 0 16px;min-width:0}
+.rail h4{font:400 11px/1.2 var(--disp);letter-spacing:.14em;text-transform:uppercase;
+  margin:0 0 8px;color:var(--ink)}
+.rail .handnote{font:600 15px/1 var(--hand);color:var(--blue);float:right;transform:rotate(-2deg)}
+.rsec{margin-bottom:20px}
+.fcard{position:relative;background:var(--sheet);border:1px solid rgba(23,21,15,.45);
+  box-shadow:2px 2px 0 rgba(23,21,15,.9);padding:9px 12px 7px;margin-bottom:12px;font-size:12.5px}
+.fcard .pin{position:absolute;top:-10px;left:11px}
+.fcard .pin::after{top:8px;height:5px}
+.fcard .fname{font-weight:700;overflow-wrap:anywhere}
+.fcard .nums{color:var(--muted)}
+.fcard .nums .plus{color:var(--blue)}
+.fcard .nums .minus{color:var(--red)}
+.fcard .view{font-size:11.5px;margin-top:3px;display:flex;gap:10px;align-items:baseline}
+.ckaxis{display:flex;gap:0;align-items:flex-start;margin-top:6px}
+.cknode{position:relative;flex:1;min-width:0;font-size:11.5px}
+.cknode .nd{width:11px;height:11px;border:2px solid var(--ink);border-radius:50%;background:var(--sheet);
+  display:block;margin-bottom:4px}
+.cknode .nd.f{background:var(--ink)}
+.cknode .ck{font-weight:700}
+.cknode .rw{font-size:11.5px;color:var(--blue)}
+.cknode .cut{position:absolute;top:4px;left:-14px;color:var(--pencil);font-size:11px}
+.cktape{background:var(--tape);height:14px;margin:-2px -2px 10px;display:block;
+  clip-path:polygon(1% 26%,5% 0,95% 2%,99% 24%,100% 78%,96% 100%,4% 98%,0 76%)}
+.tallytbl{width:100%;border-collapse:collapse;font-size:12.5px}
+.tallytbl td{border-bottom:1px dashed var(--rule);padding:4px 2px;vertical-align:baseline}
+.tallytbl td:last-child{text-align:right;font-weight:700}
+.tallytbl .lbl{color:var(--muted)}
+.chit{display:inline-block;border:1px solid var(--ink);padding:1px 7px;background:var(--paper)}
+.ctxbar{height:12px;border:1.5px solid var(--ink);background:var(--sheet);position:relative;margin-top:6px}
+.ctxbar i{position:absolute;inset:1px auto 1px 1px;width:57%;background:var(--hi)}
+.ctxbar .warnln{position:absolute;top:-3px;bottom:-3px;left:80%;width:1.5px;background:var(--red)}
+.tcard{position:relative;background:var(--sheet);border:1px solid rgba(23,21,15,.45);
+  box-shadow:2px 2px 0 rgba(23,21,15,.9);padding:9px 12px 7px;margin-bottom:10px;font-size:12.5px}
+.tcard .tape{width:44px;height:14px;top:-8px;left:8px}
+.tcard .tname{font-weight:700}
+.tcard .tmeta{color:var(--muted);font-size:11.5px}
+.tcard.kid{margin-left:18px}
+
+/* ================= tangent insets (beside frame) ================= */
+.insetrow{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,max-content));gap:34px;
+  align-items:start;justify-content:start}
+.inset{max-width:100%}
+
+/* printer's menu card — slash commands */
+.menucard{position:relative;background:var(--sheet);border:2px solid var(--ink);
+  box-shadow:2px 2px 0 rgba(23,21,15,.9);padding:16px 18px 12px;width:652px;max-width:100%}
+.menucard .mhead{display:flex;align-items:baseline;gap:12px;border-bottom:2px solid var(--ink);
+  padding-bottom:8px;margin-bottom:6px}
+.menucard .mtitle{font:400 15px/1 var(--disp);letter-spacing:.12em;text-transform:uppercase}
+.filterbox{display:flex;align-items:baseline;gap:8px;margin-left:auto;font-size:13px}
+.filterbox .fbox{border:1.5px solid var(--ink);background:var(--paper);padding:2px 10px 1px;font-weight:700}
+.mcols{display:grid;grid-template-columns:1fr 1fr 1fr}
+.mcol{padding:8px 14px 4px}
+.mcol+.mcol{border-left:1px solid var(--rule)}
+.mcol .mgrp{font:400 10px/1.2 var(--disp);letter-spacing:.16em;text-transform:uppercase;
+  color:var(--muted);border-bottom:1px dashed var(--rule);padding-bottom:4px;margin-bottom:2px}
+.cmd{position:relative;display:block;width:100%;padding:6px 4px 5px;border-bottom:1px dashed var(--rule);
+  min-height:24px}
+.cmd .cname{font-weight:700;font-size:13.5px}
+.cmd .cdesc{color:var(--muted);font-size:11.5px;line-height:1.4}
+.cmd .kk{position:absolute;right:4px;top:9px;color:var(--pencil);font-size:11px}
+.cmd .checkmark{position:absolute;right:14px;top:6px;font:700 14px/1 var(--mono);color:var(--ink)}
+.cmd:hover .checkmark{display:block}
+.cmd .checkmark{display:none}
+.cmd.dim{opacity:.5}
+.cmd.lit{opacity:1}
+.cmd.lit .cname{background:var(--hi);padding:0 2px}
+.mfoot{border-top:2px solid var(--ink);margin-top:10px;padding-top:6px;font-size:11.5px;
+  color:var(--muted);display:flex;gap:14px;align-items:baseline;flex-wrap:wrap}
+
+/* @ ticket stubs */
+.taglist{width:320px;max-width:100%}
+.stub{position:relative;background:var(--sheet);border:1.5px solid var(--ink);
+  box-shadow:2px 2px 0 rgba(23,21,15,.9);padding:9px 14px 8px 20px;margin-bottom:10px;
+  font-size:13px;overflow:hidden}
+.stub::before{content:"";position:absolute;left:6px;top:6px;bottom:6px;border-left:2px dashed var(--rule)}
+.stub .spath{font-weight:700;overflow-wrap:anywhere}
+.stub .smeta{color:var(--muted);font-size:11.5px}
+.stub.sel{background:var(--sheet)}
+.stub.sel .spath .swash{font-weight:700}
+.qline{display:flex;align-items:baseline;gap:8px;font-size:13px;margin:0 0 10px}
+.qline .qbox{border:1.5px solid var(--ink);background:var(--sheet);padding:3px 10px;font-weight:700}
+
+/* settings — the marks sheet */
+.marksheet{position:relative;background:var(--sheet);border:2px solid var(--ink);
+  box-shadow:2px 2px 0 rgba(23,21,15,.9);padding:16px 18px 14px;width:360px;max-width:100%}
+.marksheet h5{font:400 11px/1.2 var(--disp);letter-spacing:.16em;text-transform:uppercase;
+  margin:14px 0 6px;color:var(--muted)}
+.marksheet h5:first-of-type{margin-top:0}
+.mkrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:4px 0}
+.seg{display:inline-flex;border:1.5px solid var(--ink);background:var(--paper)}
+.seg button{padding:6px 10px;border-right:1.5px solid var(--ink);min-height:32px;font-size:12.5px;background:transparent}
+.seg button:last-child{border-right:none}
+.seg button.on{background:var(--hi);font-weight:700}
+.punch{display:inline-grid;place-items:center;width:19px;height:19px;border:2px solid var(--ink);
+  border-radius:50%;background:var(--paper);flex:none}
+.punch.on::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--ink)}
+.punchrow{display:flex;gap:14px;flex-wrap:wrap}
+.punchrow .pr{display:inline-flex;gap:7px;align-items:center;font-size:13px;min-height:28px}
+.ckbx{display:inline-grid;place-items:center;width:19px;height:19px;border:2px solid var(--ink);
+  background:var(--paper);flex:none;font:700 13px/1 var(--mono);transform:rotate(-1.5deg)}
+.ckbx.on{color:var(--ink)}
+.ckbx.off{color:transparent}
+.togglerow{display:flex;flex-direction:column;gap:6px}
+.togglerow .tr{display:flex;gap:9px;align-items:center;font-size:13.5px;min-height:24px}
+.togglerow .tr .lb{flex:1}
+.modelticket{position:relative;border:1.5px solid var(--ink);background:var(--paper);padding:7px 12px 6px;
+  margin-bottom:8px;font-size:13px;overflow-wrap:anywhere}
+.modelticket.on{background:var(--hi)}
+.modelticket .mt{font-weight:700}
+.advanced{border-top:1px dashed var(--rule);margin-top:12px;padding-top:6px}
+.advanced .monoarrow{color:var(--pencil)}
+
+/* ================= phone frame ================= */
+.phonewrap{display:flex;gap:40px;flex-wrap:wrap;align-items:flex-start}
+.phone{width:390px;flex:none;border:2px solid var(--ink);background:var(--paper);
+  box-shadow:2px 2px 0 rgba(23,21,15,.9);display:flex;flex-direction:column;position:relative}
+.phone.h844{height:844px;overflow:hidden}
+.phone .notch{height:6px;border-bottom:1.5px solid var(--ink);background:var(--layer);flex:none}
+.phone .ftabs{display:flex;gap:3px;overflow-x:auto;padding:4px 8px 0;background:var(--layer);
+  border-bottom:1.5px solid var(--ink);flex:none;scrollbar-width:none}
+.phone .ftabs::-webkit-scrollbar{display:none}
+.phone .ftabback{padding:1px 1px 0}
+.phone .ftab{padding:5px 11px 4px;font-size:11px}
+.phead{padding:6px 12px 5px;border-bottom:1px solid var(--rule);background:var(--sheet);flex:none}
+.phead .r1{display:flex;align-items:center;gap:8px}
+.phead .pt{font-weight:700;font-size:13px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.phead .r2{display:flex;align-items:center;gap:8px;margin-top:2px;font-size:10.5px;color:var(--muted)}
+.chipsrow{display:flex;gap:6px;overflow-x:auto;padding:6px 10px 7px;border-bottom:1.5px solid var(--ink);
+  background:var(--paper);flex:none;scrollbar-width:none}
+.chipsrow::-webkit-scrollbar{display:none}
+.stchip{flex:none;border:1.5px solid var(--ink);background:var(--sheet);padding:2px 8px;font-size:10.5px;white-space:nowrap}
+.chipsrow .stchip:last-child{margin-right:8px}
+.stchip b{font-weight:700}
+.pbody{flex:1;overflow-y:auto;padding:10px 10px 8px}
+.pbody .clip{padding:7px 10px 6px;box-shadow:1.5px 1.5px 0 rgba(23,21,15,.9)}
+.pbody .crop{padding:1px;font-size:10px}
+.pbody .tape{width:50px;height:16px}
+.pbody .tape.tl{top:-6px;left:10px}.pbody .tape.tr{top:-6px;right:10px}
+.pbody .tlabel{font-size:10.5px;margin-bottom:3px}
+.pbody p.body{font-size:12.5px;line-height:1.4;margin-bottom:0}
+.pdiff{overflow-x:auto;border:1px solid var(--rule);background:var(--paper);margin:4px 0 0}
+.pdiff .proofline{white-space:pre;font-size:11px;padding:1px 8px;line-height:1.35}
+.pauthz{border:2.5px solid var(--ink);background:var(--sheet);padding:12px 12px 7px;margin-top:4px;
+  box-shadow:2px 2px 0 rgba(23,21,15,.9)}
+.pauthz h3{font:400 16px/1.1 var(--disp);margin:0}
+.pauthz .telegram{font-size:11.5px;padding:3px 10px;margin:4px 0 2px}
+.pauthz .warning{font-size:11.5px;margin-top:2px}
+.pauthz .ahrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.pauthz .pauthbtns{display:flex;flex-direction:column;gap:5px;margin-top:6px}
+.pauthz .pauthbtns button{width:100%;min-height:52px}
+.pauthz .adeny{min-height:52px}
+.pauthz .astamp{border-radius:3px;min-height:52px;min-width:0;width:100%;font-size:12px;
+  letter-spacing:.06em;padding:8px 12px}
+.pauthz .astamp.roundish{border-radius:50%;width:72px;min-width:72px;min-height:72px;padding:6px}
+.pfoot{flex:none;border-top:2px solid var(--ink);background:var(--layer);padding:8px 10px 0;position:relative}
+.pfoot .qpoke{display:flex;gap:6px;position:absolute;top:-24px;left:10px;right:10px;z-index:2}
+.qpoke .qslip{font-size:11.5px;padding:4px 7px 3px;box-shadow:1.5px 1.5px 0 rgba(23,21,15,.9)}
+.pfoot .galley{padding:6px 10px 4px}
+.pfoot .galley textarea{font-size:12.5px;line-height:1.5}
+.pfoot .comprow{margin-top:7px}
+.pfoot .cbtn{min-height:44px;min-width:44px;font-size:15px}
+.pfoot .sendbtn{padding:12px 16px}
+.safearea{height:10px;flex:none;position:relative}
+.safearea::after{content:"";position:absolute;left:50%;bottom:5px;width:120px;height:4px;margin-left:-60px;
+  background:var(--ink);border-radius:2px}
+
+/* bottom sheets — taped-up cards with torn top edge */
+.sheetzone{position:relative;flex:1;display:flex;align-items:flex-end;padding:0}
+.sheetdim{position:absolute;inset:0;background:rgba(23,21,15,.38)}
+.torn{position:relative;width:100%;background:var(--sheet);border-top:none;
+  padding:16px 16px 0;box-shadow:0 -2px 0 rgba(23,21,15,.9)}
+.torn::before{content:"";position:absolute;left:-2px;right:-2px;top:-13px;height:14px;background:var(--sheet);
+  clip-path:polygon(0 100%,0 55%,5% 15%,10% 60%,16% 20%,22% 65%,28% 10%,34% 58%,40% 18%,46% 62%,
+  52% 8%,58% 60%,64% 22%,70% 64%,76% 15%,82% 58%,88% 20%,94% 62%,100% 12%,100% 100%)}
+.torn .tape{width:70px;height:20px;top:-16px;left:50%;margin-left:-35px;transform:rotate(-.5deg)}
+.sheetrow{display:flex;align-items:center;gap:12px;min-height:48px;padding:8px 2px;font-size:14.5px;
+  border-bottom:1px dashed var(--rule);font-weight:400}
+.sheetrow.story{font-weight:400}
+.sheetrow.danger{color:var(--red);font-weight:700}
+.sheetrow.cancel{justify-content:center;font-weight:700;letter-spacing:.06em}
+.sheettitle{font:400 10.5px/1.2 var(--disp);letter-spacing:.16em;text-transform:uppercase;
+  color:var(--muted);margin-bottom:6px}
+
+/* small insets reusing phone shell */
+.phone.small{height:520px}
+.phone.small .pbody{padding:0;display:flex;flex-direction:column}
+
+/* ================= midnight copy desk (dark) ================= */
+.dark{background:#1a1813;color:#efe9da;padding:20px;border-top:2px solid #efe9da}
+.dark .dgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,400px));gap:28px;align-items:start}
+.dark .clip{background:#221f1a;border-color:rgba(239,233,218,.4);box-shadow:2px 2px 0 rgba(239,233,218,.85);max-width:none}
+.dark .tape{background:rgba(232,210,138,.5)}
+.dark .tlabel{color:#b3ac9c}
+.dark .tlabel .who{color:#efe9da}
+.dark .pencilish{color:#8f897b}
+.dark .stamp,.dark .soon{color:#e05546;text-shadow:.5px 0 0 #e05546,0 .5px 0 #e05546}
+.dark .stamp.round{border-color:#e05546;background:#221f1a;box-shadow:inset 0 0 0 2.5px rgba(224,85,70,.3)}
+.dark .tool{background:#221f1a;border-color:#e6e0d1}
+.dark .tool .stamp.rect{background:#221f1a}
+.dark .authz{background:#221f1a;border-color:#e6e0d1;box-shadow:2px 2px 0 rgba(239,233,218,.85);max-width:none}
+.dark .authz .warning{color:#e05546}
+.dark .telegram{background:#1a1813;border-color:#e6e0d1;color:#efe9da}
+.dark .reason{color:#e6e0d1}
+.dark .astamp{color:#e05546;border-color:#e05546;background:#221f1a;
+  text-shadow:.6px 0 0 #e05546,0 .6px 0 #e05546;box-shadow:inset 0 0 0 3px rgba(224,85,70,.22)}
+.dark .adeny{background:#1a1813;color:#efe9da;border-color:#e6e0d1}
+.dark .adeny::before,.dark .adeny::after{background:#e05546}
+.dark .swash{color:var(--ink)}
+.dark ::selection{background:var(--hi);color:var(--ink)}
+.dark .cav{color:#e05546}
+
+/* ================= footer (readable contract) ================= */
+.foot{border-top:2px solid var(--ink);margin-top:48px;padding-top:16px;font-size:13.5px;
+  max-width:76ch;line-height:1.6}
+.foot .fhd{font:400 12px/1.2 var(--disp);letter-spacing:.14em;text-transform:uppercase;margin-bottom:8px}
+.foot dt{font-weight:700;margin-top:10px}
+.foot dd{margin:2px 0 0;padding-left:18px}
+.foot dd:first-of-type{margin-top:0}
+
+/* QA rebalance — pair the slash-sheet phone beside the midnight tiles */
+.pairrow{display:flex;gap:40px;align-items:flex-start;flex-wrap:wrap}
+.pairrow .dark{flex:1 1 640px;margin-top:0;min-width:0}
+</style>
+</head>
+<body>
+<div class="page">
+
+<!-- ============ A. MASTHEAD ============ -->
+<header>
+  <div class="mast">
+    <span class="regp tl">+</span><span class="regp tr">+</span>
+    <span class="regp bl">+</span><span class="regp br">+</span>
+    <h1><span class="swash">PASTE-UP</span></h1>
+    <p class="thesis">The session as a working zine — clippings taped in, corrections stamped,
+      decisions marked in highlighter. Punk energy, production discipline:
+      <span class="cav">reading order is sacred.</span></p>
+  </div>
+  <div class="utility">
+    <span>Design 6 of 6 · fresh-agent UX study · Freshell</span>
+    <a href="/">← all designs</a>
+  </div>
+</header>
+
+<!-- ============ B. DESKTOP FRAME ============ -->
+<p class="cap"><b>Desktop · 1440px</b> — full shell: filing tabs, pane header, status line, transcript + pasteboard rail, galley composer.</p>
+<section aria-label="Desktop app frame, 1440 pixels">
+<h2 class="sr-only">Desktop frame</h2>
+<div class="chrome">
+  <div class="bar">
+    <span class="b"></span><span class="b"></span><span class="b"></span>
+    <span class="url">127.0.0.1:3001/?token=••••••••</span>
+    <span>localhost · self-hosted</span>
+  </div>
+
+  <!-- filing tab strip -->
+  <div class="filerow" role="tablist" aria-label="Open tabs">
+    <span class="ftabback busyedge"><span class="ftab" role="tab" aria-selected="true" aria-current="page">
+      <span class="dot busy" title="busy"></span>&nbsp; ⚡ Trace dropped messa…</span></span>
+    <span class="ftabback mutedtab"><span class="ftab" role="tab" aria-selected="false" tabindex="0">⌨ npm run dev</span></span>
+    <span class="ftabback mutedtab"><span class="ftab" role="tab" aria-selected="false" tabindex="0">
+      <span class="burst">!</span>&nbsp;◉ Scrollback parser&nbsp;<span class="dot attn" title="needs attention"></span></span></span>
+    <button class="newtab" aria-label="New tab">+</button>
+  </div>
+
+  <!-- pane header -->
+  <div class="panehead">
+    <span class="prov"><span class="sq" aria-hidden="true"></span>freshclaude</span>
+    <span class="ptitle">Trace dropped messages on background tabs</span>
+    <span class="pstate"><span class="dot busy"></span> Working…</span>
+    <span class="idgrp">
+      <span class="pcost">$1.38</span>
+      <button class="pico" aria-label="Diffs, 3 files changed">▦<span class="bdg">3</span></button>
+      <button class="pico" aria-label="Settings">⚙</button>
+      <button class="pico" aria-label="Refresh">⟳</button>
+      <button class="pico" aria-label="Fullscreen">⛶</button>
+      <button class="pico" aria-label="Close pane">✕</button>
+    </span>
+  </div>
+
+  <!-- status line -->
+  <div class="statusline" aria-label="Session status">
+    <span>~/code/freshell</span><span class="sep">·</span>
+    <span><b>fix/ws-reconnect</b>+2</span><span class="sep">·</span>
+    <span>Opus 4.6</span><span class="sep">·</span>
+    <span>effort High</span><span class="sep">·</span>
+    <span>Ask</span><span class="sep">·</span>
+    <span><span class="meter" role="img" aria-label="Context 59 percent"><i></i></span> 59%</span>
+    <span class="sep">·</span><span><b>$1.38</b></span>
+    <span class="sep">·</span><span class="pencilish" style="color:var(--muted)">id 01JRV6…KQ3M · started 14:02 · live</span>
+  </div>
+
+  <div class="split">
+  <div class="transcript" aria-label="Session transcript">
+    <div class="jumpwrap"><span class="jumpchip">⊲ back to where you jumped in · 14:07</span></div>
+
+    <!-- 1. USER TURN -->
+    <div class="crop"><span>┌</span><i></i><span>┐</span></div>
+    <article class="clip" aria-label="User turn, 14:07">
+      <span class="tape tl"></span><span class="tape tr"></span>
+      <div class="tlabel">
+        <span class="who">You</span><span class="time">14:07</span>
+        <span class="tacts"><a href="#d-desk">copy</a><a href="#d-desk">fork</a><a href="#d-desk">rewind</a><span aria-hidden="true">⋯</span></span>
+      </div>
+      <p class="body">the reconnect loop is still dropping messages when the tab&rsquo;s in the background.
+        can you trace where the heartbeat dies?</p>
+    </article>
+
+    <!-- 2. AGENT TURN -->
+    <div class="crop"><span>└</span><i></i><span>─ ─ cut / fold ─ ─</span><i></i><span>┘</span></div>
+    <article class="clip" aria-label="Agent turn, 14:07">
+      <span class="tape tl"></span><span class="tape tr"></span>
+      <div class="tlabel">
+        <span class="who" style="color:var(--clay)">Claude · Opus 4.6</span><span class="time">14:07</span>
+        <span class="tacts"><a href="#d-desk">copy</a><a href="#d-desk">fork</a><a href="#d-desk">rewind</a><span aria-hidden="true">⋯</span></span>
+      </div>
+      <p class="body">Found it. The heartbeat is 15s — but background tabs throttle timers to ≥60s,
+        so pings gap out and the server closes the socket before the next beat ever lands.</p>
+      <p class="body">Proposal: drop the interval to 5s and add a pong watchdog — if 12s passes with
+        no pong, the client treats the socket as dead instead of waiting for the server to say so.</p>
+
+      <details class="think">
+        <summary>Thought for 12s <span class="cav">→ open</span></summary>
+        <div class="tinner">Timer clamping matches the symptom exactly: drops only happen after the tab
+          loses focus. Server logs show close-frames arriving 60–75s after last pong. A 5s beat survives
+          even the worst clamp; the watchdog covers the rest.</div>
+      </details>
+
+      <!-- TOOL GROUP — each a stamped file box -->
+      <div role="group" aria-label="Tool calls">
+        <details class="tool">
+          <summary><span class="tname">Read</span><span class="targ">server/ws-handler.ts · 1,204 lines</span>
+            <span class="okk">✓</span><span class="openhint">expand ▸</span></summary>
+          <p class="tres">Read 1,204 lines from server/ws-handler.ts — heartbeat constants at L42–L58.</p>
+          <span class="stamp round">READ<br>OK</span>
+        </details>
+
+        <details class="tool">
+          <summary><span class="tname">Grep</span><span class="targ">&ldquo;heartbeat&rdquo; in server/ · 7 matches</span>
+            <span class="okk">✓</span><span class="openhint">expand ▸</span></summary>
+          <p class="tres">7 matches across 3 files: ws-handler.ts (4), terminal-registry.ts (2), index.ts (1).</p>
+          <span class="stamp round">READ<br>OK</span>
+        </details>
+
+        <details class="tool">
+          <summary><span class="tname">Bash</span>
+            <code class="targ">npm run test:vitest -- run test/unit/ws-heartbeat.test.ts</code>
+            <span class="okk">✓</span><span class="openhint">expand ▸</span></summary>
+          <p class="tres">✓ ws-heartbeat.test.ts — <b>14 passed (2.1s)</b></p>
+          <span class="stamp rect">TEST OK<br>14 PASSED</span>
+        </details>
+
+        <!-- EDIT — expanded, the marked-up proof -->
+        <details class="tool" open>
+          <summary><span class="tname">Edit</span><span class="targ">server/ws-handler.ts&nbsp;
+            <span style="color:var(--blue)">+12</span>&nbsp;<span style="color:var(--red)">−4</span></span>
+            <span class="okk">✓</span><span class="openhint">collapse ▾</span></summary>
+          <div class="proofframe" role="img"
+               aria-label="Diff: heartbeat interval 15000 becomes 5000, with comment about background tab throttling, and lastPongAt initialized to zero">
+            <div class="proofline del"><span class="g">−</span><code class="l">const HEARTBEAT_INTERVAL = 15_000;</code>
+              <button class="annotate" aria-label="Comment on deleted line 42">✎</button></div>
+            <div class="proofline add"><span class="g">+</span><code class="l">const HEARTBEAT_INTERVAL = 5_000;</code>
+              <span class="cav">nice.</span>
+              <button class="annotate" aria-label="Comment on added line 42">✎</button></div>
+            <div class="proofline add"><span class="g">+</span><code class="l">// background-tab timers throttle to ~60s; beat fast enough to survive</code></div>
+            <div class="proofline add"><span class="g">+</span><code class="l">let lastPongAt = 0;</code>
+              <span class="cav" style="color:var(--blue)">check edge</span>
+              <button class="annotate" aria-label="Comment on added line 44">✎</button></div>
+          </div>
+          <p class="tres">Note to setter: ✎ any line to leave a per-line comment for the agent — it lands in the next turn.</p>
+          <span class="stamp rect">FILED</span>
+        </details>
+      </div>
+
+      <!-- SETTLED STRIP — hand-tallied -->
+      <div class="settled">
+        <span class="tally" aria-hidden="true">|||| |||| ||</span>
+        <span>thought 12s · 4 tools used · 2 files changed</span>
+        <span class="okk">☑ settled</span>
+      </div>
+    </article>
+
+    <!-- WEB SEARCH CLIPPING (mid-session research) -->
+    <div class="crop"><span>┌</span><i></i><span>┐</span></div>
+    <aside class="webcard" aria-label="Web search">
+      <span class="tape tl" style="width:56px;height:18px;top:-8px"></span>
+      <span class="wh">WEB CLIP · looked it up</span>
+      <p class="body" style="margin-top:6px">&ldquo;browser background tab timer throttling&rdquo;</p>
+      <div class="srcs">
+        <span class="src">MDN — setTimeout clamping</span>
+        <span class="src">Chrome for Developers — Timer throttling</span>
+      </div>
+    </aside>
+
+    <!-- 3. USER TURN with attachments -->
+    <div class="crop"><span>└</span><i></i><span>┘</span></div>
+    <article class="clip" aria-label="User turn with attachments, 14:12">
+      <span class="tape tl"></span><span class="tape tr"></span>
+      <div class="tlabel">
+        <span class="who">You</span><span class="time">14:12</span>
+        <span class="tacts"><a href="#d-desk">copy</a><a href="#d-desk">fork</a><a href="#d-desk">rewind</a><span aria-hidden="true">⋯</span></span>
+      </div>
+      <div class="atchrow" style="padding-top:0;padding-bottom:8px">
+        <span class="atchip" role="img" aria-label="Attached image screenshot.png"
+          style="padding:3px 9px 3px 3px">
+          <span style="display:inline-block;width:34px;height:24px;border:1px solid var(--ink);
+            background:var(--paper);vertical-align:middle"></span>
+          screenshot.png</span>
+        <span class="atchip"><span class="ic">≣</span> logs.txt</span>
+      </div>
+      <p class="body">here&rsquo;s what the console shows when it dies</p>
+    </article>
+
+    <!-- 4. AGENT TURN — STREAMING -->
+    <div class="crop"><span>┌</span><i></i><span>┐</span></div>
+    <article class="clip" aria-label="Agent turn streaming, 14:12" aria-live="polite">
+      <span class="tape tl"></span><span class="tape tr"></span>
+      <div class="tlabel">
+        <span class="who" style="color:var(--clay)">Claude · Opus 4.6</span><span class="time">14:12</span>
+        <span class="wait">STREAMING</span>
+      </div>
+      <p class="body">So the watchdog needs to live in the server, and the client should—<span class="stcaret" aria-hidden="true"></span></p>
+      <div class="livestrip">
+        <span class="spin" role="img" aria-label="Running"></span>
+        <span>Running <b>Edit</b> — server/ws-handler.ts</span>
+        <span class="cav">hold on…</span>
+        <button class="stopbtn" style="margin-left:auto">■ Stop</button>
+      </div>
+    </article>
+
+    <!-- 5. APPROVAL CARD — the front page; interrupts flow -->
+    <div class="crop"><span>└</span><i></i><span>┘</span></div>
+    <section class="authz" aria-label="Approval requested" aria-live="assertive" style="margin-top:20px">
+      <span class="stamp rect" style="top:-20px;left:16px;right:auto">needs your stamp</span>
+      <div class="ahrow">
+        <h3>AUTHORIZE?</h3>
+        <span class="burst">!</span>
+        <span style="font-size:13px;color:var(--muted)">tool <b>Bash</b> wants to run:</span>
+      </div>
+      <div class="telegram">
+        ┌─ WIRE ─────────────────────┐<br>
+        RM -RF .WORKTREES/REFRESH-* STOP<br>
+        └──────────────── END ───────┘
+      </div>
+      <p class="body" style="font-size:12.5px;color:var(--muted);margin-top:-2px">as typed: <code>rm -rf .worktrees/refresh-*</code></p>
+      <p class="reason">Reason: Deletes 3 stale worktrees.</p>
+      <p class="warning"><span class="burst">!</span> This command permanently deletes files.</p>
+      <div class="authbtns">
+        <button class="astamp">Allow once</button>
+        <button class="astamp rect" style="transform:rotate(2deg)">Always allow Bash this session</button>
+        <button class="adeny"><span>Deny</span></button>
+      </div>
+      <p class="body" style="font-size:11.5px;color:var(--muted);margin-top:10px">Stamp slams on press (180ms) — the one loud moment. <span class="cav">decide!</span></p>
+    </section>
+
+    <!-- 6. QUESTION BANNER — subscription slip -->
+    <div class="crop"><span>┌</span><i></i><span>┐</span></div>
+    <section class="subslip" aria-label="Editor question">
+      <span class="tape tl" style="width:56px;height:18px;top:-8px"></span>
+      <div class="sliphead">SUBSCRIPTION SLIP · tell the editor:</div>
+      <p class="q">How should the client catch up after reconnect?</p>
+      <fieldset style="border:none;margin:0;padding:0">
+        <legend class="sr-only">Catch-up strategy</legend>
+        <label class="opt"><input type="radio" name="catchup"><span class="tick"></span> Replay buffer only</label>
+        <label class="opt sel"><input type="radio" name="catchup" checked><span class="tick">✓</span> Full snapshot if gap &gt; 5s <span class="swash">picked</span></label>
+        <label class="opt"><input type="radio" name="catchup"><span class="tick"></span> Always resync</label>
+      </fieldset>
+      <label class="otherln">Other… <span class="rule" aria-hidden="true"></span></label>
+      <div class="slipfoot">
+        <button class="sendbtn" style="font-size:11px;padding:9px 16px">Submit</button>
+        <span style="font-size:11.5px;color:var(--muted)">one answer per household · answers go straight into the next turn</span>
+      </div>
+    </section>
+
+    <!-- 7. COMPACTION CARD -->
+    <div class="crop"><span>└</span><i></i><span>┘</span></div>
+    <aside class="compactcard" aria-label="Context compacted">
+      Context compacted · 41,203 → 12,850 tokens · full transcript preserved
+      <span class="stamp rect" style="top:-13px;font-size:9px;padding:3px 6px 2px">FILED</span>
+    </aside>
+
+    <!-- 8. QUEUED STRIP -->
+    <div class="crop"><span>┌</span><i></i><span>┐</span></div>
+    <div class="queuebar" aria-label="Queued messages, 2 pending">
+      <span class="wait" style="font-weight:700">2 queued</span>
+      <span class="qslip">also bump the client backoff cap
+        <button aria-label="Remove queued message: also bump the client backoff cap"><span class="rm">✕</span><span class="sr-only">remove</span></button>
+      </span>
+      <span class="qslip">then update AGENTS.md
+        <button aria-label="Remove queued message: then update AGENTS.md"><span class="rm">✕</span><span class="sr-only">remove</span></button>
+      </span>
+      <span style="font-size:11.5px;color:var(--muted)">sent in order when the turn settles</span>
+    </div>
+
+    <!-- scroll affordance -->
+    <button class="newpill">3 new ↓</button>
+  </div>
+  <aside class="rail" aria-label="Pasteboard rail">
+    <!-- DIFFS — pinned file cards -->
+    <div class="rsec">
+      <h4>Diffs <span class="handnote">3 pinned</span></h4>
+      <div class="fcard">
+        <span class="pin"></span>
+        <span class="fname">server/ws-handler.ts</span>
+        <span class="nums"><span class="plus">+12</span> <span class="minus">−4</span></span>
+        <span class="view"><a href="#d-desk">view</a><span style="color:var(--pencil)">✎ note-to-agent on any line</span></span>
+      </div>
+      <div class="fcard">
+        <span class="pin"></span>
+        <span class="fname">test/unit/ws-heartbeat.test.ts</span>
+        <span class="nums"><span class="plus">+9</span> <span class="minus">−0</span></span>
+        <span class="view"><a href="#d-desk">view</a><span style="color:var(--pencil)">✎ note-to-agent on any line</span></span>
+      </div>
+      <div class="fcard">
+        <span class="pin"></span>
+        <span class="fname">docs/AGENTS.md</span>
+        <span class="nums"><span class="plus">+2</span> <span class="minus">−2</span></span>
+        <span class="view"><a href="#d-desk">view</a><span style="color:var(--pencil)">✎ note-to-agent on any line</span></span>
+      </div>
+    </div>
+
+    <!-- CHECKPOINTS — taped timeline -->
+    <div class="rsec">
+      <h4>Checkpoints <span class="handnote">rewind ✂</span></h4>
+      <div class="cktape" aria-hidden="true"></div>
+      <div class="ckaxis">
+        <div class="cknode">
+          <span class="nd f"></span>
+          <div><span class="ck">b1</span> 14:07</div>
+          <a class="rw" href="#d-desk">Rewind ✂</a>
+        </div>
+        <div class="cknode">
+          <span class="cut">- - - - - ┆ - - - - -</span>
+          <span class="nd f"></span>
+          <div><span class="ck">b2</span> 14:19</div>
+          <a class="rw" href="#d-desk">Rewind ✂</a>
+        </div>
+        <div class="cknode">
+          <span class="cut">- - - - - ┆ - - - - -</span>
+          <span class="nd"></span>
+          <div><span class="ck">b3</span> 14:31</div>
+          <a class="rw" href="#d-desk">Rewind ✂</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- USAGE — the chit -->
+    <div class="rsec">
+      <h4>Usage <span class="handnote">the chit</span></h4>
+      <table class="tallytbl">
+        <tr><td class="lbl">cost</td><td><span class="chit">$1.38</span></td></tr>
+        <tr><td class="lbl">tokens</td><td>84.2k↑ / 9.6k↓</td></tr>
+        <tr><td class="lbl">burn</td><td>$3.45/h</td></tr>
+        <tr><td class="lbl">context</td><td>118,200 / 200,000 · 59%</td></tr>
+      </table>
+      <div class="ctxbar" role="img" aria-label="Context 59 percent, warning line at 80 percent"><i></i><span class="warnln"></span></div>
+      <div style="font-size:10.5px;color:var(--muted);margin-top:3px">bar flips <span style="color:var(--red);font-weight:700">red</span> past the 80% line</div>
+    </div>
+
+    <!-- THREADS — index cards -->
+    <div class="rsec">
+      <h4>Threads <span class="handnote">3 live</span></h4>
+      <div class="tcard"><span class="tape sm tl"></span>
+        <div class="tname">ws-reconnect·b</div>
+        <div class="tmeta">worktree · this pane</div>
+      </div>
+      <div class="tcard kid"><span class="tape sm tl"></span>
+        <div class="tname">heartbeat probe</div>
+        <div class="tmeta">child thread · waiting <span class="wait">idle</span></div>
+      </div>
+      <div class="tcard kid"><span class="tape sm tl"></span>
+        <div class="tname">docs pass</div>
+        <div class="tmeta">child thread · <span class="okk">done ✓</span></div>
+      </div>
+    </div>
+  </aside>
+  </div>
+
+  <!-- galley composer -->
+  <div class="composer" aria-label="Composer">
+    <div class="galley">
+      <span class="tape tl" style="width:44px;height:14px;top:-6px"></span>
+      <textarea rows="2" aria-label="Message to agent">make the interval configurable in settings, default 5s —</textarea>
+      <div class="atchrow">
+        <span class="atchip"><span class="ic">≣</span> heartbeat.md <button aria-label="Remove attachment heartbeat.md" style="color:var(--red);font-weight:700">✕</button></span>
+      </div>
+    </div>
+    <div class="comprow">
+      <button class="cbtn" aria-label="Attach file">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+          <path d="M11.5 7.2l-4.6 4.6a2.6 2.6 0 0 1-3.7-3.7l5-5a1.8 1.8 0 0 1 2.6 2.5l-5 5a1 1 0 0 1-1.4-1.4l4.3-4.3"/></svg>
+      </button>
+      <button class="cbtn" aria-label="Slash commands"><span aria-hidden="true">/</span></button>
+      <button class="cbtn" aria-label="Mention a file"><span aria-hidden="true">@</span></button>
+      <span style="margin-left:auto;display:flex;gap:10px;align-items:center">
+        <button class="stopbtn">■ Stop</button>
+        <button class="sendbtn">RUN IT</button>
+      </span>
+    </div>
+    <div class="hintline">⏎ send · ⇧⏎ newline · esc interrupt · ↑ history · @ files · ! shell</div>
+  </div>
+</div>
+</section>
+
+<!-- ============ DESKTOP TANGENTS ============ -->
+<p class="cap"><b>Tabs &amp; filters · desktop insets</b> — printed at natural size beside the frame.</p>
+<section aria-label="Desktop insets">
+<h2 class="sr-only">Desktop insets</h2>
+<div class="insetrow">
+
+  <!-- SLASH MENU — the printer's menu card, filter "re" typed -->
+  <div class="inset" id="d-slash">
+    <div class="menucard" role="dialog" aria-label="Slash command menu">
+      <span class="tape tl"></span><span class="tape tr"></span>
+      <div class="mhead">
+        <span class="mtitle">Commands</span>
+        <span class="filterbox">
+          <span class="cav">types here:</span>
+          <span class="fbox">/<span class="circ" style="color:var(--red);border-color:var(--red)">re</span><span class="stcaret" style="height:13px;width:7px"></span></span>
+        </span>
+      </div>
+      <div class="mcols">
+        <div class="mcol">
+          <div class="mgrp">Session</div>
+          <div class="cmd dim"><span class="cname">/new</span><div class="cdesc">fresh session (aliases /reset, /restart)</div><span class="checkmark">✓</span></div>
+          <div class="cmd dim"><span class="cname">/fork</span><div class="cdesc">branch this conversation from a turn</div><span class="checkmark">✓</span></div>
+          <div class="cmd dim"><span class="cname">/compact</span><div class="cdesc">summarize context now</div><span class="checkmark">✓</span></div>
+          <div class="cmd lit"><span class="cname">/rename</span><span class="soon">soon</span><div class="cdesc">retitle session</div><span class="kk">↵</span></div>
+          <div class="cmd dim"><span class="cname">/export</span><span class="soon">soon</span><div class="cdesc">save transcript</div><span class="checkmark">✓</span></div>
+        </div>
+        <div class="mcol">
+          <div class="mgrp">Inspect</div>
+          <div class="cmd dim"><span class="cname">/status</span><div class="cdesc">session health &amp; config</div><span class="checkmark">✓</span></div>
+          <div class="cmd dim"><span class="cname">/cost</span><div class="cdesc">usage breakdown</div><span class="checkmark">✓</span></div>
+          <div class="cmd dim"><span class="cname">/diff</span><div class="cdesc">open changed files</div><span class="checkmark">✓</span></div>
+          <div class="cmd dim"><span class="cname">/context</span><span class="soon">soon</span><div class="cdesc">token map</div><span class="checkmark">✓</span></div>
+          <div class="cmd lit"><span class="cname">/review</span><span class="soon">soon</span><div class="cdesc">request code review</div><span class="kk">↵</span></div>
+        </div>
+        <div class="mcol">
+          <div class="mgrp">Configure</div>
+          <div class="cmd dim"><span class="cname">/model</span><div class="cdesc">switch model</div><span class="checkmark">✓</span></div>
+          <div class="cmd dim"><span class="cname">/effort</span><div class="cdesc">thinking effort</div><span class="checkmark">✓</span></div>
+          <div class="cmd lit"><span class="cname">/permissions</span><div class="cdesc">permission mode</div><span class="kk">↵</span></div>
+          <div class="cmd dim"><span class="cname">/hooks</span><span class="soon">soon</span><div class="cdesc">event hooks</div><span class="checkmark">✓</span></div>
+          <div class="cmd dim"><span class="cname">/mcp</span><span class="soon">soon</span><div class="cdesc">MCP servers</div><span class="checkmark">✓</span></div>
+          <div class="cmd dim"><span class="cname">/agents</span><span class="soon">soon</span><div class="cdesc">subagents</div><span class="checkmark">✓</span></div>
+          <div class="cmd dim"><span class="cname">/notify</span><span class="soon">soon</span><div class="cdesc">completion alerts</div><span class="checkmark">✓</span></div>
+          <div class="cmd dim"><span class="cname">/theme</span><span class="soon">soon</span><div class="cdesc">pane theme</div><span class="checkmark">✓</span></div>
+        </div>
+      </div>
+      <div class="mfoot">
+        <span>3 matches for &ldquo;re&rdquo;: <span class="swash">/rename</span> <span class="swash">/review</span> <span class="swash">/permissions</span></span>
+        <span style="margin-left:auto">↑↓ pick · <b>↵</b> run · esc close</span>
+      </div>
+    </div>
+    <p class="cap"><b>Slash menu · open above composer</b> — the printer&rsquo;s menu card.</p>
+  </div>
+
+  <!-- @ FILE-MENTION — ticket stubs -->
+  <div class="inset" id="d-at">
+    <div class="taglist" role="listbox" aria-label="File mention results for @ws-">
+      <div class="qline"><span style="color:var(--muted)">ticket query:</span><span class="qbox">@ws-</span></div>
+      <div class="stub sel" role="option" aria-selected="true">
+        <div class="spath"><span class="swash">server/ws-handler.ts</span></div>
+        <div class="smeta">edited this turn · b3</div>
+      </div>
+      <div class="stub" role="option" aria-selected="false">
+        <div class="spath">src/lib/fresh-agent-ws.ts</div>
+        <div class="smeta">client socket helper</div>
+      </div>
+      <div class="stub" role="option" aria-selected="false">
+        <div class="spath">test/unit/ws-heartbeat.test.ts</div>
+        <div class="smeta">14 passing</div>
+      </div>
+      <div style="font-size:11.5px;color:var(--muted)">↵ accept · esc dismiss · stubs tear off into the composer as chips</div>
+    </div>
+    <p class="cap"><b>@ mention · dropdown</b> — ticket stubs.</p>
+  </div>
+
+  <!-- SETTINGS — the marks sheet -->
+  <div class="inset" id="d-desk">
+    <div class="marksheet" role="dialog" aria-label="Pane settings">
+      <span class="tape tl"></span><span class="tape tr"></span>
+      <h5>Style</h5>
+      <div class="mkrow">
+        <span class="seg" role="group" aria-label="Pane style">
+          <button aria-pressed="false">Sans</button><button aria-pressed="false">Serif</button><button class="on" aria-pressed="true">Mono</button>
+        </span>
+      </div>
+      <h5>Model — specimen tickets</h5>
+      <div class="modelticket on"><span class="mt">Claude Opus 4.6</span> — current <span class="cav" style="color:var(--ink)">this one.</span></div>
+      <div class="modelticket"><span class="mt">Sonnet 4.6</span> <span class="soon">soon</span></div>
+      <h5>Effort</h5>
+      <div class="mkrow">
+        <span class="seg" role="group" aria-label="Effort">
+          <button aria-pressed="false">Low</button><button aria-pressed="false">Medium</button><button class="on" aria-pressed="true">High</button>
+        </span>
+      </div>
+      <h5>Permission mode — punch one</h5>
+      <div class="punchrow" role="radiogroup" aria-label="Permission mode">
+        <span class="pr"><span class="punch on" role="radio" aria-checked="true" tabindex="0"></span>Ask</span>
+        <span class="pr"><span class="punch" role="radio" aria-checked="false" tabindex="0"></span>Accept edits</span>
+        <span class="pr"><span class="punch" role="radio" aria-checked="false" tabindex="0"></span>Bypass</span>
+        <span class="pr"><span class="punch" role="radio" aria-checked="false" tabindex="0"></span>Plan</span>
+      </div>
+      <h5>Marks</h5>
+      <div class="togglerow">
+        <button class="tr"><span class="ckbx on">✓</span><span class="lb">Show thinking</span></button>
+        <button class="tr"><span class="ckbx on">✓</span><span class="lb">Show tools</span></button>
+        <button class="tr"><span class="ckbx on">✓</span><span class="lb">Timecodes</span></button>
+        <button class="tr"><span class="ckbx off">✓</span><span class="lb">Sound on done</span><span class="soon">soon</span></button>
+        <button class="tr"><span class="ckbx off">✓</span><span class="lb">Desktop notifications</span><span class="soon">soon</span></button>
+      </div>
+      <div class="advanced">
+        <h5>Advanced <span class="soon">soon</span></h5>
+        <div class="togglerow" style="color:var(--muted)">
+          <span class="tr"><span class="monoarrow">▸</span><span class="lb">Hooks</span></span>
+          <span class="tr"><span class="monoarrow">▸</span><span class="lb">MCP servers</span></span>
+          <span class="tr"><span class="monoarrow">▸</span><span class="lb">Agents</span></span>
+          <span class="tr"><span class="monoarrow">▸</span><span class="lb">Status-line layout</span></span>
+        </div>
+      </div>
+    </div>
+    <p class="cap"><b>Settings · popover</b> — the marks sheet, anchored at the ⚙.</p>
+  </div>
+</div>
+</section>
+
+<!-- ============ C+D. PHONE FRAMES + MIDNIGHT TILES ============ -->
+<p class="cap"><b>Phone · 390px</b> — clippings full-bleed with smaller tape; AUTHORIZE card thumb-first (stacked stamps ≥52px); sheets tear up from the bottom. The pasteboard rail collapses into the scrollable status-chips row under the header.</p>
+<section aria-label="Phone frames, 390 pixels wide, with midnight copy desk swatch">
+<h2 class="sr-only">Phone frames and dark swatch</h2>
+<div class="phonewrap">
+
+  <!-- main phone frame -->
+  <div class="phone h844" id="p-main" role="img" aria-label="Phone: same session, condensed">
+    <div class="notch"></div>
+    <div class="ftabs" role="tablist" aria-label="Open tabs">
+      <span class="ftabback busyedge"><span class="ftab" role="tab" aria-selected="true"><span class="dot busy"></span>&nbsp;⚡ Trace dropped…</span></span>
+      <span class="ftabback mutedtab"><span class="ftab" role="tab" aria-selected="false">⌨ npm run dev</span></span>
+      <span class="ftabback mutedtab"><span class="ftab" role="tab" aria-selected="false"><span class="burst">!</span>&nbsp;◉ Scrollback…</span></span>
+    </div>
+    <div class="phead">
+      <div class="r1">
+        <span class="prov" style="padding:2px 7px 2px 4px;font-size:11px"><span class="sq" style="width:11px;height:11px"></span>freshclaude</span>
+        <span class="pt">Trace dropped messages on background tabs</span>
+        <button class="pico" style="width:28px;height:28px" aria-label="More actions">⋯</button>
+      </div>
+      <div class="r2"><span class="dot busy"></span> Working… · <b>$1.38</b></div>
+    </div>
+    <div class="chipsrow" aria-label="Status chips">
+      <span class="stchip">…/freshell · <b>fix/ws-reconnect</b></span>
+      <span class="stchip">Opus 4.6</span>
+      <span class="stchip"><b>59%</b></span>
+      <span class="stchip"><b>$1.38</b></span>
+    </div>
+    <div class="pbody">
+      <article class="clip">
+        <span class="tape tl"></span><span class="tape tr"></span>
+        <div class="tlabel"><span class="who">You</span><span class="time">14:07</span></div>
+        <p class="body" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">the reconnect loop is still dropping messages when the tab&rsquo;s in the background&hellip;</p>
+      </article>
+      <div class="crop"><span>┌</span><i></i><span>┐</span></div>
+      <article class="clip">
+        <span class="tape tl"></span><span class="tape tr"></span>
+        <div class="tlabel"><span class="who" style="color:var(--clay)">Claude · Opus 4.6</span><span class="time">14:07</span></div>
+        <p class="body" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Found it — heartbeat is 15s, background tabs clamp timers to ≥60s&hellip;</p>
+        <div class="pdiff" role="img" aria-label="Diff, horizontally scrollable">
+          <div class="proofline del"><span class="g">−</span><code class="l">const HEARTBEAT_INTERVAL = 15_000;</code><button class="annotate" aria-label="Comment on deleted line">✎</button></div>
+          <div class="proofline add"><span class="g">+</span><code class="l">const HEARTBEAT_INTERVAL = 5_000;</code><button class="annotate" aria-label="Comment on added line">✎</button></div>
+          <div class="proofline add"><span class="g">+</span><code class="l">let lastPongAt = 0;</code></div>
+        </div>
+        <div class="tlabel" style="margin:2px 0 0"><span class="okk">✓ 4 tools · 2 files · 12s</span></div>
+      </article>
+      <div class="crop"><span>└</span><i></i><span>┘</span></div>
+      <!-- AUTHORIZE — thumb-first, full stamp trio -->
+      <section class="pauthz" aria-label="Approval requested">
+        <span class="stamp rect" style="top:-15px;left:12px;right:auto;font-size:8.5px;padding:3px 6px 2px">needs your stamp</span>
+        <div class="ahrow" style="gap:8px"><h3>AUTHORIZE?</h3><span class="burst">!</span>
+          <span style="font-size:11.5px;color:var(--muted)">tool <b>Bash</b> wants to run:</span></div>
+        <div class="telegram">RM -RF .WORKTREES/REFRESH-* STOP</div>
+        <p class="body" style="font-size:11.5px;color:var(--muted);margin:0 0 2px"><code>rm -rf .worktrees/refresh-*</code> · Deletes 3 stale worktrees</p>
+        <p class="warning" style="font-size:12.5px;margin-top:4px"><span class="burst">!</span> This command permanently deletes files.</p>
+        <div class="pauthbtns">
+          <button class="astamp roundish" style="align-self:center">Allow once</button>
+          <button class="astamp rect">Always allow Bash this session</button>
+          <button class="adeny"><span>Deny</span></button>
+        </div>
+      </section>
+    </div>
+    <div class="pfoot">
+      <div class="qpoke">
+        <span class="qslip">also bump backoff cap <span class="rm">✕</span></span>
+        <span class="qslip" style="max-width:170px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis">then update AGENTS.md</span>
+      </div>
+      <div class="galley">
+        <textarea rows="2" aria-label="Message to agent">make the interval configurable in settings, default 5s —</textarea>
+      </div>
+      <div class="comprow">
+        <button class="cbtn" aria-label="Attach"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M11.5 7.2l-4.6 4.6a2.6 2.6 0 0 1-3.7-3.7l5-5a1.8 1.8 0 0 1 2.6 2.5l-5 5a1 1 0 0 1-1.4-1.4l4.3-4.3"/></svg></button>
+        <button class="cbtn" aria-label="Slash commands">/</button>
+        <button class="stopbtn" style="min-height:44px;flex:none">■ Stop</button>
+        <button class="sendbtn" style="flex:1">RUN IT</button>
+      </div>
+      <div class="safearea"></div>
+    </div>
+  </div>
+
+  <!-- turn actions bottom sheet -->
+  <div class="phone small" id="p-actions" role="img" aria-label="Phone: turn actions bottom sheet">
+    <div class="notch"></div>
+    <div class="phead"><div class="r1"><span class="pt">[transcript dimmed behind]</span></div></div>
+    <div class="sheetzone">
+      <div class="sheetdim" aria-hidden="true"></div>
+      <div class="torn" role="dialog" aria-label="Turn actions">
+        <span class="tape tl"></span>
+        <div class="sheettitle">Turn · You, 14:07 — the long-press sheet</div>
+        <button class="sheetrow">⧉&nbsp; Copy turn text</button>
+        <button class="sheetrow">⑂&nbsp; Fork conversation from here</button>
+        <button class="sheetrow danger"><span class="errx">Rewind code to here</span>&nbsp;<span class="cav">sure?</span></button>
+        <button class="sheetrow cancel">CANCEL</button>
+        <div class="safearea"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- settings full sheet -->
+  <div class="phone small" id="p-settings" role="img" aria-label="Phone: settings as full sheet">
+    <div class="notch"></div>
+    <div class="sheetzone">
+      <div class="torn" role="dialog" aria-label="Pane settings sheet" style="padding-top:20px">
+        <span class="tape tl"></span>
+        <div class="sheettitle">Settings — full marks page</div>
+        <div class="mkrow"><span class="seg"><button>Sans</button><button>Serif</button><button class="on">Mono</button></span>
+          <span class="seg"><button>Low</button><button>Medium</button><button class="on">High</button></span></div>
+        <div class="modelticket on"><span class="mt">Claude Opus 4.6</span> — current</div>
+        <div class="modelticket"><span class="mt">Sonnet 4.6</span> <span class="soon">soon</span></div>
+        <div class="punchrow" style="margin-top:8px">
+          <span class="pr"><span class="punch on"></span>Ask</span>
+          <span class="pr"><span class="punch"></span>Accept edits</span>
+          <span class="pr"><span class="punch"></span>Bypass</span>
+          <span class="pr"><span class="punch"></span>Plan</span>
+        </div>
+        <div class="togglerow" style="margin-top:10px">
+          <span class="tr"><span class="ckbx on">✓</span><span class="lb">Show thinking</span></span>
+          <span class="tr"><span class="ckbx on">✓</span><span class="lb">Show tools</span></span>
+          <span class="tr"><span class="ckbx on">✓</span><span class="lb">Timecodes</span></span>
+          <span class="tr"><span class="ckbx off">✓</span><span class="lb">Sound on done</span><span class="soon">soon</span></span>
+          <span class="tr"><span class="ckbx off">✓</span><span class="lb">Desktop notifications</span><span class="soon">soon</span></span>
+        </div>
+        <button class="sheetrow cancel" style="border-top:1.5px solid var(--ink);margin-top:8px">DONE</button>
+        <div class="safearea"></div>
+      </div>
+    </div>
+  </div>
+
+</div>
+</section>
+
+<!-- D. midnight copy desk, flanked by the remaining phone sheets -->
+<p class="cap"><b>Midnight copy desk · dark swatch</b> — same session under the desk lamp: ground #1a1813, recycled-paper ink #efe9da, the spots hold. Flanked by the settings sheet and slash sheet phones.</p>
+<section aria-label="Dark swatch and phone sheet insets">
+<h2 class="sr-only">Dark swatch with phone sheets</h2>
+<div class="pairrow">
+
+  <!-- slash menu bottom sheet -->
+  <div class="phone small" id="p-slash" role="img" aria-label="Phone: slash menu bottom sheet">
+    <div class="notch"></div>
+    <div class="phead"><div class="r1"><span class="pt">[transcript dimmed behind]</span></div></div>
+    <div class="sheetzone">
+      <div class="sheetdim" aria-hidden="true"></div>
+      <div class="torn" role="dialog" aria-label="Slash menu sheet">
+        <span class="tape tl"></span>
+        <div class="sheettitle">Menu card — single column · filter “re”</div>
+        <div class="sheetrow"><span class="cname" style="font-weight:700">/rename</span> <span class="soon">soon</span><span style="margin-left:auto;color:var(--muted);font-size:11.5px">retitle session</span></div>
+        <div class="sheetrow"><span class="cname" style="font-weight:700">/review</span> <span class="soon">soon</span><span style="margin-left:auto;color:var(--muted);font-size:11.5px">request code review</span></div>
+        <div class="sheetrow"><span class="cname" style="font-weight:700">/permissions</span><span style="margin-left:auto;color:var(--muted);font-size:11.5px">permission mode</span></div>
+        <button class="sheetrow cancel">CANCEL</button>
+        <div class="safearea"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- D. MIDNIGHT COPY DESK (dark swatch), paired beside the slash sheet -->
+  <section class="dark" aria-label="Dark mode swatch">
+<h2 class="sr-only">Dark mode swatch</h2>
+<div class="dgrid">
+  <article class="clip">
+    <span class="tape tl"></span><span class="tape tr"></span>
+    <div class="tlabel"><span class="who" style="color:#d4836b">Claude · Opus 4.6</span><span class="time">14:07</span>
+      <span class="tacts"><a href="#" style="color:#8ea7dd">copy</a><a href="#" style="color:#8ea7dd">fork</a><a href="#" style="color:#8ea7dd">rewind</a></span></div>
+    <p class="body">Found it. The heartbeat is 15s — but background tabs throttle timers to ≥60s,
+      so pings gap out and the server closes the socket.</p>
+    <details class="tool" open>
+      <summary><span class="tname">Edit</span><span class="targ" style="color:#b3ac9c">server/ws-handler.ts&nbsp;
+        <span style="color:#8ea7dd">+12</span>&nbsp;<span style="color:#e05546">−4</span></span></summary>
+      <p class="tres" style="border-top-color:rgba(239,233,218,.25)">Note to setter: ✎ any line to leave a per-line comment for the agent.</p>
+      <span class="stamp rect" style="top:-13px;font-size:9px;padding:3px 6px 2px">FILED</span>
+    </details>
+    <div class="settled" style="border-top-color:#e6e0d1;color:#b3ac9c">
+      <span class="tally" style="color:#efe9da">|||| |||| ||</span>
+      <span>thought 12s · 4 tools used · 2 files changed</span>
+      <span style="color:#8ea7dd;font-weight:700">☑ settled</span>
+    </div>
+    <span class="stamp round" style="background:#221f1a;top:auto;bottom:-30px;right:10px">READ<br>OK</span>
+  </article>
+
+  <section class="authz" aria-label="Approval requested, dark mode" style="margin-top:18px">
+    <span class="stamp rect" style="top:-19px;left:16px;right:auto">needs your stamp</span>
+    <div class="ahrow"><h3>AUTHORIZE?</h3><span class="burst">!</span>
+      <span style="font-size:13px;color:#b3ac9c">tool <b>Bash</b> wants to run:</span></div>
+    <div class="telegram">RM -RF .WORKTREES/REFRESH-* STOP</div>
+    <p style="font-size:12.5px;color:#b3ac9c;margin:0">as typed: <code>rm -rf .worktrees/refresh-*</code></p>
+    <p class="reason">Reason: Deletes 3 stale worktrees.</p>
+    <p class="warning"><span class="burst">!</span> This command permanently deletes files.</p>
+    <div class="authbtns">
+      <button class="astamp">Allow once</button>
+      <button class="astamp rect">Always allow Bash this session</button>
+      <button class="adeny"><span>Deny</span></button>
+    </div>
+  </section>
+</div>
+</section>
+</div>
+</section>
+
+<!-- ============ FOOTER — readable direction contract ============ -->
+<footer class="foot">
+  <div class="fhd">Direction contract — PASTE-UP</div>
+  <dl>
+    <dt>THESIS</dt>
+    <dd>A coding session is messy paste-up: clippings taped in, corrections stamped, decisions marked
+      in highlighter. Punk energy with production discipline — the marks are loud, but the reading
+      order is sacred.</dd>
+    <dt>OWN-WORLD</dt>
+    <dd>Turns arrive as taped clippings (kraft-tape corners, ≤0.6° rotation on tape only). Tool calls
+      are rubber-stamped file boxes (READ OK / TEST OK 14 PASSED / FILED); diffs are marked-up proofs
+      — deletions crossed in marker red, additions marker-underlined, ✎ per-line note to setter.
+      Approvals are the front page: AUTHORIZE? stamp card — circle-stamp Allow once, rect-stamp
+      Always allow, X-slash Deny.</dd>
+    <dt>STORY</dt>
+    <dd>A live debugging session, mid-stream, one destructive Bash command awaiting the editor&rsquo;s
+      stamp; two more thoughts queued over the galley.</dd>
+    <dt>FIRST VIEWPORT</dt>
+    <dd>Masthead on a marker swash, busy filing-tab edged in red, taped clippings left, pasteboard
+      rail right, galley composer bottom.</dd>
+    <dt>FORM + FINISH</dt>
+    <dd>Newsprint ground, Archivo Black display, Courier Prime typewriter body, Caveat margin notes;
+      highlighter yellow and stamp red are the only spots. Flat ≤2px ink offsets; no blur, no gradients,
+      no ambient motion. Stamps slam 180ms on action; hover wipes highlighter 120ms; reduced-motion
+      renders stamps static.</dd>
+  </dl>
+</footer>
+
+</div>
+</body>
+</html>

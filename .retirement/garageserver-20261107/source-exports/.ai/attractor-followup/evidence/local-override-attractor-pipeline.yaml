@@ -1,0 +1,97 @@
+bundle:
+  name: attractor-pipeline
+  version: 0.1.0
+  description: >
+    Multi-provider Attractor pipeline. The PRIMARY entry point for running
+    Attractor pipelines where the model stylesheet routes different nodes
+    to different providers (Anthropic, OpenAI, Gemini).
+
+    Provide a DOT graph via orchestrator config:
+      config.dot_file:   path to a .dot file
+      config.dot_source: inline DOT digraph string
+
+includes:
+  - bundle: attractor:behaviors/attractor-core
+
+# --- Pipeline orchestrator provider (used for orchestrator reasoning) -------
+providers:
+  - module: provider-anthropic
+    source: git+https://github.com/microsoft/amplifier-module-provider-anthropic@main
+    config:
+      default_model: claude-sonnet-4-6
+
+# --- Pipeline orchestrator session ------------------------------------------
+session:
+  orchestrator:
+    module: loop-pipeline
+    source: git+https://github.com/microsoft/amplifier-bundle-attractor@main#subdirectory=modules/loop-pipeline
+    config:
+      # Maps llm_provider values in DOT node attributes to agent names.
+      # The model stylesheet sets llm_provider per node; the engine looks
+      # up this map to spawn the correct child agent session.
+      profiles:
+        anthropic: attractor-agent-anthropic
+        openai: attractor-agent-openai
+        gemini: attractor-agent-gemini
+      # User must provide one of:
+      #   dot_file:   ./path/to/pipeline.dot
+      #   dot_source: "digraph { ... }"
+  context:
+    module: context-simple
+    source: git+https://github.com/microsoft/amplifier-module-context-simple@main
+
+# --- Pipeline orchestrator tools (filesystem access for the orchestrator) ----
+tools:
+  - module: tool-filesystem
+    source: git+https://github.com/microsoft/amplifier-module-tool-filesystem@main
+  - module: tool-bash
+    source: git+https://github.com/microsoft/amplifier-module-tool-bash@main
+    config:
+      timeout: 120
+  - module: tool-search
+    source: git+https://github.com/microsoft/amplifier-module-tool-search@main
+  - module: tool-report-outcome
+    source: git+https://github.com/microsoft/amplifier-bundle-attractor@main#subdirectory=modules/tool-report-outcome
+
+# --- Child agents (one per provider, spawned by the pipeline engine) ---------
+# IMPORTANT: inline session.orchestrator is REQUIRED here.  The spawn capability merges
+# the agent's session: key onto the parent config; without an explicit session.orchestrator
+# the child inherits the parent's loop-pipeline orchestrator and recurses.
+agents:
+  # Inline session.orchestrator is REQUIRED (passes the loop-pipeline recursion
+  # guard, which checks orchestrator.module). The Layer-1 base prompt is supplied
+  # by loop-agent's provider default (context/system-<provider>.md), so no
+  # per-agent system_prompt_file is needed here.
+  attractor-agent-anthropic:
+    description: >
+      Anthropic coding agent (Claude Code aligned).
+      Uses edit_file with old_string/new_string, 120s shell timeout.
+    session:
+      orchestrator:
+        module: loop-agent
+        source: git+https://github.com/microsoft/amplifier-bundle-attractor@main#subdirectory=modules/loop-agent
+        config:
+          max_tool_rounds_per_input: 50
+          default_command_timeout_ms: 120000
+  attractor-agent-openai:
+    description: >
+      OpenAI coding agent (codex-rs aligned).
+      Uses native apply_patch (Responses API built-in), restricted filesystem, 10s shell timeout.
+    session:
+      orchestrator:
+        module: loop-agent
+        source: git+https://github.com/microsoft/amplifier-bundle-attractor@main#subdirectory=modules/loop-agent
+        config:
+          max_tool_rounds_per_input: 50
+          default_command_timeout_ms: 10000
+  attractor-agent-gemini:
+    description: >
+      Gemini coding agent (gemini-cli aligned).
+      Uses edit_file, includes web tools for grounding.
+    session:
+      orchestrator:
+        module: loop-agent
+        source: git+https://github.com/microsoft/amplifier-bundle-attractor@main#subdirectory=modules/loop-agent
+        config:
+          max_tool_rounds_per_input: 50
+          default_command_timeout_ms: 10000

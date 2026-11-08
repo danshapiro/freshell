@@ -1,0 +1,715 @@
+<!DOCTYPE html>
+<html lang="en">
+<!--
+  DIRECTION CONTRACT — LEDGER (≤150 words)
+  THESIS — A coding session is a ledger: entries are posted, audited, balanced. Print discipline meets instrument-grade data; nothing hidden, nothing decorative.
+  OWN-WORLD — Warm paper, letterpress ink, hairline rules, tabular numerals, marginalia. Turns are double-ruled entries with №, small-caps posted-by, and a 24h timecode. Tool calls are enumerated sub-entries (i, ii, iii) settling into one sum line: "— balanced". Session facts live in the right margin as accountant's notes tied by superscript leaders.
+  STORY — Mid-debug: a diff inked, tests green, an ochre correction slip awaiting countersign, two follow-ups queued.
+  FIRST VIEWPORT — Lifted index tab, entry № 4 streaming over a breathing vermilion baseline; the margin carries register, diffs, checkpoints, usage, threads.
+  FORM+FINISH — Spectral prose, Inconsolata data; paper #f7f3ec; one vermilion accent; ochre for awaiting judgement.
+-->
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ledger — Design 1 of 6 · fresh-agent UX study</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inconsolata:wght@400;500;600&amp;family=Spectral:ital,wght@0,300;0,400;0,500;0,600;0,700;1,300;1,400;1,500&amp;display=swap" rel="stylesheet">
+<style>
+/* ================= LEDGER — material tokens ================= */
+:root{
+  --paper:#f7f3ec;      /* warm paper ground */
+  --paper2:#efe9dd;     /* second layer — rails, slips, wells */
+  --ink:#211d19;        /* letterpress ink */
+  --muted:#6b6156;
+  --accent:#c33d21;     /* vermilion — actions, selection, busy */
+  --ochre:#a86f00;      /* waiting / approval */
+  --iron:#55504a;       /* error — iron-gall */
+  --green:#3d6b4f;      /* posted / ok */
+  --clay:#c15a3c;       /* freshclaude identity hue */
+  --hair:rgba(33,29,25,.16);
+  --hair2:rgba(33,29,25,.36);
+  --vt:rgba(195,61,33,.10);
+  --serif:"Spectral",Georgia,"Times New Roman",serif;
+  --mono:"Inconsolata",ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+}
+.night{
+  --paper:#191512;      /* night ledger ground */
+  --paper2:#231c16;
+  --ink:#ece2cf;
+  --muted:#a3937d;
+  --accent:#e06a4d;
+  --ochre:#d1993c;
+  --iron:#8f8578;
+  --green:#83b392;
+  --clay:#d67c5f;
+  --hair:rgba(236,226,207,.16);
+  --hair2:rgba(236,226,207,.36);
+  --vt:rgba(224,106,77,.14);
+}
+/* ================= base + browser surfaces ================= */
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:#ddd5c4;color:#4a4437;
+  font:400 15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;padding:0 0 90px}
+code,kbd,pre,tt{font-family:var(--mono)}
+a{color:inherit;text-underline-offset:3px;text-decoration-color:rgba(195,61,33,.45)}
+button{font:inherit;color:inherit;background:none;border:none;padding:0;cursor:pointer;text-align:left}
+summary{list-style:none;cursor:pointer}
+summary::-webkit-details-marker{display:none}
+.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+::selection{background:var(--vt);color:var(--ink)}
+input,textarea,[contenteditable]{caret-color:var(--accent)}
+*{scrollbar-width:thin;scrollbar-color:var(--hair2) transparent}
+*::-webkit-scrollbar{width:8px;height:8px}
+*::-webkit-scrollbar-thumb{background:var(--hair2);border-radius:8px}
+*::-webkit-scrollbar-track{background:transparent}
+:is(a,button,summary,[tabindex]):focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:2px}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+/* ================= page chrome: captions, masthead ================= */
+.pg{max-width:1468px;margin:0 auto;padding:0 14px}
+.cap{font:500 11px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;color:#787162;margin:36px 0 9px;letter-spacing:.01em}
+.cap b{color:#5f594b;font-weight:600}
+.rows{display:flex;gap:34px;flex-wrap:wrap;justify-content:center;align-items:flex-start}
+.mast{background:var(--paper);border-bottom:3px double var(--hair2);color:var(--ink);font-family:var(--serif)}
+.mast-in{max-width:1420px;margin:0 auto;padding:46px 24px 24px;display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:22px}
+.mast h1{font:300 italic 58px/1.02 var(--serif);letter-spacing:-.015em;margin:0}
+.mast h1 .mark{font:500 15px/1 var(--mono);font-style:normal;color:var(--accent);vertical-align:34px;letter-spacing:0}
+.mast-th{font:400 italic 15.5px/1.55 var(--serif);color:var(--muted);max-width:44ch;margin:10px 0 0}
+.utilbar{background:var(--paper);border-bottom:1px solid var(--hair)}
+.util-in{max-width:1420px;margin:0 auto;padding:7px 24px;display:flex;gap:10px;align-items:baseline;
+  font:400 11px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;color:#787162}
+.util-in a{color:#5f594b}
+.util-in .sp{margin-left:auto}
+/* ================= app frame ================= */
+.frame{background:var(--paper);color:var(--ink);font-family:var(--serif);
+  border:1px solid var(--hair2);box-shadow:0 22px 46px -30px rgba(33,29,25,.55)}
+.desk{width:1440px;max-width:100%;margin:0 auto;position:relative}
+/* tab strip — ledger index tabs, active tab lifted */
+.tabs{display:flex;align-items:flex-end;gap:3px;background:var(--paper2);border-bottom:1px solid var(--hair2);padding:9px 14px 0}
+.tab{display:inline-flex;align-items:center;gap:7px;padding:9px 15px 10px;white-space:nowrap;
+  font:400 12.5px/1 var(--serif);color:var(--muted);
+  border:1px solid transparent;border-bottom:none;border-radius:5px 5px 0 0;position:relative;top:1px}
+.tab.on{background:var(--paper);border-color:var(--hair2);color:var(--ink);border-bottom:1px solid var(--paper);font-weight:500}
+.tab .bdot{width:6px;height:6px;border-radius:50%;background:var(--accent);flex:0 0 auto}
+.tab .gdot{width:8px;height:8px;border-radius:50%;background:var(--green);flex:0 0 auto;box-shadow:inset 0 0 0 2px color-mix(in srgb,var(--green) 55%,var(--paper))}
+.tabadd{width:28px;height:28px;margin-bottom:4px;border:1px dashed var(--hair2);border-radius:4px;
+  color:var(--muted);font:400 15px/1 var(--serif);display:inline-grid;place-items:center}
+/* pane header — identity group vs action group */
+.phead{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--hair)}
+.prov{display:inline-flex;align-items:center;gap:7px;padding:5px 9px;border-radius:3px;
+  border:1px solid color-mix(in srgb,var(--clay) 45%,transparent);
+  background:color-mix(in srgb,var(--clay) 9%,var(--paper));font:500 12.5px/1 var(--serif);color:var(--ink)}
+.prov b{color:var(--clay);font-weight:600;font-style:normal}
+.pttl{font:600 15px/1.2 var(--serif);color:var(--ink);margin:0}
+.live{display:inline-flex;align-items:center;gap:6px;color:var(--accent);
+  font:600 11.5px/1 var(--serif);font-variant-caps:all-small-caps;letter-spacing:.08em}
+.live i{width:6px;height:6px;border-radius:50%;background:var(--accent)}
+.cost{font:500 12px/1 var(--mono);font-variant-numeric:tabular-nums;color:var(--ink);
+  border:1px solid var(--hair2);border-radius:3px;padding:4px 7px;background:var(--paper)}
+.pacts{margin-left:auto;display:flex;gap:6px;border-left:1px solid var(--hair);padding-left:12px}
+.ib{position:relative;min-width:30px;height:30px;padding:0 6px;border:1px solid var(--hair);border-radius:3px;
+  display:inline-grid;place-items:center;font:400 13px/1 var(--serif);color:var(--muted);background:var(--paper)}
+.ib:hover{border-color:var(--hair2);color:var(--ink)}
+.ib .bdg{position:absolute;top:-7px;right:-7px;min-width:15px;padding:2px 4px;border-radius:8px;
+  background:var(--accent);color:var(--paper);font:600 9.5px/1 var(--mono);text-align:center}
+/* status line */
+.sline{display:flex;align-items:center;gap:9px;flex-wrap:wrap;padding:7px 16px;
+  border-bottom:1px solid var(--hair);background:color-mix(in srgb,var(--paper2) 55%,var(--paper));
+  font:400 12px/1.5 var(--mono);font-variant-numeric:tabular-nums;color:var(--muted)}
+.sline b{color:var(--ink);font-weight:500}
+.sline .sep{color:var(--hair2)}
+.gauge{display:inline-block;width:64px;height:6px;border:1px solid var(--hair2);background:var(--paper);
+  position:relative;vertical-align:0;margin-right:5px}
+.gauge i{position:absolute;top:1px;bottom:1px;left:1px;background:var(--ink)}
+/* body split — transcript + margin rail */
+.split{display:flex;align-items:stretch}
+.tcol{flex:1 1 auto;min-width:0;padding:20px 30px 0;position:relative;display:flex;flex-direction:column}
+.measure{width:100%;max-width:68ch;margin:0 auto;position:relative}
+.jbwrap{text-align:center;margin:0 0 2px}
+.jb{display:inline-flex;align-items:center;gap:6px;font:500 11px/1 var(--mono);color:var(--muted);
+  border:1px solid var(--hair);border-radius:10px;padding:4px 10px;background:var(--paper)}
+.jb:hover{color:var(--accent);border-color:var(--accent)}
+/* ledger entries — double hairline, hanging entry number */
+.entry{border-top:3px double var(--hair2);padding:16px 0 14px;position:relative}
+.eno{position:absolute;right:calc(100% + 20px);top:19px;text-align:right;white-space:nowrap;
+  font:400 10.5px/1.5 var(--mono);color:var(--muted)}
+.eno b{display:block;font:600 13px/1.2 var(--mono);color:var(--ink);font-weight:600}
+.ehead{display:flex;align-items:baseline;gap:10px;margin-bottom:6px}
+.by{font:600 13.5px/1 var(--serif);font-variant-caps:all-small-caps;letter-spacing:.07em;color:var(--ink)}
+.by .mdl{color:var(--muted);font-weight:500}
+.at{font:400 11.5px/1 var(--mono);color:var(--muted);font-variant-numeric:tabular-nums}
+.ldr{font:600 10px/1 var(--mono);color:var(--accent);vertical-align:3px;letter-spacing:0}
+.kebab{margin-left:auto;color:var(--muted);font:600 13px/1 var(--serif);padding:2px 7px;border:1px solid transparent;border-radius:3px}
+.kebab:hover{border-color:var(--hair);color:var(--ink)}
+.eacts{display:flex;gap:14px;margin:-2px 0 8px;font:400 10.5px/1 var(--mono);color:var(--muted)}
+.eacts button{padding:2px 0}
+.eacts button:hover{color:var(--accent)}
+.ebody p{font:400 15px/1.62 var(--serif);color:var(--ink);margin:0 0 10px;max-width:64ch}
+.ebody p:last-child{margin-bottom:0}
+.caret{display:inline-block;width:2px;height:.95em;background:var(--accent);vertical-align:-.13em;margin-left:2px}
+.baseline{position:absolute;left:0;right:0;bottom:-2px;height:2px;background:var(--accent);transform-origin:left center;opacity:.9}
+/* thinking block */
+.think{margin:12px 0 12px 2px;border-left:1px solid var(--hair2);padding:1px 0 1px 14px}
+.think summary{display:flex;align-items:baseline;gap:8px;font:500 12.5px/1.5 var(--mono);color:var(--ink);font-variant-numeric:tabular-nums}
+.mk{font:600 11px/1 var(--mono);color:var(--accent);width:12px;flex:0 0 auto}
+.mk::before{content:"+"}
+details[open] .mk::before{content:"–"}
+.think .tbody{font:400 italic 13.5px/1.55 var(--serif);color:var(--muted);margin:5px 0 4px;max-width:60ch}
+/* tool calls — enumerated sub-entries */
+.tools{margin:12px 0 2px}
+.tool{border-top:1px solid var(--hair);padding:7px 0 7px 34px;position:relative}
+.tools>.tool:first-child,summary.tool{border-top-color:var(--hair)}
+.tool .rn{position:absolute;left:2px;top:9px;width:22px;font:500 11.5px/1.2 var(--mono);color:var(--muted)}
+.trow{display:flex;align-items:baseline;gap:8px}
+.st{flex:0 0 auto;width:14px;text-align:center;font:600 12px/1 var(--mono)}
+.st.ok{color:var(--green)}
+.tn{font:600 12.5px/1.4 var(--mono);color:var(--ink)}
+.tg{font:400 12px/1.4 var(--mono);color:var(--muted)}
+.tm{margin-left:auto;font:500 11.5px/1.4 var(--mono);color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
+.tm .dp{color:var(--green)}.tm .dn{color:var(--accent)}
+details.tool{padding-left:34px}
+details.tool>summary{padding-left:0}
+details.tool .rn{top:9px}
+.tout{margin:7px 0 8px;padding:7px 12px;background:var(--paper2);border:1px solid var(--hair);
+  font:400 12px/1.6 var(--mono);color:var(--ink);font-variant-numeric:tabular-nums}
+.tout .okc{color:var(--green);font-weight:600}
+/* diff — red-ink struck old, inked new */
+.diff{margin:8px 0 10px;border:1px solid var(--hair2);background:var(--paper)}
+.dh{display:flex;justify-content:space-between;gap:10px;padding:5px 10px;border-bottom:1px solid var(--hair);
+  font:500 10.5px/1.5 var(--mono);color:var(--muted)}
+.dl{display:grid;grid-template-columns:36px 14px 1fr 26px;align-items:center;min-height:22px}
+.dl .g{font:400 10.5px/1.6 var(--mono);color:var(--muted);text-align:right;padding-right:9px;user-select:none}
+.dl .s{font:600 11.5px/1.6 var(--mono);text-align:center;user-select:none}
+.dl code{font:400 12.5px/1.6 var(--mono);white-space:pre;color:var(--ink)}
+.dl .x{color:var(--muted);opacity:.55;font-size:12px;padding:1px 4px}
+.dl .x:hover{opacity:1;color:var(--accent)}
+.dl.del{background:rgba(195,61,33,.05)}
+.dl.del code{color:var(--accent);text-decoration:line-through;text-decoration-color:rgba(195,61,33,.75)}
+.dl.del .s{color:var(--accent)}
+.dl.add{background:rgba(61,107,79,.06)}
+.dl.add .s{color:var(--green)}
+/* settled sum line */
+.sum{display:flex;align-items:center;gap:12px;margin:16px 0 4px}
+.sum i{flex:1;border-top:1px solid var(--hair)}
+.sum span{font:500 11.5px/1 var(--mono);color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+.sum b{color:var(--green);font-weight:600}
+/* attachments */
+.atches{display:flex;gap:7px;margin:0 0 9px;flex-wrap:wrap}
+.atc{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--hair2);border-radius:3px;
+  padding:4px 9px 4px 5px;font:500 11.5px/1 var(--mono);color:var(--ink);background:var(--paper)}
+.atc .th{width:26px;height:19px;border:1px solid var(--hair2);background:var(--paper2);display:inline-grid;place-items:center}
+.atc svg{display:block}
+/* approval — correction slip, ochre rule */
+.slip{margin:22px 0;background:var(--paper2);border:1px solid var(--hair2);border-top:5px double var(--ochre);
+  padding:13px 18px 16px;position:relative}
+.slip .sh{display:flex;align-items:baseline;gap:10px;margin-bottom:2px}
+.slip .stt{font:600 12.5px/1.4 var(--serif);font-variant-caps:all-small-caps;letter-spacing:.08em;color:var(--ochre)}
+.slip .sat{margin-left:auto;font:400 11px/1 var(--mono);color:var(--muted)}
+.slip .swarn-tool{font:400 12.5px/1.5 var(--serif);color:var(--muted)}
+.slip .swarn-tool b{color:var(--ink);font-family:var(--mono);font-size:12px}
+.slip .cmd{display:block;background:var(--paper);border:1px solid var(--hair2);padding:8px 12px;margin:9px 0;
+  font:600 13.5px/1.4 var(--mono);color:var(--ink)}
+.slip .why{font:400 italic 13.5px/1.5 var(--serif);color:var(--ink);margin:0 0 4px}
+.slip .warn{display:flex;gap:8px;align-items:baseline;font:400 12.5px/1.5 var(--serif);color:var(--ink);margin:0 0 13px}
+.slip .warn b{color:var(--ochre);font-weight:600;font-variant-caps:all-small-caps;letter-spacing:.07em}
+.sbtns{display:flex;gap:8px;flex-wrap:wrap}
+.btn{min-height:34px;padding:8px 14px;border:1px solid var(--hair2);border-radius:3px;background:var(--paper);
+  font:500 12.5px/1 var(--serif);color:var(--ink);display:inline-flex;align-items:center;justify-content:center}
+.btn:hover{border-color:var(--ink)}
+.btn.pri{background:var(--accent);border-color:var(--accent);color:var(--paper)}
+.btn.ses{border-color:var(--ochre)}
+.btn.ses:hover{border-color:var(--ochre);background:color-mix(in srgb,var(--ochre) 7%,var(--paper))}
+.btn.deny{color:var(--muted);border-color:var(--hair)}
+/* question — query margin note pulled into the measure */
+.query{margin:22px 0;padding:2px 0 4px 22px;border-left:1px solid var(--hair2)}
+.query .qh{font:600 11.5px/1 var(--serif);font-variant-caps:all-small-caps;letter-spacing:.09em;color:var(--muted);margin-bottom:5px}
+.query .qh .at{margin-left:8px}
+.query .qq{font:500 15px/1.55 var(--serif);color:var(--ink);margin:0 0 9px;max-width:56ch}
+.opt{display:flex;align-items:center;gap:11px;padding:5px 0;font:400 14px/1.4 var(--serif);color:var(--ink)}
+.cbx{flex:0 0 15px;width:15px;height:15px;border:1.5px solid var(--ink);border-radius:2px;position:relative;transform:rotate(-1.4deg)}
+.opt.sel .cbx::after{content:"✓";position:absolute;left:1px;top:-5px;font:600 15px/1 var(--serif);color:var(--accent);transform:rotate(4deg)}
+.opt.sel{font-weight:500}
+.opt .gapn{font-family:var(--mono);font-size:12.5px;color:var(--muted)}
+.other{display:flex;align-items:baseline;gap:11px;margin-top:4px;font:400 14px/1.4 var(--serif);color:var(--muted)}
+.other .oline{flex:0 0 190px;border-bottom:1px dotted var(--hair2)}
+.query .btn{margin-top:12px}
+/* compaction, queue, web card, new pill */
+.cmp{display:flex;align-items:center;gap:12px;margin:22px 0;color:var(--muted)}
+.cmp i{flex:1;border-top:1px solid var(--hair)}
+.cmp span{font:400 11.5px/1.4 var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+.queue{margin:20px 0 0;border:1px dashed var(--hair2);padding:9px 14px 10px;
+  background:color-mix(in srgb,var(--paper2) 45%,var(--paper))}
+.queue .qh{font:600 11px/1 var(--serif);font-variant-caps:all-small-caps;letter-spacing:.09em;color:var(--muted);margin-bottom:5px}
+.qi{display:flex;align-items:baseline;gap:9px;padding:3px 0;font:400 13px/1.4 var(--serif);color:var(--ink)}
+.qi .qn{font:500 10.5px/1 var(--mono);color:var(--muted)}
+.qi button{margin-left:auto;color:var(--muted);font-size:12px;padding:1px 4px}
+.qi button:hover{color:var(--accent)}
+.web{margin:12px 0 2px;padding-left:34px;position:relative}
+.web .rn{position:absolute;left:2px;top:9px}
+.webs{margin:4px 0 0 22px;display:block;font:400 12.5px/1.7 var(--serif);color:var(--muted)}
+.webs a{color:var(--ink);font-weight:500}
+.npwrap{display:flex;justify-content:flex-end;padding:14px 2px 0}
+.newpill{display:inline-flex;align-items:center;gap:6px;font:600 11px/1 var(--mono);color:var(--accent);
+  border:1px solid var(--accent);border-radius:11px;padding:5px 11px;background:var(--paper)}
+/* composer — the writing plate */
+.composer{border-top:1px solid var(--hair2);background:var(--paper);padding:13px 0 13px;position:sticky;bottom:0}
+.carea{max-width:68ch;margin:0 auto}
+.cline{font:400 14px/1.6 var(--serif);color:var(--ink);min-height:38px;padding:3px 0}
+.cbar{display:flex;align-items:center;gap:8px;margin-top:7px}
+.stopb{border:1px solid var(--accent);color:var(--accent);border-radius:3px;padding:7px 11px;font:500 12px/1 var(--serif)}
+.post{margin-left:auto;color:var(--accent);font:600 14px/1 var(--serif);padding:7px 2px}
+.post:hover{text-decoration:underline;text-underline-offset:3px}
+.chint{margin:8px 0 0;text-align:right;font:400 10.5px/1.6 var(--mono);color:var(--muted)}
+/* margin rail — accountant's notes */
+.rail{flex:0 0 300px;border-left:1px solid var(--hair);padding:20px 22px 30px;
+  background:color-mix(in srgb,var(--paper2) 40%,var(--paper))}
+.rsec{padding:12px 0;border-top:1px solid var(--hair)}
+.rsec:first-child{border-top:none;padding-top:2px}
+.rh{display:flex;align-items:baseline;gap:7px;margin:0 0 7px;
+  font:600 11.5px/1 var(--serif);font-variant-caps:all-small-caps;letter-spacing:.1em;color:var(--ink)}
+.rh .ldr{vertical-align:0}
+.rr{display:flex;align-items:baseline;gap:8px;padding:2.5px 0;font:400 12px/1.45 var(--mono);
+  color:var(--muted);font-variant-numeric:tabular-nums}
+.rr .k{color:var(--ink)}
+.rr .va{margin-left:auto;font:500 11px/1.4 var(--serif);color:var(--accent);white-space:nowrap}
+.rr .cm{font-size:11px;color:var(--muted)}
+.rr .dp{color:var(--green)}.rr .dn{color:var(--accent)}
+/* diff notes — two-line accounting rows: full path (breaks only at slashes), then the tally below */
+.rr2{display:flex;flex-direction:column;gap:0;padding:4px 0 6px;border-bottom:1px dotted var(--hair)}
+.rr2:last-child{border-bottom:none;padding-bottom:2px}
+.rr2 .pname{font-size:11.5px;line-height:1.5;word-break:break-word;overflow-wrap:break-word}
+.rr2 .rsub{display:flex;align-items:baseline;gap:9px;padding-left:12px;font-size:11.5px;line-height:1.5}
+.cps{position:relative;padding-left:15px;margin:2px 0}
+.cps::before{content:"";position:absolute;left:4px;top:7px;bottom:7px;border-left:1px solid var(--hair2)}
+.cp{position:relative;display:flex;align-items:baseline;gap:8px;padding:3px 0;font:400 12px/1.45 var(--mono);color:var(--muted);font-variant-numeric:tabular-nums}
+.cp::before{content:"";position:absolute;left:-14.5px;top:8px;width:5px;height:5px;border-radius:50%;
+  background:var(--paper);border:1.5px solid var(--muted)}
+.cp .k{color:var(--ink)}
+.cp .va{margin-left:auto;font:500 11px/1.4 var(--serif);color:var(--accent)}
+.rfold{margin:14px 0 0;padding-top:10px;border-top:1px solid var(--hair);
+  font:400 italic 11.5px/1.55 var(--serif);color:var(--muted)}
+/* soon stamp */
+.soon{display:inline-block;font:600 8.5px/1 var(--mono);letter-spacing:.12em;color:var(--accent);
+  border:1px solid var(--accent);border-radius:2px;padding:2.5px 3.5px 1.5px;vertical-align:1px;margin-left:6px;white-space:nowrap}
+/* ================= desktop insets ================= */
+.inset{background:var(--paper);color:var(--ink);font-family:var(--serif);
+  border:1px solid var(--hair2);box-shadow:0 16px 34px -24px rgba(33,29,25,.5)}
+.idxhead{display:flex;align-items:center;gap:7px;padding:9px 14px;border-bottom:3px double var(--hair2);
+  font-size:13px;min-height:38px}
+.keyh{margin-left:auto;font:400 10px/1 var(--mono);color:var(--muted);border:1px solid var(--hair);
+  border-radius:2px;padding:2.5px 5px;white-space:nowrap}
+.irow .keyh{margin-left:8px}
+.igroup{padding:7px 0 9px;border-bottom:1px solid var(--hair)}
+.igroup h4{margin:0;padding:3px 14px 6px;font:600 10.5px/1 var(--serif);font-variant-caps:all-small-caps;
+  letter-spacing:.1em;color:var(--muted)}
+.irow{display:flex;align-items:baseline;gap:8px;padding:5px 14px;font-size:12.5px;line-height:1.35}
+.irow:hover{background:color-mix(in srgb,var(--paper2) 55%,var(--paper))}
+.irow.isel{background:var(--vt)}
+.ic{font:600 12px/1.4 var(--mono);color:var(--ink);white-space:nowrap}
+.ic b{color:var(--accent);font-weight:600}
+.il{flex:1;min-width:14px;border-bottom:1px dotted var(--hair2);height:.8em}
+.idesc{font:400 12px/1.35 var(--serif);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:250px}
+/* settings popover — tipped-in slip */
+.spop{position:relative}
+.snotch{position:absolute;top:-13px;right:34px;width:14px;height:14px;background:var(--paper);
+  border-left:1px solid var(--hair2);border-top:1px solid var(--hair2);transform:rotate(45deg)}
+.ssec{padding:10px 14px;border-bottom:1px solid var(--hair)}
+.slabel{display:block;margin-bottom:7px;font:600 10.5px/1 var(--serif);font-variant-caps:all-small-caps;
+  letter-spacing:.1em;color:var(--muted)}
+.seg{display:inline-flex;border:1px solid var(--hair2);border-radius:3px;overflow:hidden}
+.seg.wrap{flex-wrap:wrap;width:100%}
+.seg.wrap .sg{flex:1 0 40%}
+.sg{padding:6px 12px;font:400 12px/1 var(--serif);color:var(--muted);border-left:1px solid var(--hair);background:var(--paper)}
+.sg:first-child{border-left:none}
+.seg.wrap .sg:nth-child(3){border-left:none}
+.sg.on{background:var(--paper2);color:var(--ink);font-weight:600;box-shadow:inset 0 -2px 0 0 var(--accent)}
+.mrow{display:flex;align-items:baseline;gap:8px;padding:4px 0;font:400 13.5px/1.4 var(--serif);color:var(--ink)}
+.mrow .mk2{width:14px;font:600 11px/1 var(--mono);color:var(--accent)}
+.trow2{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:5px 0;
+  font:400 13px/1.4 var(--serif);color:var(--ink)}
+.tog{position:relative;display:inline-block;width:29px;height:16px;border:1px solid var(--hair2);border-radius:999px;
+  background:var(--paper2);flex:0 0 auto}
+.tog i{position:absolute;top:2px;left:2px;width:10px;height:10px;border-radius:50%;background:var(--muted)}
+.tog.on{border-color:var(--accent);background:var(--vt)}
+.tog.on i{left:15px;background:var(--accent)}
+.arow2{display:flex;align-items:baseline;justify-content:space-between;padding:5px 0;
+  font:400 13px/1.4 var(--serif);color:var(--ink)}
+/* ================= phone frame ================= */
+.phn{flex:0 0 auto;width:390px;height:844px;display:flex;flex-direction:column;overflow:hidden;
+  background:var(--paper);color:var(--ink);font-family:var(--serif);
+  border:1px solid var(--hair2);box-shadow:0 22px 46px -30px rgba(33,29,25,.55)}
+.ptabs{display:flex;gap:6px;overflow-x:auto;padding:8px 10px 0;background:var(--paper2);
+  border-bottom:1px solid var(--hair2);scrollbar-width:none}
+.ptabs::-webkit-scrollbar{display:none}
+.ptab{flex:0 0 auto;padding:7px 12px 8px;font:400 11.5px/1 var(--serif);color:var(--muted);white-space:nowrap;
+  border:1px solid transparent;border-bottom:none;border-radius:5px 5px 0 0;position:relative;top:1px;
+  display:inline-flex;align-items:center;gap:6px}
+.ptab.on{background:var(--paper);border-color:var(--hair2);color:var(--ink);border-bottom:1px solid var(--paper);font-weight:500}
+.phd{display:flex;align-items:center;gap:8px;padding:5px 8px;border-bottom:1px solid var(--hair)}
+.phd .pttl{font-size:13.5px;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.phd .ib{min-width:30px;height:30px;font-size:13px}
+.phd .ib:last-child{min-width:44px;height:44px;font-size:15px}
+.pchips{display:flex;gap:6px;overflow-x:auto;padding:6px 10px;border-bottom:1px solid var(--hair);
+  scrollbar-width:none;background:color-mix(in srgb,var(--paper2) 55%,var(--paper))}
+.pchips::-webkit-scrollbar{display:none}
+.pchip{flex:0 0 auto;display:inline-flex;align-items:center;gap:5px;padding:4px 8px;border:1px solid var(--hair);
+  border-radius:3px;background:var(--paper);font:400 10.5px/1.4 var(--mono);color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+.pchip b{color:var(--ink);font-weight:500}
+.pchip .gauge{width:34px;height:5px}
+.pbody{flex:1;overflow:hidden;position:relative;display:flex;flex-direction:column;gap:0;
+  padding:10px 13px 6px;font-size:13px}
+.pentry{border-top:3px double var(--hair2);padding:8px 0 7px;position:relative}
+.pentry:first-child{border-top:none}
+.pehead{display:flex;align-items:baseline;gap:7px;margin-bottom:4px;
+  font:400 10.5px/1.2 var(--mono);color:var(--muted);font-variant-numeric:tabular-nums}
+.pehead .by{font:600 12px/1 var(--serif);font-variant-caps:all-small-caps;letter-spacing:.07em;color:var(--ink)}
+.pehead .at{margin-left:auto}
+.pentry p{margin:0 0 7px;font:400 13px/1.55 var(--serif);color:var(--ink)}
+.pentry p:last-child{margin-bottom:0}
+/* margin notes collapse to footnote rows */
+.foot{display:flex;align-items:baseline;gap:7px;margin:3px 0 0 16px;padding-left:9px;border-left:1px solid var(--hair2);
+  font:400 10.5px/1.5 var(--mono);color:var(--muted);font-variant-numeric:tabular-nums}
+.foot .ldr{vertical-align:0}
+.foot .va{margin-left:auto;color:var(--accent);font:500 10.5px/1 var(--serif)}
+/* compact phone diff — horizontal code scroll */
+.pdiff{border:1px solid var(--hair2);background:var(--paper);margin:2px 0 4px;overflow-x:auto}
+.pdiff .dl{min-width:max-content;min-height:20px}
+.pdiff code{white-space:pre;font-size:11.5px}
+/* phone slip — full-width stacked ≥44px buttons */
+.pslip{margin:8px 0 0;padding:10px 12px 11px;background:var(--paper2);border:1px solid var(--hair2);border-top:5px double var(--ochre)}
+.pslip .cmd{margin:5px 0;padding:6px 10px}
+.pslip .why,.pslip .warn{font-size:12px;margin:0 0 4px}
+.pslip .warn{margin-bottom:9px}
+.pslip .sbtns{flex-direction:column;gap:6px}
+.pslip .btn{width:100%;min-height:44px;font-size:13px}
+/* phone composer */
+.pcomp{border-top:1px solid var(--hair2);background:var(--paper);padding:9px 12px 0}
+.pcline{font:400 13px/1.5 var(--serif);min-height:24px;padding:2px 0 6px}
+.pbar{display:flex;align-items:center;gap:6px;min-height:44px}
+.pbar .ib{min-width:44px;height:44px;font-size:15px}
+.pbar .post{font-size:13.5px;min-height:44px;padding:0 8px}
+.safe{padding:6px 0 18px}
+.homebar{width:120px;height:4px;border-radius:2px;background:var(--hair2);margin:0 auto}
+/* phone sheets — bottom, deckle/torn top edge */
+.psheet{position:relative;display:flex;flex-direction:column}
+.psheet .scrim{flex:1;background:rgba(33,29,25,.30)}
+.sheet{background:var(--paper);border-top:none;box-shadow:0 -14px 30px -18px rgba(33,29,25,.5);
+  padding:0 0 8px;max-height:82%;overflow:hidden;display:flex;flex-direction:column}
+.deckle{height:9px;margin-top:-9px;
+  background:linear-gradient(-45deg,var(--paper) 5px,transparent 5.5px) 0 5px,
+             linear-gradient( 45deg,var(--paper) 5px,transparent 5.5px) 0 5px;
+  background-repeat:repeat-x;background-size:10px 10px;position:relative;z-index:2}
+.sheet.full{max-height:none}
+.shead{padding:11px 16px 8px;border-bottom:1px solid var(--hair)}
+.shead .st{display:flex;align-items:baseline;gap:8px;font:600 12.5px/1 var(--serif);
+  font-variant-caps:all-small-caps;letter-spacing:.08em;color:var(--ink)}
+.shead .ss{margin-top:4px;font:400 11px/1.4 var(--mono);color:var(--muted)}
+.srow{display:flex;align-items:center;gap:10px;width:100%;min-height:48px;padding:12px 16px;
+  font:400 14.5px/1.3 var(--serif);color:var(--ink);border-bottom:1px solid var(--hair)}
+.srow .sub{margin-left:auto;font:400 10.5px/1 var(--mono);color:var(--muted)}
+.srow.dest{color:var(--accent);font-weight:500}
+.srow.cancel{justify-content:center;color:var(--muted);border-bottom:none;min-height:50px;
+  background:color-mix(in srgb,var(--paper2) 55%,var(--paper))}
+.srow:hover{background:color-mix(in srgb,var(--paper2) 55%,var(--paper))}
+/* slash sheet inherits igroup/irow at phone size */
+.sheet .igroup h4{padding-left:16px}
+.sheet .irow{padding:8px 16px;min-height:44px;align-items:center}
+.sheet .idesc{font-size:12.5px;max-width:190px}
+.sheet .sscroll{overflow:hidden;position:relative;flex:1;min-height:0}
+.sheet .sscroll .fade{pointer-events:none;position:absolute;left:0;right:0;bottom:0;height:44px;z-index:2;margin:0;
+  background:linear-gradient(180deg,rgba(247,243,236,0) 0%,var(--paper) 82%)}
+/* index tail — explicit "continues" affordance, ledger language */
+.sfoot{flex:0 0 auto;display:flex;align-items:baseline;justify-content:center;gap:8px;
+  border-top:1px solid var(--hair);padding:8px 12px 12px;
+  font:500 10.5px/1.4 var(--mono);color:var(--muted)}
+.sfoot b{color:var(--accent);font-weight:600}
+/* ================= night-ledger swatch ================= */
+.ntile{width:400px;flex:0 0 auto;padding:20px 20px 22px;background:var(--paper);color:var(--ink);
+  font-family:var(--serif);border:1px solid var(--hair2);box-shadow:0 22px 46px -30px rgba(29,21,15,.75)}
+.night .sum span{color:var(--muted)}
+.night .dl.del{background:rgba(224,106,77,.09)}
+.night .dl.add{background:rgba(131,179,146,.08)}
+.nlab{font:600 10.5px/1 var(--serif);font-variant-caps:all-small-caps;letter-spacing:.1em;color:var(--muted);
+  padding-bottom:9px;margin-bottom:12px;border-bottom:3px double var(--hair2);display:flex;justify-content:space-between}
+/* ================= footer — direction contract ================= */
+.ftr{margin-top:52px;background:var(--paper);border-top:3px double var(--hair2);color:var(--ink);font-family:var(--serif)}
+.ftr-in{max-width:1100px;margin:0 auto;padding:30px 24px 12px}
+.ftr h2{margin:0 0 14px;font:300 italic 30px/1.1 var(--serif);color:var(--ink)}
+.frow{display:flex;gap:14px;align-items:baseline;padding:6px 0;border-bottom:1px solid var(--hair);
+  font:400 14px/1.55 var(--serif)}
+.frow:last-of-type{border-bottom:none}
+.fk{flex:0 0 148px;font:600 10.5px/1 var(--mono);letter-spacing:.12em;color:var(--accent)}
+.ftr .note{margin:16px 0 0;padding-top:12px;border-top:1px solid var(--hair);
+  font:400 11.5px/1.7 var(--mono);color:var(--muted)}
+.collo{max-width:1100px;margin:0 auto;padding:0 24px 26px;display:flex;gap:16px;flex-wrap:wrap;align-items:center;
+  font:400 11px/1.5 var(--mono);color:var(--muted)}
+.pal{display:inline-flex;align-items:center;gap:5px}
+.ps{width:13px;height:13px;border:1px solid var(--hair2);display:inline-block}
+/* ================= motion (annotated, reduced-motion safe) ================= */
+/* busy = thin vermilion baseline breathing under the in-flight entry — transform/opacity only, 1.8s ambient */
+.spin{display:inline-block;width:9px;height:9px;border:1.5px solid var(--hair2);border-top-color:var(--accent);border-radius:50%;vertical-align:-1px}
+@media (prefers-reduced-motion:no-preference){
+  .spin{animation:ledrot 1s linear infinite}
+  .baseline{animation:breathe 1.8s cubic-bezier(.16,1,.3,1) infinite}
+  .live i{animation:breathe 1.8s cubic-bezier(.16,1,.3,1) infinite}
+}
+@keyframes ledrot{to{transform:rotate(360deg)}}
+@keyframes breathe{0%,100%{opacity:.35;transform:scaleX(.4)}50%{opacity:1;transform:scaleX(1)}}
+@media (prefers-reduced-motion:reduce){.spin,.baseline,.live i{animation:none!important;opacity:.9;transform:none}}
+</style>
+</head>
+<body>
+<header class="mast">
+  <div class="mast-in">
+    <div>
+      <h1>Ledger<span class="mark"> № 1</span></h1>
+      <p class="mast-th">the session as an account book — every turn posted, audited, and balanced.</p>
+    </div>
+  </div>
+</header>
+<nav class="utilbar" aria-label="Study navigation">
+  <div class="util-in">
+    <span>Design <b>1 of 6</b> · fresh-agent UX study · Freshell</span>
+    <span class="sp"><a href="/">← all designs</a></span>
+  </div>
+</nav>
+<main class="pg">
+<!-- ============ B. DESKTOP FRAME ============ -->
+<p class="cap"><b>Desktop · 1440px</b> — ledger page: index tabs · posted entries · margin notes · writing plate</p>
+<section class="frame desk" aria-label="Desktop app frame">
+  <!-- tab strip -->
+  <div class="tabs" role="tablist" aria-label="Tabs">
+    <span class="tab on" role="tab" aria-selected="true"><span class="bdot" aria-hidden="true"></span>⚡ Trace dropped messa…</span>
+    <span class="tab" role="tab" aria-selected="false">⌨ npm run dev</span>
+    <span class="tab" role="tab" aria-selected="false">◉ Scrollback parser <span class="gdot" role="img" aria-label="needs attention"></span></span>
+    <button class="tabadd" aria-label="New tab">+</button>
+  </div>
+  <!-- pane header -->
+  <div class="phead">
+    <span class="prov"><b>⚡</b> freshclaude</span>
+    <h3 class="pttl">Trace dropped messages on background tabs</h3>
+    <span class="live"><i aria-hidden="true"></i>Working…</span>
+    <span class="cost">$1.38</span>
+    <div class="pacts">
+      <button class="ib" aria-label="Diffs (3 files)">±<span class="bdg">3</span></button>
+      <button class="ib" aria-label="Settings">⚙</button>
+      <button class="ib" aria-label="Refresh">⟳</button>
+      <button class="ib" aria-label="Fullscreen">⛶</button>
+      <button class="ib" aria-label="Close pane">✕</button>
+    </div>
+  </div>
+  <!-- status line -->
+  <div class="sline">
+    <span><b>~/code/freshell</b></span><span class="sep">·</span>
+    <span><b>fix/ws-reconnect+2</b></span><span class="sep">·</span>
+    <span>Opus 4.6</span><span class="sep">·</span>
+    <span>effort High</span><span class="sep">·</span>
+    <span>Ask</span><span class="sep">·</span>
+    <span><span class="gauge" role="img" aria-label="context 59 percent"><i style="width:59%"></i></span><b>59%</b></span><span class="sep">·</span>
+    <span>$1.38 <sup class="ldr">1</sup></span>
+  </div>
+  <!-- body split -->
+  <div class="split">
+    <div class="tcol">
+      <div class="measure">
+        <p class="jbwrap"><button class="jb">↑ jump back — <span class="mono">№ 1</span> · 14:07</button></p>
+
+        <!-- № 1 — user turn -->
+        <article class="entry" aria-label="Entry 1, posted by You">
+          <span class="eno"><b>№ 1</b>entry</span>
+          <header class="ehead">
+            <span class="by">You</span>
+            <span class="at">14:07</span>
+            <button class="kebab" aria-label="Turn actions">⋯</button>
+          </header>
+          <div class="ebody">
+            <p>the reconnect loop is still dropping messages when the tab's in the background. can you trace where the heartbeat dies?</p>
+          </div>
+          <div class="eacts" aria-hidden="true"><button>copy</button><button>fork</button><button>rewind</button></div>
+        </article>
+
+        <!-- № 2 — agent turn -->
+        <article class="entry" aria-label="Entry 2, posted by Claude">
+          <span class="eno"><b>№ 2</b>entry</span>
+          <header class="ehead">
+            <span class="by">Claude <span class="mdl">· Opus 4.6</span></span><sup class="ldr">2</sup>
+            <span class="at">14:07</span>
+            <button class="kebab" aria-label="Turn actions">⋯</button>
+          </header>
+          <div class="ebody">
+            <p>Traced it. The heartbeat interval is 15s, but background tabs throttle timers to ~60s — the ping never fires on time, the server's liveness check trips, and it closes the socket as dead.</p>
+            <p>Fix: drop the interval to 5s so even a throttled tab beats inside the server's grace window, and add a pong watchdog so a missed pong recycles the socket instead of dropping queued messages.</p>
+            <details class="think">
+              <summary><span class="mk"></span>Thought for 12s</summary>
+              <p class="tbody">Compared timer throttling in background tabs (min ~60s clamp) against the 15s heartbeat; weighed an adaptive backoff vs. a fixed 5s interval; chose 5s + pong watchdog because it survives the clamp without server-side timer math.</p>
+            </details>
+            <div class="tools">
+              <details class="tool">
+                <summary class="trow"><span class="rn">i</span><span class="st ok">✓</span><span class="tn">Read</span><span class="tg">server/ws-handler.ts</span><span class="tm">1,204 lines</span><span class="mk" aria-hidden="true"></span></summary>
+                <p class="tout">read 1,204 lines — heartbeat constants at ll. 41–64</p>
+              </details>
+              <details class="tool">
+                <summary class="trow"><span class="rn">ii</span><span class="st ok">✓</span><span class="tn">Grep</span><span class="tg">"heartbeat" in server/</span><span class="tm">7 matches</span><span class="mk" aria-hidden="true"></span></summary>
+                <p class="tout">7 matches across server/ws-handler.ts, server/terminal-registry.ts</p>
+              </details>
+              <details class="tool">
+                <summary class="trow"><span class="rn">iii</span><span class="st ok">✓</span><span class="tn">Bash</span><span class="tg">npm run test:vitest -- run test/unit/ws-heartbeat.test.ts</span><span class="tm">2.1s</span><span class="mk" aria-hidden="true"></span></summary>
+                <p class="tout"><span class="okc">✓ 14 passed</span> (2.1s)</p>
+              </details>
+              <details class="tool" open>
+                <summary class="trow"><span class="rn">iv</span><span class="st ok">✓</span><span class="tn">Edit</span><span class="tg">server/ws-handler.ts</span><span class="tm"><span class="dp">+12</span> <span class="dn">−4</span></span><span class="mk" aria-hidden="true"></span></summary>
+                <div class="diff" aria-label="Diff for server/ws-handler.ts">
+                  <div class="dh"><span>server/ws-handler.ts · lines 41–44</span><span>✎ comment on any line</span></div>
+                  <div class="dl del"><span class="g">41</span><span class="s">−</span><code>const HEARTBEAT_INTERVAL = 15_000;</code><button class="x" aria-label="Comment to agent on this deletion">✎</button></div>
+                  <div class="dl add"><span class="g">42</span><span class="s">+</span><code>const HEARTBEAT_INTERVAL = 5_000;</code><button class="x" aria-label="Comment to agent on this line">✎</button></div>
+                  <div class="dl add"><span class="g">43</span><span class="s">+</span><code>// background-tab timers throttle to ~60s; beat fast enough to survive</code><button class="x" aria-label="Comment to agent on this line">✎</button></div>
+                  <div class="dl add"><span class="g">44</span><span class="s">+</span><code>let lastPongAt = 0;</code><button class="x" aria-label="Comment to agent on this line">✎</button></div>
+                </div>
+              </details>
+            </div>
+            <p class="sum"><i></i><span>thought 12s · 4 tools used · 2 files changed — <b>balanced</b></span><i></i></p>
+          </div>
+        </article>
+
+        <!-- № 3 — user turn with attachments -->
+        <article class="entry" aria-label="Entry 3, posted by You, with attachments">
+          <span class="eno"><b>№ 3</b>entry</span>
+          <header class="ehead">
+            <span class="by">You</span>
+            <span class="at">14:10</span>
+            <button class="kebab" aria-label="Turn actions">⋯</button>
+          </header>
+          <div class="ebody">
+            <div class="atches">
+              <span class="atc"><span class="th" aria-hidden="true"><svg width="18" height="13" viewBox="0 0 18 13" fill="none"><rect x="0.5" y="0.5" width="17" height="12" rx="1" stroke="#6b6156"/><circle cx="5" cy="4" r="1.4" fill="#6b6156"/><path d="M1 11 L6.5 6 L10 9 L12.5 7 L17 11" stroke="#6b6156" stroke-width="1" fill="none"/></svg></span>screenshot.png</span>
+              <span class="atc"><span class="th" aria-hidden="true"><svg width="16" height="13" viewBox="0 0 16 13" fill="none"><rect x="0.5" y="0.5" width="15" height="12" rx="1" stroke="#6b6156"/><path d="M3 4 H13 M3 7 H13 M3 10 H9" stroke="#6b6156" stroke-width="1"/></svg></span>logs.txt</span>
+            </div>
+            <p>here's what the console shows when it dies</p>
+          </div>
+        </article>
+
+        <!-- № 4 — agent turn, streaming (in-flight) -->
+        <article class="entry" aria-label="Entry 4, posted by Claude, in progress">
+          <span class="eno"><b>№ 4</b>entry</span>
+          <header class="ehead">
+            <span class="by">Claude <span class="mdl">· Opus 4.6</span></span><sup class="ldr">3 4</sup>
+            <span class="at">14:12 — posting…</span>
+            <button class="kebab" aria-label="Turn actions">⋯</button>
+          </header>
+          <div class="ebody">
+            <div class="tool" style="border-top:none;padding-top:2px">
+              <span class="rn">i</span>
+              <div class="trow"><span class="st ok">✓</span><span class="tn">WebSearch</span><span class="tg">"browser background tab timer throttling"</span><span class="tm">2 sources</span></div>
+              <div class="webs">— <a href="#mdn">MDN · Timers in background tabs</a><br>— <a href="#chrome">Chrome for Developers · Timer throttling</a></div>
+            </div>
+            <p style="margin-top:10px">So the watchdog needs to live in the server, and the client should—<span class="caret" aria-hidden="true"></span></p>
+          </div>
+          <div class="trow" style="padding:8px 0 0 34px" aria-label="Live activity">
+            <span class="st" style="color:var(--accent)"><span class="spin" aria-hidden="true"></span></span>
+            <span class="tg" style="color:var(--accent)">Running Edit — server/ws-handler.ts</span>
+            <span class="tm"><button class="post" style="padding:0;font-size:12px">■ Stop</button></span>
+          </div>
+          <span class="baseline" aria-hidden="true"></span>
+        </article>
+
+        <!-- correction slip — approval -->
+        <aside class="slip" aria-label="Approval required — correction slip">
+          <div class="sh"><span class="stt">Correction slip — approval required</span><span class="sat">nº 5 · 14:13</span></div>
+          <p class="swarn-tool">tool <b>Bash</b> requests:</p>
+          <code class="cmd">rm -rf .worktrees/refresh-*</code>
+          <p class="why">reason — Deletes 3 stale worktrees</p>
+          <p class="warn"><b>warning</b> This command permanently deletes files.</p>
+          <div class="sbtns">
+            <button class="btn pri">Allow once</button>
+            <button class="btn ses">Always allow Bash this session</button>
+            <button class="btn deny">Deny</button>
+          </div>
+        </aside>
+
+        <!-- query — question banner -->
+        <aside class="query" aria-label="Question from Claude">
+          <p class="qh">Query in the margin — single select<span class="at">14:14</span></p>
+          <p class="qq">How should the client catch up after reconnect?</p>
+          <button class="opt"><span class="cbx" aria-hidden="true"></span>Replay buffer only</button>
+          <button class="opt sel" aria-pressed="true"><span class="cbx" aria-hidden="true"></span>Full snapshot if gap &gt; 5s</button>
+          <button class="opt"><span class="cbx" aria-hidden="true"></span>Always resync</button>
+          <div class="other"><span class="cbx" aria-hidden="true" style="transform:rotate(-1.4deg)"></span>Other… <span class="oline" aria-hidden="true"></span></div>
+          <button class="btn pri" style="margin-left:26px">Submit</button>
+        </aside>
+
+        <!-- compaction -->
+        <p class="cmp"><i></i><span>Context compacted · 41,203 → 12,850 tokens · full transcript preserved</span><i></i></p>
+
+        <!-- queued while busy -->
+        <div class="queue" aria-label="Queued messages">
+          <p class="qh">Queued — waits for the in-flight entry <span class="mono">№ 4</span></p>
+          <div class="qi"><span class="qn">a.</span>also bump the client backoff cap<button aria-label="Remove queued message">✕</button></div>
+          <div class="qi"><span class="qn">b.</span>then update AGENTS.md<button aria-label="Remove queued message">✕</button></div>
+        </div>
+
+        <p class="npwrap"><button class="newpill"><span class="mono">3 new</span> ↓</button></p>
+      </div>
+
+      <!-- composer — the writing plate -->
+      <div class="composer">
+        <div class="carea">
+          <div class="atches" style="margin:0 0 7px">
+            <span class="atc"><span class="th" aria-hidden="true"><svg width="14" height="11" viewBox="0 0 16 13" fill="none"><rect x="0.5" y="0.5" width="15" height="12" rx="1" stroke="#6b6156"/><path d="M3 4 H13 M3 7 H13 M3 10 H9" stroke="#6b6156" stroke-width="1"/></svg></span>heartbeat.md<button aria-label="Remove attachment" style="color:var(--muted);font-size:11px;padding:0 2px">✕</button></span>
+          </div>
+          <div class="cline" role="textbox" aria-label="Message">make the interval configurable in settings, default 5s —<span class="caret" aria-hidden="true"></span></div>
+          <div class="cbar">
+            <button class="ib" aria-label="Attach file">📎</button>
+            <button class="ib" aria-label="Slash commands" style="font-family:var(--mono);font-weight:600">/</button>
+            <button class="stopb">■ Stop</button>
+            <button class="post">Post entry →</button>
+          </div>
+          <p class="chint">⏎ send · ⇧⏎ newline · esc interrupt · ↑ history · @ files · ! shell</p>
+        </div>
+      </div>
+    </div><!-- /tcol -->
+
+    <!-- the margin — accountant's notes -->
+    <aside class="rail" aria-label="Margin notes">
+      <section class="rsec" aria-label="Register">
+        <h4 class="rh"><span class="ldr">1</span>Register</h4>
+        <div class="rr"><span class="k">01JRV6…KQ3M</span></div>
+        <div class="rr">started 14:02 · <span class="k">live</span> · 24m</div>
+      </section>
+      <section class="rsec" aria-label="Diffs">
+        <h4 class="rh"><span class="ldr">2</span>Diffs</h4>
+        <div class="rr2"><span class="k pname">server/ws-handler.ts</span>
+          <span class="rsub"><span class="dp">+12</span> <span class="dn">−4</span><span class="va">view</span><span class="cm">✎</span></span></div>
+        <div class="rr2"><span class="k pname">test/unit/ws-heartbeat.test.ts</span>
+          <span class="rsub"><span class="dp">+9</span> <span class="dn">−0</span><span class="va">view</span><span class="cm">✎</span></span></div>
+        <div class="rr2"><span class="k pname">docs/AGENTS.md</span>
+          <span class="rsub"><span class="dp">+2</span> <span class="dn">−2</span><span class="va">view</span><span class="cm">✎</span></span></div>
+      </section>
+      <section class="rsec" aria-label="Checkpoints">
+        <h4 class="rh"><span class="ldr">3</span>Checkpoints</h4>
+        <div class="cps">
+          <div class="cp"><span class="k">b1</span> 14:07<span class="va">Rewind</span></div>
+          <div class="cp"><span class="k">b2</span> 14:19<span class="va">Rewind</span></div>
+          <div class="cp"><span class="k">b3</span> 14:31<span class="va">Rewind</span></div>
+        </div>
+      </section>
+      <section class="rsec" aria-label="Usage">
+        <h4 class="rh"><span class="ldr">4</span>Usage</h4>
+        <div class="rr"><span class="k">$1.38</span> · burn $3.45/h</div>
+        <div class="rr">84.2k ↑ · 9.6k ↓ tokens</div>
+        <div class="rr"><span class="gauge" style="width:100%" role="img" aria-label="context 59 percent"><i style="width:59%"></i></span></div>
+        <div class="rr"><span class="k">118,200 / 200,000</span> · 59%</div>
+        <div class="rr" style="font-family:var(--serif);font-style:italic;font-size:11px">gauge runs vermilion past 80%</div>
+      </section>
+      <section class="rsec" aria-label="Threads">
+        <h4 class="rh"><span class="ldr">5</span>Threads</h4>
+        <div class="rr"><span class="k">⧉ ws-reconnect·b</span> (worktree)</div>
+        <div class="rr">├ heartbeat probe</div>
+        <div class="rr">└ docs pass</div>
+      </section>
+      <p class="rfold">below 900px this margin folds away — each note becomes a footnote row indented under its entry.</p>
+    </aside>
+  </div>
+</section>
+<!--P2-->
+

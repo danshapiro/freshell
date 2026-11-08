@@ -1,0 +1,229 @@
+<!-- ============ C. PHONE FRAMES ============ -->
+<section aria-label="Phone frames">
+<h2>Phone frames</h2>
+<p class="cap">Phone · 390px — strips compress, breaker gets the full deck</p>
+<div class="phones">
+
+  <!-- main phone: condensed session w/ inline breaker -->
+  <div class="phone tall" aria-label="Phone console, condensed session">
+    <div class="scr">
+      <nav class="pstrip" aria-label="Tabs">
+        <button class="ptab on"><span class="lamp"></span><span class="t">⚡ Trace dropped…</span></button>
+        <button class="ptab"><span class="t">⌨ npm run dev</span></button>
+        <button class="ptab"><span class="lamp ok"></span><span class="t">◉ Scrollback…</span></button>
+      </nav>
+      <header class="phead">
+        <span class="cart" style="padding:4px 7px;font-size:10px"><b></b>freshclaude</span>
+        <span class="ttl">Trace dropped messages on background tabs</span>
+        <button class="icob" aria-label="More" style="margin-left:auto">⋯</button>
+      </header>
+      <div class="pchiprow" aria-label="Status chips">
+        <span class="pchip">~/code/freshell · <b>fix/ws-reconnect+2</b></span>
+        <span class="pchip"><b>Opus 4.6</b></span>
+        <span class="pchip"><b>59%</b></span>
+        <span class="pchip"><b>$1.38</b></span>
+      </div>
+      <div class="pbody">
+        <article class="pentry">
+          <div class="eh"><span class="lamp off"></span><span class="who">You</span><time>14:07</time></div>
+          <p class="pt">the reconnect loop is still dropping messages when the tab&rsquo;s in the background. can you trace where the heartbeat dies?</p>
+        </article>
+        <article class="pentry">
+          <div class="eh"><span class="lamp ok"></span><span class="who" style="color:#e8b39e">Claude · Opus 4.6</span><time>14:07</time></div>
+          <p class="pt">Beat at 5s, add a server-side pong watchdog. Edit is in:</p>
+          <div class="pcode" aria-label="Diff, server/ws-handler.ts">
+            <div class="dl del"><span class="sign">−</span><pre>const HEARTBEAT_INTERVAL = 15_000;</pre></div>
+            <div class="dl add"><span class="sign">+</span><pre>const HEARTBEAT_INTERVAL = 5_000;</pre></div>
+            <div class="dl add"><span class="sign">+</span><pre>let lastPongAt = 0;</pre></div>
+          </div>
+          <div class="belt" style="margin-top:9px">
+            <span class="lamp wait"></span><span class="btxt">RUNNING EDIT — WS-HANDLER.TS</span>
+            <span class="track"><i></i></span>
+          </div>
+        </article>
+
+        <!-- breaker sheet: full-width stacked ≥56px -->
+        <section class="pbrk" aria-label="Approval required">
+          <div style="display:flex;align-items:center;gap:8px">
+            <span class="serial">BRK-01 · BASH</span>
+            <span style="margin-left:auto" class="brk-alarm"><span class="lamp err"></span>TRIP</span>
+          </div>
+          <div class="brk-cmd" style="font-size:12px">rm -rf .worktrees/refresh-*</div>
+          <div class="brk-meta" style="flex-direction:column;gap:6px">
+            <span class="w">Deletes 3 stale worktrees</span>
+            <span class="warn"><span class="lamp err"></span>This command permanently deletes files.</span>
+          </div>
+          <div class="btns">
+            <button class="rocker">Allow once</button>
+            <div class="gwrap" style="justify-content:space-between">
+              <span class="latch"><span class="ltrack" role="switch" aria-checked="false" aria-label="Always allow Bash this session"><span class="knob"></span></span><span class="swlabel" style="max-width:none">Always allow <b style="font-weight:600;color:var(--ink)">Bash</b> this session</span></span>
+              <span class="kguard" aria-hidden="true"></span>
+            </div>
+            <button class="rocker deny">DENY</button>
+          </div>
+        </section>
+      </div>
+      <footer class="pcomp" aria-label="Composer">
+        <div class="box">make the interval configurable in settings, default 5s —</div>
+        <div class="acts">
+          <button class="icob" aria-label="Attach file">📎</button>
+          <button class="icob" aria-label="Slash commands">/</button>
+          <button class="send">SEND ⏎</button>
+        </div>
+      </footer>
+      <div class="safebar"><i></i></div>
+    </div>
+  </div>
+
+  <!-- phone inset: turn actions bottom sheet -->
+  <div class="phone" aria-label="Phone inset, turn actions sheet">
+    <div class="scr sheet-host" style="height:560px">
+      <header class="phead">
+        <span class="cart" style="padding:4px 7px;font-size:10px"><b></b>freshclaude</span>
+        <span class="ttl">Trace dropped messa…</span>
+      </header>
+      <div class="sheet-bg">
+        <article class="pentry">
+          <div class="eh"><span class="lamp off"></span><span class="who">You</span><time>14:07</time></div>
+          <p class="pt">the reconnect loop is still dropping messages when the tab&rsquo;s in the background…</p>
+        </article>
+      </div>
+      <div class="sheetdim"></div>
+      <div class="sheet" role="dialog" aria-label="Turn actions">
+        <p class="plate-txt" style="margin:2px 4px 6px">TURN №01 · 14:07</p>
+        <button class="sh-row">⌘C&ensp;Copy turn text</button>
+        <button class="sh-row">⑂&ensp;Fork conversation from here</button>
+        <button class="sh-row dest">⟲&ensp;Rewind code to here</button>
+        <button class="sh-cancel">Cancel</button>
+        <div class="safebar"><i></i></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- phone inset: settings full-screen sheet -->
+  <div class="phone" aria-label="Phone inset, settings sheet">
+    <div class="scr sheet-host" style="height:560px">
+      <div class="sheet-bg" style="padding-top:4px">
+        <div class="pstrip"><button class="ptab on"><span class="lamp"></span><span class="t">⚡ Trace dropped…</span></button></div>
+      </div>
+      <div class="fullsheet" role="dialog" aria-label="Settings">
+        <div class="fs-head">
+          <span class="serial">SVC-02 · PANE CONFIG</span>
+          <button class="icob" style="margin-left:auto" aria-label="Done">✓</button>
+        </div>
+        <div class="dr-sec" style="padding-left:16px">
+          <span class="el" style="display:block;margin-bottom:8px">Style</span>
+          <div class="seg"><button class="on">Sans</button><button>Serif</button><button>Mono</button></div>
+        </div>
+        <div class="dr-sec" style="padding-left:16px">
+          <span class="el" style="display:block;margin-bottom:4px">Model</span>
+          <div class="mrow on"><span class="rad"></span><span>Claude Opus 4.6</span></div>
+          <div class="mrow" style="color:var(--muted)"><span class="rad"></span><span>Sonnet 4.6 <span class="soon" style="margin-left:6px"></span></span></div>
+        </div>
+        <div class="dr-sec" style="padding-left:16px">
+          <span class="el" style="display:block;margin-bottom:8px">Effort</span>
+          <div class="seg"><button>Low</button><button>Medium</button><button class="on">High</button></div>
+        </div>
+        <div class="dr-sec" style="padding-left:16px">
+          <span class="el" style="display:block;margin-bottom:8px">Permission mode</span>
+          <div class="seg"><button class="on">Ask</button><button>Accept</button><button>Bypass</button><button>Plan</button></div>
+        </div>
+        <div class="dr-sec" style="padding-left:16px">
+          <div class="tgl-row">Show thinking<span class="tk"><span class="tgl on"><span class="kn"></span></span></span></div>
+          <div class="tgl-row">Show tools<span class="tk"><span class="tgl on"><span class="kn"></span></span></span></div>
+          <div class="tgl-row">Timecodes<span class="tk"><span class="tgl"><span class="kn"></span></span></span></div>
+          <div class="tgl-row" style="color:var(--muted)">Sound on done <span class="soon"></span><span class="tk"><span class="tgl"><span class="kn"></span></span></span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- phone inset: slash tray sheet -->
+  <div class="phone" aria-label="Phone inset, slash sheet">
+    <div class="scr sheet-host" style="height:560px">
+      <div class="sheet-bg">
+        <footer class="pcomp"><div class="box">/re</div></footer>
+      </div>
+      <div class="sheet" role="dialog" aria-label="Slash commands" style="max-height:82%">
+        <div class="t-filter"><span class="sl">/</span><span class="val">re</span><span class="cnt">3 / 18</span></div>
+        <div class="t-group">
+          <span class="t-gplate"><span class="plate-txt">SESSION</span></span>
+          <div class="cmd hit"><span class="cname">/rename</span><span class="cdesc">retitle session</span><span class="soon"></span></div>
+          <div class="cmd faded"><span class="cname">/new</span><span class="cdesc">fresh session</span></div>
+          <div class="cmd faded"><span class="cname">/fork</span><span class="cdesc">branch from a turn</span></div>
+        </div>
+        <div class="t-group">
+          <span class="t-gplate"><span class="plate-txt">INSPECT</span></span>
+          <div class="cmd hit"><span class="cname">/review</span><span class="cdesc">request code review</span><span class="soon"></span></div>
+          <div class="cmd faded"><span class="cname">/status</span><span class="cdesc">health &amp; config</span></div>
+        </div>
+        <div class="t-group">
+          <span class="t-gplate"><span class="plate-txt">CONFIGURE</span></span>
+          <div class="cmd hit"><span class="cname">/permissions</span><span class="cdesc">permission mode</span></div>
+          <div class="cmd faded"><span class="cname">/model</span><span class="cdesc">switch model</span></div>
+        </div>
+        <div class="safebar"><i></i></div>
+      </div>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ============ D. ALT LIGHT SWATCH ============ -->
+<section aria-label="Alternate light mode">
+<h2>Alternate mode</h2>
+<p class="cap">Alt mode · “open bench” — warm aluminum #e8e6e1, ink #23262b · ~400px tiles</p>
+<div class="lite-row">
+  <div class="lite">
+    <span class="l-el" style="display:block;margin-bottom:8px">Bench tile · agent turn</span>
+    <div class="lcard">
+      <div class="lhead"><span class="lamp ok"></span><span class="lwho">Claude · Opus 4.6</span><span class="ltime num">14:07</span></div>
+      <div class="lbody">
+        <p>The heartbeat is too slow for a throttled tab. Beat at 5s and add a server-side pong watchdog instead of trusting the close timeout.</p>
+        <code class="lcode">+ const HEARTBEAT_INTERVAL = 5_000;
++ let lastPongAt = 0;</code>
+      </div>
+    </div>
+  </div>
+  <div class="lite">
+    <span class="l-el" style="display:block;margin-bottom:8px">Bench tile · breaker</span>
+    <div class="lbrk">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span class="serial">BRK-01 · BASH</span>
+        <span style="margin-left:auto;display:flex;align-items:center;gap:6px;font:600 10px/1 var(--mono);letter-spacing:0.12em" class="warn"><span class="lamp err"></span>TRIP</span>
+      </div>
+      <div class="lcmd">rm -rf .worktrees/refresh-*</div>
+      <p class="wrow warn" style="display:flex;gap:6px;align-items:center"><span class="lamp err"></span>This command permanently deletes files.</p>
+      <div style="display:flex;flex-direction:column;gap:11px;margin-top:13px">
+        <button class="rocker" style="min-height:48px">Allow once</button>
+        <span class="latch" style="display:inline-flex;align-items:center;gap:10px">
+          <span class="ltrack"><span class="knob"></span></span>
+          <span style="font:500 12.5px/1.4 var(--sans);color:#4d4841">Always allow <b style="color:#23262b">Bash</b> this session</span>
+        </span>
+        <button class="rocker deny" style="min-height:46px">DENY</button>
+      </div>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ============ FOOTER: DIRECTION CONTRACT ============ -->
+<footer>
+  <div class="footplate">
+    <span class="hex hx-tl"><i></i></span><span class="hex hx-tr"><i></i></span>
+    <span class="hex hx-bl"><i></i></span><span class="hex hx-br"><i></i></span>
+    <span class="plate-txt">SPEC PLATE · UNIT 02 · ENGRAVED IN FOOTER</span>
+    <div class="contract">
+      <div class="cl"><span class="k">THESIS</span><span class="v">A coding agent is machinery you supervise from a well-made console: milled panels, engraved labels, honest lamps and gauges. Nothing is lit unless it reports a real state.</span></div>
+      <div class="cl"><span class="k">OWN-WORLD</span><span class="v">Machined metal, studio electronics — a mastering desk, a lab instrument; warm dark, never gamer-black.</span></div>
+      <div class="cl"><span class="k">STORY</span><span class="v">24 minutes into a dropped-heartbeat trace: thought 12s, 4 tools, 2 files changed; the belt reads RUNNING EDIT while a stale-worktree delete waits at the breaker.</span></div>
+      <div class="cl"><span class="k">FIRST VIEWPORT</span><span class="v">Rack-ear tabs, freshclaude cartridge, VU context gauge at 59%, bolted composer with an orange SEND key.</span></div>
+      <div class="cl"><span class="k">FORM+FINISH</span><span class="v">Archivo labels, JetBrains Mono data; engraved micro-plates at 0.14em tracking; motion ≤250ms — belt shimmer and lamp states only; reduced-motion = static lamp.</span></div>
+    </div>
+  </div>
+  <p class="foot-note">Engine Room · design 2 of 6 · fresh-agent UX study for Freshell · <a href="/">← all designs</a></p>
+</footer>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,260 @@
+<!-- ============ C. PHONE FRAMES ============ -->
+<p class="cap"><b>Phone · 390×844</b> — the ledger folds: margin notes become footnote rows; sheets rise with a torn edge</p>
+<div class="rows">
+
+  <!-- phone 1 — live session -->
+  <section class="phn" aria-label="Phone, main session">
+    <div class="ptabs" role="tablist" aria-label="Tabs">
+      <span class="ptab on" role="tab" aria-selected="true"><span class="bdot" aria-hidden="true"></span>⚡ Trace dropped…</span>
+      <span class="ptab" role="tab" aria-selected="false">⌨ npm run dev</span>
+      <span class="ptab" role="tab" aria-selected="false">◉ Scrollback parser</span>
+      <span class="ptab" role="button" aria-label="New tab">+</span>
+    </div>
+    <div class="phd">
+      <span class="prov" style="padding:3px 7px;font-size:11px"><b>⚡</b></span>
+      <h3 class="pttl">Trace dropped messages on background tabs</h3>
+      <span class="live" style="font-size:10.5px"><i aria-hidden="true"></i>Working…</span>
+      <button class="ib" aria-label="Pane menu">⋯</button>
+    </div>
+    <div class="pchips" aria-label="Status">
+      <span class="pchip">~/code/freshell</span>
+      <span class="pchip"><b>fix/ws-reconnect+2</b></span>
+      <span class="pchip">Opus 4.6</span>
+      <span class="pchip"><span class="gauge" role="img" aria-label="context 59 percent"><i style="width:59%"></i></span><b>59%</b></span>
+      <span class="pchip"><b>$1.38</b></span>
+    </div>
+    <div class="pbody">
+      <article class="pentry">
+        <div class="pehead"><span class="by">You</span><span class="ldr">№ 1</span><span class="at">14:07</span></div>
+        <p>the reconnect loop is still dropping messages when the tab's in the background. can you trace where the heartbeat dies?</p>
+      </article>
+      <article class="pentry">
+        <div class="pehead"><span class="by">Claude · Opus 4.6</span><span class="ldr">№ 2</span><span class="at">14:07</span></div>
+        <p>Heartbeat is 15s; background tabs clamp timers to ~60s — pings gap out, server closes the socket.</p>
+        <div class="pdiff" aria-label="Diff, scrollable">
+          <div class="dl del"><span class="g">41</span><span class="s">−</span><code>const HEARTBEAT_INTERVAL = 15_000;</code><span class="x">✎</span></div>
+          <div class="dl add"><span class="g">42</span><span class="s">+</span><code>const HEARTBEAT_INTERVAL = 5_000;</code><span class="x">✎</span></div>
+          <div class="dl add"><span class="g">43</span><span class="s">+</span><code>// background-tab timers throttle to ~60s; beat fast</code><span class="x">✎</span></div>
+          <div class="dl add"><span class="g">44</span><span class="s">+</span><code>let lastPongAt = 0;</code><span class="x">✎</span></div>
+        </div>
+        <div class="foot"><span class="ldr">2</span>diffs: +12 −4 ws-handler.ts<span class="va">view</span></div>
+        <div class="foot"><span class="ldr">4</span>$1.38 · 59% ctx</div>
+      </article>
+      <aside class="pslip" aria-label="Approval required">
+        <div class="sh"><span class="stt" style="font-size:11.5px">Correction slip — approval</span><span class="sat">nº 5 · 14:13</span></div>
+        <code class="cmd" style="font-size:12px">rm -rf .worktrees/refresh-*</code>
+        <p class="why">reason — Deletes 3 stale worktrees</p>
+        <p class="warn"><b>warning</b> This command permanently deletes files.</p>
+        <div class="sbtns">
+          <button class="btn pri">Allow once</button>
+          <button class="btn ses">Always allow Bash this session</button>
+          <button class="btn deny">Deny</button>
+        </div>
+      </aside>
+      <div class="npwrap" style="padding:11px 0 3px">
+        <button class="newpill" style="box-shadow:0 4px 10px -4px rgba(195,61,33,.5)"><span class="mono">3 new</span> ↓</button>
+      </div>
+    </div>
+    <div class="pcomp">
+      <div class="pcline" role="textbox" aria-label="Message"><span class="atc" style="font-size:10.5px;padding:2px 6px 2px 4px;vertical-align:2px">▲ heartbeat.md</span> make the interval configurable, default 5s —<span class="caret" aria-hidden="true"></span></div>
+      <div class="pbar">
+        <button class="ib" aria-label="Attach file">📎</button>
+        <button class="ib" aria-label="Slash commands" style="font-family:var(--mono);font-weight:600">/</button>
+        <button class="post">Post entry →</button>
+      </div>
+      <div class="safe"><div class="homebar"></div></div>
+    </div>
+  </section>
+
+  <!-- phone 2 — turn actions sheet -->
+  <section class="phn" aria-label="Phone, turn actions sheet open">
+    <div class="ptabs"><span class="ptab on">⚡ Trace dropped…</span><span class="ptab">⌨ npm run dev</span><span class="ptab">◉ Scrollback parser</span></div>
+    <div class="phd"><span class="prov" style="padding:3px 7px;font-size:11px"><b>⚡</b></span><h3 class="pttl">Trace dropped messages</h3><button class="ib" aria-label="Pane menu">⋯</button></div>
+    <div class="psheet" style="flex:1;overflow:hidden">
+      <div style="padding:10px 13px;flex:0 0 auto">
+        <article class="pentry">
+          <div class="pehead"><span class="by">Claude · Opus 4.6</span><span class="ldr">№ 2</span><span class="at">14:07</span></div>
+          <p>Heartbeat is 15s; background tabs throttle timers to ~60s, so the ping gaps out and the server closes the socket.</p>
+          <p>Fix: 5s interval + pong watchdog — recycles the socket instead of dropping queued messages.</p>
+        </article>
+        <article class="pentry">
+          <div class="pehead"><span class="by">You</span><span class="ldr">№ 3</span><span class="at">14:10</span></div>
+          <p>here's what the console shows when it dies</p>
+        </article>
+      </div>
+      <div class="scrim"></div>
+      <div class="sheet" aria-label="Turn actions for entry number 2">
+        <div class="deckle" aria-hidden="true"></div>
+        <div class="shead">
+          <span class="st">Entry № 2 · Claude · 14:07</span>
+          <span class="ss">turn actions</span>
+        </div>
+        <button class="srow">Copy turn text</button>
+        <button class="srow">Fork conversation from here<span class="sub">→ № 2a</span></button>
+        <button class="srow dest">Rewind code to here<span class="sub">restores b1 · 14:07</span></button>
+        <button class="srow cancel">Cancel</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- phone 3 — settings sheet -->
+  <section class="phn" aria-label="Phone, settings full-screen sheet">
+    <div class="ptabs"><span class="ptab on">⚡ Trace dropped…</span><span class="ptab">⌨ npm run dev</span></div>
+      <div class="psheet" style="flex:1;overflow:hidden">
+        <div style="padding:8px 13px 0;flex:0 0 auto;opacity:.55;position:relative;z-index:0">
+          <article class="pentry" style="border-top:none;padding-top:0">
+            <div class="pehead"><span class="by">Claude · Opus 4.6</span><span class="ldr">№ 4</span><span class="at">14:12</span></div>
+            <p>So the watchdog needs to live in the server, and the client should—<span class="caret" aria-hidden="true"></span></p>
+          </article>
+        </div>
+        <div class="scrim"></div>
+        <div class="sheet full" aria-label="Settings sheet">
+        <div class="deckle" aria-hidden="true"></div>
+        <div class="shead"><span class="st">Settings</span><span class="ss">pane № — freshclaude</span></div>
+        <div class="ssec">
+          <span class="slabel">Style</span>
+          <div class="seg" role="group" aria-label="Type style"><button class="sg">Sans</button><button class="sg on">Serif</button><button class="sg">Mono</button></div>
+        </div>
+        <div class="ssec">
+          <span class="slabel">Model</span>
+          <div class="mrow on"><span class="mk2">✓</span>Claude Opus 4.6</div>
+          <div class="mrow"><span class="mk2"></span>Sonnet 4.6<span class="soon">soon</span></div>
+        </div>
+        <div class="ssec">
+          <span class="slabel">Effort</span>
+          <div class="seg" role="group" aria-label="Effort"><button class="sg">Low</button><button class="sg">Medium</button><button class="sg on">High</button></div>
+        </div>
+        <div class="ssec">
+          <span class="slabel">Permission mode</span>
+          <div class="seg wrap" role="group" aria-label="Permission mode"><button class="sg on">Ask</button><button class="sg">Accept edits</button><button class="sg">Bypass</button><button class="sg">Plan</button></div>
+        </div>
+        <div class="ssec">
+          <span class="slabel">Ledger display</span>
+          <div class="trow2"><span>Show thinking</span><span class="tog on"><i></i></span></div>
+          <div class="trow2"><span>Show tools</span><span class="tog on"><i></i></span></div>
+          <div class="trow2"><span>Timecodes</span><span class="tog on"><i></i></span></div>
+          <div class="trow2"><span>Sound on done<span class="soon">soon</span></span><span class="tog"><i></i></span></div>
+          <div class="trow2"><span>Desktop notifications<span class="soon">soon</span></span><span class="tog"><i></i></span></div>
+        </div>
+        <div class="ssec" style="border-bottom:none">
+          <span class="slabel">Advanced<span class="soon">soon</span></span>
+          <div class="arow2"><span>Hooks</span><span class="mono" style="color:var(--muted)">→</span></div>
+          <div class="arow2"><span>MCP servers</span><span class="mono" style="color:var(--muted)">→</span></div>
+          <div class="arow2"><span>Agents</span><span class="mono" style="color:var(--muted)">→</span></div>
+          <div class="arow2"><span>Status-line layout</span><span class="mono" style="color:var(--muted)">→</span></div>
+        </div>
+        <div class="safe"><div class="homebar"></div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- phone 4 — slash sheet -->
+  <section class="phn" aria-label="Phone, slash command sheet open">
+    <div class="ptabs"><span class="ptab on">⚡ Trace dropped…</span><span class="ptab">⌨ npm run dev</span></div>
+    <div class="psheet" style="flex:1;overflow:hidden">
+      <div style="padding:10px 13px;flex:0 0 auto;opacity:.55">
+        <article class="pentry">
+          <div class="pehead"><span class="by">You</span><span class="ldr">№ 1</span><span class="at">14:07</span></div>
+          <p>the reconnect loop is still dropping messages…</p>
+        </article>
+      </div>
+      <div class="scrim"></div>
+      <div class="sheet" aria-label="Slash commands">
+        <div class="deckle" aria-hidden="true"></div>
+        <div class="idxhead"><span class="mono" style="color:var(--accent);font-weight:600">/</span><span class="mono" style="color:var(--muted)">filter the index…</span><span class="keyh">↵ run</span></div>
+        <div class="sscroll" style="overflow:hidden">
+          <div class="igroup">
+            <h4>Session</h4>
+            <button class="irow" style="width:100%"><span class="ic">/new</span><span class="il"></span><span class="idesc">fresh session</span></button>
+            <button class="irow" style="width:100%"><span class="ic">/fork</span><span class="il"></span><span class="idesc">branch from a turn</span></button>
+            <button class="irow" style="width:100%"><span class="ic">/compact</span><span class="il"></span><span class="idesc">summarize context now</span></button>
+            <button class="irow" style="width:100%"><span class="ic">/rename</span><span class="il"></span><span class="idesc">retitle session<span class="soon">soon</span></span></button>
+            <button class="irow" style="width:100%"><span class="ic">/export</span><span class="il"></span><span class="idesc">save transcript<span class="soon">soon</span></span></button>
+          </div>
+          <div class="igroup">
+            <h4>Inspect</h4>
+            <button class="irow" style="width:100%"><span class="ic">/status</span><span class="il"></span><span class="idesc">health &amp; config</span></button>
+            <button class="irow" style="width:100%"><span class="ic">/cost</span><span class="il"></span><span class="idesc">usage breakdown</span></button>
+            <button class="irow" style="width:100%"><span class="ic">/diff</span><span class="il"></span><span class="idesc">open changed files</span></button>
+            <button class="irow" style="width:100%"><span class="ic">/context</span><span class="il"></span><span class="idesc">token map<span class="soon">soon</span></span></button>
+            <button class="irow" style="width:100%"><span class="ic">/review</span><span class="il"></span><span class="idesc">request code review<span class="soon">soon</span></span></button>
+          </div>
+          <div class="igroup" style="border-bottom:none">
+            <h4>Configure</h4>
+            <button class="irow" style="width:100%"><span class="ic">/model</span><span class="il"></span><span class="idesc">switch model</span></button>
+            <button class="irow" style="width:100%"><span class="ic">/effort</span><span class="il"></span><span class="idesc">thinking effort</span></button>
+            <button class="irow" style="width:100%"><span class="ic">/permissions</span><span class="il"></span><span class="idesc">permission mode</span></button>
+            <button class="irow" style="width:100%"><span class="ic">/hooks</span><span class="il"></span><span class="idesc">event hooks<span class="soon">soon</span></span></button>
+            <button class="irow" style="width:100%"><span class="ic">/mcp</span><span class="il"></span><span class="idesc">MCP servers<span class="soon">soon</span></span></button>
+            <button class="irow" style="width:100%"><span class="ic">/agents</span><span class="il"></span><span class="idesc">subagents<span class="soon">soon</span></span></button>
+            <button class="irow" style="width:100%"><span class="ic">/notify</span><span class="il"></span><span class="idesc">completion alerts<span class="soon">soon</span></span></button>
+            <button class="irow" style="width:100%"><span class="ic">/theme</span><span class="il"></span><span class="idesc">pane theme<span class="soon">soon</span></span></button>
+          </div>
+          <div class="fade" aria-hidden="true"></div>
+        </div>
+        <p class="sfoot" aria-label="More commands below"><span aria-hidden="true">✦</span> 18 posted · <b>index continues ↓</b> <span class="mono" style="font-size:9.5px">/hooks … /theme next</span></p>
+      </div>
+    </div>
+  </section>
+</div>
+
+<!-- ============ D. NIGHT LEDGER SWATCH ============ -->
+<p class="cap"><b>Alternate mode — “night ledger”</b> · ~400px tiles — deep warm brown-black ground, paper-toned ink</p>
+<div class="rows">
+  <section class="ntile night" aria-label="Night mode, agent entry">
+    <p class="nlab"><span>Night ledger</span><span>№ 2 · 14:07</span></p>
+    <article class="entry" style="border-top:none;padding-top:2px">
+      <header class="ehead">
+        <span class="by">Claude <span class="mdl">· Opus 4.6</span></span>
+        <span class="at">14:07</span>
+        <button class="kebab" aria-label="Turn actions">⋯</button>
+      </header>
+      <div class="ebody">
+        <p style="font-size:13.5px">Traced it — the 15s heartbeat dies under the background-tab timer clamp (~60s). Dropping to 5s and adding a server-side pong watchdog.</p>
+        <p class="sum" style="margin-top:10px"><i></i><span>thought 12s · 4 tools used · 2 files changed — <b>balanced</b></span><i></i></p>
+      </div>
+    </article>
+  </section>
+  <section class="ntile night" aria-label="Night mode, approval slip">
+    <p class="nlab"><span>Night ledger</span><span>correction slip</span></p>
+    <aside class="slip" style="margin:2px 0 0">
+      <div class="sh"><span class="stt">Correction slip — approval required</span><span class="sat">nº 5 · 14:13</span></div>
+      <code class="cmd" style="font-size:12.5px">rm -rf .worktrees/refresh-*</code>
+      <p class="why" style="font-size:12.5px">reason — Deletes 3 stale worktrees</p>
+      <p class="warn" style="font-size:12px;margin-bottom:11px"><b>warning</b> This command permanently deletes files.</p>
+      <div class="sbtns">
+        <button class="btn pri">Allow once</button>
+        <button class="btn ses">Always allow Bash this session</button>
+      </div>
+      <div class="sbtns" style="margin-top:7px"><button class="btn deny">Deny</button></div>
+    </aside>
+  </section>
+</div>
+
+<!-- ============ FOOTER: direction contract ============ -->
+<footer class="ftr" aria-label="Direction contract">
+  <div class="ftr-in">
+    <h2>Direction contract — Ledger</h2>
+    <div class="frow"><span class="fk">THESIS</span><span>A coding session is a ledger: entries are posted, audited, balanced. Editorial print discipline meets instrument-grade data — everything the agent did is <em>posted</em>; nothing hidden, nothing decorative.</span></div>
+    <div class="frow"><span class="fk">OWN-WORLD</span><span>Editorial print / field notebook: warm paper, letterpress ink, hairline rules, tabular data, marginalia. Turns are ledger entries (№ 1, № 2…) under double hairlines, with small-caps posted-by and 24h timecodes; tool calls are enumerated sub-entries (i–iv) settling into one sum line. Session facts live in the right margin, tied to entries by superscript leaders.</span></div>
+    <div class="frow"><span class="fk">STORY</span><span>Mid-debug on a live session: an edit freshly inked <span class="mono" style="font-size:12.5px">(+12 −4)</span>, tests read green, and a destructive <span class="mono" style="font-size:12.5px">rm -rf</span> waits on the ochre correction slip — while two follow-ups queue behind entry № 4, still posting over its breathing vermilion baseline.</span></div>
+    <div class="frow"><span class="fk">FIRST VIEWPORT</span><span>The lifted index tab, the status line with its 59% gauge, entries № 1–4 in a 68ch measure, and the margin already working: register, diffs, checkpoints, usage, threads.</span></div>
+    <div class="frow"><span class="fk">FORM+FINISH</span><span>Spectral for prose and display (300 italic masthead), Inconsolata for every numeral and path; paper #f7f3ec, ink #211d19, one vermilion accent #c33d21; ochre waits, green posts, iron-gall errs. Alt mode: night ledger #191512.</span></div>
+    <p class="note">Motion register — annotations only: busy = thin vermilion baseline breathing under the in-flight entry (transform/opacity, 1.8s); hover wipes and sheet rises ≤200ms cubic-bezier(0.16,1,0.3,1); spinner is a 1s ink ring. With prefers-reduced-motion everything is still — the baseline rests as a solid rule, the ring freezes at three-quarter fill.</p>
+  </div>
+  <div class="collo">
+    <span class="pal"><span class="ps" style="background:#f7f3ec"></span>paper</span>
+    <span class="pal"><span class="ps" style="background:#efe9dd"></span>layer</span>
+    <span class="pal"><span class="ps" style="background:#211d19"></span>ink</span>
+    <span class="pal"><span class="ps" style="background:#6b6156"></span>muted</span>
+    <span class="pal"><span class="ps" style="background:#c33d21"></span>vermilion</span>
+    <span class="pal"><span class="ps" style="background:#a86f00"></span>ochre</span>
+    <span class="pal"><span class="ps" style="background:#3d6b4f"></span>posted</span>
+    <span class="pal"><span class="ps" style="background:#55504a"></span>iron-gall</span>
+    <span class="pal"><span class="ps" style="background:#191512"></span>night</span>
+    <span>Spectral + Inconsolata · tabular-nums throughout · Design 1 of 6</span>
+  </div>
+</footer>
+</main>
+</body>
+</html>

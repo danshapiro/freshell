@@ -1,0 +1,1382 @@
+<!DOCTYPE html>
+<!--
+FIELD GUIDE — direction contract
+THESIS: Each session is a field expedition; everything the agent finds and changes is collected, labeled, and plated — naturalist-archive calm with accession-number rigor.
+OWN-WORLD: Turns are botanical Plates (thin double-rule frame, specimen-label strip with leader dots: COLLECTED 14:07 · BY CLAUDE (OPUS 4.6) · EXPEDITION 01JRV6). Tool calls are Field Notes settling into a roster ("4 notes gathered · 2 specimens altered · 12s"); diffs are pressed specimens — old growth struck in rust, new growth inked. Approval is a Handling Permit slip on darker stock, stamped GRANT or REFUSE.
+STORY: One heartbeat trace, plated live — four notes in, a permit lands mid-stream awaiting your stamp.
+FIRST VIEWPORT: A bound volume opened to Plate II — roster settling, a permit slip pinning the page, the index of plates at right.
+FORM+FINISH: Parchment/meadow grounds, loam ink; Source Serif 4 prose, Karla chrome, Intel One Mono data. Moss = agent/busy, berry = you/action, ochre = waiting/permits, rust = error/strike. Flat hairlines and one elevation; wax-seal send. Reduced-motion renders static plates.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FIELD GUIDE — fresh-agent redesign comp 4 of 6</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;0,8..60,700;1,8..60,400;1,8..60,600&family=Karla:wght@400;600;700&family=Intel+One+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+/* ============ FIELD GUIDE tokens ============ */
+:root{
+  --parch:#f5f2e8;  --meadow:#eef0e4; --cream:#faf7ec; --stock:#ece4c9;
+  --ink:#22301f;    --muted:#5f6652;  --faint:#6f7763;
+  --moss:#4a6741;   /* agent identity + busy */
+  --berry:#8e3b46;  --berry-rim:#6d2b34;   /* ACCENT: you / actions / selection */
+  --ochre:#b07d2a;  --ochre-ink:#7c5a1e;   /* waiting / permits */
+  --rust:#a63d2f;                          /* error / strike */
+  --hair:rgba(34,48,31,.26); --hair2:rgba(34,48,31,.5);
+  --plate-sh:0 1px 0 rgba(34,48,31,.05),0 10px 24px -18px rgba(34,48,31,.5);
+  --serif:"Source Serif 4",Georgia,"Times New Roman",serif;
+  --sans:"Karla","Segoe UI",system-ui,sans-serif;
+  --mono:"Intel One Mono",ui-monospace,SFMono-Regular,Consolas,monospace;
+}
+/* night press — same cabinet after dark */
+.night{
+  --parch:#1d241b; --meadow:#232b1e; --cream:#28311f; --stock:#2b2f1d;
+  --ink:#f5f2e8;   --muted:#9aa48e;  --faint:#849078;
+  --moss:#8fae82;  --berry:#cf7d89;  --berry-rim:#a35460;
+  --ochre:#d2a04a; --ochre-ink:#e2b566; --rust:#d47e6b;
+  --hair:rgba(245,242,232,.24); --hair2:rgba(245,242,232,.44);
+  --plate-sh:0 1px 0 rgba(0,0,0,.2),0 10px 24px -18px rgba(0,0,0,.65);
+}
+*{box-sizing:border-box;margin:0}
+body{background:var(--parch);color:var(--ink);font:400 16px/1.58 var(--serif);
+  font-variant-numeric:tabular-nums;
+  padding:28px 24px 72px;-webkit-font-smoothing:antialiased}
+code,kbd{font-family:var(--mono)}
+.mono{font-family:var(--mono)}
+.tn{font-variant-numeric:tabular-nums}
+a{color:var(--moss);text-underline-offset:3px}
+button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:pointer;text-align:left}
+input,textarea{font:inherit;color:inherit;caret-color:var(--berry)}
+.wrap{max-width:1464px;margin:0 auto}
+.vh{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+section{margin-top:34px}
+.cap{font:400 11px/1.5 system-ui,sans-serif;color:#71746b;margin:24px 0 7px}
+.cap b{color:#545745;font-weight:600}
+
+/* browser surfaces */
+::selection{background:rgba(142,59,70,.24)}
+:focus-visible{outline:2px solid var(--berry);outline-offset:2px;border-radius:1px}
+*{scrollbar-width:thin;scrollbar-color:rgba(34,48,31,.45) rgba(34,48,31,.08)}
+*::-webkit-scrollbar{width:9px;height:9px}
+*::-webkit-scrollbar-thumb{background:rgba(34,48,31,.45);border-radius:5px;border:2px solid var(--parch)}
+*::-webkit-scrollbar-track{background:rgba(34,48,31,.08)}
+details>summary{cursor:pointer;list-style:none}
+details>summary::-webkit-details-marker{display:none}
+
+/* ============ A · masthead — volume title page ============ */
+.mast{text-align:center;padding:26px 0 0}
+.mast .vol{font:600 12px/1.3 var(--sans);letter-spacing:.28em;color:var(--muted)}
+.mast h1{font:700 clamp(48px,5.8vw,74px)/1.0 var(--serif);letter-spacing:.02em;margin:12px 0 10px}
+.mast .thesis{font:italic 400 19px/1.45 var(--serif);max-width:48ch;margin:0 auto}
+.flourish{display:flex;align-items:center;gap:14px;max-width:360px;margin:22px auto 6px;color:var(--ochre-ink)}
+.flourish::before,.flourish::after{content:"";flex:1;border-top:1px solid var(--hair2)}
+.flourish .gly{font-size:16px}
+.utl{display:flex;justify-content:space-between;align-items:baseline;gap:16px;
+  border-top:1px solid var(--hair);border-bottom:1px solid var(--hair);
+  padding:7px 2px;font:400 12.5px/1.4 var(--sans);color:var(--muted)}
+.utl a{font-weight:600}
+.motnote{font:400 11px/1.5 var(--sans);color:var(--muted);letter-spacing:.02em}
+
+/* ============ shared material pieces ============ */
+.soon{display:inline-flex;align-items:center;gap:4px;font:600 11px/1.5 var(--sans);letter-spacing:.16em;
+  color:var(--ochre-ink);background:rgba(176,125,42,.14);border:1px solid rgba(124,90,30,.45);
+  border-radius:2px;padding:1px 6px;vertical-align:1px;white-space:nowrap;text-transform:uppercase}
+.soon::before{content:"✿";font-size:9px;color:var(--berry)}
+
+/* the PLATE — thin double-rule frame */
+.plate{position:relative;background:var(--parch);border:1px solid var(--hair2);
+  box-shadow:inset 0 0 0 4px var(--parch),inset 0 0 0 5px var(--hair),var(--plate-sh);
+  padding:20px 22px 16px}
+.plate .kebab{position:absolute;top:12px;right:12px;font:700 15px/1 var(--sans);color:var(--faint);
+  width:28px;height:28px;display:grid;place-items:center;border-radius:3px}
+.plate .kebab:hover{background:var(--meadow);color:var(--ink)}
+.hacts{position:absolute;top:40px;right:12px;display:flex;gap:9px;opacity:.55;
+  font:400 10.5px/1 var(--sans);letter-spacing:.04em} /* hover affordances, painted half-lit */
+.hacts a{color:var(--muted);text-decoration:none;border-bottom:1px dotted var(--hair2)}
+
+/* specimen label strip under each plate */
+.plabel{display:flex;align-items:baseline;gap:9px;margin-top:9px;
+  font:600 10px/1.4 var(--sans);letter-spacing:.14em;color:var(--muted);text-transform:uppercase}
+.plabel .dots{flex:1;border-bottom:2px dotted rgba(34,48,31,.3);transform:translateY(-3px)}
+.night .plabel .dots{border-color:rgba(245,242,232,.28)}
+.plabel .whoA{color:var(--moss)} .plabel .whoU{color:var(--berry)}
+.plabel .acc{color:var(--faint)}
+
+/* status vocabulary — one meaning per mark */
+.leafdot{display:inline-block;width:9px;height:9px;border-radius:0 50% 50% 50%;background:var(--moss);
+  transform:rotate(45deg);flex:none}
+.leafdot.wait{background:var(--ochre)}
+.okck{color:var(--berry);font-weight:700}
+.errx{color:var(--rust)}
+
+/* field-note roman numeral tag */
+.nota{font:600 11px/1 var(--mono);color:var(--ochre-ink)}
+</style>
+<style>
+/* ============ browser frame chrome ============ */
+.frame{border:1px solid var(--hair2);background:var(--parch);box-shadow:var(--plate-sh)}
+.frame .fbar{display:flex;align-items:center;gap:8px;padding:8px 14px;border-bottom:1px solid var(--hair);
+  background:var(--meadow);font:400 12px/1.3 var(--sans);color:var(--muted)}
+.fbar .fd{width:10px;height:10px;border-radius:50%;border:1px solid var(--hair2);background:var(--cream);flex:none}
+.fbar .furl{flex:1;text-align:center}
+
+/* chapter tabs — bound-volume strip; active wears a cloth ribbon */
+.chapters{display:flex;gap:2px;align-items:flex-end;padding:10px 14px 0;background:var(--meadow);
+  border-bottom:1px solid var(--hair2)}
+.chtab{position:relative;display:flex;align-items:center;gap:7px;padding:9px 16px 8px;
+  font:600 12.5px/1.2 var(--sans);color:var(--muted);background:transparent;white-space:nowrap;
+  border:1px solid transparent;border-bottom:none;border-radius:5px 5px 0 0}
+.chtab.on{color:var(--ink);background:var(--parch);border-color:var(--hair2);
+  box-shadow:0 1px 0 var(--parch)}
+.chtab .ribbon{position:absolute;top:-6px;right:10px;width:8px;height:16px;background:var(--berry);
+  clip-path:polygon(0 0,100% 0,100% 100%,50% 78%,0 100%)} /* cloth marker on the open chapter */
+.chtab .bm{width:6px;height:6px;border-radius:50%;background:var(--berry);flex:none} /* attention bookmark dot */
+.chtab.quiet{color:var(--faint)}
+.chtab .chplus{font-weight:400;color:var(--faint);font-size:15px}
+
+/* pane header — identity group vs action group */
+.phead{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 18px 11px;
+  border-bottom:1px solid var(--hair);background:var(--parch)}
+.pchip{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--hair2);border-radius:999px;
+  padding:4px 11px 4px 8px;background:var(--cream);font:600 11.5px/1.2 var(--sans);color:var(--moss)}
+.pchip .pc{width:12px;height:12px;border-radius:3px;background:#c15a3c;flex:none;border:1px solid rgba(34,48,31,.25)}
+.ptitle{font:600 17px/1.25 var(--serif)}
+.pstate{display:inline-flex;align-items:center;gap:6px;font:600 12px/1.3 var(--sans);color:var(--moss)}
+.pacts{margin-left:auto;display:flex;gap:8px;align-items:center}
+.pcost{font:600 12px/1 var(--mono);color:var(--ink);border:1px solid var(--hair);border-radius:3px;
+  background:var(--cream);padding:5px 9px}
+.pico{position:relative;width:32px;height:32px;display:inline-grid;place-items:center;border:1px solid var(--hair);
+  background:var(--cream);color:var(--muted);font-size:14px;border-radius:3px}
+.pico:hover{color:var(--ink);border-color:var(--hair2)}
+.pico .bdg{position:absolute;top:-7px;right:-7px;font:700 9.5px/1 var(--sans);background:var(--berry);
+  color:var(--cream);border-radius:999px;padding:2px 5px}
+.idgrp{display:flex;gap:10px;align-items:center;min-width:0}
+.actnote{font:400 11px/1.4 var(--sans);color:var(--muted);width:100%;letter-spacing:.03em}
+
+/* status line — the accession ledger strip */
+.statusline{display:flex;flex-wrap:wrap;gap:5px 14px;align-items:center;padding:7px 18px;
+  border-bottom:1px solid var(--hair2);background:var(--meadow);
+  font:400 12px/1.4 var(--sans);color:var(--muted)}
+.statusline .sep{color:rgba(34,48,31,.3)}
+.statusline b{color:var(--ink);font-weight:600}
+.meter{display:inline-block;width:78px;height:11px;border:1px solid var(--hair2);background:var(--cream);
+  position:relative;vertical-align:-2px;border-radius:2px}
+.meter i{position:absolute;top:2px;bottom:2px;left:2px;width:56%;background:var(--moss);border-radius:1px}
+.meter .warnline{position:absolute;top:-2px;bottom:-2px;left:80%;width:1.5px;background:var(--ochre)}
+
+/* ============ split: transcript + index rail ============ */
+.split{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:26px;padding:22px 20px 18px}
+.tran{min-width:0}
+.jumpwrap{display:flex;justify-content:center;margin-bottom:16px}
+.jumpchip{font:600 11.5px/1.2 var(--sans);color:var(--muted);border:1px solid var(--hair2);
+  background:var(--cream);border-radius:999px;padding:6px 14px}
+.jumpchip:hover{color:var(--berry);border-color:var(--berry)}
+.tran .plate{margin-bottom:26px;max-width:720px}
+.tran .plate.agentbox{max-width:720px}
+
+/* plate heading + body */
+.plhd{display:flex;align-items:baseline;gap:10px;margin-bottom:8px;font:600 11px/1.3 var(--sans);
+  letter-spacing:.18em;color:var(--faint);text-transform:uppercase}
+.plhd .no{color:var(--ochre-ink)}
+p.pb{margin:0 0 9px;max-width:62ch}
+p.pb:last-child{margin-bottom:0}
+
+/* thinking block */
+details.think{margin:8px 0 2px}
+details.think summary{display:inline-flex;gap:8px;align-items:center;font:italic 400 13.5px/1.4 var(--serif);
+  color:var(--muted)}
+details.think summary::before{content:"❦";font-style:normal;color:var(--ochre-ink);font-size:12px}
+details.think[open] summary{margin-bottom:6px}
+details.think .tin{border-left:1px solid var(--hair2);margin:2px 0 4px 4px;padding:4px 14px;
+  font:italic 400 13.5px/1.55 var(--serif);color:var(--muted);max-width:58ch}
+
+/* field-notes roster */
+.notes{margin:12px 0 2px;border-top:1px solid var(--hair2)}
+.note{border-bottom:1px solid var(--hair)}
+.note>summary{display:flex;gap:10px;align-items:baseline;padding:8px 4px;min-height:34px}
+.note>summary:hover{background:var(--meadow)}
+.note .ntool{font:600 13.5px/1.3 var(--serif)}
+.note .narg{font:400 12.5px/1.4 var(--mono);color:var(--muted);overflow-wrap:anywhere}
+.note .nstat{margin-left:auto;display:flex;gap:10px;align-items:baseline;flex:none;
+  font:400 11.5px/1.3 var(--sans);color:var(--muted)}
+.note .nx{padding:2px 4px 12px 24px;font:400 13px/1.5 var(--serif);color:var(--muted)}
+.note .nx code{font-size:12px}
+.rosterline{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;margin-top:10px;
+  border-top:1px solid var(--hair2);padding-top:9px;font:600 12px/1.4 var(--sans);color:var(--muted)}
+.rosterline .rmark{color:var(--ochre-ink)}
+
+/* pressed-specimen diff */
+.specimen{border:1px solid var(--hair2);background:var(--cream);margin:8px 0 4px;position:relative}
+.specimen .shead{display:flex;gap:8px;align-items:baseline;padding:7px 12px;border-bottom:1px solid var(--hair);
+  font:600 10px/1.3 var(--sans);letter-spacing:.14em;color:var(--muted);text-transform:uppercase}
+.dline{display:flex;gap:10px;padding:3px 12px;border-bottom:1px dotted var(--hair);
+  font:400 12.5px/1.5 var(--mono);font-variant-numeric:tabular-nums}
+.dline:last-child{border-bottom:none}
+.dline .ln{flex:none;width:2.2em;text-align:right;color:var(--faint)}
+.dline .sg{flex:none;width:1em;color:var(--faint)}
+.dline .cd{overflow-wrap:anywhere;min-width:0}
+.dline.del .cd{color:var(--rust);text-decoration:line-through;text-decoration-thickness:1.5px}
+.dline.del{background:rgba(166,61,47,.06)}
+.dline.add .cd{color:var(--ink)}
+.dline.add{background:rgba(74,103,65,.09)}
+.dline.add .sg{color:var(--moss)}
+.dline .annot{margin-left:auto;flex:none;color:var(--faint);font-size:11px;align-self:center}
+.dline .annot:hover{color:var(--berry)}
+.dline.ctx .cd{color:var(--muted)}
+
+/* streaming state */
+.caret{display:inline-block;width:2px;height:15px;background:var(--berry);vertical-align:-2px;margin-left:1px}
+.liverow{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px;border-top:1px solid var(--hair);
+  padding-top:10px;font:400 12.5px/1.4 var(--sans);color:var(--muted)}
+.spinner{width:13px;height:13px;flex:none;border:1.5px solid var(--hair2);border-top-color:var(--moss);
+  border-radius:50%}
+.stopb{font:700 11.5px/1 var(--sans);letter-spacing:.08em;color:var(--cream);background:var(--berry);
+  border:1px solid var(--berry-rim);border-radius:3px;padding:7px 14px;margin-left:auto}
+
+/* ============ permit slip — approval ============ */
+.permit{position:relative;background:var(--stock);border:1px solid rgba(124,90,30,.55);
+  box-shadow:inset 0 0 0 4px var(--stock),inset 0 0 0 5px rgba(124,90,30,.35),var(--plate-sh);
+  padding:18px 22px 14px;margin-bottom:26px;max-width:720px}
+.permit .phd{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.permit .pnm{font:600 11px/1.3 var(--sans);letter-spacing:.2em;color:var(--ochre-ink)}
+.permit .pno{font:400 11px/1.3 var(--mono);color:var(--muted);margin-left:auto}
+.warnmark{display:inline-grid;place-items:center;width:22px;height:22px;border:1.5px solid var(--ochre-ink);
+  color:var(--ochre-ink);font:700 13px/1 var(--sans);border-radius:2px;transform:translateY(4px)}
+.permit .cmdline{font:600 13.5px/1.5 var(--mono);color:var(--ink);background:var(--parch);
+  border:1px solid var(--hair);padding:8px 12px;margin:10px 0 2px;overflow-wrap:anywhere;border-radius:2px}
+.permit .why{font:400 13px/1.5 var(--serif);color:var(--muted)}
+.permit .wtxt{display:flex;gap:9px;align-items:center;color:var(--ochre-ink);
+  font:600 13px/1.4 var(--sans);margin-top:9px}
+.stamps{display:flex;gap:16px;flex-wrap:wrap;margin-top:14px}
+.stamp{min-width:128px;min-height:58px;padding:10px 18px;display:grid;place-items:center;text-align:center;
+  border:2px solid var(--berry);color:var(--berry);background:transparent;border-radius:4px;
+  font:700 14px/1.25 var(--sans);letter-spacing:.16em;text-transform:uppercase;
+  box-shadow:inset 0 0 0 1.5px rgba(142,59,70,.35)}
+.stamp small{display:block;font:400 9.5px/1.3 var(--sans);letter-spacing:.1em;color:var(--muted);
+  text-transform:none;margin-top:2px}
+.stamp.refuse{border-color:var(--rust);color:var(--rust);box-shadow:inset 0 0 0 1.5px rgba(166,61,47,.35)}
+.blanket{display:flex;gap:9px;align-items:center;margin-top:12px;padding-top:10px;
+  border-top:1px dashed rgba(124,90,30,.5);font:400 12.5px/1.4 var(--sans);color:var(--muted)}
+.blanket .box{width:15px;height:15px;flex:none;border:1.5px solid var(--ochre-ink);border-radius:2px;
+  display:grid;place-items:center;color:var(--berry);font-weight:700;font-size:11px}
+.permit .pnote{font:400 11.5px/1.5 var(--sans);color:var(--muted);margin-top:9px;letter-spacing:.02em}
+
+/* ============ identification key — question banner ============ */
+.keytbl{position:relative;background:var(--cream);border:1px solid var(--hair2);
+  box-shadow:var(--plate-sh);padding:16px 22px 14px;margin-bottom:26px;max-width:720px}
+.keytbl .khd{display:flex;gap:9px;align-items:baseline;font:600 10.5px/1.3 var(--sans);
+  letter-spacing:.16em;color:var(--muted);text-transform:uppercase}
+.keytbl .qq{font:600 16px/1.4 var(--serif);margin:8px 0 8px;max-width:60ch}
+.krow{display:flex;align-items:baseline;gap:12px;padding:6px 8px;min-height:30px;font:400 14px/1.5 var(--serif)}
+.krow .kk{font:600 12px/1.3 var(--mono);color:var(--ochre-ink);flex:none;width:22px}
+.krow .kradio{margin-left:auto;width:15px;height:15px;flex:none;border:1.5px solid var(--hair2);
+  border-radius:50%;align-self:center;position:relative}
+.krow.sel{background:rgba(142,59,70,.08);outline:1px solid rgba(142,59,70,.35);border-radius:2px}
+.krow.sel .kradio{border-color:var(--berry)}
+.krow.sel .kradio::after{content:"";position:absolute;inset:3px;border-radius:50%;background:var(--berry)}
+.kother{display:flex;gap:10px;align-items:baseline;margin-top:4px;padding:6px 8px;color:var(--muted);
+  font:italic 400 13.5px/1.5 var(--serif)}
+.kother .oline{flex:1;border-bottom:1.5px dotted var(--hair2);min-height:20px}
+.keytbl .kfoot{display:flex;gap:12px;align-items:center;margin-top:10px}
+.keytbl .kfoot .motnote{margin-left:auto}
+
+/* accession note — compaction */
+.accession{position:relative;max-width:720px;margin-bottom:26px;background:var(--cream);
+  border:1px solid var(--hair);padding:10px 16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+  font:400 13px/1.5 var(--sans);color:var(--muted)}
+.accession .ano{font:600 10px/1.3 var(--sans);letter-spacing:.16em;color:var(--ochre-ink);text-transform:uppercase}
+.accession b{color:var(--ink);font-weight:600}
+
+/* search find — a pinned citation */
+.findcard{position:relative;max-width:720px;margin-bottom:26px;background:var(--cream);
+  border:1px solid var(--hair2);box-shadow:var(--plate-sh);padding:12px 16px 10px}
+.findcard .fhd{font:600 10px/1.3 var(--sans);letter-spacing:.16em;color:var(--muted);text-transform:uppercase}
+.findcard .fq{font:italic 400 14.5px/1.5 var(--serif);margin-top:5px}
+.findcard .srcs{display:flex;gap:8px;flex-wrap:wrap;margin-top:7px}
+.findcard .src{font:600 11.5px/1.3 var(--sans);color:var(--moss);border:1px solid var(--hair);
+  border-radius:999px;padding:3px 10px;background:var(--parch)}
+
+/* queued bookmarks — cloth tabs peeking above the slope */
+.queuepeek{display:flex;gap:8px;align-items:flex-end;max-width:720px;margin:0 auto -1px;position:relative;z-index:2}
+.qbm{display:inline-flex;align-items:center;gap:8px;font:600 12px/1.3 var(--sans);color:var(--cream);
+  background:var(--berry);padding:7px 10px 12px;border-radius:4px 4px 0 0;max-width:290px;
+  box-shadow:0 -1px 0 var(--berry-rim)}
+.qbm:nth-child(2){background:var(--moss)}
+.qbm .qx{color:rgba(250,247,236,.85);font-weight:700}
+.qbm .qx:hover{color:var(--cream)}
+.qtag{font:600 10px/1.3 var(--sans);letter-spacing:.14em;text-transform:uppercase;color:var(--muted);
+  align-self:center;padding-bottom:10px;margin-right:auto}
+
+/* ============ composer — the writing slope ============ */
+.slope{border-top:1px solid var(--hair2);background:var(--meadow);padding:14px 20px 12px;
+  position:relative}
+.slopein{position:relative;max-width:720px;margin:0 auto;background:var(--cream);
+  border:1px solid var(--hair2);border-radius:3px;box-shadow:inset 0 2px 0 rgba(34,48,31,.05),var(--plate-sh);
+  padding:12px 16px 10px}
+.slopein textarea{display:block;width:100%;border:none;background:transparent;resize:none;outline:none;
+  font:italic 400 15.5px/1.55 var(--serif);color:var(--ink);padding:0 0 8px;
+  border-bottom:1px solid var(--hair)}
+.slopein textarea:focus-visible{outline:none;border-bottom-color:var(--berry)}
+.leafchip{display:inline-flex;align-items:center;gap:6px;font:600 11.5px/1.3 var(--sans);
+  border:1px solid var(--hair);background:var(--parch);border-radius:3px;padding:3px 8px 3px 4px;margin-top:9px}
+.leafchip .lf{width:13px;height:15px;flex:none;background:var(--moss);
+  clip-path:polygon(50% 0,100% 30%,80% 100%,50% 82%,20% 100%,0 30%)}
+.leafchip .lx{color:var(--faint);font-weight:700}
+.leafchip .lx:hover{color:var(--rust)}
+.comprow{display:flex;gap:9px;align-items:center;margin-top:10px;max-width:720px;margin-left:auto;margin-right:auto}
+.cbtn{width:36px;height:36px;display:inline-grid;place-items:center;border:1px solid var(--hair);
+  background:var(--cream);border-radius:3px;color:var(--muted);font-size:15px}
+.cbtn:hover{color:var(--ink);border-color:var(--hair2)}
+.cbtn.cy{color:var(--moss);font-weight:700}
+.stopsq{font:700 11px/1 var(--sans);letter-spacing:.1em;color:var(--cream);background:var(--berry);
+  border:1px solid var(--berry-rim);border-radius:3px;padding:9px 13px}
+/* the wax-seal send — FLAT, 1px darker rim, no gradient, no halo */
+.seal{width:44px;height:44px;border-radius:50%;background:var(--berry);border:1px solid var(--berry-rim);
+  color:var(--cream);display:grid;place-items:center;margin-left:auto;position:relative;
+  font-size:17px}
+.seal::after{content:"";position:absolute;inset:4px;border-radius:50%;border:1px solid rgba(250,247,236,.5)}
+.seal:hover{background:#7d323d}
+.seal:active{transform:scale(.97)}
+.hintline{max-width:720px;margin:8px auto 0;font:400 11px/1.5 var(--sans);color:var(--faint);
+  font-variant-numeric:tabular-nums}
+
+/* scroll affordances */
+.newpill{position:sticky;bottom:14px;display:block;width:max-content;margin:18px auto 0;z-index:3;
+  font:600 12px/1 var(--sans);color:var(--cream);background:var(--berry);border:1px solid var(--berry-rim);
+  border-radius:999px;padding:8px 16px;box-shadow:var(--plate-sh)}
+
+/* generic small buttons */
+.actline{display:flex;gap:14px;flex-wrap:wrap;margin-top:10px}
+.mlink{font:600 12px/1.3 var(--sans);color:var(--moss);text-decoration:none;border-bottom:1px dotted var(--hair2)}
+.mlink:hover{color:var(--berry);border-color:var(--berry)}
+</style>
+<style>
+/* ============ index of plates (right rail) ============ */
+.rail{min-width:0}
+.rsec{margin-bottom:22px}
+.rhd{display:flex;align-items:baseline;gap:8px;font:600 10.5px/1.3 var(--sans);letter-spacing:.18em;
+  color:var(--muted);text-transform:uppercase;border-bottom:1px solid var(--hair2);padding-bottom:6px;margin-bottom:9px}
+.rhd .rn{color:var(--ochre-ink)}
+.rhd .rr{margin-left:auto;font:400 10px/1.3 var(--sans);color:var(--faint);letter-spacing:.06em}
+/* pressed-specimen schedule — diffs */
+.drow{padding:7px 0 6px;border-bottom:1px dotted var(--hair);font-size:12.5px}
+.drow .fp{font:400 12px/1.4 var(--mono);color:var(--ink);overflow-wrap:anywhere}
+.drow .nums{font:400 11.5px/1.4 var(--mono);font-variant-numeric:tabular-nums;margin-top:1px}
+.drow .pl{color:var(--moss)} .drow .mn{color:var(--rust)}
+.drow .vline{display:flex;gap:12px;align-items:baseline;margin-top:2px;
+  font:400 11px/1.4 var(--sans);color:var(--muted)}
+.drow .vline a{color:var(--moss);font-weight:600}
+.drow .vline .xh{color:var(--faint)}
+/* accession timeline — checkpoints */
+.ckaxis{position:relative;margin:4px 0 2px 5px;border-left:1.5px solid var(--hair2);padding-left:0}
+.cknode{position:relative;padding:0 0 14px 16px;font:400 12.5px/1.4 var(--sans)}
+.cknode:last-child{padding-bottom:2px}
+.cknode::before{content:"";position:absolute;left:-5.5px;top:5px;width:9px;height:9px;border-radius:50%;
+  border:1.5px solid var(--moss);background:var(--parch)}
+.cknode .ck{font:600 12px/1.3 var(--mono);color:var(--ink)}
+.cknode .rw{font:600 11px/1.3 var(--sans);color:var(--moss);margin-left:8px;
+  border-bottom:1px dotted var(--hair2)}
+.cknode .rw:hover{color:var(--berry);border-color:var(--berry)}
+/* expedition ledger — usage */
+.ledger{width:100%;border-collapse:collapse;font:400 12.5px/1.5 var(--sans)}
+.ledger td{border-bottom:1px dotted var(--hair);padding:4.5px 0;font-variant-numeric:tabular-nums}
+.ledger td:last-child{text-align:right;font-weight:600;color:var(--ink)}
+.ledger .lbl{color:var(--muted)}
+.ctxbar{height:11px;border:1px solid var(--hair2);background:var(--cream);position:relative;
+  border-radius:2px;margin-top:7px}
+.ctxbar i{position:absolute;top:2px;bottom:2px;left:2px;width:56%;background:var(--moss);border-radius:1px}
+.ctxbar .warnline{position:absolute;top:-3px;bottom:-3px;left:80%;width:1.5px;background:var(--ochre)}
+.ctxnote{font:400 11px/1.4 var(--sans);color:var(--muted);margin-top:4px}
+/* related volumes — threads */
+.volrow{display:flex;gap:9px;align-items:baseline;padding:5px 0;border-bottom:1px dotted var(--hair);
+  font:400 12.5px/1.4 var(--sans)}
+.volrow .vn{font-weight:600;color:var(--ink)}
+.volrow .vk{color:var(--faint);font-size:11px}
+.volrow.kid{padding-left:18px}
+.volrow.kid .vn{font-weight:400}
+.motrow{margin-top:6px}
+
+/* ============ tangent insets (part 2) ============ */
+.insetrow{display:flex;gap:40px;flex-wrap:wrap;align-items:flex-start}
+
+/* table of plates — slash menu */
+.toclist{width:640px;max-width:100%;background:var(--parch);border:1px solid var(--hair2);
+  box-shadow:inset 0 0 0 4px var(--parch),inset 0 0 0 5px var(--hair),var(--plate-sh);padding:16px 20px 12px}
+.toclist .thd{display:flex;align-items:baseline;gap:12px;border-bottom:1px solid var(--hair2);
+  padding-bottom:8px;margin-bottom:4px}
+.toclist .ttl{font:600 12px/1.3 var(--sans);letter-spacing:.2em;color:var(--ink);text-transform:uppercase}
+.tocfilter{margin-left:auto;display:flex;align-items:baseline;gap:7px;font:400 12.5px/1.3 var(--sans);color:var(--muted)}
+.tocfilter .fb{font:600 12.5px/1.4 var(--mono);color:var(--ink);border:1px solid var(--hair2);
+  background:var(--cream);padding:2px 9px;border-radius:2px}
+.tocfilter .fb .caret{height:11px;vertical-align:-1px}
+.tocgrid{display:grid;grid-template-columns:1fr 1fr;column-gap:26px}
+.tocg{padding-top:8px}
+.tocg .ghd{display:flex;align-items:baseline;gap:8px;font:600 10px/1.3 var(--sans);letter-spacing:.2em;
+  color:var(--faint);text-transform:uppercase;padding-bottom:3px}
+.tocg .ghd::after{content:"";flex:1;border-top:1px solid var(--hair)}
+.tcmd{display:block;width:100%;padding:6px 2px 5px;border-bottom:1px dotted var(--hair);min-height:30px}
+.tcmd .crow{display:flex;align-items:baseline;gap:8px}
+.tcmd .cplno{font:400 10.5px/1.4 var(--mono);color:var(--faint);flex:none;width:16px}
+.tcmd .cname{font:600 12.5px/1.4 var(--mono);color:var(--ink)}
+.tcmd .cdot{flex:1;border-bottom:2px dotted rgba(34,48,31,.22);transform:translateY(-3px)}
+.tcmd .cret{font:400 10.5px/1.4 var(--mono);color:var(--faint);flex:none}
+.tcmd .cdesc{font:400 11.5px/1.4 var(--sans);color:var(--muted);margin:1px 0 0 24px}
+.tcmd.miss .cname,.tcmd.miss .cdesc,.tcmd.miss .cret,.tcmd.miss .cplno{opacity:.32}
+.tcmd.hit{background:rgba(142,59,70,.07);border-radius:2px}
+.tcmd.hit .cname{color:var(--berry)}
+.tocfoot{display:flex;gap:12px;align-items:center;border-top:1px solid var(--hair2);margin-top:8px;
+  padding-top:7px;font:400 11.5px/1.4 var(--sans);color:var(--muted)}
+.tocfoot .kk{font:600 10.5px/1.3 var(--mono);border:1px solid var(--hair2);border-bottom-width:2px;
+  border-radius:3px;padding:1px 6px;background:var(--cream);color:var(--ink)}
+
+/* specimen catalog — @ mention */
+.catalog{width:330px;max-width:100%;background:var(--parch);border:1px solid var(--hair2);
+  box-shadow:var(--plate-sh);padding:12px 14px 10px}
+.catalog .chd{display:flex;align-items:baseline;gap:8px;font:400 12px/1.3 var(--sans);color:var(--muted)}
+.catalog .chd .cb{font:600 12.5px/1.4 var(--mono);color:var(--ink);border:1px solid var(--hair2);
+  background:var(--cream);padding:2px 9px;border-radius:2px}
+.catrow{display:flex;gap:9px;align-items:baseline;padding:7px 8px 6px;margin-top:6px;
+  border:1px solid transparent;border-bottom:1px dotted var(--hair);border-radius:2px}
+.catrow .sp{font:400 12px/1.4 var(--mono);color:var(--ink);overflow-wrap:anywhere}
+.catrow .sm{font:400 10.5px/1.4 var(--sans);color:var(--faint)}
+.catrow .cfam{margin-left:auto;flex:none;font:600 9px/1.4 var(--sans);letter-spacing:.12em;
+  color:var(--muted);text-transform:uppercase}
+.catrow.sel{background:rgba(142,59,70,.07);outline:1px solid rgba(142,59,70,.35);border-bottom-color:transparent}
+.catconst{font:400 11px/1.4 var(--sans);color:var(--muted);margin-top:7px}
+
+/* tipped-in leaf — settings popover */
+.leafwrap{position:relative;width:400px;max-width:100%}
+.gearanchor{display:inline-grid;place-items:center;width:32px;height:32px;border:1px solid var(--hair2);
+  border-radius:3px;background:var(--cream);color:var(--muted);font-size:15px;margin-bottom:10px}
+.tippedleaf{position:relative;background:var(--cream);border:1px solid var(--hair2);
+  box-shadow:inset 0 0 0 4px var(--cream),inset 0 0 0 5px var(--hair),var(--plate-sh);
+  padding:14px 20px 12px;border-radius:2px}
+.tippedleaf::before{content:"";position:absolute;top:0;right:0;width:0;height:0;
+  border-left:22px solid transparent;border-top:22px solid rgba(34,48,31,.14)} /* folded corner */
+.tippedleaf::after{content:"";position:absolute;top:1px;right:1px;width:0;height:0;
+  border-left:20px solid transparent;border-top:20px solid var(--meadow)}
+.tippedleaf .lhd{font:600 10.5px/1.3 var(--sans);letter-spacing:.18em;text-transform:uppercase;
+  color:var(--muted);border-bottom:1px solid var(--hair2);padding-bottom:7px;margin-bottom:2px;
+  display:flex;gap:8px;align-items:baseline}
+.tippedleaf .lhd .rr{margin-left:auto;font-weight:400;color:var(--faint);letter-spacing:.04em;text-transform:none}
+.lrow{display:flex;gap:12px;align-items:center;min-height:40px;padding:8px 0;
+  border-bottom:1px solid var(--hair);font:400 13px/1.4 var(--sans)}
+.lrow .llab{color:var(--muted);flex:none;width:104px}
+.lrow .lval{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.lrow.stack{flex-direction:column;align-items:stretch}
+.lrow.stack .llab{width:auto}
+.seg{display:inline-flex;border:1px solid var(--hair2);border-radius:3px;background:var(--parch)}
+.seg button{padding:6px 11px;font:600 12px/1.3 var(--sans);color:var(--muted);
+  border-right:1px solid var(--hair);min-height:30px}
+.seg button:last-child{border-right:none}
+.seg button.on{background:var(--berry);color:var(--cream)}
+.seg button.on:hover{background:#7d323d}
+.modelrow{display:flex;gap:10px;align-items:baseline;border:1px solid var(--hair);border-radius:2px;
+  background:var(--parch);padding:7px 12px 6px;margin-top:6px;font:400 13px/1.4 var(--sans)}
+.modelrow .mdot{width:13px;height:13px;flex:none;border:1.5px solid var(--hair2);border-radius:50%;
+  align-self:center;position:relative}
+.modelrow.on{outline:1.5px solid var(--berry)}
+.modelrow.on .mdot{border-color:var(--berry)}
+.modelrow.on .mdot::after{content:"";position:absolute;inset:3px;border-radius:50%;background:var(--berry)}
+.modelrow .mt{font-weight:600;color:var(--ink)}
+.modelrow .mc{color:var(--faint);font-size:11.5px;margin-left:auto}
+/* wax-dot toggle */
+.wtoggle{display:inline-flex;gap:9px;align-items:center;min-height:24px;font:400 13px/1.4 var(--sans)}
+.wtoggle .wdot{width:17px;height:17px;border-radius:50%;background:var(--berry);
+  border:1px solid var(--berry-rim);flex:none;position:relative}
+.wtoggle .wdot::after{content:"";position:absolute;inset:3px;border-radius:50%;border:1px solid rgba(250,247,236,.55)}
+.wtoggle.off .wdot{background:transparent;border:1.5px solid var(--hair2)}
+.wtoggle.off .wdot::after{display:none}
+.wtoggle .simpson{margin-left:2px}
+.advgrp{font:400 12.5px/1.4 var(--sans);color:var(--muted)}
+.advgrp .arow{display:block;width:100%;padding:4px 0;min-height:26px}
+.advgrp .arow .aa{color:var(--faint);margin-right:8px}
+.leaffold-note{font:400 11px/1.5 var(--sans);color:var(--muted);margin-top:9px;letter-spacing:.02em}
+</style>
+<style>
+/* ============ phone frame ============ */
+.phonewrap{display:flex;gap:38px;flex-wrap:wrap;align-items:flex-start}
+.phone{width:390px;flex:none;border:1px solid var(--hair2);background:var(--parch);
+  box-shadow:var(--plate-sh);display:flex;flex-direction:column;position:relative;border-radius:22px;overflow:hidden}
+.phone.h844{height:844px}
+.phone .notch{height:9px;flex:none;background:var(--ink);border-radius:0 0 8px 8px;width:120px;margin:0 auto}
+.pchapters{display:flex;gap:4px;overflow-x:auto;padding:8px 10px 0;background:var(--meadow);
+  border-bottom:1px solid var(--hair2);flex:none;scrollbar-width:none}
+.pchapters::-webkit-scrollbar{display:none}
+.pchapters .chtab{padding:7px 12px 6px;font-size:11.5px}
+.pphead{padding:10px 14px 9px;border-bottom:1px solid var(--hair);background:var(--parch);flex:none}
+.pphead .r1{display:flex;align-items:center;gap:8px;min-width:0}
+.pphead .pt{font:600 13.5px/1.3 var(--serif);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pphead .r2{display:flex;align-items:center;gap:7px;margin-top:3px;font:400 11px/1.4 var(--sans);color:var(--muted)}
+.pchiprow{display:flex;gap:7px;overflow-x:auto;padding:6px 12px;border-bottom:1px solid var(--hair2);
+  background:var(--meadow);flex:none;scrollbar-width:none}
+.pchiprow::-webkit-scrollbar{display:none}
+.pstchip{flex:none;font:400 11px/1.4 var(--sans);color:var(--muted);border:1px solid var(--hair);
+  background:var(--cream);border-radius:999px;padding:3px 9px;white-space:nowrap}
+.pstchip b{color:var(--ink);font-weight:600}
+.pbody{flex:1;overflow-y:auto;padding:14px 10px 12px}
+.pbody .plate{padding:13px 13px 10px;margin-bottom:18px}
+.pbody .plabel{flex-wrap:wrap;row-gap:2px}
+.pbody p.pb{font-size:14.5px;margin-bottom:7px;max-width:none}
+.pbody .plhd{margin-bottom:5px}
+.pbody details.think summary{font-size:13px}
+.pbody .note>summary{padding:6px 2px;gap:8px;min-height:30px}
+.pbody .note .ntool{font-size:12.5px}
+.pbody .note .narg{font-size:11.5px}
+.pbody .note .nstat{font-size:10.5px;gap:7px}
+.pbody .rosterline{font-size:11px}
+.pbody .specimen .dline{font-size:11.5px;padding:3px 8px}
+.pbody .specimen{overflow-x:auto}
+.pbody .dline .cd{white-space:nowrap;overflow-wrap:normal} /* phone: horizontal scroll for the pressed diff */
+.pbody .permit{padding:12px 12px 10px;margin-bottom:0}
+.pbody .permit .phd{gap:8px}
+.pbody .permit .pnm{letter-spacing:.14em}
+.pbody .permit .warnmark{width:18px;height:18px;font-size:11px;transform:translateY(3px)}
+.pbody .permit .cmdline{font-size:12.5px;padding:6px 10px;margin:7px 0 1px}
+.pbody .permit .why{font-size:12px}
+.pbody .permit .wtxt{font-size:12px;margin-top:6px}
+.pbody .pstampgrid{gap:8px;margin-top:9px}
+.pbody .blanket{margin-top:8px;padding-top:8px;font-size:11.5px}
+.pbody .newpill{margin:14px auto 4px}
+.pstampgrid{display:flex;flex-direction:column;gap:10px;margin-top:12px}
+.pstampgrid .stamp{width:100%;min-height:52px}
+.plive .liverow{font-size:11.5px}
+.safearea{height:20px;flex:none;position:relative}
+.safearea::after{content:"";position:absolute;left:50%;bottom:6px;width:118px;height:4px;margin-left:-59px;
+  background:var(--ink);border-radius:2px}
+.pslope{flex:none;border-top:1px solid var(--hair2);background:var(--meadow);padding:8px 10px 0}
+.pslope .queuepeek{padding:0 6px;max-width:none}
+.pslope .qbm{font-size:11px;padding:6px 9px 10px;max-width:210px}
+.pslope .slopein{padding:9px 11px 8px}
+.pslope .slopein textarea{font-size:13.5px;padding-bottom:6px}
+.pslope .comprow{margin-top:8px}
+.pslope .cbtn{width:44px;height:44px;font-size:16px}
+.pslope .seal{width:44px;height:44px;margin-left:auto}
+
+/* bottom sheets — lifted plates with a cloth pull-tab */
+.sheetzone{position:relative;flex:1;display:flex;align-items:flex-end;min-height:0}
+.sheetdim{position:absolute;inset:0;background:rgba(34,48,31,.34)}
+.sheetlift{position:relative;width:100%;background:var(--parch);border-top:1px solid var(--hair2);
+  box-shadow:0 -14px 30px -22px rgba(34,48,31,.7);padding:10px 14px 0;border-radius:14px 14px 0 0}
+.pulltab{display:block;width:44px;height:10px;margin:0 auto 10px;background:var(--berry);border:none;
+  border-radius:3px 3px 0 0;clip-path:polygon(12% 100%,0 100%,16% 0,84% 0,100% 100%,88% 100%)} /* cloth pull-tab */
+.sheetlift .shd{font:600 10.5px/1.3 var(--sans);letter-spacing:.18em;text-transform:uppercase;
+  color:var(--muted);margin-bottom:4px}
+.shrow{display:flex;align-items:center;gap:12px;min-height:50px;padding:9px 2px;width:100%;
+  border-bottom:1px dotted var(--hair);font:400 14.5px/1.4 var(--serif)}
+.shrow .sic{font:600 13px/1 var(--sans);color:var(--moss);flex:none;width:20px;text-align:center}
+.shrow.danger{color:var(--rust);font-weight:600}
+.shrow.danger .sic{color:var(--rust)}
+.shrow.cancel{justify-content:center;font:600 12px/1.3 var(--sans);letter-spacing:.14em;
+  text-transform:uppercase;color:var(--muted)}
+.shrow.cancel:hover{color:var(--berry)}
+.sheetlift .toggzone .lrow{border-bottom:1px dotted var(--hair)}
+.phone.small{height:600px}
+.phone.sheetactions{height:auto;min-height:0}
+.phone.sheetactions .pbody{flex:none}
+.phone.sheetactions .sheetzone{min-height:120px;padding-top:48px}
+.phone.tall{height:740px}
+.phone.small .pbody{padding:0;display:flex;flex-direction:column;overflow:hidden}
+.phone.small .sheetlift{max-height:100%;overflow-y:auto}
+.phone.pslash{height:auto;min-height:0}
+.phone.pslash .pbody{flex:none}
+.pbody .pslashdim{padding:6px 14px 10px;font:italic 400 12px/1.5 var(--serif);color:var(--muted)}
+.pslash .shrow{min-height:46px;font:400 13.5px/1.4 var(--serif)}
+.pslash .shrow .cname{font:600 13px/1.4 var(--mono);color:var(--berry)}
+.pslash .shrow .cdesc{margin-left:auto;color:var(--faint);font:400 11.5px/1.4 var(--sans)}
+.pslash .grp{font:600 10px/1.3 var(--sans);letter-spacing:.2em;text-transform:uppercase;
+  color:var(--faint);padding:8px 2px 3px}
+
+/* mobile rail collapse: index drawer hint */
+.drawertab{display:none}
+@media (max-width:900px){
+  .frame .split{grid-template-columns:1fr}
+  .frame .rail{display:none}
+  .frame .drawertab{display:flex;align-items:center;gap:8px;border:1px solid var(--hair2);
+    background:var(--cream);border-radius:3px;padding:7px 12px;margin:0 20px;
+    font:600 11px/1.3 var(--sans);letter-spacing:.12em;color:var(--muted);text-transform:uppercase}
+}
+
+/* ============ night press swatch ============ */
+.nightbar{background:#151a13;border:1px solid rgba(245,242,232,.2);padding:22px;margin-top:6px}
+.nightbar .ngrid{display:flex;gap:26px;flex-wrap:wrap;align-items:flex-start}
+.ntile{width:400px;max-width:100%}
+.night .plabel{margin-top:8px}
+.night .slopein textarea{color:var(--ink)}
+
+/* ============ footer — contract in copperplate ============ */
+.foot{margin-top:52px;border-top:1px solid var(--hair2);padding-top:18px;max-width:78ch}
+.foot .ffhd{display:flex;align-items:baseline;gap:10px;font:600 11px/1.3 var(--sans);letter-spacing:.2em;
+  color:var(--muted);text-transform:uppercase;margin-bottom:10px}
+.foot .ffhd::after{content:"";flex:1;border-top:1px solid var(--hair)}
+.foot dl{font:400 14px/1.6 var(--serif)}
+.foot dt{font:600 10.5px/1.4 var(--sans);letter-spacing:.16em;text-transform:uppercase;color:var(--ochre-ink);
+  margin-top:12px}
+.foot dd{margin:3px 0 0;padding-left:20px;position:relative}
+.foot dd::before{content:"—";position:absolute;left:0;color:var(--faint)}
+.foot .sig{font:italic 600 15px/1.4 var(--serif);color:var(--moss);margin-top:18px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<!-- ============ A · MASTHEAD — title page of Vol. VI ============ -->
+<header class="mast">
+  <div class="vol">VOL. VI</div>
+  <h1>Field Guide</h1>
+  <p class="thesis">the session as a collected specimen record — every find labeled,
+    every change plated, every decision stamped.</p>
+  <div class="flourish" aria-hidden="true"><span class="gly">❦</span></div>
+  <div class="vol" style="letter-spacing:.18em">PLATE № 4 · FRESH-AGENT UX STUDY</div>
+  <div class="utl">
+    <span>Design 4 of 6 · fresh-agent UX study · Freshell</span>
+    <a href="/">← all designs</a>
+  </div>
+</header>
+
+<!-- ============ B · DESKTOP FRAME ============ -->
+<section aria-label="Desktop frame, 1440 pixels">
+<h2 class="vh">Desktop app frame</h2>
+<p class="cap"><b>Desktop · 1440px</b> — the bound volume open on the reading stand: chapter tabs, accession ledger strip, transcript of plates, index rail at right, writing slope below.</p>
+
+<div class="frame" id="d-desk">
+  <div class="fbar">
+    <span class="fd"></span><span class="fd"></span><span class="fd"></span>
+    <span class="furl">127.0.0.1:3001/?token=••••••••</span>
+    <span>localhost · self-hosted</span>
+  </div>
+
+  <!-- chapter tabs -->
+  <nav class="chapters" aria-label="Open tabs">
+    <button class="chtab on" aria-current="page"><span class="ribbon" aria-hidden="true"></span>
+      <span class="leafdot" title="busy"></span>⚡ Trace dropped messa…</button>
+    <button class="chtab quiet">⌨ npm run dev</button>
+    <button class="chtab quiet">◉ Scrollback parser<span class="bm" title="needs attention"></span></button>
+    <button class="chtab quiet" aria-label="New tab"><span class="chplus">+</span></button>
+  </nav>
+
+  <!-- pane header -->
+  <div class="phead">
+    <div class="idgrp">
+      <span class="pchip"><span class="pc" aria-hidden="true"></span>freshclaude</span>
+      <h3 class="ptitle">Trace dropped messages on background tabs</h3>
+      <span class="pstate"><span class="leafdot"></span>Working…</span>
+    </div>
+    <div class="pacts">
+      <span class="pcost">$1.38</span>
+      <button class="pico" aria-label="Diffs, 3 files changed">⎘<span class="bdg">3</span></button>
+      <button class="pico" aria-label="Settings">⚙</button>
+      <button class="pico" aria-label="Refresh">⟳</button>
+      <button class="pico" aria-label="Fullscreen">⛶</button>
+      <button class="pico" aria-label="Close pane">✕</button>
+    </div>
+    <div class="actnote">identity left · actions right — two clusters, never mingled</div>
+  </div>
+
+  <!-- status line -->
+  <div class="statusline" aria-label="Session status ledger">
+    <span class="mono">~/code/freshell</span><span class="sep">·</span>
+    <span>branch <b>fix/ws-reconnect+2</b></span><span class="sep">·</span>
+    <span>Opus 4.6</span><span class="sep">·</span>
+    <span>effort High</span><span class="sep">·</span>
+    <span>Ask</span><span class="sep">·</span>
+    <span><span class="meter" role="img" aria-label="Context 59 percent"><i></i><span class="warnline"></span></span> <b>59%</b></span>
+    <span class="sep">·</span><span><b>$1.38</b></span>
+    <span class="sep">·</span><span class="mono tn" style="color:var(--faint)">id 01JRV6…KQ3M · started 14:02 · live · 24m</span>
+  </div>
+
+  <div class="split">
+  <div class="tran" aria-label="Session transcript, plated">
+    <div class="jumpwrap"><a href="#d-desk" class="jumpchip">⇧ jump back to where you left the trail · 14:07</a></div>
+
+    <!-- PLATE I — user turn -->
+    <article class="plate" aria-label="Plate I, your message, 14:07">
+      <button class="kebab" aria-label="More actions for this turn">· · ·</button>
+      <div class="hacts"><a href="#d-desk">copy</a><a href="#d-desk">fork</a><a href="#d-desk">rewind</a></div>
+      <div class="plhd"><span class="no">Plate I</span><span>collected in the field</span></div>
+      <p class="pb">the reconnect loop is still dropping messages when the tab&rsquo;s in the background.
+        can you trace where the heartbeat dies?</p>
+    </article>
+    <div class="plabel"><span>Collected 14:07</span><span class="dots"></span>
+      <span>by <span class="whoU">You</span></span><span class="dots"></span>
+      <span class="acc">Expedition 01JRV6</span></div>
+
+    <!-- PLATE II — agent turn with the field-note roster -->
+    <article class="plate agentbox" aria-label="Plate II, Claude, 14:07" style="margin-top:26px">
+      <button class="kebab" aria-label="More actions for this turn">· · ·</button>
+      <div class="hacts"><a href="#d-desk">copy</a><a href="#d-desk">fork</a><a href="#d-desk">rewind</a></div>
+      <div class="plhd"><span class="no">Plate II</span><span>the trace</span></div>
+      <p class="pb">Found it. The heartbeat is 15s — but background tabs throttle timers to ≥60s,
+        so the pings gap out and the server closes the socket before the next beat lands.</p>
+      <p class="pb">Proposal: drop the interval to 5s and add a pong watchdog — if 12s passes with
+        no pong, the client treats the socket as dead instead of waiting for the server to say so.</p>
+
+      <details class="think">
+        <summary>Thought for 12s</summary>
+        <div class="tin">Timer clamping matches the symptom exactly: drops only occur after the tab
+          loses focus. Server logs show close-frames 60–75s after the last pong. A 5s beat survives
+          even the worst clamp; the watchdog covers the rest.</div>
+      </details>
+
+      <!-- FIELD NOTES — settling into the roster -->
+      <div class="notes" aria-label="Field notes, four gathered">
+        <details class="note">
+          <summary><span class="nota">i</span><span class="ntool">Read</span>
+            <span class="narg">server/ws-handler.ts</span>
+            <span class="nstat">1,204 lines <span class="okck">✓</span></span></summary>
+          <div class="nx">Read 1,204 lines — heartbeat constants at L42–L58.</div>
+        </details>
+        <details class="note">
+          <summary><span class="nota">ii</span><span class="ntool">Grep</span>
+            <span class="narg">&ldquo;heartbeat&rdquo; in server/</span>
+            <span class="nstat">7 matches <span class="okck">✓</span></span></summary>
+          <div class="nx">7 matches across 3 files: ws-handler.ts (4), terminal-registry.ts (2), index.ts (1).</div>
+        </details>
+        <details class="note">
+          <summary><span class="nota">iii</span><span class="ntool">Bash</span>
+            <span class="narg">npm run test:vitest -- run test/unit/ws-heartbeat.test.ts</span>
+            <span class="nstat">14 passed (2.1s) <span class="okck">✓</span></span></summary>
+          <div class="nx"><code>✓ ws-heartbeat.test.ts — 14 passed (2.1s)</code></div>
+        </details>
+
+        <!-- Note iv — the pressed specimen, opened -->
+        <details class="note" open>
+          <summary><span class="nota">iv</span><span class="ntool">Edit</span>
+            <span class="narg">server/ws-handler.ts&nbsp;<b style="color:var(--moss)">+12</b>&nbsp;<b style="color:var(--rust)">−4</b></span>
+            <span class="nstat">pressed <span class="okck">✓</span></span></summary>
+          <div class="specimen" role="img"
+               aria-label="Diff: heartbeat interval 15000 becomes 5000, with a comment about background tab throttling, and lastPongAt initialized to zero">
+            <div class="shead"><span>Pressed specimen</span><span style="letter-spacing:.02em">server/ws-handler.ts</span></div>
+            <div class="dline ctx"><span class="ln">41</span><span class="sg"></span><code class="cd">// keepalive cadence — see docs/AGENTS.md</code></div>
+            <div class="dline del"><span class="ln">42</span><span class="sg">−</span><code class="cd">const HEARTBEAT_INTERVAL = 15_000;</code>
+              <button class="annot" aria-label="Comment on deleted line 42">✎</button></div>
+            <div class="dline add"><span class="ln">42</span><span class="sg">+</span><code class="cd">const HEARTBEAT_INTERVAL = 5_000;</code>
+              <button class="annot" aria-label="Comment on added line 42">✎</button></div>
+            <div class="dline add"><span class="ln">43</span><span class="sg">+</span><code class="cd">// background-tab timers throttle to ~60s; beat fast enough to survive</code>
+              <button class="annot" aria-label="Comment on added line 43">✎</button></div>
+            <div class="dline add"><span class="ln">44</span><span class="sg">+</span><code class="cd">let lastPongAt = 0;</code>
+              <button class="annot" aria-label="Comment on added line 44">✎</button></div>
+          </div>
+          <div class="nx">Margin ✎ leaves a per-line comment <em>to the agent</em> — it lands in the next note.</div>
+        </details>
+      </div>
+
+      <!-- settled roster strip -->
+      <div class="rosterline">
+        <span class="rmark">❧</span>
+        <span><b>4 notes gathered</b> · 2 specimens altered · 12s</span>
+        <span style="margin-left:auto">thought 12s · 4 tools used · 2 files changed <span class="okck">✓ filed</span></span>
+      </div>
+    </article>
+    <div class="plabel"><span>Collected 14:07</span><span class="dots"></span>
+      <span>by <span class="whoA">Claude (Opus 4.6)</span></span><span class="dots"></span>
+      <span class="acc">Expedition 01JRV6</span></div>
+
+    <!-- PLATE III — user turn with specimens attached -->
+    <article class="plate" aria-label="Plate III, your message with attachments, 14:12" style="margin-top:26px">
+      <button class="kebab" aria-label="More actions for this turn">· · ·</button>
+      <div class="hacts"><a href="#d-desk">copy</a><a href="#d-desk">fork</a><a href="#d-desk">rewind</a></div>
+      <div class="plhd"><span class="no">Plate III</span><span>evidence attached</span></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin:2px 0 10px">
+        <span class="leafchip" role="img" aria-label="Attached image screenshot.png"
+          style="padding:3px 9px 3px 3px;margin-top:0">
+          <span style="display:inline-block;width:34px;height:24px;border:1px solid var(--hair2);
+            background:var(--meadow);vertical-align:middle;border-radius:2px"></span>
+          screenshot.png</span>
+        <span class="leafchip" style="margin-top:0"><span class="lf" aria-hidden="true"></span>logs.txt</span>
+      </div>
+      <p class="pb">here&rsquo;s what the console shows when it dies</p>
+    </article>
+    <div class="plabel"><span>Collected 14:12</span><span class="dots"></span>
+      <span>by <span class="whoU">You</span></span><span class="dots"></span>
+      <span class="acc">Expedition 01JRV6</span></div>
+
+    <!-- PLATE IV — streaming -->
+    <article class="plate agentbox plive" aria-label="Plate IV, Claude streaming, 14:12" aria-live="polite" style="margin-top:26px">
+      <div class="plhd"><span class="no">Plate IV</span><span>being written — ink wet</span></div>
+      <p class="pb">So the watchdog needs to live in the server, and the client should—<span class="caret" aria-hidden="true"></span></p>
+      <div class="liverow">
+        <span class="spinner" role="img" aria-label="Running"></span>
+        <span>Running <b style="color:var(--ink)">Edit</b> — server/ws-handler.ts</span>
+        <span class="leafdot wait" title="waiting on tool"></span>
+        <button class="stopb">Stop</button>
+      </div>
+    </article>
+
+    <!-- HANDLING PERMIT — the approval slip, pins the page -->
+    <section class="permit" aria-label="Handling permit requested" aria-live="assertive" style="margin-top:26px">
+      <div class="phd">
+        <span class="warnmark" aria-hidden="true">!</span>
+        <span class="pnm">Handling Permit</span>
+        <span class="pno">№ 01JRV6-07 · tool Bash</span>
+      </div>
+      <div class="cmdline"><span style="color:var(--faint)">$</span> rm -rf .worktrees/refresh-*</div>
+      <p class="why">Reason for the request: <b style="color:var(--ink)">Deletes 3 stale worktrees.</b></p>
+      <p class="wtxt"><span class="warnmark" aria-hidden="true" style="width:18px;height:18px;font-size:11px">!</span>
+        This command permanently deletes files.</p>
+      <div class="stamps">
+        <button class="stamp">Grant<small>Allow once — this command only</small></button>
+        <button class="stamp refuse">Refuse<small>Deny — nothing runs</small></button>
+      </div>
+      <label class="blanket"><span class="box" aria-hidden="true"></span>
+        <span><b style="color:var(--ink)">Always allow Bash this session</b> — a blanket permit
+          for the rest of this expedition.</span></label>
+      <p class="pnote">the stamp presses 100ms (scale .97) on grant — the one loud moment; reduced-motion draws it pressed, no motion</p>
+    </section>
+
+    <!-- IDENTIFICATION KEY — AskUserQuestion -->
+    <section class="keytbl" aria-label="Identification key — question from the agent" style="margin-top:26px">
+      <div class="khd"><span class="nota">key</span><span>Identification key — one branch holds</span></div>
+      <p class="qq">How should the client catch up after reconnect?</p>
+      <div role="radiogroup" aria-label="Catch-up strategy">
+        <div class="krow"><span class="kk">1a</span><span>Replay buffer only — cheapest, gaps stay gaps</span>
+          <span class="kradio" role="radio" aria-checked="false" tabindex="0"></span></div>
+        <div class="krow sel"><span class="kk">1b</span><span>Full snapshot if gap &gt; 5s <b style="color:var(--berry)">· key leads here</b></span>
+          <span class="kradio" role="radio" aria-checked="true" tabindex="0"></span></div>
+        <div class="krow"><span class="kk">1c</span><span>Always resync — safest, heaviest payload</span>
+          <span class="kradio" role="radio" aria-checked="false" tabindex="0"></span></div>
+      </div>
+      <label class="kother">Other… <span class="oline" aria-hidden="true"></span></label>
+      <div class="kfoot">
+        <button class="stopb" style="margin-left:0">Submit the key</button>
+        <span class="motnote">single-select · the answer enters the next field note</span>
+      </div>
+    </section>
+
+    <!-- ACCESSION NOTE — compaction -->
+    <div class="accession" role="note" aria-label="Accession note: context compacted">
+      <span class="ano">Accession № 41·a</span>
+      <span><b>Context compacted</b> · 41,203 → 12,850 tokens · full transcript preserved in the herbarium</span>
+    </div>
+
+    <!-- pinned citation — web search card -->
+    <aside class="findcard" aria-label="Pinned citation, web search">
+      <div class="fhd">Note v — pinned citation · web search</div>
+      <p class="fq">&ldquo;browser background tab timer throttling&rdquo;</p>
+      <div class="srcs">
+        <a class="src" href="#d-desk">MDN — setTimeout clamping</a>
+        <a class="src" href="#d-desk">Chrome for Developers — timer throttling</a>
+      </div>
+    </aside>
+
+  </div>
+
+  <!-- ============ INDEX OF PLATES — right rail ============ -->
+  <aside class="rail" aria-label="Index of plates">
+
+    <div class="rsec">
+      <h4 class="rhd"><span class="rn">§I</span> Pressed specimens <span class="rr">3 altered</span></h4>
+      <div class="drow">
+        <div class="fp">server/ws-handler.ts</div>
+        <div class="nums"><span class="pl">+12</span> <span class="mn">−4</span></div>
+        <div class="vline"><a href="#d-desk">view ↗</a><span class="xh">✎ note to agent on any line</span></div>
+      </div>
+      <div class="drow">
+        <div class="fp">test/unit/ws-heartbeat.test.ts</div>
+        <div class="nums"><span class="pl">+9</span> <span class="mn">−0</span></div>
+        <div class="vline"><a href="#d-desk">view ↗</a><span class="xh">✎ note to agent on any line</span></div>
+      </div>
+      <div class="drow">
+        <div class="fp">docs/AGENTS.md</div>
+        <div class="nums"><span class="pl">+2</span> <span class="mn">−2</span></div>
+        <div class="vline"><a href="#d-desk">view ↗</a><span class="xh">✎ note to agent on any line</span></div>
+      </div>
+    </div>
+
+    <div class="rsec">
+      <h4 class="rhd"><span class="rn">§II</span> Accession timeline <span class="rr">rewind ↺</span></h4>
+      <div class="ckaxis">
+        <div class="cknode"><span class="ck">b1</span> <span class="tn">14:07</span> · plate ii filed
+          <a class="rw" href="#d-desk">↺ Rewind</a></div>
+        <div class="cknode"><span class="ck">b2</span> <span class="tn">14:19</span> · specimen iv pressed
+          <a class="rw" href="#d-desk">↺ Rewind</a></div>
+        <div class="cknode"><span class="ck">b3</span> <span class="tn">14:31</span> · key answered
+          <a class="rw" href="#d-desk">↺ Rewind</a></div>
+      </div>
+      <div class="motrow motnote">rewind restores code to that accession</div>
+    </div>
+
+    <div class="rsec">
+      <h4 class="rhd"><span class="rn">§III</span> Expedition ledger <span class="rr">usage</span></h4>
+      <table class="ledger">
+        <tr><td class="lbl">session cost</td><td>$1.38</td></tr>
+        <tr><td class="lbl">tokens</td><td>84.2k↑ / 9.6k↓</td></tr>
+        <tr><td class="lbl">burn</td><td>$3.45/h</td></tr>
+        <tr><td class="lbl">context</td><td>118,200 / 200,000 · 59%</td></tr>
+      </table>
+      <div class="ctxbar" role="img" aria-label="Context 59 percent, caution line at 80 percent">
+        <i></i><span class="warnline"></span></div>
+      <div class="ctxnote">bar turns <b style="color:var(--ochre-ink)">ochre</b> past the 80% caution line</div>
+    </div>
+
+    <div class="rsec">
+      <h4 class="rhd"><span class="rn">§IV</span> Related volumes <span class="rr">threads</span></h4>
+      <div class="volrow"><span class="vn mono" style="font-size:12px">ws-reconnect·b</span>
+        <span class="vk">worktree · this volume</span></div>
+      <div class="volrow kid"><span class="vn">heartbeat probe</span>
+        <span class="vk">child thread · idle</span></div>
+      <div class="volrow kid"><span class="vn">docs pass</span>
+        <span class="vk">child thread · <span class="okck">filed ✓</span></span></div>
+    </div>
+  </aside>
+  </div>
+
+  <!-- rail collapse affordance (<900px) — annotated only in this static layout -->
+  <div class="drawertab"><span class="nota">§</span> Index of plates — pull to open drawer</div>
+
+  <!-- "3 new" pill floats over the transcript -->
+  <div style="position:relative">
+    <button class="newpill">3 new ↓</button>
+  </div>
+
+  <!-- ============ composer — the writing slope ============ -->
+  <div class="slope" aria-label="Composer">
+    <!-- queued bookmarks peek above the slope -->
+    <div class="queuepeek" aria-label="Queued messages, two waiting">
+      <span class="qtag">2 pressed in queue</span>
+      <span class="qbm">also bump the client backoff cap
+        <button class="qx" aria-label="Remove queued message: also bump the client backoff cap">✕</button></span>
+      <span class="qbm">then update AGENTS.md
+        <button class="qx" aria-label="Remove queued message: then update AGENTS.md">✕</button></span>
+    </div>
+    <div class="slopein">
+      <textarea rows="2" aria-label="Message to the agent">make the interval configurable in settings, default 5s —</textarea>
+      <span class="leafchip"><span class="lf" aria-hidden="true"></span>heartbeat.md
+        <button class="lx" aria-label="Remove attachment heartbeat.md">✕</button></span>
+    </div>
+    <div class="comprow">
+      <button class="cbtn" aria-label="Attach a pressed leaf (file)">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
+          <path d="M11.5 7.2l-4.6 4.6a2.6 2.6 0 0 1-3.7-3.7l5-5a1.8 1.8 0 0 1 2.6 2.5l-5 5a1 1 0 0 1-1.4-1.4l4.3-4.3"/></svg>
+      </button>
+      <button class="cbtn" aria-label="Table of plates (slash commands)" style="font-family:var(--mono);font-weight:600">/</button>
+      <button class="cbtn cy" aria-label="Mention a specimen (file)">@</button>
+      <button class="stopsq" aria-label="Stop the running note">■ Stop</button>
+      <button class="seal" aria-label="Send — press the wax seal">➤</button>
+    </div>
+    <div class="hintline">⏎ send · ⇧⏎ newline · esc interrupt · ↑ history · @ files · ! shell</div>
+  </div>
+</div>
+</section>
+
+<!-- ============ DESKTOP INSETS ============ -->
+<section aria-label="Desktop insets">
+<h2 class="vh">Desktop insets</h2>
+<p class="cap"><b>Inserts &amp; finding aids · desktop insets</b> — printed at natural size beside the volume.</p>
+<div class="insetrow">
+
+  <!-- TABLE OF PLATES — slash menu, filter "re" typed -->
+  <div class="inset" id="d-slash">
+    <div class="toclist" role="dialog" aria-label="Table of plates, slash command menu">
+      <div class="thd">
+        <span class="ttl">Table of Plates</span>
+        <span class="tocfilter">finding aid:
+          <span class="fb">/re<span class="caret" aria-hidden="true"></span></span></span>
+      </div>
+      <div class="tocgrid">
+        <div class="tocg">
+          <div class="ghd">Session</div>
+          <button class="tcmd miss"><span class="crow"><span class="cplno">i.</span>
+            <span class="cname">/new</span><span class="cdot"></span><span class="cret">fresh session</span></span>
+            <span class="cdesc">aliases /reset, /restart</span></button>
+          <button class="tcmd miss"><span class="crow"><span class="cplno">ii.</span>
+            <span class="cname">/fork</span><span class="cdot"></span><span class="cret">branch</span></span>
+            <span class="cdesc">branch this conversation from a turn</span></button>
+          <button class="tcmd miss"><span class="crow"><span class="cplno">iii.</span>
+            <span class="cname">/compact</span><span class="cdot"></span><span class="cret">summarize</span></span>
+            <span class="cdesc">summarize context now</span></button>
+          <button class="tcmd hit"><span class="crow"><span class="cplno">iv.</span>
+            <span class="cname">/rename</span><span class="soon">soon</span><span class="cdot"></span>
+            <span class="cret">retitle session ↵</span></span>
+            <span class="cdesc">retitle session</span></button>
+          <button class="tcmd miss"><span class="crow"><span class="cplno">v.</span>
+            <span class="cname">/export</span><span class="soon">soon</span><span class="cdot"></span>
+            <span class="cret">save transcript</span></span>
+            <span class="cdesc">save transcript</span></button>
+        </div>
+        <div class="tocg">
+          <div class="ghd">Inspect &amp; Configure</div>
+          <button class="tcmd miss"><span class="crow"><span class="cplno">vi.</span>
+            <span class="cname">/status</span><span class="cdot"></span><span class="cret">health</span></span>
+            <span class="cdesc">session health &amp; config</span></button>
+          <button class="tcmd miss"><span class="crow"><span class="cplno">vii.</span>
+            <span class="cname">/cost</span><span class="cdot"></span><span class="cret">usage</span></span>
+            <span class="cdesc">usage breakdown</span></button>
+          <button class="tcmd miss"><span class="crow"><span class="cplno">viii.</span>
+            <span class="cname">/diff</span><span class="cdot"></span><span class="cret">open diffs</span></span>
+            <span class="cdesc">open changed files</span></button>
+          <button class="tcmd miss"><span class="crow"><span class="cplno">ix.</span>
+            <span class="cname">/context</span><span class="soon">soon</span><span class="cdot"></span><span class="cret">token map</span></span>
+            <span class="cdesc">token map</span></button>
+          <button class="tcmd hit"><span class="crow"><span class="cplno">x.</span>
+            <span class="cname">/review</span><span class="soon">soon</span><span class="cdot"></span>
+            <span class="cret">request code review ↵</span></span>
+            <span class="cdesc">request code review</span></button>
+          <button class="tcmd hit"><span class="crow"><span class="cplno">xi.</span>
+            <span class="cname">/permissions</span><span class="cdot"></span>
+            <span class="cret">permission mode ↵</span></span>
+            <span class="cdesc">permission mode</span></button>
+        </div>
+      </div>
+      <!-- the remaining plates, present in the full index -->
+      <div class="tocg" style="padding-top:10px">
+        <div class="ghd">Configure — continued (unmatched are greyed by the “re” filter)</div>
+        <div style="column-count:2;column-gap:26px">
+          <span class="tcmd miss" style="display:flex;gap:8px;align-items:baseline;min-height:24px;padding:4px 2px 3px">
+            <span class="cplno">xii.</span><span class="cname">/model</span><span class="cdot"></span><span class="cret">switch model</span></span>
+          <span class="tcmd miss" style="display:flex;gap:8px;align-items:baseline;min-height:24px;padding:4px 2px 3px">
+            <span class="cplno">xiii.</span><span class="cname">/effort</span><span class="cdot"></span><span class="cret">thinking effort</span></span>
+          <span class="tcmd miss" style="display:flex;gap:8px;align-items:baseline;min-height:24px;padding:4px 2px 3px">
+            <span class="cplno">xiv.</span><span class="cname">/hooks</span><span class="soon">soon</span><span class="cdot"></span><span class="cret">event hooks</span></span>
+          <span class="tcmd miss" style="display:flex;gap:8px;align-items:baseline;min-height:24px;padding:4px 2px 3px">
+            <span class="cplno">xv.</span><span class="cname">/mcp</span><span class="soon">soon</span><span class="cdot"></span><span class="cret">MCP servers</span></span>
+          <span class="tcmd miss" style="display:flex;gap:8px;align-items:baseline;min-height:24px;padding:4px 2px 3px">
+            <span class="cplno">xvi.</span><span class="cname">/agents</span><span class="soon">soon</span><span class="cdot"></span><span class="cret">subagents</span></span>
+          <span class="tcmd miss" style="display:flex;gap:8px;align-items:baseline;min-height:24px;padding:4px 2px 3px">
+            <span class="cplno">xvii.</span><span class="cname">/notify</span><span class="soon">soon</span><span class="cdot"></span><span class="cret">completion alerts</span></span>
+          <span class="tcmd miss" style="display:flex;gap:8px;align-items:baseline;min-height:24px;padding:4px 2px 3px">
+            <span class="cplno">xviii.</span><span class="cname">/theme</span><span class="soon">soon</span><span class="cdot"></span><span class="cret">pane theme</span></span>
+        </div>
+      </div>
+      <div class="tocfoot">
+        <span>the “re” filter lights three plates: <b style="color:var(--berry)">/rename</b> ·
+          <b style="color:var(--berry)">/review</b> · <b style="color:var(--berry)">/permissions</b></span>
+        <span style="margin-left:auto"><span class="kk">↑↓</span> leaf · <span class="kk">↵</span> open · <span class="kk">esc</span> close</span>
+      </div>
+    </div>
+    <p class="cap"><b>Slash menu · opens above the slope</b> — a table of plates: two-column index, leader dots, plate numbers; “re” typed.</p>
+  </div>
+
+  <!-- SPECIMEN CATALOG — @ mention -->
+  <div class="inset" id="d-at">
+    <div class="catalog" role="listbox" aria-label="Specimen catalog for @ws-">
+      <div class="chd">catalog query: <span class="cb">@ws-<span class="caret" style="height:11px;vertical-align:-1px" aria-hidden="true"></span></span></div>
+      <div class="catrow sel" role="option" aria-selected="true">
+        <span class="cfam">edited</span>
+        <span><span class="sp">server/ws-handler.ts</span>
+          <div class="sm">pressed this turn · accession b2</div></span>
+      </div>
+      <div class="catrow" role="option" aria-selected="false">
+        <span class="cfam">client</span>
+        <span><span class="sp">src/lib/fresh-agent-ws.ts</span>
+          <div class="sm">socket helper — patch candidate</div></span>
+      </div>
+      <div class="catrow" role="option" aria-selected="false">
+        <span class="cfam">test</span>
+        <span><span class="sp">test/unit/ws-heartbeat.test.ts</span>
+          <div class="sm">14 passing · green herbarium sheet</div></span>
+      </div>
+      <div class="catconst">↵ slips the specimen into the slope as a pressed-leaf chip · esc dismisses</div>
+    </div>
+    <p class="cap"><b>@ mention · dropdown</b> — the specimen catalog.</p>
+  </div>
+
+  <!-- TIPPED-IN LEAF — settings popover, anchored near the ⚙ -->
+  <div class="inset" id="d-gear">
+    <div class="leafwrap">
+      <span class="gearanchor" aria-hidden="true">⚙</span>
+      <div class="tippedleaf" role="dialog" aria-label="Pane settings, tipped-in leaf">
+        <div class="lhd">Pane Settings <span class="rr">tipped-in leaf · fold marks the corner</span></div>
+        <div class="lrow"><span class="llab">Style</span>
+          <span class="lval"><span class="seg" role="group" aria-label="Pane style">
+            <button aria-pressed="false">Sans</button><button aria-pressed="false">Serif</button><button class="on" aria-pressed="true">Mono</button>
+          </span></span></div>
+        <div class="lrow stack"><span class="llab">Model</span>
+          <span class="lval" style="flex-direction:column;align-items:stretch;gap:0;flex:1">
+            <span class="modelrow on"><span class="mdot" aria-hidden="true"></span><span class="mt">Claude Opus 4.6</span><span class="mc">in the field</span></span>
+            <span class="modelrow"><span class="mdot" aria-hidden="true"></span><span class="mt">Sonnet 4.6</span><span class="soon">soon</span><span class="mc">not yet collected</span></span>
+          </span></div>
+        <div class="lrow"><span class="llab">Effort</span>
+          <span class="lval"><span class="seg" role="group" aria-label="Effort">
+            <button aria-pressed="false">Low</button><button aria-pressed="false">Medium</button><button class="on" aria-pressed="true">High</button>
+          </span></span></div>
+        <div class="lrow"><span class="llab">Permission</span>
+          <span class="lval"><span class="seg" role="group" aria-label="Permission mode">
+            <button class="on" aria-pressed="true">Ask</button><button aria-pressed="false">Accept edits</button><button aria-pressed="false">Bypass</button><button aria-pressed="false">Plan</button>
+          </span></span></div>
+        <div class="lrow stack"><span class="llab">Marks to show</span>
+          <span class="lval" style="flex-direction:column;align-items:stretch;gap:7px;padding-top:4px">
+            <button class="wtoggle"><span class="wdot" aria-hidden="true"></span>Show thinking</button>
+            <button class="wtoggle"><span class="wdot" aria-hidden="true"></span>Show tools</button>
+            <button class="wtoggle"><span class="wdot" aria-hidden="true"></span>Timecodes</button>
+            <button class="wtoggle off"><span class="wdot" aria-hidden="true"></span>Sound on done <span class="soon simpson">soon</span></button>
+            <button class="wtoggle off"><span class="wdot" aria-hidden="true"></span>Desktop notifications <span class="soon simpson">soon</span></button>
+          </span></div>
+        <div class="lrow stack" style="border-bottom:none">
+          <span class="llab">Advanced <span class="soon">soon</span></span>
+          <span class="advgrp">
+            <button class="arow"><span class="aa">→</span>Hooks<span style="float:right;color:var(--muted)">config № 1</span></button>
+            <button class="arow"><span class="aa">→</span>MCP servers<span style="float:right;color:var(--muted)">config № 2</span></button>
+            <button class="arow"><span class="aa">→</span>Agents<span style="float:right;color:var(--muted)">config № 3</span></button>
+            <button class="arow"><span class="aa">→</span>Status-line layout<span style="float:right;color:var(--muted)">config № 4</span></button>
+          </span></div>
+        <div class="leaffold-note">toggles press like wax dots — 100ms scale .97 · reduced-motion keeps them still</div>
+      </div>
+    </div>
+    <p class="cap"><b>Settings · popover</b> — a tipped-in leaf, rule-separated rows, wax-dot toggles; anchored near the gear.</p>
+  </div>
+</div>
+</section>
+
+<!-- ============ C · PHONE FRAMES ============ -->
+<section aria-label="Phone frames, 390 pixels wide">
+<h2 class="vh">Phone frames</h2>
+<p class="cap"><b>Phone · 390×844</b> — plates full-bleed, single column; the permit slip stands upright with two big stamps (≥52px); the index rail folds into the scrollable chips row; sheets lift on a cloth pull-tab.</p>
+<div class="phonewrap">
+
+  <!-- main phone frame -->
+  <div class="phone h844" role="img" aria-label="Phone: the same session, condensed">
+    <div class="notch" aria-hidden="true"></div>
+    <div class="pchapters" role="tablist" aria-label="Open tabs">
+      <span class="chtab on" role="tab" aria-selected="true"><span class="ribbon" style="height:12px"></span>
+        <span class="leafdot"></span>⚡ Trace dropped…</span>
+      <span class="chtab quiet" role="tab" aria-selected="false">⌨ npm run dev</span>
+      <span class="chtab quiet" role="tab" aria-selected="false">◉ Scrollback…<span class="bm"></span></span>
+    </div>
+    <div class="pphead">
+      <div class="r1">
+        <span class="pchip" style="padding:2px 8px 2px 5px;font-size:10.5px">
+          <span class="pc" style="width:10px;height:10px"></span>freshclaude</span>
+        <span class="pt">Trace dropped messages on background tabs</span>
+        <button class="pico" style="width:28px;height:28px" aria-label="More actions">…</button>
+      </div>
+      <div class="r2"><span class="leafdot"></span> Working… · <b class="tn">$1.38</b></div>
+    </div>
+    <div class="pchiprow" aria-label="Status chips">
+      <span class="pstchip mono">~/code/freshell · <b>fix/ws-reconnect</b></span>
+      <span class="pstchip">Opus 4.6</span>
+      <span class="pstchip"><b>59%</b> ctx</span>
+      <span class="pstchip"><b>$1.38</b></span>
+    </div>
+    <div class="pbody">
+      <div style="margin-top:-436px"> <!-- static comp: transcript drawn scrolled to the permit -->
+      <article class="plate" aria-label="Plate I condensed, your message">
+        <div class="plhd"><span class="no">Plate I</span></div>
+        <p class="pb">the reconnect loop is still dropping messages when the tab&rsquo;s in the background&hellip;</p>
+      </article>
+      <div class="plabel"><span>14:07</span><span class="dots"></span><span>by <span class="whoU">You</span></span><span class="dots"></span><span class="acc">01JRV6</span></div>
+
+      <article class="plate agentbox" aria-label="Plate II condensed, Claude" style="margin-top:18px">
+        <div class="plhd"><span class="no">Plate II</span></div>
+        <p class="pb">Found it — heartbeat is 15s, background tabs clamp timers to ≥60s. Pings gap out;
+          the server closes the socket&hellip;</p>
+        <details class="think"><summary>Thought for 12s</summary>
+          <div class="tin">A 5s beat survives the worst clamp; the watchdog covers the rest.</div></details>
+        <div class="notes">
+          <details class="note" open>
+            <summary><span class="nota">iv</span><span class="ntool">Edit</span>
+              <span class="narg">ws-handler.ts&nbsp;<b style="color:var(--moss)">+12</b>&nbsp;<b style="color:var(--rust)">−4</b></span>
+              <span class="nstat"><span class="okck">✓</span></span></summary>
+            <div class="specimen">
+              <div class="dline del"><span class="ln">42</span><span class="sg">−</span><code class="cd">const HEARTBEAT_INTERVAL = 15_000;</code>
+                <button class="annot" aria-label="Comment on deleted line">✎</button></div>
+              <div class="dline add"><span class="ln">42</span><span class="sg">+</span><code class="cd">const HEARTBEAT_INTERVAL = 5_000;</code>
+                <button class="annot" aria-label="Comment on added line">✎</button></div>
+              <div class="dline add"><span class="ln">44</span><span class="sg">+</span><code class="cd">let lastPongAt = 0;</code></div>
+            </div>
+          </details>
+        </div>
+        <div class="rosterline"><span class="rmark">❧</span>
+          <span>4 notes gathered · 2 specimens altered · 12s</span></div>
+      </article>
+      <div class="plabel"><span>14:07</span><span class="dots"></span><span>by <span class="whoA">Claude · Opus 4.6</span></span><span class="dots"></span><span class="acc">01JRV6</span></div>
+
+      <!-- HANDLING PERMIT — upright slip, thumb-first stamps -->
+      <section class="permit" aria-label="Handling permit requested">
+        <div class="phd"><span class="warnmark">!</span>
+          <span class="pnm">Handling Permit</span>
+          <span class="pno">№ 01JRV6-07 · Bash</span></div>
+        <div class="cmdline">rm -rf .worktrees/refresh-*</div>
+        <p class="why">Deletes 3 stale worktrees.</p>
+        <p class="wtxt"><span class="warnmark" style="width:17px;height:17px;font-size:10px">!</span>
+          This command permanently deletes files.</p>
+        <div class="pstampgrid">
+          <button class="stamp">Grant<small>Allow once</small></button>
+          <button class="stamp refuse">Refuse<small>Deny</small></button>
+        </div>
+        <label class="blanket"><span class="box"></span>
+          <span><b style="color:var(--ink)">Always allow Bash this session</b> — blanket permit, this expedition.</span></label>
+      </section>
+      <button class="newpill">3 new ↓</button>
+      </div>
+    </div>
+
+    <div class="pslope">
+      <div class="queuepeek">
+        <span class="qbm">also bump backoff… <button class="qx" aria-label="Remove queued message">✕</button></span>
+        <span class="qbm">then update AGENTS.md <button class="qx" aria-label="Remove queued message">✕</button></span>
+      </div>
+      <div class="slopein">
+        <textarea rows="2" aria-label="Message to the agent">make the interval configurable in settings, default 5s —</textarea>
+      </div>
+      <div class="comprow">
+        <button class="cbtn" aria-label="Attach a pressed leaf"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M11.5 7.2l-4.6 4.6a2.6 2.6 0 0 1-3.7-3.7l5-5a1.8 1.8 0 0 1 2.6 2.5l-5 5a1 1 0 0 1-1.4-1.4l4.3-4.3"/></svg></button>
+        <button class="cbtn" aria-label="Table of plates" style="font-family:var(--mono);font-weight:600">/</button>
+        <button class="seal" aria-label="Send — press the wax seal">➤</button>
+      </div>
+      <div class="safearea"></div>
+    </div>
+  </div>
+
+  <!-- turn actions — bottom sheet -->
+  <div class="phone small sheetactions" role="img" aria-label="Phone: turn actions as bottom sheet">
+    <div class="notch" aria-hidden="true"></div>
+    <div class="pphead"><div class="r1"><span class="pt" style="color:var(--faint)">[volume dimmed beneath]</span></div></div>
+    <div class="pbody sheetzone">
+      <div class="sheetdim" aria-hidden="true"></div>
+      <div class="sheetlift" role="dialog" aria-label="Turn actions sheet">
+        <span class="pulltab" aria-hidden="true"></span>
+        <div class="shd">Plate I · your turn, 14:07 — lifted plate</div>
+        <button class="shrow"><span class="sic">⧉</span>Copy turn text</button>
+        <button class="shrow"><span class="sic">⑂</span>Fork conversation from here</button>
+        <button class="shrow danger"><span class="sic">↺</span>Rewind code to here</button>
+        <button class="shrow cancel">Cancel</button>
+        <div class="safearea"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- settings — full leaf sheet -->
+  <div class="phone small tall" role="img" aria-label="Phone: settings as a full-screen sheet">
+    <div class="notch" aria-hidden="true"></div>
+    <div class="pbody" style="padding:0;display:flex;flex-direction:column;overflow:hidden">
+      <div class="sheetlift toggzone" role="dialog" aria-label="Settings full sheet" style="flex:1">
+        <span class="pulltab" aria-hidden="true"></span>
+        <div class="shd">Settings — the whole leaf</div>
+        <div class="lrow"><span class="llab">Style</span>
+          <span class="lval"><span class="seg"><button>Sans</button><button>Serif</button><button class="on">Mono</button></span></span></div>
+        <div class="lrow"><span class="llab">Model</span>
+          <span class="lval" style="flex-direction:column;align-items:stretch;gap:5px;flex:1">
+            <span class="modelrow on"><span class="mdot"></span><span class="mt">Claude Opus 4.6</span></span>
+            <span class="modelrow"><span class="mdot"></span><span class="mt">Sonnet 4.6</span><span class="soon">soon</span></span>
+          </span></div>
+        <div class="lrow"><span class="llab">Effort</span>
+          <span class="lval"><span class="seg"><button>Low</button><button>Medium</button><button class="on">High</button></span></span></div>
+        <div class="lrow" style="flex-wrap:wrap"><span class="llab">Permission</span>
+          <span class="lval"><span class="seg"><button class="on">Ask</button><button>Accept edits</button><button>Bypass</button><button>Plan</button></span></span></div>
+        <div class="lrow" style="flex-direction:column;align-items:stretch;gap:8px">
+          <span class="wtoggle"><span class="wdot"></span>Show thinking</span>
+          <span class="wtoggle"><span class="wdot"></span>Show tools</span>
+          <span class="wtoggle"><span class="wdot"></span>Timecodes</span>
+          <span class="wtoggle off"><span class="wdot"></span>Sound on done <span class="soon">soon</span></span>
+          <span class="wtoggle off"><span class="wdot"></span>Desktop notifications <span class="soon">soon</span></span>
+        </div>
+        <div class="lrow" style="border-bottom:none;flex-direction:column;align-items:stretch">
+          <span class="llab">Advanced <span class="soon">soon</span></span>
+          <span class="advgrp">
+            <button class="arow"><span class="aa">→</span>Hooks · MCP servers · Agents · Status-line layout</button>
+          </span></div>
+        <button class="shrow cancel" style="border-top:1px solid var(--hair2);margin-top:6px">Close the leaf</button>
+        <div class="safearea"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- table of plates — bottom sheet, single column -->
+  <div class="phone small pslash" role="img" aria-label="Phone: slash menu as bottom sheet">
+    <div class="notch" aria-hidden="true"></div>
+    <div class="pphead"><div class="r1"><span class="pt" style="color:var(--faint)">[volume dimmed beneath]</span></div></div>
+    <div class="pbody sheetzone">
+      <div class="sheetdim" aria-hidden="true"></div>
+      <div class="sheetlift" role="dialog" aria-label="Table of plates sheet, filtered by re">
+        <span class="pulltab" aria-hidden="true"></span>
+        <div class="shd">Table of plates · “re” — three plates answer</div>
+        <div class="pslashdim">eighteen plates in the full index; the filter keeps these three —
+          <b style="color:var(--ink)">/rename</b>, <b style="color:var(--ink)">/review</b>, <b style="color:var(--ink)">/permissions</b></div>
+        <div class="grp">Session</div>
+        <button class="shrow"><span class="cname">/rename</span><span class="soon">soon</span><span class="cdesc">retitle session</span></button>
+        <div class="grp">Inspect</div>
+        <button class="shrow"><span class="cname">/review</span><span class="soon">soon</span><span class="cdesc">request code review</span></button>
+        <div class="grp">Configure</div>
+        <button class="shrow"><span class="cname">/permissions</span><span class="cdesc">permission mode</span></button>
+        <button class="shrow cancel">Cancel</button>
+        <div class="safearea"></div>
+      </div>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ============ D · NIGHT PRESS — alternate mode swatch ============ -->
+<section aria-label="Night press, dark mode swatch">
+<h2 class="vh">Night press swatch</h2>
+<p class="cap"><b>Night press · the cabinet after dark</b> — same plate and permit under lamplight: ground #1d241b, ink turns parchment; moss/berry/ochre lift one step.</p>
+<div class="nightbar night">
+  <div class="ngrid">
+    <div class="ntile">
+      <article class="plate" aria-label="Night plate, Claude, 14:07">
+        <div class="plhd"><span class="no">Plate II</span><span>the trace</span></div>
+        <p class="pb">Found it. The heartbeat is 15s — but background tabs throttle timers to ≥60s,
+          so the pings gap out and the server closes the socket.</p>
+        <details class="note" style="border-bottom:1px solid var(--hair)">
+          <summary style="display:flex;gap:10px;align-items:baseline;padding:8px 4px">
+            <span class="nota">iv</span><span class="ntool">Edit</span>
+            <span class="narg" style="color:var(--muted)">server/ws-handler.ts&nbsp;
+              <b style="color:var(--moss)">+12</b>&nbsp;<b style="color:var(--rust)">−4</b></span></summary>
+        </details>
+        <div class="rosterline"><span class="rmark">❧</span>
+          <span>4 notes gathered · 2 specimens altered · 12s</span>
+          <span style="margin-left:auto" class="okck">✓ filed</span></div>
+      </article>
+      <div class="plabel"><span>Collected 14:07</span><span class="dots"></span>
+        <span>by <span class="whoA">Claude (Opus 4.6)</span></span><span class="dots"></span>
+        <span class="acc">Expedition 01JRV6</span></div>
+    </div>
+    <div class="ntile">
+      <section class="permit" aria-label="Night permit slip">
+        <div class="phd"><span class="warnmark">!</span>
+          <span class="pnm">Handling Permit</span>
+          <span class="pno">№ 01JRV6-07</span></div>
+        <div class="cmdline" style="background:var(--meadow)">rm -rf .worktrees/refresh-*</div>
+        <p class="why">Deletes 3 stale worktrees.</p>
+        <p class="wtxt"><span class="warnmark" style="width:17px;height:17px;font-size:10px">!</span>
+          This command permanently deletes files.</p>
+        <div class="stamps">
+          <button class="stamp">Grant<small>Allow once</small></button>
+          <button class="stamp refuse">Refuse<small>Deny</small></button>
+        </div>
+      </section>
+      <div class="slopein" style="margin-top:14px;max-width:none">
+        <textarea rows="1" aria-label="Night composer" readonly>make the interval configurable —</textarea>
+        <div class="comprow" style="margin-top:8px">
+          <button class="cbtn" aria-label="Slash">/</button>
+          <button class="seal" aria-label="Send">➤</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ============ FOOTER — the contract, rendered readably ============ -->
+<footer class="foot">
+  <div class="ffhd">Direction contract — Field Guide</div>
+  <dl>
+    <dt>Thesis</dt>
+    <dd>Each session is a field expedition; everything the agent finds and changes is collected,
+      labeled, and plated — naturalist-archive calm with accession-number rigor.</dd>
+    <dt>Own-world</dt>
+    <dd>Turns are Plates with a thin double-rule frame and a specimen-label strip beneath
+      (Collected 14:07 · by Claude (Opus 4.6) · Expedition 01JRV6). Tool calls are Field Notes that
+      settle into a roster, diffs are pressed specimens — old growth struck in rust, new growth
+      inked — and approval is a Handling Permit on darker stock, stamped Grant or Refuse.</dd>
+    <dt>Story</dt>
+    <dd>One heartbeat trace, plated live: four notes gathered, two specimens altered,
+      and a permit pin landing mid-stream.</dd>
+    <dt>First viewport</dt>
+    <dd>A bound volume opened to Plate II — roster settling, permit slip pinning the page,
+      index of plates at right.</dd>
+    <dt>Form + finish</dt>
+    <dd>Parchment and meadow grounds, loam ink. Source Serif 4 prose, Karla chrome, Intel One Mono
+      data. Moss is the agent, berry is you and every action, ochre waits, rust errs. Flat hairlines
+      and one elevation; a wax-seal send. Notes unfold 200ms (transform/opacity), the wax and stamps
+      press 100ms scale .97; no ambient motion, and reduced-motion renders every plate static.</dd>
+  </dl>
+  <p class="sig">filed, Expedition 01JRV6 · Vol. VI</p>
+</footer>
+
+</div>
+</body>
+</html>

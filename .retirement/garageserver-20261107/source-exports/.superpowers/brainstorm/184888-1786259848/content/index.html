@@ -1,0 +1,97 @@
+<h2>Six directions for the fresh-agent experience</h2>
+<p class="subtitle">Same session content in every comp: tabs, pane header, status line (cwd · branch · model · effort · permission · context 59% · $1.38), full transcript (thinking, 4 tools, expanded diff, streaming), approval card, question banner, compaction, queued messages, command menu (18 commands incl. <em>soon</em>-tagged), @ mentions, settings, rail, 390px phones, dark/light swatch. Features tagged <b>soon</b> aren't implemented yet — this is the target experience. Click a card to vote, or describe a mix in the terminal.</p>
+
+<style>
+  .dgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:18px; margin:22px 0; }
+  .dcard { border:1px solid var(--border,#3a3a3a); border-radius:10px; overflow:hidden; cursor:pointer; transition:border-color .15s, transform .15s; }
+  .dcard:hover { border-color:var(--accent,#888); transform:translateY(-2px); }
+  .dcard.selected { border-color:#7ec8e3; box-shadow:0 0 0 2px #7ec8e355; }
+  .swatches { display:flex; height:56px; }
+  .swatches span { flex:1; }
+  .dbody { padding:14px 16px 12px; }
+  .dbody h3 { margin:0 0 4px; font-size:17px; }
+  .dbody .th { font-size:13px; opacity:.85; margin:0 0 10px; line-height:1.45; }
+  .dbody .meta { font-size:11.5px; opacity:.65; line-height:1.6; }
+  .dbody a { display:inline-block; margin-top:10px; font-size:13px; }
+  .cmptable { width:100%; border-collapse:collapse; font-size:13px; margin:8px 0 26px; }
+  .cmptable th, .cmptable td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--border,#3a3a3a); vertical-align:top; }
+  .cmptable th { font-weight:600; opacity:.7; font-size:11.5px; letter-spacing:.06em; }
+</style>
+
+<div class="dgrid">
+
+  <div class="dcard" data-choice="ledger" onclick="toggleSelect(this)">
+    <div class="swatches"><span style="background:#f7f3ec"></span><span style="background:#efe9dd"></span><span style="background:#211d19"></span><span style="background:#c33d21"></span><span style="background:#a86f00"></span></div>
+    <div class="dbody">
+      <h3>1 · Ledger</h3>
+      <p class="th">The session as an account book — entries posted, audited, balanced. Editorial print discipline; metadata lives in the margin like an accountant's notes.</p>
+      <div class="meta">Light-first warm paper · Spectral serif + Inconsolata data · vermilion single accent · turns as numbered ledger entries, tools as roman sub-entries i–iv, approval as an ochre correction slip, margin-note rail.</div>
+      <a href="design-1-ledger.html">Open full comp ↗</a>
+    </div>
+  </div>
+
+  <div class="dcard" data-choice="engine-room" onclick="toggleSelect(this)">
+    <div class="swatches"><span style="background:#1b1d20"></span><span style="background:#282b31"></span><span style="background:#ece7de"></span><span style="background:#ff6a1f"></span><span style="background:#3fae8a"></span></div>
+    <div class="dbody">
+      <h3>2 · Engine Room</h3>
+      <p class="th">The session as a machined console — milled panels, engraved plates, honest lamps and gauges. Nothing glows for decoration; every lit element is a real state.</p>
+      <div class="meta">Dark-first warm steel · Archivo + JetBrains Mono · safety-orange actions · groove-separated console strips (no cards), serial-plated tool modules, circuit-breaker approval, VU context gauge. Ships a light "open bench" mode.</div>
+      <a href="design-2-engine-room.html">Open full comp ↗</a>
+    </div>
+  </div>
+
+  <div class="dcard" data-choice="draft" onclick="toggleSelect(this)">
+    <div class="swatches"><span style="background:#12294d"></span><span style="background:#1c3a66"></span><span style="background:#e9f1ff"></span><span style="background:#7fd4ff"></span><span style="background:#ffb454"></span></div>
+    <div class="dbody">
+      <h3>3 · Draft</h3>
+      <p class="th">The session as a working drawing — revisions dimensioned, details called out, approvals redlined. The pane header is an architectural title block.</p>
+      <div class="meta">Committed blueprint ground · Overpass + Chivo Mono · flat cyan annotations, amber actions · dimension rails measuring tokens/time per turn, DETAIL callouts for tools, revision-cloud approval, schedule-table slash menu. Light "trace paper" mode w/ in-panel toggle.</div>
+      <a href="design-3-draft.html">Open full comp ↗</a>
+    </div>
+  </div>
+
+  <div class="dcard" data-choice="field-guide" onclick="toggleSelect(this)">
+    <div class="swatches"><span style="background:#f5f2e8"></span><span style="background:#eef0e4"></span><span style="background:#22301f"></span><span style="background:#4a6741"></span><span style="background:#8e3b46"></span></div>
+    <div class="dbody">
+      <h3>4 · Field Guide</h3>
+      <p class="th">The session as a collected specimen record — turns are plates, tools are field notes, approvals are handling permits. Scholarly calm with accession-number rigor.</p>
+      <div class="meta">Light parchment + meadow · Source Serif 4 + Karla + Intel One Mono · moss/berry/ochre/rust role colors · plate frames w/ specimen labels, dichotomous-key questions, cloth-bookmark queue, wax-seal send, tipped-leaf settings. "Night press" dark mode.</div>
+      <a href="design-4-field-guide.html">Open full comp ↗</a>
+    </div>
+  </div>
+
+  <div class="dcard" data-choice="logbook" onclick="toggleSelect(this)">
+    <div class="swatches"><span style="background:#fafbfc"></span><span style="background:#f2f4f7"></span><span style="background:#101418"></span><span style="background:#2b4fd8"></span><span style="background:#b45309"></span></div>
+    <div class="dbody">
+      <h3>5 · Logbook</h3>
+      <p class="th">The session as an operations record — every entry timestamped, sourced, auditable, keyboard-first. Flight recorder meets ISO manual; the UI disappears into the record.</p>
+      <div class="meta">Light-first cool paper · Public Sans + Red Hat Mono · single cobalt accent · columnar transcript (TIME/ORIGIN/ENTRY/META), command-line composer, command-palette slash menu w/ kbd hints, sign-off approval blocks, annex rail. "Night shift" dark mode.</div>
+      <a href="design-5-logbook.html">Open full comp ↗</a>
+    </div>
+  </div>
+
+  <div class="dcard" data-choice="paste-up" onclick="toggleSelect(this)">
+    <div class="swatches"><span style="background:#f4f1ea"></span><span style="background:#e8d28a"></span><span style="background:#17150f"></span><span style="background:#ffd319"></span><span style="background:#c23a2e"></span></div>
+    <div class="dbody">
+      <h3>6 · Paste-Up</h3>
+      <p class="th">The session as a working zine — clippings taped in, tools rubber-stamped, approvals stamped on the front page. Graphic chaos, structural discipline.</p>
+      <div class="meta">Newsprint ground · Archivo Black display + Courier Prime body (earned typewriter) · highlighter yellow + stamp red spots · taped clippings, stamped file boxes ("TEST OK 14 PASSED"), AUTHORIZE stamp card, scissor-cut checkpoints, galley composer. "Midnight copy desk" dark mode.</div>
+      <a href="design-6-paste-up.html">Open full comp ↗</a>
+    </div>
+  </div>
+
+</div>
+
+<div class="section">
+  <h3>Side-by-side</h3>
+  <table class="cmptable">
+    <tr><th>Direction</th><th>Material / thesis</th><th>Mode</th><th>Distinctive information design</th><th>Strongest if you want…</th></tr>
+    <tr><td><b>Ledger</b></td><td>Editorial print; postings &amp; audit</td><td>Light-first</td><td>Numbered entries, marginalia rail, sum-line activity</td><td>calm authority, readable prose, margin metadata</td></tr>
+    <tr><td><b>Engine Room</b></td><td>Machined console; real states</td><td>Dark-first</td><td>Gauges &amp; lamps, module serials, breaker approval</td><td>ops-density that feels engineered, dark mode</td></tr>
+    <tr><td><b>Draft</b></td><td>Blueprint; revisions dimensioned</td><td>Dark blue</td><td>Dimension rails, detail callouts, schedule tables</td><td>precise change-visualization (diffs/redlines)</td></tr>
+    <tr><td><b>Field Guide</b></td><td>Naturalist archive; collected specimens</td><td>Light-first</td><td>Plates + specimen labels, key-table questions</td><td>warmth + scholarly confidence</td></tr>
+    <tr><td><b>Logbook</b></td><td>Ops record; flight recorder</td><td>Light-first</td><td>Columnar audit rows, command palette core</td><td>max density, keyboard-first, zero decoration</td></tr>
+    <tr><td><b>Paste-Up</b></td><td>Zine; stamps &amp; tape</td><td>Light-first</td><td>Rubber-stamp tool receipts, stamp-trio approvals</td><td>personality &amp; energy, memorable moments</td></tr>
+  </table>
+  <p class="subtitle" style="margin-top:6px">QA: all six comps passed a craft review + fix + confirm cycle (screenshot-verified at 1500px; phones measured at 390×844). Full-page final captures and the HTML sources persist in the repo under <code>.superpowers/brainstorm/184888-1786259848/</code>.</p>
+</div>

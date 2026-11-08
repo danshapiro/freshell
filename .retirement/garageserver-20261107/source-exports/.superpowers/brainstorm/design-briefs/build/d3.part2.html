@@ -1,0 +1,147 @@
+
+<!-- ============ B-INSETS · DESKTOP OVERLAYS ============ -->
+<section class="sheetsec" aria-label="Desktop overlays and popovers">
+<h2 class="vh">Desktop overlays</h2>
+<p class="cap"><b>Overlays · pinned beside the sheet</b> — the slash SCHEDULE TABLES (filter <span class="mono">re</span> latched), the @ parts schedule, and the revision panel hanging outboard so the drawing stays visible.</p>
+<div class="isets">
+
+  <!-- SLASH — schedule tables -->
+  <div class="incol" id="d3-slash">
+    <div class="sched" role="dialog" aria-label="Slash command schedule, filter re">
+      <div class="sc2h">
+        <span class="dh2">Schedule — slash commands · sheet S.01</span>
+        <span class="sflt">/re<span class="cur" aria-hidden="true"></span></span>
+      </div>
+      <div class="sgrid">
+        <div class="sgrp">
+          <div class="gh">Session</div>
+          <button class="scrow mut"><span class="line1"><span class="cn">/new</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">fresh session — aliases /reset, /restart</span></button>
+          <button class="scrow mut"><span class="line1"><span class="cn">/fork</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">branch this conversation from a turn</span></button>
+          <button class="scrow mut"><span class="line1"><span class="cn">/compact</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">summarize context now</span></button>
+          <button class="scrow hit"><span class="line1"><span class="cn">/rename</span><span class="soon">soon</span><span class="cdot"></span><span class="cret">↵ run</span></span>
+            <span class="cd2">retitle session</span></button>
+          <button class="scrow mut"><span class="line1"><span class="cn">/export</span><span class="soon">soon</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">save transcript</span></button>
+        </div>
+        <div class="sgrp">
+          <div class="gh">Inspect</div>
+          <button class="scrow mut"><span class="line1"><span class="cn">/status</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">session health &amp; config</span></button>
+          <button class="scrow mut"><span class="line1"><span class="cn">/cost</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">usage breakdown</span></button>
+          <button class="scrow mut"><span class="line1"><span class="cn">/diff</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">open changed files</span></button>
+          <button class="scrow mut"><span class="line1"><span class="cn">/context</span><span class="soon">soon</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">token map</span></button>
+          <button class="scrow hit"><span class="line1"><span class="cn">/review</span><span class="soon">soon</span><span class="cdot"></span><span class="cret">↵ run</span></span>
+            <span class="cd2">request code review</span></button>
+        </div>
+        <div class="sgrp" style="grid-column:1/-1">
+          <div class="gh">Configure</div>
+          <button class="scrow mut"><span class="line1"><span class="cn">/model</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">switch model</span></button>
+          <button class="scrow mut"><span class="line1"><span class="cn">/effort</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">thinking effort</span></button>
+          <button class="scrow hit"><span class="line1"><span class="cn">/permissions</span><span class="cdot"></span><span class="cret">↵ run</span></span>
+            <span class="cd2">permission mode</span></button>
+          <button class="scrow mut"><span class="line1"><span class="cn">/hooks</span><span class="soon">soon</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">event hooks</span></button>
+          <button class="scrow mut"><span class="line1"><span class="cn">/mcp</span><span class="soon">soon</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">MCP servers</span></button>
+          <button class="scrow mut"><span class="line1"><span class="cn">/agents</span><span class="soon">soon</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">subagents</span></button>
+          <button class="scrow mut"><span class="line1"><span class="cn">/notify</span><span class="soon">soon</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">completion alerts</span></button>
+          <button class="scrow mut"><span class="line1"><span class="cn">/theme</span><span class="soon">soon</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">pane theme</span></button>
+        </div>
+      </div>
+      <div class="sfoot">
+        <span><b class="mono">3</b> of 18 commands match &ldquo;re&rdquo;</span>
+        <span style="display:flex;gap:7px;align-items:center"><span class="kk">↑↓</span> choose <span class="kk">↵</span> run</span>
+        <span class="rr">esc close</span>
+      </div>
+    </div>
+    <div style="font:400 10.5px/1.5 var(--mono);color:var(--faint);margin-top:8px;letter-spacing:.04em">
+      motion note — schedule slides up over the composer 200ms; rows do not stagger</div>
+  </div>
+
+  <!-- @ parts schedule -->
+  <div class="incol" id="d3-mention">
+    <div class="parts" role="dialog" aria-label="Mention menu, parts schedule, query ws-">
+      <div class="qh"><span style="color:var(--anno);font-weight:700">@</span>
+        <span>files schedule —</span>
+        <span class="qb">ws-<span class="cur" style="display:inline-block;width:7px;height:11px;background:var(--amber);vertical-align:-1px" aria-hidden="true"></span></span>
+        <span style="margin-left:auto;font-size:8.5px;letter-spacing:.14em;text-transform:uppercase">3 parts</span></div>
+      <button class="prow sel"><span class="pn">server/ws-handler.ts</span><span class="pk">detail D · in-sheet</span></button>
+      <button class="prow"><span class="pn">src/lib/fresh-agent-ws.ts</span><span class="pk">source</span></button>
+      <button class="prow"><span class="pn">test/unit/ws-heartbeat.test.ts</span><span class="pk">test · 14 passed</span></button>
+      <div class="pfoot">↵ insert into spec strip · esc withdraws</div>
+    </div>
+  </div>
+
+  <!-- REVISION PANEL — settings -->
+  <div class="incol" id="d3-settings">
+    <div class="revp" role="dialog" aria-label="Settings, revision panel">
+      <div class="gearline"><span class="gib" aria-hidden="true">⚙</span><span>opens from settings ⚙ in the ops cell — popover, not modal</span></div>
+      <div class="rv3h"><span class="dh3">Revision panel — pane config · S.01</span>
+        <span class="rnote">draft b4 · not yet issued</span>
+        <button style="margin-left:8px;color:var(--muted);font-size:13px" aria-label="Close settings">✕</button></div>
+
+      <div class="rrow"><span class="rl">Style</span><span class="rld"></span>
+        <span class="rv"><span class="seg" role="radiogroup" aria-label="Pane style">
+          <button class="on">Sans</button><button>Serif</button><button>Mono</button></span></span></div>
+
+      <div class="rrow" title="Preview only — flips this sheet to the §D trace-paper ground">
+        <span class="rl">Finish</span><span class="rld"></span>
+        <span class="rv"><span class="seg" role="radiogroup" aria-label="Sheet finish">
+          <button class="on">Blueprint</button><button>Trace paper</button></span>
+          <span style="font:500 9px/1.4 var(--mono);color:var(--muted);letter-spacing:.04em">mock flips to §D — preview tiles below</span></span></div>
+
+      <div class="rrow" style="flex-wrap:wrap;border-bottom-style:solid">
+        <span class="rl">Model</span><span class="rld"></span>
+        <span class="rv" style="flex-direction:column;align-items:stretch;gap:6px;flex:1;text-align:left">
+          <span class="mdlrow on"><span class="rdt"></span>Claude Opus 4.6 <span class="mmut">current drafting hand</span></span>
+          <span class="mdlrow"><span class="rdt"></span>Sonnet 4.6 <span class="soon">soon</span><span class="mmut">lighter revs</span></span>
+        </span></div>
+
+      <div class="rrow"><span class="rl">Effort</span><span class="rld"></span>
+        <span class="rv"><span class="seg" role="radiogroup" aria-label="Thinking effort">
+          <button>Low</button><button>Medium</button><button class="on">High</button></span></span></div>
+
+      <div class="rrow"><span class="rl">Permission</span><span class="rld"></span>
+        <span class="rv"><span class="seg" role="radiogroup" aria-label="Permission mode">
+          <button class="on">Ask</button><button>Accept edits</button><button>Bypass</button><button>Plan</button></span></span></div>
+
+      <div class="rrow"><span class="rl">Thinking</span><span class="rld"></span>
+        <span class="rv">Show thinking <span class="switch on" role="switch" aria-checked="true" aria-label="Show thinking"></span></span></div>
+      <div class="rrow"><span class="rl">Tools</span><span class="rld"></span>
+        <span class="rv">Show tools <span class="switch on" role="switch" aria-checked="true" aria-label="Show tools"></span></span></div>
+      <div class="rrow"><span class="rl">Timecodes</span><span class="rld"></span>
+        <span class="rv">Timecodes <span class="switch on" role="switch" aria-checked="true" aria-label="Timecodes"></span></span></div>
+      <div class="rrow" style="color:var(--muted)"><span class="rl">Sound</span><span class="rld"></span>
+        <span class="rv">Sound on done <span class="soon">soon</span>
+          <span class="switch" role="switch" aria-checked="false" aria-label="Sound on done"></span></span></div>
+      <div class="rrow" style="color:var(--muted)"><span class="rl">Notify</span><span class="rld"></span>
+        <span class="rv">Desktop notifications <span class="soon">soon</span>
+          <span class="switch" role="switch" aria-checked="false" aria-label="Desktop notifications"></span></span></div>
+
+      <div class="advgrp">
+        <div style="font:600 8.5px/1.4 var(--mono);letter-spacing:.2em;text-transform:uppercase;color:var(--faint);padding:8px 0 5px">
+          Advanced — annex sheets <span class="soon">soon</span></div>
+        <div class="advr"><span class="anm">Hooks</span><span class="ago">event hooks · annex H</span></div>
+        <div class="advr"><span class="anm">MCP servers</span><span class="ago">tool sched · annex M</span></div>
+        <div class="advr"><span class="anm">Agents</span><span class="ago">subagent roster · annex A</span></div>
+        <div class="advr"><span class="anm">Status-line layout</span><span class="ago">datum strip fields · annex D</span></div>
+      </div>
+      <div class="sfoot" style="border-top:1px solid var(--line2)">
+        <span>values are the drawn state — leader dots read left → right</span>
+        <span class="rr">esc withdraw</span>
+      </div>
+    </div>
+  </div>
+</div>
+</section>

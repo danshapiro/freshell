@@ -1,0 +1,317 @@
+// 2026-07-28-remote-access-networking.dot  (v2 — post-incident revision, 2026-08-02)
+//
+// Attractor pipeline: iterate until remote-access networking WORKS on the
+// Rust Freshell server. v2 incorporates the root-caused lessons from the
+// failed 2026-07-28 run:
+//
+//   LESSON 1 (fail-closed outcomes): the engine now includes upstream fix
+//     073221c — plain-text responses on goal_gate nodes yield RETRY, and gates
+//     require is_success AND is_explicit. Therefore EVERY LLM node prompt ends
+//     with a MANDATORY OUTCOME contract instructing an explicit report_outcome
+//     call; otherwise honest work retry-loops.
+//   LESSON 2 (deterministic convergence routing): the converge judge writes
+//     .ai/remote-access/VERDICT with CONVERGED / NOT_CONVERGED as its final
+//     line; a tool node (check_verdict) reads it and routes deterministically.
+//     The judge's own report_outcome is necessary but NOT sufficient to reach
+//     finalize — belt and suspenders.
+//   LESSON 3 (pipe-masked exit codes): every tool_command starts with
+//     set -o pipefail AND, structurally, captures the real exit code to a
+//     variable BEFORE any tail/grep, so masking is impossible regardless of
+//     the shell's pipefail support.
+//   LESSON 4 (isolated worktree + durable commits): /home/dan/code/freshell is
+//     a SHARED checkout with other active agents — the 2026-07-28 run lost all
+//     uncommitted work to concurrent git operations there. ALL pipeline work
+//     happens in the dedicated worktree
+//       /home/dan/code/freshell/.worktrees/remote-access-networking
+//     on branch feat/remote-access-networking (created before launch; preflight
+//     verifies it and records the base SHA to .ai/remote-access/BASE_SHA).
+//     Every slice COMMITS before reporting success; every test node verifies a
+//     new commit exists since BASE_SHA in addition to green tests.
+//
+// The NET-01..NET-10 checklist (docs/plans/2026-07-14-rust-tauri-parity-
+// completion-checklist.md:502-532) is the MAP, not the goal. The goal is a
+// working, secure, Linux-verifiable remote-access surface. Windows-elevated
+// behavior (NET-04/05/07) is implemented-with-tests and deferred-with-evidence,
+// never live-executed (port/HANDOFF.md safety rule 6: no netsh add/delete, no
+// elevated UAC — mutation stays behind injected CommandRunner fakes).
+//
+// HARD SAFETY INVARIANTS every node must respect:
+//   * ALL work happens in the worktree
+//     /home/dan/code/freshell/.worktrees/remote-access-networking on branch
+//     feat/remote-access-networking — NEVER in the main checkout
+//     /home/dan/code/freshell, where other agents operate concurrently.
+//   * Never execute mutating Windows network/firewall commands or elevated
+//     PowerShell. Golden-string builders + injected fakes only.
+//   * Never execute privileged Linux commands (ufw/iptables/sudo) — NET-10
+//     requires guidance text, not execution. Rebinding the server's own
+//     listener (127.0.0.1 <-> 0.0.0.0) is allowed and is the Linux live path.
+//   * Never touch server/, shared/, src/ reference sources (frozen at 98ed121c).
+//     src/ client CALLS are the contract to satisfy, not code to edit.
+//   * Read-only cross-boundary probes ARE allowed and expected (verified
+//     live 2026-07-28): powershell.exe invoked directly from WSL2
+//     (Invoke-WebRequest, Test-NetConnection, read-only netsh queries) and
+//     ssh shapiroserver2 (BatchMode key auth, curl). Mutating netsh and
+//     elevated PowerShell remain forbidden without exception.
+//   * Isolated HOME for every test server; reap every process you start.
+//     Tier-C LAN tests run on port 3001 (pre-existing portproxy+firewall
+//     rule); ensure the legacy TS server is NOT holding 3001 during tests
+//     and kill test listeners afterward. Only ONE listener on 3001 machine-wide.
+//   * Commit to feat/remote-access-networking with conventional commit
+//     messages and the Amplifier attribution block; never commit to main or
+//     feat/rust-tauri-port. Uncommitted work is treated as NONEXISTENT.
+//
+// Convergence = the converge node's criteria (goal_gate) PLUS the
+// deterministic check_verdict gate. The pipeline loops (fix -> retest,
+// replan -> reslice) until both pass or the duration cap is hit.
+
+digraph RemoteAccessNetworking {
+    graph [
+        goal="Make remote-access networking WORK on the Rust Freshell server (all work in the dedicated worktree /home/dan/code/freshell/.worktrees/remote-access-networking on branch feat/remote-access-networking, every slice durably COMMITTED — the main checkout is shared with other agents and must not be touched): all five network endpoints the client calls exist and behave (GET /api/lan-info, GET /api/network/status, POST /api/network/configure, POST /api/network/disable-remote-access, POST /api/network/configure-firewall); network status is truthful (live port-reachability probe wired, remoteAccessEnabled/needsRepair no longer hardcoded-false); expose/retract is proven from REAL external vantages on a three-tier ladder (verified live 2026-07-28): (a) WSL loopback, (b) Windows host via powershell.exe -> current WSL eth0 IP (bind-address truth test, any port), (c) true LAN via ssh shapiroserver2 -> 192.168.3.50:3001 (pre-existing portproxy, port 3001 only) — 0.0.0.0-bound reachable from (b) and (c), after disable/rebind-to-loopback both REFUSED while (a) still works, config lossless across restart, with documented tier-c degradation allowed when the portproxy target no longer matches the current eth0 IP; every mutation is secured per NET-08 (auth, validation, no injection, no replay, no overlapping privileged ops); Windows-elevated behavior (NET-04/05/07) implemented behind injected runners with golden tests and documented as deferred-with-evidence, never executed.",
+        label="Freshell Rust Remote-Access Networking (v2)",
+        default_fidelity="compact",
+        default_max_retry=3,
+        retry_target="analyze_plan",
+        fallback_retry_target="analyze_plan",
+        max_pipeline_duration="480m",
+        model_stylesheet="
+            * {
+                llm_provider: anthropic;
+                llm_model: claude-sonnet-*;
+                reasoning_effort: medium;
+            }
+            .planning {
+                llm_model: claude-opus-*;
+                reasoning_effort: high;
+            }
+            .code {
+                llm_model: claude-sonnet-*;
+                reasoning_effort: medium;
+            }
+            .adversarial {
+                llm_model: claude-opus-*;
+                reasoning_effort: high;
+            }
+            .judge {
+                llm_model: claude-opus-*;
+                reasoning_effort: high;
+            }
+        "
+    ]
+    rankdir=TB
+
+    // ---------------------------------------------------------------- structural
+    start [shape=Mdiamond, label="Start"]
+    done  [shape=Msquare, label="Networking works"]
+
+    // ---------------------------------------------------------------- stage 0: preflight
+    // Verifies the DEDICATED WORKTREE (created before launch), branch, cleanliness,
+    // records BASE_SHA once, then cargo-checks. Exit code captured before tail.
+    preflight [
+        shape=parallelogram,
+        label="Preflight: worktree + branch + build",
+        tool_command="WT=/home/dan/code/freshell/.worktrees/remote-access-networking; cd $WT || { echo WORKTREE_MISSING: create it first with: git worktree add .worktrees/remote-access-networking -b feat/remote-access-networking; exit 1; }; BR=$(git rev-parse --abbrev-ref HEAD); [ $BR = feat/remote-access-networking ] || { echo WRONG_BRANCH: $BR; exit 1; }; N=$(git status --porcelain | grep -v -e .ai/ -e .verify-vantages.env | wc -l); [ $N -eq 0 ] || { git status --porcelain | head -20; echo WORKTREE_DIRTY; exit 1; }; mkdir -p .ai/remote-access; [ -f .ai/remote-access/BASE_SHA ] || git rev-parse HEAD > .ai/remote-access/BASE_SHA; echo BASE_SHA=$(cat .ai/remote-access/BASE_SHA); cargo check -p freshell-server -p freshell-platform --quiet > .ai/remote-access/preflight-check.log 2>&1; rc=$?; tail -20 .ai/remote-access/preflight-check.log; [ $rc -eq 0 ] && echo PREFLIGHT_OK"
+    ]
+
+    preflight_fix [
+        label="Fix preflight breakage",
+        class="code",
+        prompt="Working dir: /home/dan/code/freshell/.worktrees/remote-access-networking (dedicated worktree, branch feat/remote-access-networking — do ALL work here, never in the main checkout /home/dan/code/freshell where other agents operate). The preflight check failed. Possible causes and what to do:\n- WORKTREE_MISSING: report fail — the operator must create the worktree (git worktree add .worktrees/remote-access-networking -b feat/remote-access-networking from the main checkout); do not create it yourself if branch state is ambiguous.\n- WRONG_BRANCH: check out feat/remote-access-networking in the worktree if it exists; otherwise report fail with what you found.\n- WORKTREE_DIRTY: inspect git status. If the dirt is leftover pipeline artifacts (.ai/, .verify-vantages.env) the check should already ignore them — otherwise commit legitimate in-flight pipeline work with a conventional commit + Amplifier attribution block, or report fail describing the foreign changes. Never discard changes you cannot attribute.\n- cargo check failure: diagnose and fix the build/workspace problem WITHOUT touching server/, shared/, or src/ (frozen reference). Check for stale target/ artifacts first (ENV-0001 lesson).\n- If you were routed here from the VANTAGE preflight instead, diagnose READ-ONLY: powershell.exe invocation from WSL (interop enabled, /mnt/c/Windows/System32/WindowsPowerShell/v1.0 on PATH), ssh BatchMode key auth to shapiroserver2 (~/.ssh/config, ~/.ssh/id_rsa_shapiroserver2), and the port-3001 portproxy connect-address vs the current eth0 IP — never run mutating netsh or elevated commands to 'fix' a vantage.\nReport what was wrong and what you changed.\n\nMANDATORY OUTCOME: finish by asserting an explicit verdict: call the report_outcome tool if it is in your tool list; if it is NOT, your FINAL assistant message must be EXACTLY one raw JSON object with no other text and no code fences, of the form {\"status\": \"success\", \"notes\": \"<one-line evidence>\"} or {\"status\": \"fail\", \"failure_reason\": \"<exactly what failed>\"} — status=success only if the blocking problem is actually fixed (state the evidence in notes), otherwise status=fail with failure_reason naming exactly what is still broken. The engine is fail-closed: ending with plain text (no report_outcome call) is treated as an unasserted outcome and loops this node."
+    ]
+
+    preflight_vantage [
+        label="Preflight: external vantages",
+        class="code",
+        max_retries=2,
+        retry_target="preflight_vantage",
+        prompt="Working dir: /home/dan/code/freshell/.worktrees/remote-access-networking (dedicated worktree — all file writes go here, never the main checkout). Verify the two REAL external test vantages (both verified live 2026-07-28) and record availability for the harness. Every check here is READ-ONLY; never run mutating netsh or elevated PowerShell.\n1. Resolve the CURRENT WSL eth0 IP via ip -4 addr show eth0 — it is dynamic across reboots, never hardcode it (Windows host is DANDESKTOP, LAN IP 192.168.3.50; WSL2 is NAT mode).\n2. TIER B (REQUIRED — Windows-host vantage): powershell.exe -NoProfile -Command 'Write-Output VANTAGE_B_OK' must succeed from this shell (strip trailing CR when comparing). This vantage hits the WSL eth0 IP from Windows, bypassing WSL localhost forwarding, so it truthfully distinguishes 0.0.0.0-bound from 127.0.0.1-bound on ANY port. If it fails, the pipeline cannot prove cross-boundary bind behavior: report fail with the diagnosis.\n3. TIER C (DEGRADABLE — true LAN vantage): (a) ssh -o BatchMode=yes -o ConnectTimeout=5 shapiroserver2 hostname must succeed (dan@192.168.3.185, curl available there); (b) the READ-ONLY query powershell.exe -NoProfile -Command 'netsh interface portproxy show all' must show the port-3001 rule with a connect-address MATCHING the current eth0 IP from step 1 — the rule was written against a past WSL IP, and a mismatch means tier C silently breaks, so detect it HERE rather than failing mysteriously later. Only port 3001 (plus pre-forwarded 3002/3011/3351/3411-3416) traverses the NAT; arbitrary ports (verified: 3199) are unreachable. If either sub-check fails, tier C is DEGRADED: record the exact reason.\n4. Confirm nothing is currently listening on port 3001 (the legacy TS server must NOT hold 3001 during tier-C tests); if something is, record who. Only ONE listener may hold 3001 machine-wide during tests.\n5. Write .verify-vantages.env in the WORKTREE root: WSL_IP=<ip>, TIER_B=ok, TIER_C=ok or degraded:<reason>, PORT3001_PORTPROXY_TARGET=<addr>, PORT3001_LISTENER=<none|desc>. Do not commit it.\n\nMANDATORY OUTCOME: finish by asserting an explicit verdict: call the report_outcome tool if it is in your tool list; if it is NOT, your FINAL assistant message must be EXACTLY one raw JSON object with no other text and no code fences, of the form {\"status\": \"success\", \"notes\": \"<one-line evidence>\"} or {\"status\": \"fail\", \"failure_reason\": \"<exactly what failed>\"} — status=success only if tier B works AND .verify-vantages.env is written (tier-C degradation is acceptable WITH documented evidence in the file and in notes); status=fail with failure_reason = the diagnosis if tier B is broken or the file could not be written. The engine is fail-closed: ending with plain text (no report_outcome call) loops this node."
+    ]
+
+    // ---------------------------------------------------------------- stage 1: deep analysis + plan
+    analyze_plan [
+        label="Deep analysis & slice plan",
+        class="planning",
+        fidelity="full",
+        prompt="Working dir: /home/dan/code/freshell/.worktrees/remote-access-networking (dedicated worktree, branch feat/remote-access-networking — ALL reads, writes, and commits happen here; the main checkout /home/dan/code/freshell is shared with other agents and must not be touched). Goal: $goal\n\nBuild (or on re-entry, REVISE using everything learned so far — prior failures, review findings, harness output, the converge judge's failure_reason and any converge_failure context) the implementation plan for remote-access networking on the Rust server. Read, at minimum:\n1. The TS reference (READ-ONLY, frozen): server/network-router.ts (all 5 routes: /lan-info:412, /network/status:421, /network/configure:431, /network/disable-remote-access:448, /network/configure-firewall:617), server/network-manager.ts (getStatus 282-398, configure, rebind, teardown verification), server/network-access.ts, the zod schemas (NetworkConfigureSchema, ConfigureFirewallRequestSchema), the confirmation-token machinery (resolveRepairAction, matchesConfirmation, consumeCurrentConfirmation, confirmedRepairInFlight lock), and how the client calls these (src/store/networkSlice.ts, src/components/settings/NetworkSettings.tsx, src/components/NetworkQuickAccess.tsx) — the client is the CONTRACT, do not edit it.\n2. The Rust side: crates/freshell-server/src/network.rs (status route + its two documented deferrals: raw_port_open=None probe, stale=false), crates/freshell-server/src/boot.rs (auth gate, how routers mount, how settings/bind state flows), crates/freshell-platform/src/{network.rs,firewall.rs,port_forward.rs,elevated.rs} (golden-string builders + injected CommandRunner), the config store used for settings persistence (NET-09 rides the serialized store — find it).\n3. Constraints: port/HANDOFF.md safety rule 6 (never execute mutating netsh/elevated; STATUS reads only), the checklist NET-01..NET-10 (docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md:502-532) and reconciliation classes (docs/plans/2026-07-18-checklist-reconciliation.md:253-266).\n\nThen WRITE the plan to docs/plans/2026-07-28-remote-access-networking-plan.md (in the worktree) with exactly three implementation slices plus a verification-harness spec:\n- Slice 1 (status truthfulness + lan-info): implement the live port-reachability probe (loopback AND 0.0.0.0 paths — a plain TCP connect to the bound port from a non-loopback vantage where possible, else loopback-faithful null), unhardcode remoteAccessEnabled/needsRepair, add GET /api/lan-info, wire native-Linux LAN-IP detection (the network.rs comment says non-WSL Linux returns [] — fix for NET-10), keep ufw commands as guidance strings only.\n- Slice 2 (mutation endpoints, Linux-live): POST /api/network/configure (transactional rebind: prove the new listener before persisting, keep old on failure — NET-02), POST /api/network/disable-remote-access (rebind loopback + verified teardown of only-Freshell-managed state — NET-06), both writing through the serialized config store losslessly (NET-09), settings broadcast after change like the TS router.\n- Slice 3 (firewall endpoint + Windows machinery behind fakes): POST /api/network/configure-firewall with the full confirmation-token protocol (one-time action-bound tokens, in-progress 409 lock, elevation-denial/timeout/partial-result handling — NET-04/07 semantics), WSL2 portproxy planning (NET-05), ALL OS mutation behind the injected CommandRunner with golden-string tests; on this Linux host the real runner path for Windows mutation must be structurally unreachable.\n- Harness spec: scripts/verify-remote-access.sh — boots the built Rust server with an isolated HOME, curls all five endpoints (auth positive+negative), and proves expose/retract on a THREE-TIER VANTAGE LADDER (both external vantages verified live 2026-07-28): (a) WSL loopback curl; (b) Windows host via powershell.exe Invoke-WebRequest against the CURRENT WSL eth0 IP, re-resolved at harness start via ip -4 addr show eth0 (dynamic) — bypasses WSL localhost forwarding so 200 truthfully means 0.0.0.0-bound and refused truthfully means loopback-bound; works on any port; REQUIRED; (c) true LAN via ssh shapiroserver2 curl http://192.168.3.50:3001/ — valid ONLY with the server on port 3001 (pre-existing Windows portproxy 0.0.0.0:3001 -> <WSL eth0 IP>:3001 plus inbound firewall allow; NEVER create/modify rules; read-only netsh interface portproxy show all via powershell.exe is the only netsh use); tier-c preconditions: portproxy connect-address matches current eth0 IP and legacy TS server not holding 3001, else DEGRADE with a documented note and continue on tiers a+b. Expose sequence: configure->0.0.0.0->status reachable->tier b 200->tier c 200 (or documented degradation); retract sequence: disable->loopback-only->tier b REFUSED->tier c REFUSED (or documented degradation)->tier a still 200->restart->config byte-preserved. Also runs the NET-08 negative matrix (missing auth 401, malformed body 400, arbitrary-host rejection, injection strings never reaching a runner, token replay + concurrent-op 409), kills everything it started, exits 0 only if all pass.\n\nFor each slice list files to touch, TS file:line anchors, acceptance criteria, and which NET items it evidences. Explicitly mark NET-04/05/07 live-effects as HOST-BLOCKED (deferred-with-evidence). Prioritize working behavior over checkbox parity; where the TS behavior is buggy, fix it and note the deviation for port/oracle/DEVIATIONS.md adjudication rather than replicating bug-for-bug. COMMIT the plan document to feat/remote-access-networking (conventional commit + Amplifier attribution block) before reporting.\n\nMANDATORY OUTCOME: finish by asserting an explicit verdict: call the report_outcome tool if it is in your tool list; if it is NOT, your FINAL assistant message must be EXACTLY one raw JSON object with no other text and no code fences, of the form {\"status\": \"success\", \"notes\": \"<one-line evidence>\"} or {\"status\": \"fail\", \"failure_reason\": \"<exactly what failed>\"} — status=success only if the plan file exists on disk with all three slices + harness spec AND is committed; otherwise status=fail with failure_reason. The engine is fail-closed: ending with plain text (no report_outcome call) loops this node."
+    ]
+
+    // ---------------------------------------------------------------- stage 2: slice loops
+    slice_status [
+        label="Slice 1: truthful status + lan-info",
+        class="code",
+        fidelity="full",
+        thread_id="slice-status",
+        goal_gate=true,
+        max_retries=3,
+        retry_target="slice_status",
+        prompt="Working dir: /home/dan/code/freshell/.worktrees/remote-access-networking (dedicated worktree, branch feat/remote-access-networking — never touch the main checkout). Implement Slice 1 from docs/plans/2026-07-28-remote-access-networking-plan.md: the live port-reachability probe (replace raw_port_open=None in crates/freshell-server/src/network.rs), unhardcoded remoteAccessEnabled/remoteAccessNeedsRepair, GET /api/lan-info (server/network-router.ts:412 shape: {ips: [...]}), and native-Linux LAN-IP detection. Keep every live probe READ-ONLY. Keep build_network_status pure and unit-tested; add tests for the new probe wiring (probe injected/fakeable). Match the TS NetworkStatus wire shape exactly (network-manager.ts:189-209). Do NOT touch server/, shared/, src/. Run cargo test -p freshell-server -p freshell-platform and cargo clippy on what you changed before declaring success. COMMIT your work to feat/remote-access-networking before reporting success — conventional commit message (e.g. feat(network): ...) with the Amplifier attribution block. Uncommitted work is treated as NONEXISTENT: the 2026-07-28 run lost all uncommitted work to concurrent agents, and the test gate after this node independently verifies a new commit exists since BASE_SHA.\n\nMANDATORY OUTCOME: finish by asserting an explicit verdict: call the report_outcome tool if it is in your tool list; if it is NOT, your FINAL assistant message must be EXACTLY one raw JSON object with no other text and no code fences, of the form {\"status\": \"success\", \"notes\": \"<one-line evidence>\"} or {\"status\": \"fail\", \"failure_reason\": \"<exactly what failed>\"} — status=success only if tests+clippy pass AND the commit exists (put the commit hash in notes); status=fail with failure_reason if tests fail or you could not finish. The engine is fail-closed: ending with plain text (no report_outcome call) loops this node."
+    ]
+
+    test_status [
+        shape=parallelogram,
+        label="Test slice 1 (tests + clippy + durable commit)",
+        tool_command="WT=/home/dan/code/freshell/.worktrees/remote-access-networking; cd $WT || exit 1; cargo test -p freshell-server -p freshell-platform --quiet > .ai/remote-access/test-slice1.log 2>&1; rc=$?; tail -30 .ai/remote-access/test-slice1.log; [ $rc -eq 0 ] || { echo SLICE1_TESTS_RED; exit 1; }; cargo clippy -p freshell-server -p freshell-platform --quiet > .ai/remote-access/clippy-slice1.log 2>&1; rc=$?; tail -10 .ai/remote-access/clippy-slice1.log; [ $rc -eq 0 ] || { echo SLICE1_CLIPPY_RED; exit 1; }; git log $(cat .ai/remote-access/BASE_SHA)..HEAD --oneline -- crates/ scripts/ | grep -q . || { echo NO_DURABLE_COMMIT_SINCE_BASE_SHA; exit 1; }; echo SLICE1_GREEN"
+    ]
+
+    slice_mutate [
+        label="Slice 2: configure / disable / persistence",
+        class="code",
+        fidelity="full",
+        thread_id="slice-mutate",
+        goal_gate=true,
+        max_retries=3,
+        retry_target="slice_mutate",
+        prompt="Working dir: /home/dan/code/freshell/.worktrees/remote-access-networking (dedicated worktree, branch feat/remote-access-networking — never touch the main checkout). Implement Slice 2 from docs/plans/2026-07-28-remote-access-networking-plan.md: POST /api/network/configure (validated body per NetworkConfigureSchema semantics; transactional rebind — bind the NEW listener and prove it accepts before persisting config and retiring the old one; on failure keep old listener + old config usable, return the error; response = fresh status + rebindScheduled like network-router.ts:431-447) and POST /api/network/disable-remote-access (rebind to loopback, tear down ONLY verified Freshell-managed exposure, never claim completion before verification — network-router.ts:448+; on this Linux host the Windows/WSL2 teardown branches stay behind injected fakes). Route ALL config writes through the serialized config store so unrelated sections are byte-preserved (NET-09). Broadcast settings-updated after successful change. Auth-gate both routes with the same is_authed gate as /api/network/status. Add unit + integration tests (isolated HOME, ephemeral ports, reap processes). Do NOT touch server/, shared/, src/. Run the tests before declaring success. COMMIT your work to feat/remote-access-networking before reporting success — conventional commit + Amplifier attribution block; uncommitted work is treated as NONEXISTENT and the next gate verifies a new commit since BASE_SHA.\n\nMANDATORY OUTCOME: finish by asserting an explicit verdict: call the report_outcome tool if it is in your tool list; if it is NOT, your FINAL assistant message must be EXACTLY one raw JSON object with no other text and no code fences, of the form {\"status\": \"success\", \"notes\": \"<one-line evidence>\"} or {\"status\": \"fail\", \"failure_reason\": \"<exactly what failed>\"} — status=success only if tests pass AND the commit exists (commit hash in notes); status=fail with failure_reason otherwise. The engine is fail-closed: ending with plain text (no report_outcome call) loops this node."
+    ]
+
+    test_mutate [
+        shape=parallelogram,
+        label="Test slice 2 (tests + durable commit)",
+        tool_command="WT=/home/dan/code/freshell/.worktrees/remote-access-networking; cd $WT || exit 1; cargo test -p freshell-server -p freshell-platform --quiet > .ai/remote-access/test-slice2.log 2>&1; rc=$?; tail -30 .ai/remote-access/test-slice2.log; [ $rc -eq 0 ] || { echo SLICE2_TESTS_RED; exit 1; }; git log $(cat .ai/remote-access/BASE_SHA)..HEAD --oneline -- crates/ scripts/ | grep -q . || { echo NO_DURABLE_COMMIT_SINCE_BASE_SHA; exit 1; }; echo SLICE2_GREEN"
+    ]
+
+    slice_firewall [
+        label="Slice 3: firewall endpoint + gated Windows machinery",
+        class="code",
+        fidelity="full",
+        thread_id="slice-firewall",
+        goal_gate=true,
+        max_retries=3,
+        retry_target="slice_firewall",
+        prompt="Working dir: /home/dan/code/freshell/.worktrees/remote-access-networking (dedicated worktree, branch feat/remote-access-networking — never touch the main checkout). Implement Slice 3 from docs/plans/2026-07-28-remote-access-networking-plan.md: POST /api/network/configure-firewall (server/network-router.ts:617+) with the full protocol: request validation (ConfigureFirewallRequestSchema semantics — reject unknown/malformed fields), one-time ACTION-BOUND confirmation tokens (constant-time compare, consumed on use, replay rejected), a process-wide in-progress lock returning 409 {error, method:'in-progress'} on overlap, and result handling for elevation denial / timeout / partial success / verification failure that reconciles with a fresh status read (NET-07 semantics). ALL OS mutation (netsh portproxy add/delete, New-NetFirewallRule, elevated PowerShell via crates/freshell-platform/src/elevated.rs) must go through the injected CommandRunner; the REAL runner must be structurally unreachable for mutating commands on this host — enforce with a type/constructor guard plus a test asserting a mutation attempt with the real runner on non-Windows is an error, not an execution. Extend golden-string tests for every command the endpoint can construct, including hostile inputs (quotes, semicolons, backticks, dollar-parens, newlines, unicode). Terminal/no-op cases (e.g. Linux ufw guidance) return the TS-shaped response without executing anything (NET-10). Add tests, run them. COMMIT your work to feat/remote-access-networking before reporting success — conventional commit + Amplifier attribution block; uncommitted work is treated as NONEXISTENT and the next gate verifies a new commit since BASE_SHA.\n\nMANDATORY OUTCOME: finish by asserting an explicit verdict: call the report_outcome tool if it is in your tool list; if it is NOT, your FINAL assistant message must be EXACTLY one raw JSON object with no other text and no code fences, of the form {\"status\": \"success\", \"notes\": \"<one-line evidence>\"} or {\"status\": \"fail\", \"failure_reason\": \"<exactly what failed>\"} — status=success only if tests pass AND the commit exists (commit hash in notes); status=fail with failure_reason otherwise. The engine is fail-closed: ending with plain text (no report_outcome call) loops this node."
+    ]
+
+    test_firewall [
+        shape=parallelogram,
+        label="Test slice 3 (tests + durable commit)",
+        tool_command="WT=/home/dan/code/freshell/.worktrees/remote-access-networking; cd $WT || exit 1; cargo test -p freshell-server -p freshell-platform --quiet > .ai/remote-access/test-slice3.log 2>&1; rc=$?; tail -30 .ai/remote-access/test-slice3.log; [ $rc -eq 0 ] || { echo SLICE3_TESTS_RED; exit 1; }; git log $(cat .ai/remote-access/BASE_SHA)..HEAD --oneline -- crates/ scripts/ | grep -q . || { echo NO_DURABLE_COMMIT_SINCE_BASE_SHA; exit 1; }; echo SLICE3_GREEN"
+    ]
+
+    // ---------------------------------------------------------------- stage 3: adversarial security audit (NET-08)
+    security_audit [
+        label="Adversarial security audit (NET-08)",
+        class="adversarial",
+        fidelity="full",
+        prompt="Working dir: /home/dan/code/freshell/.worktrees/remote-access-networking (dedicated worktree — audit the code AS COMMITTED on feat/remote-access-networking here, never the main checkout). You are an ADVERSARIAL security reviewer for the pre-untrusted-LAN gate. Audit the new Rust network-mutation surface with fresh eyes (read the code as shipped, not the claims about it):\n1. AUTH: every mutating route (configure, disable-remote-access, configure-firewall) rejects missing/wrong tokens with 401 BEFORE any side effect or expensive work. lan-info and status too.\n2. INPUT: unknown fields, wrong types, arbitrary/hostile host values (e.g. '0.0.0.0; rm -rf', '::1%eth0', overlong strings) are rejected 400 with no state change.\n3. COMMAND CONSTRUCTION: adversarially audit crates/freshell-platform/src/elevated.rs quoting plus every argv/string builder in firewall.rs and port_forward.rs. Trace every path from HTTP input to a command string. PowerShell single-quote escaping, ArgvQuote, cmd metacharacters, newline smuggling. Can ANY request byte reach a shell/PowerShell string unescaped?\n4. TOKEN PROTOCOL: confirmation tokens are one-time, action-bound, constant-time compared, consumed on both success and failure paths; replay and cross-action reuse rejected.\n5. CONCURRENCY: the in-progress lock actually excludes overlapping privileged ops (check for TOCTOU between lock check and set).\n6. SECRET HYGIENE: the auth token / share-URL token is never written to logs, error bodies, or debug output (NET-03); check the JSONL logging layer.\n7. EXECUTION GUARD: mutating Windows commands are structurally unreachable with the real CommandRunner on this host.\nFor each finding: severity, file:line, exploit sketch. Write the report to docs/plans/2026-07-28-net08-security-audit.md in the worktree and COMMIT it (conventional commit + Amplifier attribution block).\n\nMANDATORY OUTCOME: finish by asserting an explicit verdict: call the report_outcome tool if it is in your tool list; if it is NOT, your FINAL assistant message must be EXACTLY one raw JSON object with no other text and no code fences, of the form {\"status\": \"success\", \"notes\": \"<one-line evidence>\"} or {\"status\": \"fail\", \"failure_reason\": \"<exactly what failed>\"} — status=success ONLY if the audit report is written+committed AND there are zero high/critical findings; otherwise status=fail with failure_reason summarizing the high/critical findings. The engine is fail-closed: ending with plain text (no report_outcome call) loops this node."
+    ]
+
+    fix_security [
+        label="Fix security findings",
+        class="code",
+        fidelity="full",
+        thread_id="slice-security-fix",
+        prompt="Working dir: /home/dan/code/freshell/.worktrees/remote-access-networking (dedicated worktree, branch feat/remote-access-networking — never touch the main checkout). Fix EVERY high/critical finding in docs/plans/2026-07-28-net08-security-audit.md. For each: implement the fix, add a regression test that encodes the exploit sketch and fails without the fix, and note the fix in the audit doc. Run cargo test -p freshell-server -p freshell-platform. COMMIT the fixes (conventional commit + Amplifier attribution block) before reporting — uncommitted work is treated as NONEXISTENT.\n\nMANDATORY OUTCOME: finish by asserting an explicit verdict: call the report_outcome tool if it is in your tool list; if it is NOT, your FINAL assistant message must be EXACTLY one raw JSON object with no other text and no code fences, of the form {\"status\": \"success\", \"notes\": \"<one-line evidence>\"} or {\"status\": \"fail\", \"failure_reason\": \"<exactly what failed>\"} — status=success only if every high/critical finding has a committed fix + regression test and tests pass (commit hash in notes); status=fail with failure_reason otherwise. The engine is fail-closed: ending with plain text (no report_outcome call) loops this node."
+    ]
+
+    // ---------------------------------------------------------------- stage 4: live verification harness
+    build_harness [
+        label="Build live verification harness",
+        class="code",
+        fidelity="full",
+        thread_id="harness",
+        goal_gate=true,
+        max_retries=3,
+        retry_target="build_harness",
+        prompt="Working dir: /home/dan/code/freshell/.worktrees/remote-access-networking (dedicated worktree, branch feat/remote-access-networking — the harness lives, runs, and is COMMITTED here; never touch the main checkout). Create (or repair) scripts/verify-remote-access.sh per the harness spec in docs/plans/2026-07-28-remote-access-networking-plan.md. Requirements:\n- set -euo pipefail; builds the server (cargo build -p freshell-server) or uses the existing debug binary FROM THIS WORKTREE; boots it with an ISOLATED HOME (mktemp -d), a known AUTH_TOKEN, and an ephemeral port; traps EXIT to kill every process it started and remove temp dirs.\n- VANTAGE LADDER (three tiers; both external vantages verified live 2026-07-28; all probes READ-ONLY): at harness start re-resolve the WSL eth0 IP via ip -4 addr show eth0 (dynamic across reboots — never hardcode, never trust a stale .verify-vantages.env without re-checking). TIER A = curl from WSL loopback. TIER B (REQUIRED) = Windows-host probe: powershell.exe -NoProfile -Command '(Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 http://<WSL_ETH0_IP>:<PORT>/).StatusCode' — hitting the WSL eth0 IP from Windows bypasses WSL localhost forwarding, so 200 truthfully means 0.0.0.0-bound and connection-refused truthfully means loopback-bound; works on any port; abort loudly if powershell.exe is unavailable. TIER C (DEGRADABLE) = true LAN probe: ssh -o BatchMode=yes shapiroserver2 curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://192.168.3.50:3001/ — valid ONLY with the server bound on port 3001 (pre-existing portproxy + firewall rule; NEVER create/modify rules). Tier-C preflight inside the harness: read-only powershell.exe 'netsh interface portproxy show all' confirms the 3001 connect-address matches the current eth0 IP, and nothing (e.g. the legacy TS server) already listens on 3001; on any mismatch print one DEGRADED-TIER-C line with the exact reason and continue with tiers A+B only.\n- POSITIVE: GET /api/network/status and /api/lan-info return 200 with the TS wire shape (jq assertions on required keys); run the expose/retract leg with the server on PORT 3001 so tier C applies: POST configure {host:'0.0.0.0'} succeeds, a follow-up status shows host 0.0.0.0 and portOpen true (probe live), TIER B returns 200 AND TIER C returns 200 (or documented degradation); POST disable-remote-access returns to loopback, then TIER B is REFUSED and TIER C is REFUSED (or documented degradation) while TIER A still gets 200; restart the server against the same HOME and assert the config file's unrelated sections are byte-identical to a pre-seeded sentinel (NET-09). Kill the 3001 test listener before exiting (EXIT trap).\n- NEGATIVE (NET-08 matrix): no token -> 401; wrong token -> 401; malformed JSON -> 400; unknown field -> 400; hostile host string -> 400 with no bind change; token replay on configure-firewall -> rejected; two concurrent configure-firewall confirms -> exactly one 409; assert zero privileged executions (the script must never invoke sudo/ufw or any MUTATING netsh/elevated PowerShell — read-only queries via powershell.exe such as 'netsh interface portproxy show all', Invoke-WebRequest, and Test-NetConnection are the ONLY allowed cross-boundary calls — and server logs must show no mutation-runner execution on this host).\n- CLIENT CONTRACT: assert none of the five paths the client calls returns 404.\n- Exits 0 only if ALL checks pass; prints one FAIL line per failed check. Make it executable, run it once yourself, fix what breaks, then COMMIT scripts/verify-remote-access.sh to feat/remote-access-networking (conventional commit + Amplifier attribution block) — the run_harness gate independently verifies the script is committed and will fail otherwise.\n\nMANDATORY OUTCOME: finish by asserting an explicit verdict: call the report_outcome tool if it is in your tool list; if it is NOT, your FINAL assistant message must be EXACTLY one raw JSON object with no other text and no code fences, of the form {\"status\": \"success\", \"notes\": \"<one-line evidence>\"} or {\"status\": \"fail\", \"failure_reason\": \"<exactly what failed>\"} — status=success only if the script exists, is executable, you ran it yourself, and it is COMMITTED (commit hash in notes; if the run is red, still commit the script but report status=fail with the failing checks in failure_reason); status=fail otherwise. The engine is fail-closed: ending with plain text (no report_outcome call) loops this node."
+    ]
+
+    run_harness [
+        shape=parallelogram,
+        label="Run live harness (3-tier vantage ladder)",
+        tool_command="WT=/home/dan/code/freshell/.worktrees/remote-access-networking; cd $WT || exit 1; test -x scripts/verify-remote-access.sh || { echo HARNESS_SCRIPT_MISSING_OR_NOT_EXECUTABLE; exit 1; }; git log $(cat .ai/remote-access/BASE_SHA)..HEAD --oneline -- scripts/verify-remote-access.sh | grep -q . || { echo HARNESS_NOT_COMMITTED; exit 1; }; bash scripts/verify-remote-access.sh > .ai/remote-access/harness.log 2>&1; rc=$?; tail -80 .ai/remote-access/harness.log; exit $rc"
+    ]
+
+    fix_from_harness [
+        label="Diagnose & fix harness failures",
+        class="code",
+        fidelity="full",
+        thread_id="harness",
+        prompt="Working dir: /home/dan/code/freshell/.worktrees/remote-access-networking (dedicated worktree, branch feat/remote-access-networking — never touch the main checkout). The live harness gate failed. Read its output above. If it failed with HARNESS_SCRIPT_MISSING_OR_NOT_EXECUTABLE or HARNESS_NOT_COMMITTED, the harness was never durably created — recreate/chmod/commit it per the spec. Otherwise the harness ran red (full log: .ai/remote-access/harness.log): reproduce the specific failing check manually, and determine whether the bug is in the SERVER (fix the server, add a regression test) or in the HARNESS (fix the script only if the server behavior is actually correct per the TS reference — do NOT weaken an assertion to make it pass; that is the ENV-0001 anti-pattern), or in the ENVIRONMENT: if a TIER B/C vantage check failed, triage read-only first — re-resolve the eth0 IP (dynamic), re-check the port-3001 portproxy connect-address via powershell.exe 'netsh interface portproxy show all', and check whether the legacy TS server is squatting on 3001. A tier-C environmental failure must become a DOCUMENTED degradation, never a silently weakened assertion, and never a reason to run mutating netsh; a tier-B failure is blocking and must be diagnosed. Kill any leaked test servers (especially any test listener on 3001). COMMIT every fix (conventional commit + Amplifier attribution block) — uncommitted work is treated as NONEXISTENT.\n\nMANDATORY OUTCOME: finish by asserting an explicit verdict: call the report_outcome tool if it is in your tool list; if it is NOT, your FINAL assistant message must be EXACTLY one raw JSON object with no other text and no code fences, of the form {\"status\": \"success\", \"notes\": \"<one-line evidence>\"} or {\"status\": \"fail\", \"failure_reason\": \"<exactly what failed>\"} — status=success only if the diagnosed cause is fixed AND committed (commit hash + diagnosis in notes); status=fail with failure_reason otherwise. The engine is fail-closed: ending with plain text (no report_outcome call) loops this node."
+    ]
+
+    // ---------------------------------------------------------------- stage 5: Windows-gated evidence
+    windows_defer [
+        label="Deferred-with-evidence: NET-04/05/07",
+        class="code",
+        prompt="Working dir: /home/dan/code/freshell/.worktrees/remote-access-networking (dedicated worktree, branch feat/remote-access-networking — write and commit everything here, never in the main checkout). Write docs/plans/2026-07-28-net-windows-deferred-evidence.md documenting the host-blocked items honestly (never fabricate a live result):\n- For NET-04 (Windows firewall configure/repair), NET-05 (WSL2 forwarding), NET-07 (elevation failure handling): what IS implemented and proven on this host (endpoint protocol, golden-string command tests, injected-fake integration tests, security audit coverage) with file:line and test-name evidence; what is NOT proven (live elevated execution, real netsh/firewall effects, UAC denial paths) and exactly why (HANDOFF safety rule 6 + no disposable elevated Windows VM, HARNESS-09 unchecked).\n- NET-01 evidence UPGRADE: the harness now proves reachability from REAL external vantages (Windows host via powershell.exe Invoke-WebRequest against the current WSL eth0 IP — a true bind-address test that bypasses WSL localhost forwarding; and true LAN via ssh shapiroserver2 curl to 192.168.3.50:3001 through the pre-existing portproxy). Record this in the checklist annotation as empirical cross-boundary reachability evidence, upgrading NET-01 from loopback-only-verified to externally-probed (cite the harness run, date, and probe results; note the tier-C caveats: port 3001 only, pre-existing rule, degrades if the portproxy target drifts from the current eth0 IP). NET-05 gains OBSERVATIONAL evidence only — an existing portproxy rule was exercised and inspected read-only, never created/modified — so do NOT claim live NET-05 validation. Mutating netsh/elevated commands remain forbidden and unexecuted; nothing about the deferral rules changes.\n- A precise runbook for the future VM validation pass: environment, commands, expected observations, and which assertions flip from deferred to verified.\n- Update the NET section of docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md with dated PARTIAL/evidence annotations mirroring the existing DIAG-01 annotation style — do NOT check any box whose validation contract isn't actually met.\nCOMMIT both documents (conventional commit + Amplifier attribution block) before reporting.\n\nMANDATORY OUTCOME: finish by asserting an explicit verdict: call the report_outcome tool if it is in your tool list; if it is NOT, your FINAL assistant message must be EXACTLY one raw JSON object with no other text and no code fences, of the form {\"status\": \"success\", \"notes\": \"<one-line evidence>\"} or {\"status\": \"fail\", \"failure_reason\": \"<exactly what failed>\"} — status=success only if both documents exist with honest evidence AND are committed (commit hash in notes); status=fail with failure_reason otherwise (including if the implementation work the evidence should describe does not actually exist on this branch — say so plainly). The engine is fail-closed: ending with plain text (no report_outcome call) loops this node."
+    ]
+
+    // ---------------------------------------------------------------- stage 6: convergence gate
+    converge [
+        label="Convergence gate: does networking WORK?",
+        class="judge",
+        fidelity="full",
+        goal_gate=true,
+        max_retries=4,
+        retry_target="analyze_plan",
+        prompt="Working dir: /home/dan/code/freshell/.worktrees/remote-access-networking (dedicated worktree, branch feat/remote-access-networking). You are the convergence judge. FIRST delete any stale .ai/remote-access/VERDICT file. Then verify with FRESH EVIDENCE (re-run commands yourself IN THE WORKTREE; do not trust prior claims) that networking WORKS:\n1. bash scripts/verify-remote-access.sh exits 0 (run it), AND its output shows the vantage ladder actually exercised with fresh evidence: TIER B (Windows host via powershell.exe -> current WSL eth0 IP) returned 200 while 0.0.0.0-bound and was REFUSED after disable; TIER C (ssh shapiroserver2 -> 192.168.3.50:3001) likewise 200 then REFUSED, OR a documented DEGRADED-TIER-C line stating the exact reason (portproxy connect-address mismatch vs current eth0 IP, ssh unavailable, or 3001 occupied). Tier-B evidence is REQUIRED — a run with no cross-boundary proof does not converge.\n2. cargo test -p freshell-server -p freshell-platform passes (run it).\n3. All five client-called routes exist and are auth-gated: grep the Rust route table for /api/lan-info, /api/network/status, /api/network/configure, /api/network/disable-remote-access, /api/network/configure-firewall.\n4. Status truthfulness: crates/freshell-server/src/network.rs no longer hardcodes raw_port_open=None into 'remoteAccessEnabled always false' — the probe is live and a 0.0.0.0-bound server reports remoteAccessEnabled=true when reachable — confirmed from OUTSIDE the WSL boundary by the harness's tier-B probe, not merely from loopback.\n5. Security: docs/plans/2026-07-28-net08-security-audit.md exists with zero unresolved high/critical findings, and the NET-08 negative matrix is part of the passing harness.\n6. Safety + durability: git log/diff shows no changes under server/, shared/, or src/; nothing in the new code executes mutating netsh/elevated/ufw on this host (spot-check the execution guard test); AND all work is durably committed — git status is clean apart from .ai/ and .verify-vantages.env, and git log $(cat .ai/remote-access/BASE_SHA)..HEAD --oneline -- crates/ scripts/ is non-empty (the implementation actually exists as commits on this branch, not just as claims).\n7. Honest deferral: docs/plans/2026-07-28-net-windows-deferred-evidence.md exists, checklist NET annotations updated (including the NET-01 evidence-quality upgrade from the real external vantages and the observational-only NET-05 note), no box checked without its validation contract met.\n\nTHEN, before reporting: write .ai/remote-access/VERDICT (overwrite) — earlier lines may summarize the evidence per criterion, but the FINAL LINE must be exactly CONVERGED or exactly NOT_CONVERGED (uppercase, nothing else on that line, nothing after it). A deterministic gate reads that last line and routes on it; a missing or malformed file is treated as NOT converged.\n\nMANDATORY OUTCOME: finish by asserting an explicit verdict: call the report_outcome tool if it is in your tool list; if it is NOT, your FINAL assistant message must be EXACTLY one raw JSON object with no other text and no code fences, of the form {\"status\": \"success\", \"notes\": \"<one-line evidence>\"} or {\"status\": \"fail\", \"failure_reason\": \"<exactly what failed>\"} — status=success ONLY if ALL seven criteria are verified with fresh evidence AND you wrote VERDICT ending in CONVERGED. Otherwise: write VERDICT ending in NOT_CONVERGED and call report_outcome with status=fail, failure_reason = which criteria failed and the single most important fix, and set context_updates converge_failure=<criterion numbers> so the replan can target it. Never report success on partial evidence — the engine is fail-closed and the verdict file is cross-checked."
+    ]
+
+    // Deterministic verdict gate (belt-and-suspenders on top of the fail-closed
+    // engine): reads the judge-written VERDICT file; only an exact final line of
+    // CONVERGED reaches finalize. Anything else — NOT_CONVERGED, malformed,
+    // missing file, tool failure — routes back to analyze_plan.
+    check_verdict [
+        shape=parallelogram,
+        label="Deterministic verdict check",
+        tool_command="WT=/home/dan/code/freshell/.worktrees/remote-access-networking; cd $WT || exit 1; test -f .ai/remote-access/VERDICT || { echo VERDICT_FILE_MISSING; exit 1; }; tail -n 1 .ai/remote-access/VERDICT"
+    ]
+
+    // ---------------------------------------------------------------- stage 7: finalize
+    finalize [
+        label="Finalize: report + push",
+        class="code",
+        prompt="Working dir: /home/dan/code/freshell/.worktrees/remote-access-networking (dedicated worktree, branch feat/remote-access-networking). Convergence passed (judge + deterministic verdict gate). Write docs/plans/2026-07-28-remote-access-networking-report.md: what was built per slice (with commit hashes from git log $(cat .ai/remote-access/BASE_SHA)..HEAD), the convergence evidence (harness output summary, test counts, vantage-ladder results), the security-audit outcome, what remains Windows-VM-gated and where the runbook lives. Ensure EVERYTHING is committed to feat/remote-access-networking (conventional commits + Amplifier attribution block; git status clean apart from .ai/ and .verify-vantages.env) and push the branch to origin. Never push to main or feat/rust-tauri-port.\n\nMANDATORY OUTCOME: finish by asserting an explicit verdict: call the report_outcome tool if it is in your tool list; if it is NOT, your FINAL assistant message must be EXACTLY one raw JSON object with no other text and no code fences, of the form {\"status\": \"success\", \"notes\": \"<one-line evidence>\"} or {\"status\": \"fail\", \"failure_reason\": \"<exactly what failed>\"} — status=success only if the report is committed and the branch is pushed to origin (put the pushed HEAD sha in notes); status=fail with failure_reason otherwise. The engine is fail-closed: ending with plain text (no report_outcome call) loops this node."
+    ]
+
+    // ================================================================ edges
+
+    start -> preflight
+    preflight -> preflight_vantage [condition="outcome=success"]
+    preflight -> preflight_fix [condition="outcome=fail", label="worktree/build broken"]
+    preflight_fix -> preflight
+    preflight_vantage -> analyze_plan [condition="outcome=success", weight=10]
+    preflight_vantage -> preflight_fix [condition="outcome=fail", label="vantage broken"]
+
+    analyze_plan -> slice_status
+
+    // Slice 1 loop
+    slice_status -> test_status
+    test_status -> slice_mutate [condition="outcome=success", weight=10]
+    test_status -> slice_status [condition="outcome=fail", label="tests red / no commit"]
+
+    // Slice 2 loop
+    slice_mutate -> test_mutate
+    test_mutate -> slice_firewall [condition="outcome=success", weight=10]
+    test_mutate -> slice_mutate [condition="outcome=fail", label="tests red / no commit"]
+
+    // Slice 3 loop
+    slice_firewall -> test_firewall
+    test_firewall -> security_audit [condition="outcome=success", weight=10]
+    test_firewall -> slice_firewall [condition="outcome=fail", label="tests red / no commit"]
+
+    // Security audit loop
+    security_audit -> build_harness [condition="outcome=success", weight=10, label="clean"]
+    security_audit -> fix_security [condition="outcome=fail", label="findings"]
+    fix_security -> security_audit [label="re-audit"]
+
+    // Live harness loop
+    build_harness -> run_harness
+    run_harness -> windows_defer [condition="outcome=success", weight=10, label="harness green"]
+    run_harness -> fix_from_harness [condition="outcome=fail", label="harness red / not committed"]
+    fix_from_harness -> run_harness
+
+    // Evidence, then the convergence gate
+    windows_defer -> converge
+
+    // Convergence: judge success -> deterministic verdict check; judge fail -> replan.
+    converge -> check_verdict [condition="outcome=success", weight=10]
+    converge -> analyze_plan [condition="outcome=fail", label="judge: not converged — replan"]
+
+    // Deterministic routing: ONLY an exact CONVERGED final line reaches finalize.
+    // The unconditional edge is the fail-closed fallback for NOT_CONVERGED,
+    // malformed verdicts, missing file, or tool failure.
+    check_verdict -> finalize [condition="context.tool.last_line=CONVERGED", weight=10, label="CONVERGED"]
+    check_verdict -> analyze_plan [label="NOT_CONVERGED / missing verdict — replan"]
+
+    finalize -> done
+}

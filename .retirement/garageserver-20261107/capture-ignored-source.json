@@ -1,0 +1,359 @@
+{
+  "purpose": "Source preservation for permanent garageserver retirement; unfinished source is not a tested release.",
+  "original_worktree": null,
+  "original_branch": null,
+  "original_head": "cbcb0726431d906355c407ed2c2859227618e1ae",
+  "entries": null,
+  "sources": [
+    {
+      "source": "/home/dan/code/freshell/.ai/attractor-local/attractor-pipeline.yaml",
+      "destination": ".retirement/garageserver-20261107/source-exports/.ai/attractor-local/attractor-pipeline.yaml",
+      "mode": "100644",
+      "oid": "7b6a49f84483103c8bda4a0adeaa75cbb70a9cfc",
+      "bytes": 4117
+    },
+    {
+      "source": "/home/dan/code/freshell/.ai/attractor-followup/evidence/local-override-attractor-pipeline.yaml",
+      "destination": ".retirement/garageserver-20261107/source-exports/.ai/attractor-followup/evidence/local-override-attractor-pipeline.yaml",
+      "mode": "100644",
+      "oid": "7b6a49f84483103c8bda4a0adeaa75cbb70a9cfc",
+      "bytes": 4117
+    },
+    {
+      "source": "/home/dan/code/freshell/.ai/attractor-followup/logs/attempt2/pipeline.dot",
+      "destination": ".retirement/garageserver-20261107/source-exports/.ai/attractor-followup/logs/attempt2/pipeline.dot",
+      "mode": "100644",
+      "oid": "e15337f7de0d3488d63d9ae2ddfea4c8222865ae",
+      "bytes": 49219
+    },
+    {
+      "source": "/home/dan/code/freshell/.ai/attractor-followup/logs/attempt2/graph.dot",
+      "destination": ".retirement/garageserver-20261107/source-exports/.ai/attractor-followup/logs/attempt2/graph.dot",
+      "mode": "100644",
+      "oid": "e15337f7de0d3488d63d9ae2ddfea4c8222865ae",
+      "bytes": 49219
+    },
+    {
+      "source": "/home/dan/code/freshell/.ai/attractor-followup/logs/attempt1/pipeline.dot",
+      "destination": ".retirement/garageserver-20261107/source-exports/.ai/attractor-followup/logs/attempt1/pipeline.dot",
+      "mode": "100644",
+      "oid": "46cf62c432b315c9fdbc143b595a0d03a493602e",
+      "bytes": 49321
+    },
+    {
+      "source": "/home/dan/code/freshell/.ai/attractor-followup/logs/attempt1/graph.dot",
+      "destination": ".retirement/garageserver-20261107/source-exports/.ai/attractor-followup/logs/attempt1/graph.dot",
+      "mode": "100644",
+      "oid": "46cf62c432b315c9fdbc143b595a0d03a493602e",
+      "bytes": 49321
+    },
+    {
+      "source": "/home/dan/code/freshell/.ai/attractor-followup/logs/attempt3/pipeline.dot",
+      "destination": ".retirement/garageserver-20261107/source-exports/.ai/attractor-followup/logs/attempt3/pipeline.dot",
+      "mode": "100644",
+      "oid": "54fb01dcee4d8d871e1577d5c32677eda7eca643",
+      "bytes": 53392
+    },
+    {
+      "source": "/home/dan/code/freshell/.ai/attractor-followup/logs/attempt3/graph.dot",
+      "destination": ".retirement/garageserver-20261107/source-exports/.ai/attractor-followup/logs/attempt3/graph.dot",
+      "mode": "100644",
+      "oid": "54fb01dcee4d8d871e1577d5c32677eda7eca643",
+      "bytes": 53392
+    },
+    {
+      "source": "/home/dan/code/freshell/.ai/attractor-followup/logs/attempt4/pipeline.dot",
+      "destination": ".retirement/garageserver-20261107/source-exports/.ai/attractor-followup/logs/attempt4/pipeline.dot",
+      "mode": "100644",
+      "oid": "9adf5525f9229be55205ead9385d0b9c9d34a6c9",
+      "bytes": 53816
+    },
+    {
+      "source": "/home/dan/code/freshell/.ai/attractor-followup/logs/attempt4/graph.dot",
+      "destination": ".retirement/garageserver-20261107/source-exports/.ai/attractor-followup/logs/attempt4/graph.dot",
+      "mode": "100644",
+      "oid": "9adf5525f9229be55205ead9385d0b9c9d34a6c9",
+      "bytes": 53816
+    },
+    {
+      "source": "/home/dan/code/freshell/.ai/attractor-runs/remote-access-v2-attempt4/pipeline.dot",
+      "destination": ".retirement/garageserver-20261107/source-exports/.ai/attractor-runs/remote-access-v2-attempt4/pipeline.dot",
+      "mode": "100644",
+      "oid": "9adf5525f9229be55205ead9385d0b9c9d34a6c9",
+      "bytes": 53816
+    },
+    {
+      "source": "/home/dan/code/freshell/.ai/attractor-runs/remote-access-v2-attempt4/graph.dot",
+      "destination": ".retirement/garageserver-20261107/source-exports/.ai/attractor-runs/remote-access-v2-attempt4/graph.dot",
+      "mode": "100644",
+      "oid": "9adf5525f9229be55205ead9385d0b9c9d34a6c9",
+      "bytes": 53816
+    },
+    {
+      "source": "/home/dan/code/freshell/.ai/attractor-runs/remote-access-v2-attempt2/pipeline.dot",
+      "destination": ".retirement/garageserver-20261107/source-exports/.ai/attractor-runs/remote-access-v2-attempt2/pipeline.dot",
+      "mode": "100644",
+      "oid": "e15337f7de0d3488d63d9ae2ddfea4c8222865ae",
+      "bytes": 49219
+    },
+    {
+      "source": "/home/dan/code/freshell/.ai/attractor-runs/remote-access-v2-attempt2/graph.dot",
+      "destination": ".retirement/garageserver-20261107/source-exports/.ai/attractor-runs/remote-access-v2-attempt2/graph.dot",
+      "mode": "100644",
+      "oid": "e15337f7de0d3488d63d9ae2ddfea4c8222865ae",
+      "bytes": 49219
+    },
+    {
+      "source": "/home/dan/code/freshell/.ai/attractor-runs/remote-access-v2-attempt1/pipeline.dot",
+      "destination": ".retirement/garageserver-20261107/source-exports/.ai/attractor-runs/remote-access-v2-attempt1/pipeline.dot",
+      "mode": "100644",
+      "oid": "46cf62c432b315c9fdbc143b595a0d03a493602e",
+      "bytes": 49321
+    },
+    {
+      "source": "/home/dan/code/freshell/.ai/attractor-runs/remote-access-v2-attempt1/graph.dot",
+      "destination": ".retirement/garageserver-20261107/source-exports/.ai/attractor-runs/remote-access-v2-attempt1/graph.dot",
+      "mode": "100644",
+      "oid": "46cf62c432b315c9fdbc143b595a0d03a493602e",
+      "bytes": 49321
+    },
+    {
+      "source": "/home/dan/code/freshell/.ai/attractor-runs/remote-access-v2-attempt3/pipeline.dot",
+      "destination": ".retirement/garageserver-20261107/source-exports/.ai/attractor-runs/remote-access-v2-attempt3/pipeline.dot",
+      "mode": "100644",
+      "oid": "54fb01dcee4d8d871e1577d5c32677eda7eca643",
+      "bytes": 53392
+    },
+    {
+      "source": "/home/dan/code/freshell/.ai/attractor-runs/remote-access-v2-attempt3/graph.dot",
+      "destination": ".retirement/garageserver-20261107/source-exports/.ai/attractor-runs/remote-access-v2-attempt3/graph.dot",
+      "mode": "100644",
+      "oid": "54fb01dcee4d8d871e1577d5c32677eda7eca643",
+      "bytes": 53392
+    },
+    {
+      "source": "/home/dan/code/freshell/.superpowers/brainstorm/184888-1786259848/content/index.html",
+      "destination": ".retirement/garageserver-20261107/source-exports/.superpowers/brainstorm/184888-1786259848/content/index.html",
+      "mode": "100644",
+      "oid": "de78da722a7f6e14bc2426febafd75816c57b32f",
+      "bytes": 8951
+    },
+    {
+      "source": "/home/dan/code/freshell/.superpowers/brainstorm/184888-1786259848/content/design-1-ledger.html",
+      "destination": ".retirement/garageserver-20261107/source-exports/.superpowers/brainstorm/184888-1786259848/content/design-1-ledger.html",
+      "mode": "100644",
+      "oid": "87f84d075939346960d123630bc54315537ac7ee",
+      "bytes": 77783
+    },
+    {
+      "source": "/home/dan/code/freshell/.superpowers/brainstorm/184888-1786259848/content/design-3-draft.html",
+      "destination": ".retirement/garageserver-20261107/source-exports/.superpowers/brainstorm/184888-1786259848/content/design-3-draft.html",
+      "mode": "100644",
+      "oid": "9e22da19c0d46b651793c4d31cc5bdd648437832",
+      "bytes": 104396
+    },
+    {
+      "source": "/home/dan/code/freshell/.superpowers/brainstorm/184888-1786259848/content/design-5-logbook.html",
+      "destination": ".retirement/garageserver-20261107/source-exports/.superpowers/brainstorm/184888-1786259848/content/design-5-logbook.html",
+      "mode": "100644",
+      "oid": "239ba88d0af9273838ee583d4f4215d9e2d2a47d",
+      "bytes": 71555
+    },
+    {
+      "source": "/home/dan/code/freshell/.superpowers/brainstorm/184888-1786259848/content/design-2-engine-room.html",
+      "destination": ".retirement/garageserver-20261107/source-exports/.superpowers/brainstorm/184888-1786259848/content/design-2-engine-room.html",
+      "mode": "100644",
+      "oid": "07ca1e68f809fed5ec881844d3a2746de1afa3f2",
+      "bytes": 83973
+    },
+    {
+      "source": "/home/dan/code/freshell/.superpowers/brainstorm/184888-1786259848/content/design-6-paste-up.html",
+      "destination": ".retirement/garageserver-20261107/source-exports/.superpowers/brainstorm/184888-1786259848/content/design-6-paste-up.html",
+      "mode": "100644",
+      "oid": "cc658532291142ca11aab777fc121aed89cc0cb5",
+      "bytes": 78556
+    },
+    {
+      "source": "/home/dan/code/freshell/.superpowers/brainstorm/184888-1786259848/content/design-4-field-guide.html",
+      "destination": ".retirement/garageserver-20261107/source-exports/.superpowers/brainstorm/184888-1786259848/content/design-4-field-guide.html",
+      "mode": "100644",
+      "oid": "82a90106694a4f1c6862dd28e3fef8877a81ff34",
+      "bytes": 88975
+    },
+    {
+      "source": "/home/dan/code/freshell/.superpowers/brainstorm/3142811-1786896044/content/current-and-new-model-selector.html",
+      "destination": ".retirement/garageserver-20261107/source-exports/.superpowers/brainstorm/3142811-1786896044/content/current-and-new-model-selector.html",
+      "mode": "100644",
+      "oid": "fbd8de395c78a0042cab50533c75d54acd1eb11a",
+      "bytes": 11951
+    },
+    {
+      "source": "/home/dan/code/freshell/.superpowers/brainstorm/design-briefs/build/d1.part3.html",
+      "destination": ".retirement/garageserver-20261107/source-exports/.superpowers/brainstorm/design-briefs/build/d1.part3.html",
+      "mode": "100644",
+      "oid": "885d5d0df8ae9392a6cc538b400013021aa7982f",
+      "bytes": 19764
+    },
+    {
+      "source": "/home/dan/code/freshell/.superpowers/brainstorm/design-briefs/build/d4.part3.html",
+      "destination": ".retirement/garageserver-20261107/source-exports/.superpowers/brainstorm/design-briefs/build/d4.part3.html",
+      "mode": "100644",
+      "oid": "fc458ac4f871c671ec2ba6b4df6693768a5fa40d",
+      "bytes": 16191
+    },
+    {
+      "source": "/home/dan/code/freshell/.superpowers/brainstorm/design-briefs/build/d3.part2.html",
+      "destination": ".retirement/garageserver-20261107/source-exports/.superpowers/brainstorm/design-briefs/build/d3.part2.html",
+      "mode": "100644",
+      "oid": "9ab2fddbff1361f87e134e5e17cc938b44363bf4",
+      "bytes": 11491
+    },
+    {
+      "source": "/home/dan/code/freshell/.superpowers/brainstorm/design-briefs/build/d2.part3.html",
+      "destination": ".retirement/garageserver-20261107/source-exports/.superpowers/brainstorm/design-briefs/build/d2.part3.html",
+      "mode": "100644",
+      "oid": "3fc6bbb59f8b70ac7bb2569a09900bb29a47d611",
+      "bytes": 13597
+    },
+    {
+      "source": "/home/dan/code/freshell/.superpowers/brainstorm/design-briefs/build/d4.part2.html",
+      "destination": ".retirement/garageserver-20261107/source-exports/.superpowers/brainstorm/design-briefs/build/d4.part2.html",
+      "mode": "100644",
+      "oid": "1fd21b460e8a8e5daf8bc570c123ef150636263c",
+      "bytes": 12104
+    },
+    {
+      "source": "/home/dan/code/freshell/.superpowers/brainstorm/design-briefs/build/d4.part1.html",
+      "destination": ".retirement/garageserver-20261107/source-exports/.superpowers/brainstorm/design-briefs/build/d4.part1.html",
+      "mode": "100644",
+      "oid": "9347aa25f29cd1e286468e8690087a7f6a593139",
+      "bytes": 60680
+    },
+    {
+      "source": "/home/dan/code/freshell/.superpowers/brainstorm/design-briefs/build/d1.part1.html",
+      "destination": ".retirement/garageserver-20261107/source-exports/.superpowers/brainstorm/design-briefs/build/d1.part1.html",
+      "mode": "100644",
+      "oid": "dce3283cea5c205043c448f088e7b705a6a1d39b",
+      "bytes": 49558
+    },
+    {
+      "source": "/home/dan/code/freshell/.superpowers/brainstorm/design-briefs/build/d2.part2.html",
+      "destination": ".retirement/garageserver-20261107/source-exports/.superpowers/brainstorm/design-briefs/build/d2.part2.html",
+      "mode": "100644",
+      "oid": "a574d4a6f82c53180790797c1ed9241e7a952986",
+      "bytes": 8287
+    },
+    {
+      "source": "/home/dan/code/freshell/.superpowers/brainstorm/design-briefs/build/d5.part2.html",
+      "destination": ".retirement/garageserver-20261107/source-exports/.superpowers/brainstorm/design-briefs/build/d5.part2.html",
+      "mode": "100644",
+      "oid": "8f97abc5669bd189e8f857420425c65ed6f53bdd",
+      "bytes": 7729
+    },
+    {
+      "source": "/home/dan/code/freshell/.superpowers/brainstorm/design-briefs/build/d5.part3.html",
+      "destination": ".retirement/garageserver-20261107/source-exports/.superpowers/brainstorm/design-briefs/build/d5.part3.html",
+      "mode": "100644",
+      "oid": "c47ffd94653d6f9967f8e73978798be4637f9a0c",
+      "bytes": 11634
+    },
+    {
+      "source": "/home/dan/code/freshell/.superpowers/brainstorm/design-briefs/build/d1.part2.html",
+      "destination": ".retirement/garageserver-20261107/source-exports/.superpowers/brainstorm/design-briefs/build/d1.part2.html",
+      "mode": "100644",
+      "oid": "b43c75c3f68a5b19d005ab71cc66c850da9a1399",
+      "bytes": 8461
+    },
+    {
+      "source": "/home/dan/code/freshell/.superpowers/brainstorm/design-briefs/build/d5.part1.html",
+      "destination": ".retirement/garageserver-20261107/source-exports/.superpowers/brainstorm/design-briefs/build/d5.part1.html",
+      "mode": "100644",
+      "oid": "e436b378769cf4fbac974dcf13376e53160163b5",
+      "bytes": 52192
+    },
+    {
+      "source": "/home/dan/code/freshell/.superpowers/brainstorm/design-briefs/build/d2.part1.html",
+      "destination": ".retirement/garageserver-20261107/source-exports/.superpowers/brainstorm/design-briefs/build/d2.part1.html",
+      "mode": "100644",
+      "oid": "9fa0445cf32a6d9d8252a46568e7c805754da63e",
+      "bytes": 62089
+    },
+    {
+      "source": "/home/dan/code/freshell/.superpowers/brainstorm/design-briefs/build/d3.part3.html",
+      "destination": ".retirement/garageserver-20261107/source-exports/.superpowers/brainstorm/design-briefs/build/d3.part3.html",
+      "mode": "100644",
+      "oid": "053047003d7762faf9e58d60422a5cd11c879dae",
+      "bytes": 19323
+    },
+    {
+      "source": "/home/dan/code/freshell/.superpowers/brainstorm/design-briefs/build/d3.part1.html",
+      "destination": ".retirement/garageserver-20261107/source-exports/.superpowers/brainstorm/design-briefs/build/d3.part1.html",
+      "mode": "100644",
+      "oid": "ee34c5e90a653e263e5b18be88a88c1a96ce236a",
+      "bytes": 73582
+    },
+    {
+      "source": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/merge-resolve-codex2.py",
+      "destination": ".retirement/garageserver-20261107/source-exports/darkforge/z06a/.dfx/merge-resolve-codex2.py",
+      "mode": "100644",
+      "oid": "79e251287ce33c50951421964e783a5817405724",
+      "bytes": 5645
+    },
+    {
+      "source": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/write-file.sh",
+      "destination": ".retirement/garageserver-20261107/source-exports/darkforge/z06a/.dfx/write-file.sh",
+      "mode": "100644",
+      "oid": "e8a73c22d218ad0321936602689a7057b228b49e",
+      "bytes": 256
+    },
+    {
+      "source": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/merge-resolve-inventory.py",
+      "destination": ".retirement/garageserver-20261107/source-exports/darkforge/z06a/.dfx/merge-resolve-inventory.py",
+      "mode": "100644",
+      "oid": "2bf5e237b08880e46ce9adebb25fb2b5ef7620ac",
+      "bytes": 865
+    },
+    {
+      "source": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/x.sh",
+      "destination": ".retirement/garageserver-20261107/source-exports/darkforge/z06a/.dfx/x.sh",
+      "mode": "100644",
+      "oid": "3610606bba3fd79fc8bd82877869ea568ecdc659",
+      "bytes": 988
+    },
+    {
+      "source": "/home/dan/code/freshell/.superpowers/brainstorm/design-briefs/content-spec.md",
+      "destination": ".retirement/garageserver-20261107/source-exports/.superpowers/brainstorm/design-briefs/content-spec.md",
+      "mode": "100644",
+      "oid": "9b5ca064d0c1e75739b5ee38bef8a54489a49c49",
+      "bytes": 10643
+    },
+    {
+      "source": "/home/dan/code/freshell/.superpowers/brainstorm/design-briefs/craft-floor.md",
+      "destination": ".retirement/garageserver-20261107/source-exports/.superpowers/brainstorm/design-briefs/craft-floor.md",
+      "mode": "100644",
+      "oid": "86f7a0c8816915a2b5a4e4bce93e0c7de9a08c47",
+      "bytes": 5226
+    },
+    {
+      "source": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/eaw7/.eaw7-scratch/plan-client-slice.md",
+      "destination": ".retirement/garageserver-20261107/source-exports/darkforge/eaw7/.eaw7-scratch/plan-client-slice.md",
+      "mode": "100644",
+      "oid": "6e833fedbff227eab8b85397d63afb3e51e8337b",
+      "bytes": 29369
+    },
+    {
+      "source": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/eaw7/.eaw7-scratch/plan-tests-docs.md",
+      "destination": ".retirement/garageserver-20261107/source-exports/darkforge/eaw7/.eaw7-scratch/plan-tests-docs.md",
+      "mode": "100644",
+      "oid": "e660562a94a4d4080a2497e15aebdd55dbba3bc1",
+      "bytes": 28629
+    },
+    {
+      "source": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/eaw7/.eaw7-scratch/plan-server-frames.md",
+      "destination": ".retirement/garageserver-20261107/source-exports/darkforge/eaw7/.eaw7-scratch/plan-server-frames.md",
+      "mode": "100644",
+      "oid": "37ef8375dc2bc89896b3370b2cb8cd4d5565bac9",
+      "bytes": 25394
+    }
+  ]
+}

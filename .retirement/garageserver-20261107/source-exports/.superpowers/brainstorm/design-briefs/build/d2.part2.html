@@ -1,0 +1,117 @@
+<!-- ============ B2. DESKTOP INSETS ============ -->
+<section aria-label="Desktop insets">
+<h2>Desktop insets</h2>
+<p class="cap">Desktop insets · slash tray (filter “re” latched) · @ parts catalog · service drawer</p>
+<div class="insets">
+
+  <!-- slash tray, open under a ghost composer -->
+  <div class="inset trayWrap">
+    <span class="el" style="display:block;margin-bottom:8px">Module tray · flip-down</span>
+    <div class="tray">
+      <span class="tab-a"></span><span class="tab-b"></span>
+      <div class="t-filter">
+        <span class="sl">/</span><span class="val">re</span><span class="cursor" aria-hidden="true"></span>
+        <span class="cnt">3 / 18 MODULES</span>
+      </div>
+      <div class="t-group">
+        <span class="t-gplate"><span class="plate-txt">SESSION</span></span>
+        <div class="cmd faded"><span class="cname">/new</span><span class="cdesc">fresh session</span><span class="alias">/reset, /restart</span></div>
+        <div class="cmd faded"><span class="cname">/fork</span><span class="cdesc">branch this conversation from a turn</span></div>
+        <div class="cmd faded"><span class="cname">/compact</span><span class="cdesc">summarize context now</span></div>
+        <div class="cmd hit"><span class="cname">/rename</span><span class="cdesc">retitle session</span><span class="soon"></span><span class="kbd ret">↵</span></div>
+        <div class="cmd faded"><span class="cname">/export</span><span class="cdesc">save transcript</span><span class="soon"></span></div>
+      </div>
+      <div class="t-group">
+        <span class="t-gplate"><span class="plate-txt">INSPECT</span></span>
+        <div class="cmd faded"><span class="cname">/status</span><span class="cdesc">session health &amp; config</span></div>
+        <div class="cmd faded"><span class="cname">/cost</span><span class="cdesc">usage breakdown</span></div>
+        <div class="cmd faded"><span class="cname">/diff</span><span class="cdesc">open changed files</span></div>
+        <div class="cmd faded"><span class="cname">/context</span><span class="cdesc">token map</span><span class="soon"></span></div>
+        <div class="cmd hit"><span class="cname">/review</span><span class="cdesc">request code review</span><span class="soon"></span><span class="kbd ret">↵</span></div>
+      </div>
+      <div class="t-group">
+        <span class="t-gplate"><span class="plate-txt">CONFIGURE</span></span>
+        <div class="cmd faded"><span class="cname">/model</span><span class="cdesc">switch model</span></div>
+        <div class="cmd faded"><span class="cname">/effort</span><span class="cdesc">thinking effort</span></div>
+        <div class="cmd hit"><span class="cname">/permissions</span><span class="cdesc">permission mode</span><span class="kbd ret">↵</span></div>
+        <div class="cmd faded"><span class="cname">/hooks</span><span class="cdesc">event hooks</span><span class="soon"></span></div>
+        <div class="cmd faded"><span class="cname">/mcp</span><span class="cdesc">MCP servers</span><span class="soon"></span></div>
+        <div class="cmd faded"><span class="cname">/agents</span><span class="cdesc">subagents</span><span class="soon"></span></div>
+        <div class="cmd faded"><span class="cname">/notify</span><span class="cdesc">completion alerts</span><span class="soon"></span></div>
+        <div class="cmd faded"><span class="cname">/theme</span><span class="cdesc">pane theme</span><span class="soon"></span></div>
+      </div>
+    </div>
+    <div class="ghost-composer" aria-hidden="true">make the interval…<span class="gsend"></span></div>
+    <p class="mnote" style="margin-top:10px">matches arm orange (#26190f); sealed modules dim; ↵ arms the top match</p>
+  </div>
+
+  <!-- @ parts catalog -->
+  <div class="inset">
+    <span class="el" style="display:block;margin-bottom:8px">Parts bin · @ mentions</span>
+    <div class="ddparts">
+      <span class="hex hx-tl" style="position:absolute;top:6px;left:6px;transform:scale(0.8)"><i></i></span>
+      <span class="hex hx-tr" style="position:absolute;top:6px;right:6px;transform:scale(0.8)"><i></i></span>
+      <div class="q"><span class="ats">@</span><span>ws-</span><span class="cursor" aria-hidden="true"></span><span style="margin-left:auto" class="mnote">3 PARTS</span></div>
+      <div class="prt on"><span class="fi">TS</span><span class="fn">server/ws-handler.ts</span><span class="kbd">↵</span></div>
+      <div class="prt"><span class="fi">TS</span><span class="fn">src/lib/fresh-agent-ws.ts</span><span class="fs">2.1k</span></div>
+      <div class="prt"><span class="fi">TS</span><span class="fn">test/unit/ws-heartbeat.test.ts</span><span class="fs">0.9k</span></div>
+    </div>
+    <p class="mnote" style="margin-top:10px">bolt-through plate: query in the well, parts on the shelf</p>
+  </div>
+
+  <!-- settings service drawer -->
+  <div class="inset">
+    <span class="el" style="display:block;margin-bottom:8px">Service drawer · settings</span>
+    <div class="drawer">
+      <span class="dr-rail"></span>
+      <div class="dr-head">
+        <span class="serial">SVC-02 · PANE CONFIG</span>
+        <button class="icob" style="margin-left:auto" aria-label="Close settings">✕</button>
+      </div>
+      <div class="dr-sec">
+        <span class="el" style="display:block;margin-bottom:8px">Style</span>
+        <div class="seg" role="radiogroup" aria-label="Pane style">
+          <button class="on">Sans</button><button>Serif</button><button>Mono</button>
+        </div>
+      </div>
+      <div class="dr-sec">
+        <span class="el" style="display:block;margin-bottom:4px">Model</span>
+        <div class="mrow on"><span class="rad"></span><span>Claude Opus 4.6 <span class="msub">flagship · current</span></span></div>
+        <div class="mrow" style="color:var(--muted)"><span class="rad"></span><span>Sonnet 4.6 <span class="soon" style="margin-left:6px"></span></span></div>
+      </div>
+      <div class="dr-sec">
+        <span class="el" style="display:block;margin-bottom:9px">Effort · rotary</span>
+        <div class="dialwrap">
+          <span class="dial"><span class="ptr"></span></span>
+          <span class="dial-lbl">
+            <span class="dl-lab"><span class="tk2"></span>LOW</span>
+            <span class="dl-lab"><span class="tk2"></span>MEDIUM</span>
+            <span class="dl-lab on"><span class="tk2"></span>HIGH</span>
+          </span>
+        </div>
+      </div>
+      <div class="dr-sec">
+        <span class="el" style="display:block;margin-bottom:8px">Permission mode</span>
+        <div class="seg" role="radiogroup" aria-label="Permission mode">
+          <button class="on">Ask</button><button>Accept edits</button><button>Bypass</button><button>Plan</button>
+        </div>
+      </div>
+      <div class="dr-sec">
+        <span class="el" style="display:block;margin-bottom:4px">Telemetry &amp; trace</span>
+        <div class="tgl-row">Show thinking<span class="tk"><span class="tgl on" role="switch" aria-checked="true"><span class="kn"></span></span></span></div>
+        <div class="tgl-row">Show tools<span class="tk"><span class="tgl on" role="switch" aria-checked="true"><span class="kn"></span></span></span></div>
+        <div class="tgl-row">Timecodes<span class="tk"><span class="tgl on" role="switch" aria-checked="true"><span class="kn"></span></span></span></div>
+        <div class="tgl-row" style="color:var(--muted)">Sound on done <span class="soon"></span><span class="tk"><span class="tgl" role="switch" aria-checked="false"><span class="kn"></span></span></span></div>
+        <div class="tgl-row" style="color:var(--muted)">Desktop notifications <span class="soon"></span><span class="tk"><span class="tgl" role="switch" aria-checked="false"><span class="kn"></span></span></span></div>
+      </div>
+      <div class="dr-sec">
+        <span class="el" style="display:block;margin-bottom:5px">Advanced <span class="soon"></span></span>
+        <div class="adv-row">Hooks<span class="car">›</span></div>
+        <div class="adv-row">MCP servers<span class="car">›</span></div>
+        <div class="adv-row">Agents<span class="car">›</span></div>
+        <div class="adv-row">Status-line layout<span class="car">›</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+</section>

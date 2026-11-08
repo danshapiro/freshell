@@ -1,0 +1,175 @@
+
+<!-- ===== C · PHONE FRAME ===== -->
+<section class="wrap" aria-label="Phone frames" style="margin-top:8px">
+  <h2 class="sr-only">Phone app frame</h2>
+  <p class="cap">Phone · 390×844 · in-session live view</p>
+  <div class="phonegrid">
+    <div class="phone" role="region" aria-label="Freshell phone app">
+      <div class="ph-status"><span>14:31</span><span class="r">freshell · ▮▮▮▯</span></div>
+      <div class="ph-tabs">
+        <div class="ph-tab on"><span class="sw busy"></span><span class="lbl">⚡ Trace dropped messa…</span></div>
+        <div class="ph-tab"><span class="lbl">⌨ npm run dev</span></div>
+        <div class="ph-tab"><span class="sw ok"></span><span class="lbl">◉ Scrollback parser</span></div>
+        <div class="ph-tab" aria-label="New tab"><span class="lbl">+</span></div>
+      </div>
+      <div class="ph-head">
+        <div class="l1">
+          <span class="origin"><span class="odot"></span>FRESHCLAUDE</span>
+          <span class="t">Trace dropped messages on backgr…</span>
+          <button class="abtn" aria-label="More actions">⋯</button>
+        </div>
+        <div style="display:flex;align-items:center;gap:7px;margin-top:4px">
+          <span class="live"><span class="sw busy"></span>Working…</span>
+          <span class="costchip">$1.38</span>
+        </div>
+      </div>
+      <div class="ph-chips" aria-label="Status">
+        <span class="chip">~/code/freshell · <b>fix/ws-reconnect+2</b></span>
+        <span class="chip">Opus 4.6 · High</span>
+        <span class="chip">ctx <b>59%</b></span>
+        <span class="chip"><b>$1.38</b></span>
+      </div>
+      <div class="ph-led">
+        <div class="ph-row">
+          <div class="meta-line"><span class="o you">YOU</span><span class="tm">14:07<span class="c2">46 tok</span></span></div>
+          <div class="bd">the reconnect loop is still dropping messages when the tab's in the background. can you trace where the heartbeat dies?</div>
+        </div>
+        <div class="ph-row">
+          <div class="meta-line"><span class="o claude">CLAUDE</span><span class="tm">14:07<span class="c2">9.6k out · 38s</span></span></div>
+          <div class="bd">Heartbeat is 15s; background tabs throttle timers to ≥60s, so pings gap out and the server closes the socket. Proposing a 5s interval + pong watchdog.
+            <div class="ph-diff"><span class="minus">- const HEARTBEAT_INTERVAL = 15_000;</span>
+<span class="plus">+ const HEARTBEAT_INTERVAL = 5_000;</span>
+<span class="plus">+ // bg-tab timers throttle to ~60s</span>
+<span class="plus">+ let lastPongAt = 0;</span></div>
+          </div>
+        </div>
+        <div class="ph-row">
+          <div class="meta-line"><span class="o claude">CLAUDE</span><span class="tm">14:13<span class="c2"><span style="color:var(--accent)">live</span></span></span></div>
+          <div class="bd">So the watchdog needs to live in the server, and the client should—<span class="cursor" aria-hidden="true"></span>
+            <div class="livechip" style="margin-top:6px"><span class="spin"></span>Running Edit — ws-handler.ts</div>
+          </div>
+        </div>
+        <!-- phone sign-off: full-width stacked cells -->
+        <div class="ph-so" role="alert">
+          <div class="so-head"><span class="sw wait"></span><b>SIGN-OFF</b><span class="so-tool">Bash</span></div>
+          <div class="so-cmd">rm -rf .worktrees/refresh-*</div>
+          <p class="so-why">Deletes 3 stale worktrees.</p>
+          <p class="so-warn"><span class="sw"></span>This command permanently deletes files.</p>
+          <div class="so-acts">
+            <button class="act primary"><span class="k">AUTHORIZE</span><small>Allow once</small></button>
+            <button class="act"><span class="k">AUTHORIZE ALL SIMILAR — SESSION</span><small>Always allow Bash this session</small></button>
+            <button class="act deny"><span class="k">REJECT</span><small>Deny</small></button>
+          </div>
+        </div>
+        <div class="ph-row">
+          <div class="meta-line"><span class="o" style="color:var(--wait)">SYS</span><span class="tm">14:26</span></div>
+          <div class="bd" style="color:var(--muted)">Context compacted · <span class="mono" style="color:var(--ink)">41,203 → 12,850</span> tokens · full transcript preserved</div>
+        </div>
+      </div>
+      <div class="ph-cmp">
+        <div class="tx"><span class="ps1">&gt;_</span><span class="tt">make the interval configurable in settings, default 5s —</span></div>
+        <div class="arow">
+          <button class="cbtn" aria-label="Attach">📎 +ATT</button>
+          <button class="cbtn" aria-label="Slash commands">/</button>
+          <button class="cbtn send">ISSUE ⏎</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- turn actions bottom sheet -->
+    <div>
+      <p class="cap" style="margin-top:0">Sheet · turn actions (long-press row)</p>
+      <div class="sheet-wrap" role="region" aria-label="Turn actions sheet">
+        <div class="scrim">transcript dimmed behind</div>
+        <div class="sheet">
+          <div class="grip"><i></i></div>
+          <h5>Turn · 14:07 · you</h5>
+          <button class="sh-row">Copy turn text<span class="sh-meta">⧉</span></button>
+          <button class="sh-row">Fork conversation from here<span class="sh-meta">⑂</span></button>
+          <button class="sh-row danger">Rewind code to here<span class="sh-meta">destructive</span></button>
+          <button class="sh-row cancel">Cancel</button>
+        </div>
+      </div>
+
+      <p class="cap">Sheet · settings (full-screen)</p>
+      <div class="sheet-wrap" style="height:340px" role="region" aria-label="Settings sheet">
+        <div class="sheet" style="border-top:0;padding-top:6px">
+          <div class="grip"><i></i></div>
+          <h5>Settings</h5>
+          <div class="sh-row">Style<span class="sh-meta">Sans</span></div>
+          <div class="sh-row">Model<span class="sh-meta">Opus 4.6 ✓</span></div>
+          <div class="sh-row">Effort<span class="sh-meta">High</span></div>
+          <div class="sh-row">Permission mode<span class="sh-meta">Ask</span></div>
+          <div class="sh-row">Show thinking<span class="sh-meta">on</span></div>
+          <div class="sh-row">Sound on done <span class="soon">SOON</span><span class="sh-meta">off</span></div>
+          <div class="sh-row">Advanced <span class="soon">SOON</span><span class="sh-meta">›</span></div>
+        </div>
+      </div>
+
+      <p class="cap">Sheet · slash palette, filter "re"</p>
+      <div class="sheet-wrap" role="region" aria-label="Slash sheet">
+        <div class="scrim">composer behind · kbd sheet</div>
+        <div class="sheet">
+          <div class="grip"><i></i></div>
+          <h5>/re — 3 of 18 <span style="float:right;color:var(--accent)">3/18</span></h5>
+          <button class="sh-row"><span class="mono" style="font-weight:600;color:var(--accent)">/rename</span>&nbsp; retitle session <span class="soon">SOON</span><span class="sh-meta">Session</span></button>
+          <button class="sh-row"><span class="mono" style="font-weight:600;color:var(--accent)">/review</span>&nbsp; request code review <span class="soon">SOON</span><span class="sh-meta">Inspect</span></button>
+          <button class="sh-row"><span class="mono" style="font-weight:600;color:var(--accent)">/permissions</span>&nbsp; permission mode<span class="sh-meta">Configure</span></button>
+          <button class="sh-row cancel">Dismiss — esc</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== D · NIGHT SHIFT SWATCH ===== -->
+<section class="wrap" aria-label="Alternate mode">
+  <h2 class="sr-only">Alternate color mode</h2>
+  <p class="cap">Alt mode · "night shift" swatch (#0f1114 ground, cobalt holds) · 400px tiles</p>
+  <div style="display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start">
+    <div class="night" role="region" aria-label="Night shift agent turn">
+      <div class="nh"><span class="sw"></span>NIGHT SHIFT · LEDGER EXCERPT</div>
+      <div class="nrow">
+        <span class="no">CLAUDE</span><span class="nt">14:07 · 9.6k out · 38s</span>
+        <p>Heartbeat is 15s; background tabs throttle timers to ≥60s, so pings gap out and the server closes the socket. Proposing 5s + pong watchdog.</p>
+        <p class="nm" style="margin-top:6px">✓ Edit server/ws-handler.ts <span style="color:#7fb98f">+12</span> <span style="color:#e38b7b">−4</span> · Thought for 12s</p>
+      </div>
+      <div class="nrow">
+        <span class="no" style="color:#8f98a5">YOU</span><span class="nt">14:12</span>
+        <p>here's what the console shows when it dies <span class="nm">· screenshot.png, logs.txt</span></p>
+      </div>
+    </div>
+    <div class="night" role="region" aria-label="Night shift sign-off">
+      <div class="nh"><span class="sw" style="background:#b45309"></span>NIGHT SHIFT · SIGN-OFF</div>
+      <div class="signoff so" role="alert">
+        <div class="so-head"><span class="sw wait"></span><b>SIGN-OFF REQUIRED</b><span class="so-tool">Bash</span></div>
+        <div class="so-cmd">rm -rf .worktrees/refresh-*</div>
+        <p class="so-why">Deletes 3 stale worktrees.</p>
+        <p class="so-warn"><span class="sw"></span>This command permanently deletes files.</p>
+        <div class="so-acts" style="grid-template-columns:1fr">
+          <button class="act primary" style="min-height:48px;border-right:0;border-bottom:1px solid rgba(230,233,238,.14)"><span class="k">AUTHORIZE</span><small>Allow once</small></button>
+          <button class="act" style="min-height:48px;border-right:0;border-bottom:1px solid rgba(230,233,238,.14)"><span class="k">AUTHORIZE ALL SIMILAR — SESSION</span><small>Always allow Bash this session</small></button>
+          <button class="act deny" style="min-height:48px;border-right:0"><span class="k">REJECT</span><small>Deny</small></button>
+        </div>
+      </div>
+      <div class="nrow" style="border-bottom:0"><p class="nm">status vocab unchanged: <span style="color:#5b7ef0">■ busy</span> <span style="color:#d99a5b">■ waiting</span> <span style="color:#7fb98f">■ ok</span> <span style="color:#e38b7b">■ error</span></p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== FOOTER CONTRACT ===== -->
+<footer class="contract">
+  <div class="wrap">
+    <h2>LOGBOOK</h2>
+    <div class="cd">FRSH-AGT-05 · REV C · direction contract · rendered as part of the deliverable</div>
+    <dl>
+      <dt>Thesis</dt><dd>A session is an operations record — timestamped, sourced, auditable, keyboard-first. The UI disappears into the record.</dd>
+      <dt>Own-world</dt><dd>Technical documentation crossed with air-traffic strips. The transcript is a columnar ledger — TIME / ORIGIN / ENTRY / META, tools as indented child rows. Slash commands are the primary keyboard surface; the composer is a command line. Approvals are sign-off blocks with act cells.</dd>
+      <dt>Story</dt><dd>An operator traces dropped websocket heartbeats, reviews the diff inline, signs off a destructive command, answers a routing question, and queues follow-ups — never leaving the keyboard.</dd>
+      <dt>First viewport</dt><dd>Document tabs, a two-row record masthead with the key-value status strip, and the columnar ledger mid-stream under a live cobalt top-border sweep.</dd>
+      <dt>Form + finish</dt><dd>Cool paper #fafbfc, one accent (ops cobalt #2b4fd8), 9px square status swatches, Public Sans + Red Hat Mono at a 1.125 scale, hairline rules on a strict 4pt grid. Night shift: #0f1114 ground, cobalt holds.</dd>
+    </dl>
+  </div>
+</footer>
+</body>
+</html>

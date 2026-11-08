@@ -1,0 +1,1273 @@
+<!DOCTYPE html>
+<!--
+ENGINE ROOM — direction contract (also rendered in footer)
+THESIS: A coding agent is machinery you supervise from a well-made console — milled panels, engraved labels, honest lamps; nothing lit unless it reports a real state.
+OWN-WORLD: machined steel, studio electronics, mastering desk. Strips on a rack, never cards; engraved serial plates on tool modules; a circuit-breaker panel for approvals.
+STORY: 24 minutes into a dropped-heartbeat trace; the VU meter rides at 59%, the belt says RUNNING EDIT, and a worktree-delete just tripped the breaker.
+FORM+FINISH: warm dark steel, off-white ink, safety-orange single accent, Archivo labels, JetBrains Mono data, tabular numerals, solid lamps with inset rims.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Engine Room — Design 2 of 6</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+/* ============ TOKENS ============ */
+:root{
+  --ground:#1b1d20; --panel:#22252a; --raised:#282b31; --recess:#16181b;
+  --groove:rgba(255,244,230,0.09); --dark:#0e0f11;
+  --hi:rgba(255,244,230,0.06);
+  --ink:#ece7de; --muted:#a49c8e; --faint:#7d7669;
+  --orange:#ff6a1f; --amber:#ffb63d; --ok:#3fae8a; --red:#e5484d;
+  --coral:#c15a3c; --keyink:#2a1408;
+  --sans:'Archivo','Helvetica Neue',Arial,sans-serif;
+  --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --bench:#131416;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{background:var(--bench)}
+body{color:var(--ink);font:400 15px/1.55 var(--sans);-webkit-font-smoothing:antialiased}
+::selection{background:rgba(255,106,31,0.32);color:inherit}
+a{color:#ff8a4d;text-decoration:underline;text-underline-offset:3px}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+summary{list-style:none;cursor:pointer}
+summary::-webkit-details-marker{display:none}
+:focus-visible{outline:2px solid var(--amber);outline-offset:2px;border-radius:2px}
+textarea,input[type="text"]{caret-color:var(--orange)}
+html{scrollbar-width:thin;scrollbar-color:#3a3e44 transparent}
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-thumb{background:#3a3e44;border-radius:5px}
+::-webkit-scrollbar-track{background:transparent}
+code,.mono{font-family:var(--mono)}
+.num,time{font-variant-numeric:tabular-nums}
+.wrap{max-width:1500px;margin:0 auto;padding:34px 28px 70px}
+.cap{font:400 11px/1.5 system-ui,-apple-system,'Segoe UI',sans-serif;color:#767066;margin:26px 0 10px}
+section h2{position:absolute;left:-9999px;top:auto}
+
+/* ============ MACHINED PRIMITIVES ============ */
+.el{font:600 10px/1.3 var(--sans);letter-spacing:0.14em;text-transform:uppercase;color:var(--muted)}
+.plate-txt{font:500 10px/1.4 var(--mono);letter-spacing:0.12em;text-transform:uppercase;color:var(--muted)}
+.groove-t{border-top:1px solid var(--groove)}
+.hex{width:9px;height:10px;flex:none;position:relative;display:inline-block;background:#34383f;
+  clip-path:polygon(28% 0,72% 0,100% 50%,72% 100%,28% 100%,0 50%)}
+.hex i{position:absolute;left:2px;right:2px;top:4px;height:1.5px;background:#14161a;transform:rotate(40deg)}
+.lamp{width:8px;height:8px;flex:none;border-radius:50%;background:var(--orange);
+  box-shadow:inset 0 1px 1px rgba(9,10,12,0.75),inset 0 -1px 0 rgba(255,244,230,0.12);display:inline-block}
+.lamp.ok{background:var(--ok)} .lamp.wait{background:var(--amber)}
+.lamp.err{background:var(--red)} .lamp.off{background:#33373e}
+.soon{display:inline-block;vertical-align:1px;font:600 8.5px/1 var(--mono);letter-spacing:0.13em;
+  padding:3px 5px 2px;border-radius:2px;color:#cfc8ba;background:#31353c;
+  border:1px solid var(--groove);box-shadow:inset 0 1px 0 rgba(255,244,230,0.10)}
+.kbd{font:500 10px/1 var(--mono);color:var(--muted);background:var(--recess);border:1px solid var(--groove);
+  border-radius:3px;padding:3px 5px}
+.icob{width:30px;height:30px;flex:none;display:inline-flex;align-items:center;justify-content:center;
+  position:relative;color:var(--muted);background:var(--raised);border:1px solid var(--groove);
+  border-radius:6px;box-shadow:inset 0 1px 0 var(--hi),0 1px 0 rgba(9,10,12,0.5);font-size:13px;line-height:1}
+.icob:hover{color:var(--ink);background:#2d3037}
+.icob .bdg{position:absolute;top:-6px;right:-6px;min-width:16px;height:16px;padding:0 4px;border-radius:8px;
+  background:var(--orange);color:var(--keyink);font:600 10px/16px var(--sans);text-align:center}
+.mnote{font:400 11px/1.5 var(--mono);color:var(--muted)}
+.btn{display:inline-flex;align-items:center;gap:7px;font:600 12.5px/1 var(--sans);color:var(--ink);
+  background:var(--raised);border:1px solid var(--groove);border-radius:6px;padding:8px 12px;
+  box-shadow:inset 0 1px 0 var(--hi),0 1px 0 rgba(9,10,12,0.5)}
+.btn:hover{background:#2d3037}
+.btn.ghost{background:transparent;color:var(--muted)}
+
+/* ============ PAGE MASTHEAD ============ */
+.masthead{margin:2px 0 4px}
+.mh-plate{display:inline-block;position:relative;padding:22px 34px 18px;background:var(--panel);
+  border:1px solid var(--groove);border-radius:5px;
+  box-shadow:inset 0 1px 0 var(--hi),0 3px 0 rgba(9,10,12,0.5)}
+.mh-plate .hex{position:absolute}
+.mh-plate .hx-tl{top:7px;left:7px}.mh-plate .hx-tr{top:7px;right:7px}
+.mh-plate .hx-bl{bottom:7px;left:7px}.mh-plate .hx-br{bottom:7px;right:7px}
+h1.wordmark{font:700 44px/1 var(--sans);letter-spacing:-0.015em;color:#eae3d7;
+  text-shadow:0 -1px 1px rgba(9,10,12,0.8),0 1px 0 rgba(255,244,230,0.10)}
+.mh-serial{display:block;margin-top:9px;color:var(--faint)}
+.mh-thesis{margin:16px 0 9px;font-size:16.5px;color:var(--muted);max-width:66ch}
+.mh-util{font:400 12px/1.5 system-ui,-apple-system,'Segoe UI',sans-serif;color:#767066}
+.mh-util a{color:#8f8a80}
+
+/* ============ DESKTOP FRAME ============ */
+.frame{width:min(1440px,100%);background:var(--ground);border:1px solid var(--groove);border-radius:12px;
+  overflow:hidden;box-shadow:0 26px 48px -30px rgba(9,10,12,0.75)}
+.chrome{display:flex;align-items:center;gap:9px;padding:9px 14px;background:#181a1e;border-bottom:1px solid var(--groove)}
+.chrome .dot{width:9px;height:9px;border-radius:50%;background:#2e3238;border:1px solid var(--groove)}
+.chrome .url{margin:0 auto;font:400 10.5px/1 var(--mono);color:var(--faint);background:var(--recess);
+  border:1px solid var(--groove);border-radius:5px;padding:5px 14px}
+
+/* tab strip: rack ears */
+.tabs{display:flex;align-items:flex-end;gap:4px;padding:8px 14px 0;background:#1e2125;border-bottom:1px solid var(--groove)}
+.tab{position:relative;display:flex;align-items:center;gap:8px;max-width:262px;padding:10px 16px 9px 26px;
+  background:var(--panel);border:1px solid var(--groove);border-bottom:0;border-radius:7px 7px 0 0;
+  font:500 13px/1.2 var(--sans);color:var(--muted);white-space:nowrap}
+.tab .ttl{overflow:hidden;text-overflow:ellipsis}
+.tab .ledge{position:absolute;left:8px;top:50%;width:9px;height:3px;margin-top:-1.5px;background:#34383f;border-radius:1px}
+.tab.on{background:var(--raised);color:var(--ink);box-shadow:inset 0 1px 0 var(--hi)}
+.tab.on::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:1px;background:var(--raised)}
+.tab-add{width:28px;height:28px;margin-bottom:4px}
+
+/* pane header: unit faceplate */
+.faceplate{position:relative;display:flex;align-items:center;gap:12px;padding:12px 18px 12px 22px;
+  background:var(--panel);border-bottom:1px solid var(--groove)}
+.faceplate>.hex-tr{position:absolute;top:7px;right:7px}
+.slot{display:flex;align-items:center;padding:5px 6px 5px 5px;background:var(--recess);
+  border:1px solid var(--groove);border-radius:6px;box-shadow:inset 0 1px 2px rgba(9,10,12,0.7)}
+.cart{display:flex;align-items:center;gap:7px;background:#2c2622;border:1px solid rgba(193,90,60,0.55);
+  border-radius:4px;padding:5px 9px;font:600 11px/1 var(--mono);letter-spacing:0.08em;color:#e8b39e;
+  box-shadow:inset 0 1px 0 rgba(255,244,230,0.08)}
+.cart b{width:7px;height:7px;background:var(--coral);border-radius:1.5px}
+.fp-title{font:600 15px/1.3 var(--sans);color:var(--ink)}
+.fp-kv{display:flex;align-items:center;gap:9px;margin-top:3px}
+.fp-state{display:flex;align-items:center;gap:6px;font:500 12px/1 var(--sans);color:var(--orange)}
+.fp-sid{font:400 10.5px/1 var(--mono);color:var(--faint)}
+.fp-right{margin-left:auto;display:flex;align-items:center;gap:7px}
+.fp-cost{font:500 12px/1 var(--mono);color:var(--ink);padding:7px 11px;background:var(--recess);
+  border:1px solid var(--groove);border-radius:5px;box-shadow:inset 0 1px 1px rgba(9,10,12,0.6)}
+
+/* status strip: VU gauge row */
+.statusbar{display:flex;align-items:center;padding:0 18px;background:#1e2125;border-bottom:1px solid var(--groove);
+  font:400 12px/1.4 var(--sans);color:var(--muted);overflow-x:auto}
+.cell{display:flex;align-items:center;gap:7px;padding:9px 13px 9px 0;white-space:nowrap}
+.cell+.cell{padding-left:13px;border-left:1px solid var(--groove)}
+.cell .mono{font-size:11.5px;color:var(--ink)}
+.cell .dv{font:500 11.5px/1 var(--mono);color:var(--ink)}
+.vu{display:flex;gap:2.5px;align-items:flex-end}
+.vu b{width:5px;height:12px;background:#2c3036;border-radius:1px;box-shadow:inset 0 1px 0 rgba(9,10,12,0.6)}
+.vu b.on{background:var(--orange);box-shadow:inset 0 1px 0 rgba(255,244,230,0.18)}
+.vu-sub{font:400 10px/1 var(--mono);color:var(--faint)}
+
+/* body split */
+.split{display:flex;align-items:stretch}
+.scrollcol{flex:1;min-width:0;background:var(--ground);position:relative;overflow-x:clip}
+.bay{width:300px;flex:none;background:#1e2125;border-left:1px solid var(--groove);padding:15px 15px 18px}
+
+/* transcript entries */
+.entry{display:flex;gap:13px;padding:15px 20px 15px 12px;border-top:1px solid var(--groove)}
+.entry:first-child{border-top:0}
+.rail{width:38px;flex:none;display:flex;flex-direction:column;align-items:center;gap:8px;padding-top:3px}
+.rail .n{font:500 10px/1 var(--mono);color:var(--faint)}
+.rail .ln{flex:1;width:1px;background:var(--groove)}
+.body{flex:1;min-width:0}
+.ehead{display:flex;align-items:center;gap:9px;margin-bottom:8px;flex-wrap:wrap}
+.ehead .who{font:600 13px/1 var(--sans);color:var(--ink)}
+.ehead .who.agent{color:#e8b39e}
+.ehead time{font:400 11px/1 var(--mono);color:var(--faint)}
+.ehead .meta{font:400 11.5px/1 var(--sans);color:var(--muted)}
+.ehead .dots{margin-left:auto}
+.prose{font:400 15px/1.62 var(--sans);max-width:72ch}
+.prose p+p{margin-top:8px}
+.prose code{font-size:12.5px;background:var(--recess);border:1px solid var(--groove);border-radius:3px;padding:1px 5px;color:#f0d9b8}
+
+/* thinking block */
+.think{margin:11px 0 0;background:var(--recess);border:1px solid var(--groove);border-radius:6px;
+  box-shadow:inset 0 1px 2px rgba(9,10,12,0.6)}
+.think summary{display:flex;align-items:center;gap:9px;padding:8px 12px;font:500 12px/1.4 var(--mono);color:var(--muted)}
+.think summary::before{content:"▸";font-size:9px;color:var(--faint)}
+.think .t-body{padding:0 12px 10px 30px;font:400 12.5px/1.6 var(--sans);color:var(--muted)}
+
+/* tool modules */
+.mods{margin-top:13px;display:flex;flex-direction:column;gap:7px}
+.mod{background:var(--panel);border:1px solid var(--groove);border-radius:6px;
+  box-shadow:inset 0 1px 0 var(--hi),0 1px 0 rgba(9,10,12,0.5);position:relative}
+.mod>.hex-tl{position:absolute;top:6px;left:6px;transform:scale(0.85);opacity:0.75}
+.mod>.hex-tr{position:absolute;top:6px;right:6px;transform:scale(0.85);opacity:0.75}
+.serial{display:inline-flex;align-items:center;background:var(--recess);border:1px solid var(--groove);
+  border-radius:4px;padding:4px 8px;font:500 9.5px/1 var(--mono);letter-spacing:0.11em;color:var(--muted);
+  text-transform:uppercase;box-shadow:inset 0 1px 1px rgba(9,10,12,0.6)}
+.mod-head{display:flex;align-items:center;gap:10px;padding:9px 12px 9px 24px}
+.mod-head .mod-meta{margin-left:auto;font:400 10.5px/1 var(--mono);color:var(--faint)}
+.mod-head .chev{color:var(--faint);font-size:10px}
+details.mod>.mod-head .chev::before{content:"▸"}
+details.mod[open]>.mod-head .chev::before{content:"▾"}
+.mod-body{padding:0 12px 12px 24px}
+.mod-cmd{font:400 11.5px/1.6 var(--mono);color:#f0d9b8;word-break:break-all}
+.mod-out{margin-top:5px;font:400 11px/1.6 var(--mono);color:var(--muted)}
+.mod-out .ok-t{color:var(--ok)}
+.delta .p{color:#7fd4b8}.delta .m{color:#ff9d92}
+.diff{margin:2px 12px 12px 24px;background:#191b1f;border:1px solid var(--groove);border-radius:6px;
+  padding:11px 0 9px;font:400 11.5px/1.75 var(--mono);position:relative;
+  box-shadow:inset 0 1px 2px rgba(9,10,12,0.65)}
+.diff>.hex{position:absolute}
+.diff>.hx-tl{top:6px;left:6px}.diff>.hx-tr{top:6px;right:6px}
+.diff>.hx-bl{bottom:6px;left:6px}.diff>.hx-br{bottom:6px;right:6px}
+.dl{display:flex;align-items:center;padding:0 10px}
+.dl .gut{width:28px;flex:none;text-align:right;padding-right:9px;color:var(--faint);user-select:none}
+.dl .sign{width:14px;flex:none;user-select:none}
+.dl pre{white-space:pre-wrap;word-break:break-all;flex:1;min-width:0;text-wrap:wrap}
+.dl.del{background:rgba(229,72,77,0.10)} .dl.del .sign,.dl.del pre{color:#ff9d92}
+.dl.add{background:rgba(63,174,138,0.10)} .dl.add .sign,.dl.add pre{color:#7fd4b8}
+.dl.ctx{color:var(--muted)}
+.dl .cmt{margin-left:9px;flex:none;width:16px;height:16px;font-size:9px;color:var(--faint);
+  background:var(--raised);border:1px solid var(--groove);border-radius:3px;display:none;
+  align-items:center;justify-content:center}
+.dl:hover .cmt,.dl .cmt.show{display:inline-flex}
+
+/* settled strip */
+.settled{margin-top:12px;display:flex;align-items:center;gap:9px;padding:7px 12px;background:var(--recess);
+  border:1px solid var(--groove);border-radius:5px;font:400 11px/1.4 var(--mono);color:var(--muted)}
+
+/* attachments */
+.atts{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:9px}
+.att{display:flex;align-items:center;gap:8px;background:var(--recess);border:1px solid var(--groove);
+  border-radius:5px;padding:5px 9px 5px 5px;font:400 11.5px/1 var(--mono);color:var(--muted);
+  box-shadow:inset 0 1px 1px rgba(9,10,12,0.5)}
+.att .th{width:26px;height:20px;flex:none;background:#2b2f36;border:1px solid var(--groove);border-radius:3px;
+  position:relative;overflow:hidden}
+.att .th i{position:absolute;left:3px;top:3px;right:9px;bottom:8px;background:#3b4149;border-radius:1px}
+.att .th i::after{content:"";position:absolute;left:0;right:6px;bottom:0;height:5px;background:#c46a35}
+
+/* streaming / belt */
+.cursor{display:inline-block;width:8px;height:14px;margin-left:2px;background:var(--orange);vertical-align:-2px}
+.belt{display:flex;align-items:center;gap:10px;margin-top:12px;padding:8px 12px;background:#221d14;
+  border:1px solid rgba(255,106,31,0.40);border-radius:5px;
+  box-shadow:inset 0 1px 0 rgba(255,106,31,0.14)}
+.belt .btxt{font:500 10.5px/1 var(--mono);letter-spacing:0.12em;color:var(--orange);text-transform:uppercase}
+.belt .track{flex:1;height:5px;background:var(--recess);border:1px solid var(--groove);border-radius:3px;position:relative;overflow:hidden}
+.belt .track i{position:absolute;left:0;top:0;bottom:0;width:38%;background:rgba(255,106,31,0.5);border-radius:3px}
+.microstop{display:inline-flex;align-items:center;height:24px;padding:0 10px;font:600 10.5px/1 var(--sans);
+  letter-spacing:0.08em;color:#ff9d92;background:#33191b;border:1px solid rgba(229,72,77,0.45);
+  border-radius:12px;box-shadow:inset 0 1px 1px rgba(9,10,12,0.5)}
+
+/* circuit breaker approval */
+.breaker{margin-top:13px;background:#1a1c21;border:1px solid var(--groove);border-radius:10px;
+  box-shadow:inset 0 1px 0 var(--hi),0 3px 0 rgba(9,10,12,0.5),0 12px 24px -16px rgba(9,10,12,0.8);
+  padding:14px 16px 15px;position:relative}
+.brk-top{display:flex;align-items:center;gap:9px;margin-bottom:10px}
+.brk-alarm{margin-left:auto;display:flex;align-items:center;gap:6px;font:600 10px/1 var(--mono);
+  letter-spacing:0.12em;color:#ffb0ab}
+.brk-sub{font:400 12.5px/1.5 var(--sans);color:var(--muted);padding:0 2px}
+.brk-cmd{margin:10px 1px;background:var(--recess);border:1px solid var(--groove);border-radius:6px;
+  padding:12px 18px;font:400 13px/1.5 var(--mono);color:#ffd9a8;
+  box-shadow:inset 0 1px 2px rgba(9,10,12,0.75);word-break:break-all}
+.brk-meta{display:flex;gap:16px;flex-wrap:wrap;padding:0 2px}
+.brk-meta .w{font:400 12px/1.5 var(--sans);color:var(--muted)}
+.brk-meta .warn{display:flex;align-items:center;gap:6px;font:400 12px/1.5 var(--sans);color:#ffb0ab}
+.brk-sw{display:grid;grid-template-columns:auto 1fr auto;gap:20px;align-items:end;margin-top:16px;
+  padding-top:14px;border-top:1px solid var(--groove)}
+.swcell{display:flex;flex-direction:column;gap:8px;align-items:flex-start;min-width:0}
+.rocker{display:inline-flex;align-items:center;justify-content:center;min-height:48px;padding:0 26px;
+  font:600 15px/1 var(--sans);letter-spacing:0.03em;color:var(--keyink);background:var(--orange);
+  border:1px solid rgba(90,36,4,0.7);border-radius:8px;
+  box-shadow:inset 0 1px 0 rgba(255,224,200,0.5),inset 0 -3px 0 rgba(120,45,6,0.6),0 2px 0 rgba(9,10,12,0.55)}
+.rocker:active{transform:translateY(1px)}
+.rocker.deny{min-height:46px;padding:0 22px;color:#ff9d92;background:#231f22;
+  border:1px solid rgba(229,72,77,0.4);
+  box-shadow:inset 0 2px 3px rgba(9,10,12,0.85),inset 0 -1px 0 rgba(255,244,230,0.05)}
+.gwrap{display:flex;align-items:flex-end;gap:10px}
+.kguard{width:30px;height:16px;margin-bottom:-2px;margin-left:5px;border:1.5px solid var(--amber);
+  border-bottom:0;border-radius:3px 3px 0 0;transform:rotate(-26deg);transform-origin:bottom left}
+.latch{display:flex;align-items:center;gap:12px}
+.ltrack{width:44px;height:24px;flex:none;position:relative;background:var(--recess);border:1px solid var(--groove);
+  border-radius:12px;box-shadow:inset 0 2px 2px rgba(9,10,12,0.75)}
+.ltrack .knob{position:absolute;top:2px;left:2px;width:19px;height:19px;border-radius:50%;background:#3a3f47;
+  box-shadow:inset 0 1px 0 rgba(255,244,230,0.15),0 1px 1px rgba(9,10,12,0.6)}
+.swlabel{font:500 12px/1.45 var(--sans);color:var(--muted);max-width:36ch}
+
+/* question banner */
+.ask{margin-top:13px;background:var(--panel);border:1px solid var(--groove);border-radius:8px;
+  box-shadow:inset 0 1px 0 var(--hi),0 1px 0 rgba(9,10,12,0.5);padding:13px 15px}
+.ask .q{font:600 13.5px/1.5 var(--sans);margin:2px 0 10px}
+.opts{display:flex;flex-direction:column;gap:6px}
+.opt{display:flex;align-items:center;gap:11px;padding:9px 12px;background:var(--recess);
+  border:1px solid var(--groove);border-radius:6px;font:400 13.5px/1.4 var(--sans);color:var(--ink);
+  text-align:left;box-shadow:inset 0 1px 1px rgba(9,10,12,0.55)}
+.opt:hover{border-color:rgba(255,244,230,0.22)}
+.opt.sel{border-color:rgba(255,106,31,0.55);background:#26190f}
+.opt .rad{width:13px;height:13px;flex:none;border-radius:50%;border:1.5px solid var(--faint);position:relative}
+.opt.sel .rad{border-color:var(--orange)}
+.opt.sel .rad::after{content:"";position:absolute;inset:3px;border-radius:50%;background:var(--orange)}
+.opt .hint{margin-left:auto;font:400 11.5px/1.4 var(--sans);color:var(--muted)}
+.opt.sel .hint{color:var(--muted)}
+.ask .other{display:flex;gap:10px;margin-top:10px;align-items:center}
+.oinput{flex:1;background:var(--recess);border:1px solid var(--groove);border-radius:6px;color:var(--ink);
+  font:400 13px/1.4 var(--sans);padding:9px 12px;caret-color:var(--orange);
+  box-shadow:inset 0 1px 1px rgba(9,10,12,0.55)}
+.oinput::placeholder{color:var(--faint)}
+
+/* compaction / queue / search */
+.compact{margin-top:13px;display:flex;align-items:center;gap:11px;padding:9px 13px;background:var(--panel);
+  border:1px solid var(--groove);border-radius:6px;box-shadow:inset 0 1px 0 var(--hi)}
+.queue-note{margin-top:13px;background:#201d1a;border:1px dashed rgba(255,182,61,0.4);border-radius:8px;
+  padding:10px 13px}
+.queue-note .qrow{display:flex;align-items:center;gap:10px;padding:5px 0;font:400 13px/1.5 var(--sans)}
+.queue-note .qn{font:500 9.5px/1 var(--mono);letter-spacing:0.1em;color:var(--amber)}
+.queue-note .qx{margin-left:auto;color:var(--faint);font-size:13px;padding:2px 6px;border-radius:4px}
+.queue-note .qx:hover{color:var(--ink);background:var(--raised)}
+.search{margin-top:13px;background:var(--panel);border:1px solid var(--groove);border-radius:8px;
+  padding:12px 15px;box-shadow:inset 0 1px 0 var(--hi)}
+.search .query{font:400 12.5px/1.5 var(--mono);color:#f0d9b8}
+.srclist{display:flex;gap:8px;flex-wrap:wrap;margin-top:9px}
+.src{display:inline-flex;align-items:center;gap:7px;font:400 11.5px/1 var(--sans);color:var(--muted);
+  background:var(--recess);border:1px solid var(--groove);border-radius:4px;padding:6px 9px}
+.src b{color:var(--ink);font-weight:500}
+.src .dom{font:400 10px/1 var(--mono);color:var(--faint)}
+
+/* scroll affordances */
+.scaff{display:flex;justify-content:center;padding:9px 0}
+.jumpchip{display:inline-flex;align-items:center;gap:8px;font:400 11px/1 var(--mono);color:var(--muted);
+  background:var(--raised);border:1px solid var(--groove);border-radius:12px;padding:7px 13px;
+  box-shadow:inset 0 1px 0 var(--hi),0 1px 0 rgba(9,10,12,0.5)}
+.newp{display:flex;justify-content:center;padding:11px 0 13px}
+.newpill{display:inline-flex;align-items:center;gap:8px;font:600 12.5px/1 var(--sans);color:var(--keyink);
+  background:var(--orange);border:1px solid rgba(90,36,4,0.7);border-radius:14px;padding:9px 16px;
+  box-shadow:inset 0 1px 0 rgba(255,224,200,0.4),0 2px 0 rgba(9,10,12,0.5)}
+
+/* composer: bolted desk strip */
+.composer{background:#20232a;border-top:1px solid var(--groove);padding:13px 18px 8px;position:relative}
+.composer .bolt{position:absolute;top:8px;width:7px;height:7px;border-radius:50%;background:#17191d;
+  box-shadow:inset 0 1px 1px rgba(9,10,12,0.85),inset 0 -1px 0 rgba(255,244,230,0.10)}
+.composer .bolt.l{left:8px}.composer .bolt.r{right:8px}
+.c-shell{display:flex;gap:10px;align-items:flex-end;background:var(--recess);border:1px solid var(--groove);
+  border-radius:10px;padding:10px 10px 10px 13px;box-shadow:inset 0 2px 3px rgba(9,10,12,0.7),0 1px 0 var(--hi)}
+.c-mid{flex:1;min-width:0}
+.c-mid textarea{display:block;width:100%;background:transparent;border:0;resize:none;color:var(--ink);
+  font:400 14px/1.55 var(--sans);min-height:44px;outline:none;caret-color:var(--orange)}
+.c-chips{display:flex;gap:7px;margin-bottom:8px;flex-wrap:wrap}
+.c-chip{display:inline-flex;align-items:center;gap:7px;font:400 11px/1 var(--mono);color:var(--muted);
+  background:var(--panel);border:1px solid var(--groove);border-radius:4px;padding:4px 8px;
+  box-shadow:inset 0 1px 0 var(--hi)}
+.c-chip .x{color:var(--faint)}
+.c-actions{display:flex;gap:9px;align-items:center}
+.send{min-height:48px;padding:0 24px;display:inline-flex;align-items:center;gap:8px;
+  font:600 15px/1 var(--sans);letter-spacing:0.04em;color:var(--keyink);background:var(--orange);
+  border:1px solid rgba(90,36,4,0.7);border-radius:8px;
+  box-shadow:inset 0 1px 0 rgba(255,224,200,0.5),inset 0 -3px 0 rgba(120,45,6,0.6),0 2px 0 rgba(9,10,12,0.55)}
+.send:active{transform:translateY(1px)}
+.stopm{width:34px;height:34px;flex:none;border-radius:50%;background:#c93b3a;
+  border:1px solid rgba(90,16,16,0.75);position:relative;
+  box-shadow:inset 0 2px 2px rgba(255,244,230,0.2),inset 0 -3px 3px rgba(90,16,16,0.6),0 2px 0 rgba(9,10,12,0.55)}
+.stopm::after{content:"";position:absolute;inset:11px;border-radius:2px;background:#5d1414}
+.c-hint{display:flex;justify-content:center;padding:8px 0 3px;font:400 10.5px/1.6 var(--mono);
+  color:var(--faint);letter-spacing:0.03em}
+.c-hint b{color:var(--muted);font-weight:600}
+
+/* gauge rail */
+.inst{padding:12px 0 13px;border-top:1px solid var(--groove)}
+.inst:first-child{border-top:0;padding-top:2px}
+.inst-h{display:flex;align-items:center;gap:8px;margin-bottom:9px}
+.inst-h .count{margin-left:auto;font:500 10px/1 var(--mono);color:var(--faint)}
+.irow{display:flex;align-items:center;gap:8px;padding:4px 1px;font:400 11.5px/1.5 var(--sans);color:var(--muted)}
+.irow .fname{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono);font-size:10.5px;color:var(--ink)}
+.irow .delta{margin-left:auto;flex:none;font:500 10px/1 var(--mono)}
+.vlink{flex:none;font:600 9.5px/1 var(--sans);letter-spacing:0.08em;color:var(--muted);
+  background:var(--raised);border:1px solid var(--groove);border-radius:3px;padding:4px 7px;text-transform:uppercase}
+.vlink:hover{color:var(--ink)}
+.cp{display:flex;align-items:center;gap:9px;padding:4px 1px;font:400 11px/1.5 var(--mono);color:var(--muted)}
+.cp .cpn{color:var(--ink);width:22px}
+.cp .rw{margin-left:auto}
+.urow{display:flex;align-items:baseline;gap:8px;padding:3px 1px;font:400 11.5px/1.4 var(--sans);color:var(--muted)}
+.urow .v{margin-left:auto;font:500 11.5px/1.4 var(--mono);color:var(--ink);text-align:right}
+.gaugewrap{display:flex;align-items:center;gap:12px;margin:4px 0 8px}
+.arc{width:112px;height:64px}
+.ctxbar{height:6px;background:var(--recess);border:1px solid var(--groove);border-radius:3px;position:relative;
+  box-shadow:inset 0 1px 1px rgba(9,10,12,0.6)}
+.ctxbar i{position:absolute;left:0;top:0;bottom:0;width:59%;background:var(--ok);border-radius:2px}
+.ctxbar .warn{position:absolute;left:80%;top:-2px;bottom:-2px;width:1px;background:var(--amber)}
+.thr{display:flex;align-items:center;gap:8px;padding:4px 1px;font:400 11.5px/1.5 var(--sans);color:var(--muted)}
+.thr .tn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.thr .tkind{font:500 9px/1 var(--mono);letter-spacing:0.1em;color:var(--faint)}
+
+/* turn menu */
+.turnmenu{position:absolute;top:36px;right:24px;max-width:calc(100% - 48px);z-index:6;width:232px;background:var(--raised);
+  border:1px solid var(--groove);border-radius:7px;padding:5px;
+  box-shadow:0 12px 24px -12px rgba(9,10,12,0.8),inset 0 1px 0 var(--hi)}
+.turnmenu button{display:flex;align-items:center;gap:9px;width:100%;text-align:left;padding:8px 10px;
+  border-radius:5px;font:500 12.5px/1.3 var(--sans);color:var(--ink)}
+.turnmenu button:hover{background:#31353c}
+.turnmenu .dest{color:#ff9d92}
+.hasmenu{position:relative}
+
+/* ============ PART 2: INSET STAGE ============ */
+.insets{display:grid;grid-template-columns:1.28fr 1fr 1.02fr;gap:24px;align-items:start}
+.inset{background:#181a1e;border:1px solid var(--groove);border-radius:12px;padding:20px 22px;
+  box-shadow:0 18px 34px -26px rgba(9,10,12,0.8)}
+.ghost-composer{display:flex;align-items:center;gap:10px;background:var(--recess);
+  border:1px solid var(--groove);border-radius:8px;padding:9px 12px;font:400 11.5px/1 var(--mono);color:var(--faint)}
+.gsend{margin-left:auto;width:32px;height:22px;background:var(--orange);border-radius:4px;
+  box-shadow:inset 0 1px 0 rgba(255,224,200,0.5),inset 0 -2px 0 rgba(120,45,6,0.6)}
+.trayWrap{position:relative}
+.tray{background:var(--panel);border:1px solid var(--groove);border-bottom:0;border-radius:9px 9px 0 0;
+  box-shadow:inset 0 1px 0 var(--hi);position:relative;margin-top:-1px;padding:0 0 8px}
+.tray .tab-a,.tray .tab-b{position:absolute;top:-6px;width:78px;height:7px;background:var(--panel);
+  border:1px solid var(--groove);border-bottom:0;border-radius:4px 4px 0 0}
+.tray .tab-a{left:14%}.tray .tab-b{right:14%}
+.t-filter{display:flex;align-items:center;gap:9px;margin:12px 12px 4px;background:var(--recess);
+  border:1px solid rgba(255,106,31,0.5);border-radius:6px;padding:8px 11px;
+  box-shadow:inset 0 1px 2px rgba(9,10,12,0.65)}
+.t-filter .sl{color:var(--orange);font:500 13px/1 var(--mono)}
+.t-filter .val{font:400 13px/1 var(--mono);color:var(--ink)}
+.t-filter .cnt{margin-left:auto;font:400 10px/1 var(--mono);color:var(--faint)}
+.t-group{margin:9px 12px 0}
+.t-gplate{display:inline-flex;align-items:center;gap:8px;background:var(--raised);border:1px solid var(--groove);
+  border-radius:4px;padding:4px 10px;margin-bottom:3px;box-shadow:inset 0 1px 0 var(--hi),0 1px 0 rgba(9,10,12,0.5)}
+.cmd{display:flex;align-items:center;gap:10px;padding:6.5px 9px;border-radius:5px}
+.cmd.hit{background:#26190f}
+.cmd.faded{opacity:0.38}
+.cmd .cname{font:500 12.5px/1.3 var(--mono);color:var(--ink);min-width:112px;flex:none}
+.cmd .cdesc{font:400 12px/1.4 var(--sans);color:var(--muted);flex:1;min-width:0}
+.cmd .alias{font:400 9.5px/1 var(--mono);color:var(--faint);flex:none}
+.cmd .ret{flex:none;opacity:0}.cmd.hit .ret{opacity:1}
+.ddparts{width:100%;background:var(--raised);border:1px solid var(--groove);border-radius:8px;padding:6px;
+  box-shadow:0 14px 26px -14px rgba(9,10,12,0.8),inset 0 1px 0 var(--hi);position:relative}
+.ddparts .q{display:flex;align-items:center;gap:8px;margin:2px 2px 8px;padding:7px 10px;background:var(--recess);
+  border:1px solid var(--groove);border-radius:5px;font:400 12.5px/1 var(--mono);color:var(--ink);
+  box-shadow:inset 0 1px 2px rgba(9,10,12,0.65)}
+.ddparts .ats{color:var(--orange)}
+.prt{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:5px}
+.prt:hover{background:#31353c}
+.prt.on{background:#26190f;box-shadow:inset 0 0 0 1px rgba(255,106,31,0.45)}
+.prt .fi{width:22px;height:22px;flex:none;display:flex;align-items:center;justify-content:center;
+  font:600 9px/1 var(--mono);color:var(--muted);background:var(--panel);border:1px solid var(--groove);border-radius:4px}
+.prt .fn{font:400 11.5px/1.4 var(--mono);color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.prt .fs{margin-left:auto;font:400 9.5px/1 var(--mono);color:var(--faint);flex:none}
+
+/* service drawer */
+.drawer{background:var(--panel);border:1px solid var(--line);border-radius:10px;position:relative;
+  box-shadow:0 2px 0 rgba(9,10,12,0.65),0 18px 34px -20px rgba(9,10,12,0.9),inset 0 1px 0 var(--hi)}
+.dr-rail{position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--recess);border-right:1px solid var(--groove)}
+.dr-head{display:flex;align-items:center;gap:10px;padding:13px 16px 11px 24px;border-bottom:1px solid var(--groove)}
+.dr-sec{padding:11px 16px 13px 24px;border-top:1px solid var(--groove)}
+.dr-sec:first-of-type{border-top:0}
+.seg{display:flex;gap:2px;background:var(--recess);border:1px solid var(--groove);border-radius:6px;padding:2px;
+  box-shadow:inset 0 1px 2px rgba(9,10,12,0.6)}
+.seg button{flex:1;padding:7px 8px;font:500 11.5px/1 var(--sans);color:var(--muted);border-radius:4px}
+.seg button.on{background:var(--raised);color:var(--ink);box-shadow:inset 0 1px 0 var(--hi),0 1px 0 rgba(9,10,12,0.5)}
+.mrow{display:flex;align-items:center;gap:10px;padding:7px 2px;font:400 13px/1.4 var(--sans);color:var(--ink)}
+.mrow .msub{display:block;font:400 10.5px/1.3 var(--sans);color:var(--faint)}
+.mrow .rad{width:12px;height:12px;flex:none;border-radius:50%;border:1.5px solid var(--faint);position:relative}
+.mrow.on .rad{border-color:var(--orange)}
+.mrow.on .rad::after{content:"";position:absolute;inset:2.5px;border-radius:50%;background:var(--orange)}
+.tgl-row{display:flex;align-items:center;gap:12px;padding:6px 2px;font:400 12.5px/1.4 var(--sans);color:var(--ink)}
+.tgl-row .tk{margin-left:auto}
+.tgl{width:38px;height:21px;flex:none;position:relative;background:var(--recess);border:1px solid var(--groove);
+  border-radius:11px;box-shadow:inset 0 2px 2px rgba(9,10,12,0.75)}
+.tgl .kn{position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#3a3f47;
+  box-shadow:inset 0 1px 0 rgba(255,244,230,0.15),0 1px 1px rgba(9,10,12,0.6)}
+.tgl.on{background:#3a2413}
+.tgl.on .kn{left:19px;background:var(--orange)}
+.dialwrap{display:flex;align-items:center;gap:14px}
+.dial{position:relative;width:70px;height:70px;flex:none;border-radius:50%;background:var(--raised);
+  border:1px solid var(--groove);box-shadow:inset 0 1px 0 var(--hi),0 2px 0 rgba(9,10,12,0.55)}
+.dial::before{content:"";position:absolute;inset:8px;border-radius:50%;background:var(--recess);
+  border:1px solid var(--groove);box-shadow:inset 0 2px 3px rgba(9,10,12,0.7)}
+.dial .ptr{position:absolute;left:50%;top:11px;width:3px;height:24px;margin-left:-1.5px;background:var(--orange);
+  border-radius:2px;transform:rotate(38deg);transform-origin:50% 24px}
+.dial-lbl{display:flex;flex-direction:column;gap:6px}
+.dl-lab{display:flex;align-items:center;gap:8px;font:500 11px/1 var(--sans);color:var(--faint)}
+.dl-lab.on{color:var(--ink)}
+.dl-lab .tk2{width:10px;height:2px;background:var(--faint);border-radius:1px}
+.dl-lab.on .tk2{background:var(--orange)}
+.adv-row{display:flex;align-items:center;gap:9px;padding:5px 2px;font:400 12px/1.4 var(--sans);color:var(--muted)}
+.adv-row .car{margin-left:auto;color:var(--faint)}
+
+/* ============ PART 3: PHONES ============ */
+.phones{display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start}
+.phone{width:390px;flex:none;background:#101114;border:1px solid var(--groove);border-radius:36px;padding:9px;
+  box-shadow:0 22px 44px -30px rgba(9,10,12,0.85)}
+.phone .scr{background:var(--ground);border-radius:28px;overflow:hidden;display:flex;flex-direction:column;
+  border:1px solid var(--groove)}
+.phone.tall{height:844px}
+.phone.tall .scr{height:826px}
+.phone.mid .scr{height:640px}
+.pstrip{display:flex;gap:6px;padding:9px 10px 8px;background:#1e2125;border-bottom:1px solid var(--groove);overflow:hidden}
+.ptab{flex:none;display:flex;align-items:center;gap:6px;padding:6px 10px;background:var(--panel);
+  border:1px solid var(--groove);border-radius:11px;font:500 11px/1 var(--sans);color:var(--muted);max-width:148px}
+.ptab .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ptab.on{background:var(--raised);color:var(--ink);box-shadow:inset 0 1px 0 var(--hi)}
+.phead{display:flex;align-items:center;gap:8px;padding:10px 13px;background:var(--panel);border-bottom:1px solid var(--groove)}
+.phead .ttl{font:600 12.5px/1.3 var(--sans);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.phead .icob{width:26px;height:26px;font-size:12px}
+.pchiprow{display:flex;gap:6px;padding:8px 13px;background:#1e2125;overflow-x:auto;border-bottom:1px solid var(--groove)}
+.pchip{flex:none;font:400 10.5px/1 var(--mono);color:var(--muted);background:var(--recess);
+  border:1px solid var(--groove);border-radius:10px;padding:6px 10px;white-space:nowrap}
+.pchip b{color:var(--ink);font-weight:500}
+.pbody{flex:1;min-height:0;padding:2px 13px 0;overflow:hidden}
+.pentry{padding:9px 1px;border-top:1px solid var(--groove)}
+.pentry:first-child{border-top:0}
+.pentry .eh{display:flex;align-items:center;gap:7px;margin-bottom:5px}
+.pentry .who{font:600 11px/1 var(--sans)}
+.pentry time{font:400 10px/1 var(--mono);color:var(--faint)}
+.pentry .pt{font:400 13px/1.55 var(--sans)}
+.pcode{margin-top:7px;background:#191b1f;border:1px solid var(--groove);border-radius:6px;padding:8px 0;
+  overflow-x:auto;font:400 10px/1.8 var(--mono)}
+.pcode .dl{padding:0 9px;white-space:nowrap}
+.pcomp{background:#20232a;border-top:1px solid var(--groove);padding:9px 12px 11px}
+.pcomp .box{background:var(--recess);border:1px solid var(--groove);border-radius:9px;padding:9px 11px;
+  font:400 13px/1.5 var(--sans);box-shadow:inset 0 2px 3px rgba(9,10,12,0.65)}
+.pcomp .acts{display:flex;gap:8px;margin-top:9px;align-items:center}
+.pcomp .acts .icob{width:44px;height:44px;font-size:16px}
+.pcomp .acts .send{flex:1;min-height:44px}
+.safebar{display:flex;justify-content:center;padding:6px 0 7px}
+.safebar i{width:120px;height:4px;border-radius:2px;background:#33373e}
+.pbrk{margin:9px 1px;background:#1a1c21;border:1px solid var(--groove);border-radius:12px;padding:12px 13px;
+  box-shadow:inset 0 1px 0 var(--hi),0 3px 0 rgba(9,10,12,0.5)}
+.pbrk .btns{display:flex;flex-direction:column;gap:12px;margin-top:13px}
+.pbrk .rocker{width:100%;min-height:56px;font-size:15.5px}
+.pbrk .gwrap{align-items:center}
+
+/* sheets in phone insets */
+.sheet-host{position:relative;height:100%;display:flex;flex-direction:column;overflow:hidden}
+.sheet-bg{flex:1;padding:0 13px;filter:none}
+.sheetdim{position:absolute;inset:0;background:rgba(14,15,17,0.66)}
+.sheet{position:absolute;left:0;right:0;bottom:0;background:var(--panel);border-top:1px solid var(--groove);
+  border-radius:16px 16px 0 0;box-shadow:0 -4px 0 rgba(9,10,12,0.5),inset 0 1px 0 var(--hi);
+  padding:6px 14px 0;max-height:78%;overflow:auto}
+.sheet::before{content:"";display:block;width:40px;height:4px;margin:3px auto 10px;border-radius:2px;background:#3a3e44}
+.sh-row{display:flex;align-items:center;gap:12px;width:100%;text-align:left;min-height:50px;padding:11px 6px;
+  font:400 15px/1.35 var(--sans);color:var(--ink);border-bottom:1px solid var(--groove)}
+.sh-row:last-of-type{border-bottom:0}
+.sh-row.dest{color:#ff9d92}
+.sh-cancel{margin:10px 0 22px;min-height:46px;width:100%;display:flex;align-items:center;justify-content:center;
+  font:600 14px/1 var(--sans);color:var(--ink);background:var(--raised);border:1px solid var(--groove);
+  border-radius:9px;box-shadow:inset 0 1px 0 var(--hi),0 1px 0 rgba(9,10,12,0.5)}
+.sheet .t-filter{margin:8px 2px 6px}
+.sheet .t-group{margin:8px 2px 0}
+.sheet .cmd{padding:10px 8px}
+.sheet .cmd .cname{font-size:13px;min-width:98px}
+.fullsheet{position:absolute;inset:0;top:26px;background:var(--panel);border-radius:22px 22px 0 0;
+  border-top:1px solid var(--groove);overflow:auto;padding-bottom:20px;
+  box-shadow:0 -3px 0 rgba(9,10,12,0.5),inset 0 1px 0 var(--hi)}
+.fullsheet .fs-head{position:sticky;top:0;background:var(--panel);padding:11px 15px 10px;
+  border-bottom:1px solid var(--groove);display:flex;align-items:center;gap:10px;z-index:2}
+
+/* ============ PART 3: LIGHT SWATCH ============ */
+.lite-row{display:flex;gap:24px;flex-wrap:wrap}
+.lite{width:412px;flex:none;background:#d9d6cf;border:1px solid rgba(35,38,43,0.25);border-radius:12px;
+  padding:16px;box-shadow:0 18px 34px -24px rgba(35,38,43,0.55)}
+.l-el{font:600 10px/1.3 var(--sans);letter-spacing:0.14em;text-transform:uppercase;color:#6f6a60}
+.lite .lamp{box-shadow:inset 0 1px 1px rgba(35,38,43,0.5),inset 0 -1px 0 rgba(255,253,250,0.5)}
+.lcard{background:#efede8;border:1px solid rgba(35,38,43,0.17);border-radius:8px;color:#23262b;
+  box-shadow:inset 0 1px 0 rgba(255,253,250,0.8),0 1px 0 rgba(35,38,43,0.12)}
+.lcard .lhead{display:flex;align-items:center;gap:9px;padding:10px 13px;border-bottom:1px solid rgba(35,38,43,0.12)}
+.lcard .lwho{font:600 12.5px/1 var(--sans);color:#a04427}
+.lcard .ltime{font:400 10.5px/1 var(--mono);color:#726d63;margin-left:auto}
+.lcard .lbody{padding:11px 13px 13px;font:400 13.5px/1.6 var(--sans)}
+.lcard .lcode{font:400 11.5px/1.7 var(--mono);color:#5d564a;background:#e2dfda;border:1px solid rgba(35,38,43,0.15);
+  border-radius:5px;padding:7px 10px;margin-top:9px;display:block;white-space:pre-wrap}
+.lcard .serial{background:#e0ddd6;border-color:rgba(35,38,43,0.15);color:#726d63;box-shadow:none}
+.lbrk{margin-top:14px;background:#e3e0d9;border:1px solid rgba(35,38,43,0.22);border-radius:10px;color:#23262b;
+  box-shadow:inset 0 1px 0 rgba(255,253,250,0.75),0 3px 0 rgba(35,38,43,0.16);padding:13px 14px}
+.lbrk .lcmd{margin:9px 0;background:#dcd9d2;border:1px solid rgba(35,38,43,0.16);border-radius:6px;
+  padding:9px 12px;font:400 12.5px/1.5 var(--mono);color:#8a4a10;word-break:break-all}
+.lbrk .rocker{border:1px solid rgba(90,36,4,0.55)}
+.lbrk .deny{background:#cac5bc;color:#b3121f;border:1px solid rgba(179,18,31,0.55);
+  box-shadow:inset 0 2px 3px rgba(35,38,43,0.16),inset 0 -1px 0 rgba(255,253,250,0.5)}
+.lbrk .ltrack{background:#dcd9d2;border-color:rgba(35,38,43,0.16)}
+.lbrk .ltrack .knob{background:#b9b4aa}
+.lbrk .warn{color:#a03237}
+.lbrk .wrow{font:400 11.5px/1.5 var(--sans);color:#6f6a60}
+
+/* ============ FOOTER ============ */
+footer{margin-top:44px}
+.footplate{background:var(--panel);border:1px solid var(--groove);border-radius:5px;padding:18px 24px 16px;
+  position:relative;box-shadow:inset 0 1px 0 var(--hi),0 3px 0 rgba(9,10,12,0.5)}
+.footplate>.plate-txt{font-size:11px;color:#b4ac9e}
+.footplate .hex{position:absolute}
+.footplate .hx-tl{top:7px;left:7px}.footplate .hx-tr{top:7px;right:7px}
+.footplate .hx-bl{bottom:7px;left:7px}.footplate .hx-br{bottom:7px;right:7px}
+.contract{display:grid;gap:9px;margin-top:10px}
+.cl{display:grid;grid-template-columns:118px 1fr;gap:16px;align-items:baseline}
+.cl .k{font:600 11px/1.5 var(--sans);letter-spacing:0.14em;color:#b4ac9e}
+.cl .v{font:400 13.5px/1.55 var(--sans);color:var(--ink)}
+.foot-note{margin-top:14px;font:400 11px/1.6 system-ui,-apple-system,'Segoe UI',sans-serif;color:#767066;text-align:center}
+
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+@media (max-width:1100px){.insets{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<!-- ============ A. MASTHEAD ============ -->
+<header class="masthead">
+  <div class="mh-plate">
+    <span class="hex hx-tl"><i></i></span><span class="hex hx-tr"><i></i></span>
+    <span class="hex hx-bl"><i></i></span><span class="hex hx-br"><i></i></span>
+    <h1 class="wordmark">ENGINE ROOM</h1>
+    <span class="plate-txt mh-serial">UNIT 02 · AGENT CONSOLE · S/N 184888-06</span>
+  </div>
+  <p class="mh-thesis">The session as a machined console — milled panels, engraved labels, honest lamps and gauges. Nothing is lit unless it reports a real state.</p>
+  <p class="mh-util">Design 2 of 6 · fresh-agent UX study · Freshell &nbsp;·&nbsp; <a href="/">← all designs</a></p>
+</header>
+
+<!-- ============ B. DESKTOP FRAME ============ -->
+<section aria-label="Desktop console frame">
+<h2>Desktop frame</h2>
+<p class="cap">Desktop · 1440px — strips on a rack, never cards</p>
+<div class="frame">
+  <div class="chrome">
+    <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+    <span class="url">localhost:3001 — console</span>
+  </div>
+
+  <!-- 1 · tab strip -->
+  <nav class="tabs" aria-label="Open tabs">
+    <button class="tab on" aria-current="true"><span class="ledge"></span><span class="lamp" title="busy"></span><span class="ttl">⚡ Trace dropped messa…</span></button>
+    <button class="tab"><span class="ledge"></span><span class="lamp off"></span><span class="ttl">⌨ npm run dev</span></button>
+    <button class="tab"><span class="ledge"></span><span class="lamp ok" title="needs attention"></span><span class="ttl">◉ Scrollback parser</span></button>
+    <button class="icob tab-add" aria-label="New tab">+</button>
+  </nav>
+
+  <!-- 2 · pane header faceplate -->
+  <header class="faceplate">
+    <span class="hex hx-tr"><i></i></span>
+    <span class="slot"><span class="cart"><b></b>freshclaude</span></span>
+    <div>
+      <div class="fp-title">Trace dropped messages on background tabs</div>
+      <div class="fp-kv">
+        <span class="fp-state"><span class="lamp"></span>Working…</span>
+        <span class="fp-sid num">01JRV6…KQ3M · started 14:02</span>
+      </div>
+    </div>
+    <div class="fp-right">
+      <span class="fp-cost" title="Session cost">$1.38</span>
+      <button class="icob" aria-label="Diffs, 3 files changed">⇄<span class="bdg">3</span></button>
+      <button class="icob" aria-label="Settings">⚙</button>
+      <button class="icob" aria-label="Refresh">⟳</button>
+      <button class="icob" aria-label="Fullscreen">⛶</button>
+      <button class="icob" aria-label="Close pane">✕</button>
+    </div>
+  </header>
+
+  <!-- 3 · status strip -->
+  <div class="statusbar" aria-label="Session status">
+    <span class="cell"><span class="el">cwd</span><span class="mono">~/code/freshell</span></span>
+    <span class="cell"><span class="el">branch</span><span class="mono">fix/ws-reconnect+2</span></span>
+    <span class="cell"><span class="el">model</span><span class="mono">Opus 4.6</span></span>
+    <span class="cell"><span class="el">effort</span><span class="mono">High</span></span>
+    <span class="cell"><span class="el">perm</span><span class="mono">Ask</span></span>
+    <span class="cell">
+      <span class="el">ctx</span>
+      <span class="vu" aria-label="Context 59 percent"><b class="on"></b><b class="on"></b><b class="on"></b><b class="on"></b><b class="on"></b><b class="on"></b><b class="on"></b><b class="on"></b><b class="on"></b><b class="on"></b><b class="on"></b><b class="on"></b><b></b><b></b><b></b><b></b><b></b><b></b><b></b><b></b></span>
+      <span class="dv">59%</span><span class="vu-sub">118,200</span>
+    </span>
+    <span class="cell"><span class="el">cost</span><span class="mono">$1.38</span></span>
+    <span class="cell"><span class="el">live</span><span class="lamp" title="live"></span></span>
+  </div>
+
+  <!-- 4 · body split -->
+  <div class="split">
+    <div class="scrollcol" aria-label="Transcript">
+      <div class="scaff"><button class="jumpchip">↑ jump to turn 01 · 14:07</button></div>
+
+      <!-- 01 · user -->
+      <article class="entry hasmenu">
+        <div class="rail"><span class="n">01</span><span class="lamp off"></span><span class="ln"></span></div>
+        <div class="body">
+          <div class="ehead">
+            <span class="who">You</span><time>14:07</time>
+            <button class="icob dots" aria-label="Turn actions">⋯</button>
+          </div>
+          <p class="prose">the reconnect loop is still dropping messages when the tab&rsquo;s in the background. can you trace where the heartbeat dies?</p>
+          <div class="turnmenu" role="menu" aria-label="Turn actions shown open">
+            <button>⌘C&ensp;Copy turn text</button>
+            <button>⑂&ensp;Fork conversation from here</button>
+            <button class="dest">⟲&ensp;Rewind code to here</button>
+          </div>
+        </div>
+      </article>
+
+      <!-- 02 · agent settled -->
+      <article class="entry">
+        <div class="rail"><span class="n">02</span><span class="lamp ok"></span><span class="ln"></span></div>
+        <div class="body">
+          <div class="ehead">
+            <span class="who agent">Claude · Opus 4.6</span><time>14:07</time>
+            <span class="meta">settled · 2 files changed</span>
+          </div>
+          <div class="prose">
+            <p>The heartbeat is too slow for a throttled tab. The client pings on a 15s <code>setInterval</code>, but background tabs defer timers to once per minute — so pings gap out and the server closes a perfectly healthy socket.</p>
+            <p>Two fixes: beat at 5s instead, and add a pong watchdog server-side so a quiet-but-alive tab degrades instead of dying. The diff below wires the watchdog into <code>ws-handler.ts</code>.</p>
+          </div>
+          <details class="think">
+            <summary><span class="plate-txt">REASON-01</span>Thought for 12s</summary>
+            <div class="t-body">Heartbeat cadence vs. background-tab timer clamping. Weighed replaying missed events over a flood-guarded burst; chose a server-side pong watchdog because the server already owns socket lifecycle.</div>
+          </details>
+          <div class="mods">
+            <details class="mod">
+              <span class="hex hx-tl"><i></i></span><span class="hex hx-tr"><i></i></span>
+              <summary class="mod-head"><span class="lamp ok"></span><span class="serial">MOD-01 · READ · WS-HANDLER.TS</span><span class="mod-meta">1,204 lines</span><span class="chev"></span></summary>
+              <div class="mod-body"><p class="mod-out">streamed 1,204 lines · cached for session</p></div>
+            </details>
+            <details class="mod">
+              <span class="hex hx-tl"><i></i></span><span class="hex hx-tr"><i></i></span>
+              <summary class="mod-head"><span class="lamp ok"></span><span class="serial">MOD-02 · GREP · “heartbeat” IN SERVER/</span><span class="mod-meta">7 matches</span><span class="chev"></span></summary>
+              <div class="mod-body"><p class="mod-out">7 matches across ws-handler.ts, terminal-registry.ts</p></div>
+            </details>
+            <details class="mod">
+              <span class="hex hx-tl"><i></i></span><span class="hex hx-tr"><i></i></span>
+              <summary class="mod-head"><span class="lamp ok"></span><span class="serial">MOD-03 · BASH · TEST:WS-HEARTBEAT</span><span class="mod-meta">14 passed · 2.1s</span><span class="chev"></span></summary>
+              <div class="mod-body">
+                <p class="mod-cmd">npm run test:vitest -- run test/unit/ws-heartbeat.test.ts</p>
+                <p class="mod-out"><span class="ok-t">✓</span> 14 passed (2.1s)</p>
+              </div>
+            </details>
+            <details class="mod" open>
+              <span class="hex hx-tl"><i></i></span><span class="hex hx-tr"><i></i></span>
+              <summary class="mod-head"><span class="lamp ok"></span><span class="serial">MOD-04 · EDIT · WS-HANDLER.TS</span><span class="mod-meta delta"><span class="p">+12</span> <span class="m">−4</span></span><span class="chev"></span></summary>
+              <div class="mod-body">
+                <div class="diff" aria-label="Diff: server/ws-handler.ts">
+                  <span class="hex hx-tl"><i></i></span><span class="hex hx-tr"><i></i></span>
+                  <span class="hex hx-bl"><i></i></span><span class="hex hx-br"><i></i></span>
+                  <div class="dl ctx"><span class="gut">421</span><span class="sign">&nbsp;</span><pre>// keep background-tab sockets alive</pre></div>
+                  <div class="dl del"><span class="gut">422</span><span class="sign">−</span><pre>const HEARTBEAT_INTERVAL = 15_000;</pre><button class="cmt" aria-label="Comment to agent about this line">✎</button></div>
+                  <div class="dl add"><span class="gut">422</span><span class="sign">+</span><pre>const HEARTBEAT_INTERVAL = 5_000;</pre><button class="cmt show" aria-label="Comment to agent about this line">✎</button></div>
+                  <div class="dl add"><span class="gut">423</span><span class="sign">+</span><pre>// background-tab timers throttle to ~60s; beat fast enough to survive</pre><button class="cmt" aria-label="Comment to agent about this line">✎</button></div>
+                  <div class="dl add"><span class="gut">424</span><span class="sign">+</span><pre>let lastPongAt = 0;</pre><button class="cmt" aria-label="Comment to agent about this line">✎</button></div>
+                </div>
+              </div>
+            </details>
+          </div>
+          <div class="settled"><span class="lamp ok"></span>thought 12s · 4 tools used · 2 files changed</div>
+        </div>
+      </article>
+      <!-- 03 · user with attachments -->
+      <article class="entry">
+        <div class="rail"><span class="n">03</span><span class="lamp off"></span><span class="ln"></span></div>
+        <div class="body">
+          <div class="ehead"><span class="who">You</span><time>14:31</time></div>
+          <div class="atts">
+            <span class="att"><span class="th"><i></i></span>screenshot.png</span>
+            <span class="att"><span class="th" style="background:#262a30"><i style="background:#3b4149"></i></span>logs.txt</span>
+          </div>
+          <p class="prose">here&rsquo;s what the console shows when it dies</p>
+        </div>
+      </article>
+
+      <!-- 04 · agent streaming -->
+      <article class="entry" aria-busy="true">
+        <div class="rail"><span class="n">04</span><span class="lamp"></span><span class="ln"></span></div>
+        <div class="body">
+          <div class="ehead">
+            <span class="who agent">Claude · Opus 4.6</span><time>14:32</time>
+            <span class="meta" style="color:var(--orange)">streaming</span>
+          </div>
+          <p class="prose">So the watchdog needs to live in the server, and the client should—<span class="cursor" aria-hidden="true"></span></p>
+          <div class="belt" title="belt shimmer 200ms when connected; static lamp otherwise">
+            <span class="lamp"></span>
+            <span class="btxt">RUNNING EDIT — WS-HANDLER.TS</span>
+            <span class="track"><i></i></span>
+            <button class="microstop">■ STOP</button>
+          </div>
+        </div>
+      </article>
+
+      <!-- 05 · approval breaker -->
+      <article class="entry">
+        <div class="rail"><span class="n">05</span><span class="lamp wait"></span><span class="ln"></span></div>
+        <div class="body">
+          <section class="breaker corners" aria-label="Approval required">
+            <span class="hex hx-tl"><i></i></span><span class="hex hx-tr"><i></i></span>
+            <span class="hex hx-bl"><i></i></span><span class="hex hx-br"><i></i></span>
+            <div class="brk-top">
+              <span class="serial">BRK-01 · BASH · APPROVAL</span>
+              <span class="brk-alarm"><span class="lamp err"></span>TRIP</span>
+            </div>
+            <p class="brk-sub">The agent wants to run a shell command outside the sandboxed path.</p>
+            <div class="brk-cmd">rm -rf .worktrees/refresh-*</div>
+            <div class="brk-meta">
+              <span class="w">Why: <b style="font-weight:500;color:var(--ink)">Deletes 3 stale worktrees</b></span>
+              <span class="warn"><span class="lamp err"></span>This command permanently deletes files.</span>
+            </div>
+            <div class="brk-sw">
+              <div class="swcell">
+                <span class="el">Circuit A · once</span>
+                <button class="rocker">Allow once</button>
+              </div>
+              <div class="swcell">
+                <span class="el">Circuit B · latching · guarded</span>
+                <span class="gwrap">
+                  <span class="kguard" aria-hidden="true"></span>
+                  <span class="latch"><span class="ltrack" role="switch" aria-checked="false" aria-label="Always allow Bash this session"><span class="knob"></span></span></span>
+                </span>
+                <span class="swlabel">Always allow <b style="font-weight:600;color:var(--ink)">Bash</b> this session</span>
+              </div>
+              <div class="swcell" style="align-items:stretch">
+                <span class="el">Dump</span>
+                <button class="rocker deny">DENY</button>
+              </div>
+            </div>
+          </section>
+        </div>
+      </article>
+
+      <!-- 06 · question banner -->
+      <article class="entry">
+        <div class="rail"><span class="n">06</span><span class="lamp wait"></span><span class="ln"></span></div>
+        <div class="body">
+          <section class="ask" aria-label="Question from agent">
+            <span class="el">AskUserQuestion · single-select</span>
+            <p class="q">How should the client catch up after reconnect?</p>
+            <div class="opts" role="radiogroup" aria-label="Catch-up strategy">
+              <button class="opt" role="radio" aria-checked="false"><span class="rad"></span>Replay buffer only<span class="hint">fastest · may miss throttled beats</span></button>
+              <button class="opt sel" role="radio" aria-checked="true"><span class="rad"></span>Full snapshot if gap &gt; 5s<span class="hint">selected · balanced</span></button>
+              <button class="opt" role="radio" aria-checked="false"><span class="rad"></span>Always resync<span class="hint">slowest · most robust</span></button>
+            </div>
+            <div class="other">
+              <input class="oinput" type="text" placeholder="Other…" aria-label="Other answer">
+              <button class="btn ghost">Submit</button>
+            </div>
+          </section>
+        </div>
+      </article>
+
+      <!-- 07 · compaction -->
+      <article class="entry">
+        <div class="rail"><span class="n">07</span><span class="lamp ok"></span><span class="ln"></span></div>
+        <div class="body">
+          <div class="compact">
+            <span class="lamp ok"></span>
+            <span class="plate-txt">AUTO-COMPACT · ✓</span>
+            <span style="font:400 12.5px/1.5 var(--sans);color:var(--muted)"><b style="color:var(--ink);font-weight:600">Context compacted</b> · <span class="num">41,203 → 12,850</span> tokens · full transcript preserved</span>
+          </div>
+        </div>
+      </article>
+
+      <!-- 08 · queued strip -->
+      <article class="entry">
+        <div class="rail"><span class="n">08</span><span class="lamp wait"></span><span class="ln"></span></div>
+        <div class="body">
+          <div class="queue-note">
+            <span class="el" style="color:var(--amber)">Input queue · 2 armed</span>
+            <div class="qrow"><span class="qn">Q1</span>also bump the client backoff cap<button class="qx" aria-label="Remove queued message">✕</button></div>
+            <div class="qrow"><span class="qn">Q2</span>then update AGENTS.md<button class="qx" aria-label="Remove queued message">✕</button></div>
+          </div>
+        </div>
+      </article>
+
+      <!-- 09 · web search -->
+      <article class="entry">
+        <div class="rail"><span class="n">09</span><span class="lamp ok"></span><span class="ln"></span></div>
+        <div class="body">
+          <div class="search">
+            <span class="el">Web search · tool</span>
+            <p class="query">&ldquo;browser background tab timer throttling&rdquo;</p>
+            <div class="srclist">
+              <span class="src"><b>MDN</b><span class="dom">developer.mozilla.org</span></span>
+              <span class="src"><b>Chrome for Developers</b><span class="dom">developer.chrome.com</span></span>
+            </div>
+          </div>
+        </div>
+      </article>
+
+      <!-- jump forward -->
+      <div class="newp"><button class="newpill">3 new ↓</button></div>
+    </div>
+
+    <!-- 5 · instrument bay -->
+    <aside class="bay" aria-label="Auxiliary gauge rail">
+      <section class="inst" aria-label="Diffs">
+        <div class="inst-h"><span class="el">Diffs</span><span class="count">3 FILES</span></div>
+        <div class="irow"><span class="fname">server/ws-handler.ts</span><button class="vlink">view</button><span class="delta"><span class="p">+12</span> <span class="m">−4</span></span></div>
+        <div class="irow"><span class="fname">test/unit/ws-heartbeat.test.ts</span><button class="vlink">view</button><span class="delta"><span class="p">+9</span> <span class="m">−0</span></span></div>
+        <div class="irow"><span class="fname">docs/AGENTS.md</span><button class="vlink">view</button><span class="delta"><span class="p">+2</span> <span class="m">−2</span></span></div>
+        <p class="mnote" style="margin-top:7px">per-line ✎ comments inside each view</p>
+      </section>
+
+      <section class="inst" aria-label="Checkpoints">
+        <div class="inst-h"><span class="el">Checkpoints</span><span class="count">3 SEALED</span></div>
+        <div class="cp"><span class="lamp ok"></span><span class="cpn">b1</span><span class="num">14:07</span><button class="vlink rw">rewind</button></div>
+        <div class="cp"><span class="lamp ok"></span><span class="cpn">b2</span><span class="num">14:19</span><button class="vlink rw">rewind</button></div>
+        <div class="cp"><span class="lamp"></span><span class="cpn">b3</span><span class="num">14:31</span><button class="vlink rw">rewind</button></div>
+      </section>
+
+      <section class="inst" aria-label="Usage">
+        <div class="inst-h"><span class="el">Usage</span><span class="count">LIVE</span></div>
+        <div class="gaugewrap">
+          <svg class="arc" viewBox="0 0 112 64" role="img" aria-label="Context 59 percent">
+            <path d="M10 58 A 47 47 0 0 1 102 58" fill="none" stroke="#2c3036" stroke-width="6"/>
+            <path d="M10 58 A 47 47 0 0 1 62.4 15.4" fill="none" stroke="#3fae8a" stroke-width="6"/>
+            <path d="M85.6 17.6 A 47 47 0 0 1 102 58" fill="none" stroke="rgba(255,182,61,0.4)" stroke-width="6" stroke-dasharray="2 3"/>
+            <line x1="56" y1="58" x2="59.2" y2="22.2" stroke="#ece7de" stroke-width="2.2" stroke-linecap="round"/>
+            <circle cx="56" cy="58" r="4" fill="#282b31" stroke="rgba(255,244,230,0.13)"/>
+            <text x="56" y="52" text-anchor="middle" fill="#a49c8e" font-size="11" font-family="JetBrains Mono,monospace">59%</text>
+          </svg>
+          <div>
+            <div class="urow"><span>cost</span><span class="v num">$1.38</span></div>
+            <div class="urow"><span>burn</span><span class="v num">$3.45/h</span></div>
+            <div class="urow"><span>tokens</span><span class="v num">84.2k↑ 9.6k↓</span></div>
+          </div>
+        </div>
+        <div class="urow"><span>context</span><span class="v num">59%</span></div>
+        <div class="ctxbar" style="margin-top:4px"><i></i><span class="warn" title="amber past 80%"></span></div>
+        <p class="mnote" style="margin-top:5px">amber latch &gt; 80%</p>
+      </section>
+
+      <section class="inst" aria-label="Threads">
+        <div class="inst-h"><span class="el">Threads</span><span class="count">1 WT + 2</span></div>
+        <div class="thr"><span class="lamp ok"></span><span class="tkind">WT</span><span class="tn mono">ws-reconnect·b</span></div>
+        <div class="thr"><span class="lamp off"></span><span class="tkind">CH</span><span class="tn">heartbeat probe</span></div>
+        <div class="thr"><span class="lamp off"></span><span class="tkind">CH</span><span class="tn">docs pass</span></div>
+      </section>
+    </aside>
+  </div>
+
+  <!-- 6 · composer -->
+  <footer class="composer" aria-label="Composer">
+    <span class="bolt l"></span><span class="bolt r"></span>
+    <div class="c-shell">
+      <div class="c-mid">
+        <div class="c-chips"><span class="c-chip"><span class="hex" style="transform:scale(0.75);opacity:0.9" aria-hidden="true"><i></i></span>heartbeat.md<button class="x" aria-label="Remove attachment">✕</button></span></div>
+        <textarea aria-label="Message Claude" rows="2">make the interval configurable in settings, default 5s —</textarea>
+      </div>
+      <div class="c-actions">
+        <button class="icob" aria-label="Attach file">📎</button>
+        <button class="icob" aria-label="Slash commands">/</button>
+        <button class="stopm" aria-label="Stop generation" title="Stop"></button>
+        <button class="send">SEND ⏎</button>
+      </div>
+    </div>
+    <p class="c-hint">⏎ send · ⇧⏎ newline · esc interrupt · ↑ history · @ files · ! shell</p>
+  </footer>
+</div>
+</section>
+<!-- ============ B2. DESKTOP INSETS ============ -->
+<section aria-label="Desktop insets">
+<h2>Desktop insets</h2>
+<p class="cap">Desktop insets · slash tray (filter “re” latched) · @ parts catalog · service drawer</p>
+<div class="insets">
+
+  <!-- slash tray, open under a ghost composer -->
+  <div class="inset trayWrap">
+    <span class="el" style="display:block;margin-bottom:8px">Module tray · flip-down</span>
+    <div class="tray">
+      <span class="tab-a"></span><span class="tab-b"></span>
+      <div class="t-filter">
+        <span class="sl">/</span><span class="val">re</span><span class="cursor" aria-hidden="true"></span>
+        <span class="cnt">3 / 18 MODULES</span>
+      </div>
+      <div class="t-group">
+        <span class="t-gplate"><span class="plate-txt">SESSION</span></span>
+        <div class="cmd faded"><span class="cname">/new</span><span class="cdesc">fresh session</span><span class="alias">/reset, /restart</span></div>
+        <div class="cmd faded"><span class="cname">/fork</span><span class="cdesc">branch this conversation from a turn</span></div>
+        <div class="cmd faded"><span class="cname">/compact</span><span class="cdesc">summarize context now</span></div>
+        <div class="cmd hit"><span class="cname">/rename</span><span class="cdesc">retitle session</span><span class="soon"></span><span class="kbd ret">↵</span></div>
+        <div class="cmd faded"><span class="cname">/export</span><span class="cdesc">save transcript</span><span class="soon"></span></div>
+      </div>
+      <div class="t-group">
+        <span class="t-gplate"><span class="plate-txt">INSPECT</span></span>
+        <div class="cmd faded"><span class="cname">/status</span><span class="cdesc">session health &amp; config</span></div>
+        <div class="cmd faded"><span class="cname">/cost</span><span class="cdesc">usage breakdown</span></div>
+        <div class="cmd faded"><span class="cname">/diff</span><span class="cdesc">open changed files</span></div>
+        <div class="cmd faded"><span class="cname">/context</span><span class="cdesc">token map</span><span class="soon"></span></div>
+        <div class="cmd hit"><span class="cname">/review</span><span class="cdesc">request code review</span><span class="soon"></span><span class="kbd ret">↵</span></div>
+      </div>
+      <div class="t-group">
+        <span class="t-gplate"><span class="plate-txt">CONFIGURE</span></span>
+        <div class="cmd faded"><span class="cname">/model</span><span class="cdesc">switch model</span></div>
+        <div class="cmd faded"><span class="cname">/effort</span><span class="cdesc">thinking effort</span></div>
+        <div class="cmd hit"><span class="cname">/permissions</span><span class="cdesc">permission mode</span><span class="kbd ret">↵</span></div>
+        <div class="cmd faded"><span class="cname">/hooks</span><span class="cdesc">event hooks</span><span class="soon"></span></div>
+        <div class="cmd faded"><span class="cname">/mcp</span><span class="cdesc">MCP servers</span><span class="soon"></span></div>
+        <div class="cmd faded"><span class="cname">/agents</span><span class="cdesc">subagents</span><span class="soon"></span></div>
+        <div class="cmd faded"><span class="cname">/notify</span><span class="cdesc">completion alerts</span><span class="soon"></span></div>
+        <div class="cmd faded"><span class="cname">/theme</span><span class="cdesc">pane theme</span><span class="soon"></span></div>
+      </div>
+    </div>
+    <div class="ghost-composer" aria-hidden="true">make the interval…<span class="gsend"></span></div>
+    <p class="mnote" style="margin-top:10px">matches arm orange (#26190f); sealed modules dim; ↵ arms the top match</p>
+  </div>
+
+  <!-- @ parts catalog -->
+  <div class="inset">
+    <span class="el" style="display:block;margin-bottom:8px">Parts bin · @ mentions</span>
+    <div class="ddparts">
+      <span class="hex hx-tl" style="position:absolute;top:6px;left:6px;transform:scale(0.8)"><i></i></span>
+      <span class="hex hx-tr" style="position:absolute;top:6px;right:6px;transform:scale(0.8)"><i></i></span>
+      <div class="q"><span class="ats">@</span><span>ws-</span><span class="cursor" aria-hidden="true"></span><span style="margin-left:auto" class="mnote">3 PARTS</span></div>
+      <div class="prt on"><span class="fi">TS</span><span class="fn">server/ws-handler.ts</span><span class="kbd">↵</span></div>
+      <div class="prt"><span class="fi">TS</span><span class="fn">src/lib/fresh-agent-ws.ts</span><span class="fs">2.1k</span></div>
+      <div class="prt"><span class="fi">TS</span><span class="fn">test/unit/ws-heartbeat.test.ts</span><span class="fs">0.9k</span></div>
+    </div>
+    <p class="mnote" style="margin-top:10px">bolt-through plate: query in the well, parts on the shelf</p>
+  </div>
+
+  <!-- settings service drawer -->
+  <div class="inset">
+    <span class="el" style="display:block;margin-bottom:8px">Service drawer · settings</span>
+    <div class="drawer">
+      <span class="dr-rail"></span>
+      <div class="dr-head">
+        <span class="serial">SVC-02 · PANE CONFIG</span>
+        <button class="icob" style="margin-left:auto" aria-label="Close settings">✕</button>
+      </div>
+      <div class="dr-sec">
+        <span class="el" style="display:block;margin-bottom:8px">Style</span>
+        <div class="seg" role="radiogroup" aria-label="Pane style">
+          <button class="on">Sans</button><button>Serif</button><button>Mono</button>
+        </div>
+      </div>
+      <div class="dr-sec">
+        <span class="el" style="display:block;margin-bottom:4px">Model</span>
+        <div class="mrow on"><span class="rad"></span><span>Claude Opus 4.6 <span class="msub">flagship · current</span></span></div>
+        <div class="mrow" style="color:var(--muted)"><span class="rad"></span><span>Sonnet 4.6 <span class="soon" style="margin-left:6px"></span></span></div>
+      </div>
+      <div class="dr-sec">
+        <span class="el" style="display:block;margin-bottom:9px">Effort · rotary</span>
+        <div class="dialwrap">
+          <span class="dial"><span class="ptr"></span></span>
+          <span class="dial-lbl">
+            <span class="dl-lab"><span class="tk2"></span>LOW</span>
+            <span class="dl-lab"><span class="tk2"></span>MEDIUM</span>
+            <span class="dl-lab on"><span class="tk2"></span>HIGH</span>
+          </span>
+        </div>
+      </div>
+      <div class="dr-sec">
+        <span class="el" style="display:block;margin-bottom:8px">Permission mode</span>
+        <div class="seg" role="radiogroup" aria-label="Permission mode">
+          <button class="on">Ask</button><button>Accept edits</button><button>Bypass</button><button>Plan</button>
+        </div>
+      </div>
+      <div class="dr-sec">
+        <span class="el" style="display:block;margin-bottom:4px">Telemetry &amp; trace</span>
+        <div class="tgl-row">Show thinking<span class="tk"><span class="tgl on" role="switch" aria-checked="true"><span class="kn"></span></span></span></div>
+        <div class="tgl-row">Show tools<span class="tk"><span class="tgl on" role="switch" aria-checked="true"><span class="kn"></span></span></span></div>
+        <div class="tgl-row">Timecodes<span class="tk"><span class="tgl on" role="switch" aria-checked="true"><span class="kn"></span></span></span></div>
+        <div class="tgl-row" style="color:var(--muted)">Sound on done <span class="soon"></span><span class="tk"><span class="tgl" role="switch" aria-checked="false"><span class="kn"></span></span></span></div>
+        <div class="tgl-row" style="color:var(--muted)">Desktop notifications <span class="soon"></span><span class="tk"><span class="tgl" role="switch" aria-checked="false"><span class="kn"></span></span></span></div>
+      </div>
+      <div class="dr-sec">
+        <span class="el" style="display:block;margin-bottom:5px">Advanced <span class="soon"></span></span>
+        <div class="adv-row">Hooks<span class="car">›</span></div>
+        <div class="adv-row">MCP servers<span class="car">›</span></div>
+        <div class="adv-row">Agents<span class="car">›</span></div>
+        <div class="adv-row">Status-line layout<span class="car">›</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+</section>
+<!-- ============ C. PHONE FRAMES ============ -->
+<section aria-label="Phone frames">
+<h2>Phone frames</h2>
+<p class="cap">Phone · 390px — strips compress, breaker gets the full deck</p>
+<div class="phones">
+
+  <!-- main phone: condensed session w/ inline breaker -->
+  <div class="phone tall" aria-label="Phone console, condensed session">
+    <div class="scr">
+      <nav class="pstrip" aria-label="Tabs">
+        <button class="ptab on"><span class="lamp"></span><span class="t">⚡ Trace dropped…</span></button>
+        <button class="ptab"><span class="t">⌨ npm run dev</span></button>
+        <button class="ptab"><span class="lamp ok"></span><span class="t">◉ Scrollback…</span></button>
+      </nav>
+      <header class="phead">
+        <span class="cart" style="padding:4px 7px;font-size:10px"><b></b>freshclaude</span>
+        <span class="ttl">Trace dropped messages on background tabs</span>
+        <button class="icob" aria-label="More" style="margin-left:auto">⋯</button>
+      </header>
+      <div class="pchiprow" aria-label="Status chips">
+        <span class="pchip">~/code/freshell · <b>fix/ws-reconnect+2</b></span>
+        <span class="pchip"><b>Opus 4.6</b></span>
+        <span class="pchip"><b>59%</b></span>
+        <span class="pchip"><b>$1.38</b></span>
+      </div>
+      <div class="pbody">
+        <article class="pentry">
+          <div class="eh"><span class="lamp off"></span><span class="who">You</span><time>14:07</time></div>
+          <p class="pt">the reconnect loop is still dropping messages when the tab&rsquo;s in the background. can you trace where the heartbeat dies?</p>
+        </article>
+        <article class="pentry">
+          <div class="eh"><span class="lamp ok"></span><span class="who" style="color:#e8b39e">Claude · Opus 4.6</span><time>14:07</time></div>
+          <p class="pt">Beat at 5s, add a server-side pong watchdog. Edit is in:</p>
+          <div class="pcode" aria-label="Diff, server/ws-handler.ts">
+            <div class="dl del"><span class="sign">−</span><pre>const HEARTBEAT_INTERVAL = 15_000;</pre></div>
+            <div class="dl add"><span class="sign">+</span><pre>const HEARTBEAT_INTERVAL = 5_000;</pre></div>
+            <div class="dl add"><span class="sign">+</span><pre>let lastPongAt = 0;</pre></div>
+          </div>
+          <div class="belt" style="margin-top:9px">
+            <span class="lamp wait"></span><span class="btxt">RUNNING EDIT — WS-HANDLER.TS</span>
+            <span class="track"><i></i></span>
+          </div>
+        </article>
+
+        <!-- breaker sheet: full-width stacked ≥56px -->
+        <section class="pbrk" aria-label="Approval required">
+          <div style="display:flex;align-items:center;gap:8px">
+            <span class="serial">BRK-01 · BASH</span>
+            <span style="margin-left:auto" class="brk-alarm"><span class="lamp err"></span>TRIP</span>
+          </div>
+          <div class="brk-cmd" style="font-size:12px">rm -rf .worktrees/refresh-*</div>
+          <div class="brk-meta" style="flex-direction:column;gap:6px">
+            <span class="w">Deletes 3 stale worktrees</span>
+            <span class="warn"><span class="lamp err"></span>This command permanently deletes files.</span>
+          </div>
+          <div class="btns">
+            <button class="rocker">Allow once</button>
+            <div class="gwrap" style="justify-content:space-between">
+              <span class="latch"><span class="ltrack" role="switch" aria-checked="false" aria-label="Always allow Bash this session"><span class="knob"></span></span><span class="swlabel" style="max-width:none">Always allow <b style="font-weight:600;color:var(--ink)">Bash</b> this session</span></span>
+              <span class="kguard" aria-hidden="true"></span>
+            </div>
+            <button class="rocker deny">DENY</button>
+          </div>
+        </section>
+      </div>
+      <footer class="pcomp" aria-label="Composer">
+        <div class="box">make the interval configurable in settings, default 5s —</div>
+        <div class="acts">
+          <button class="icob" aria-label="Attach file">📎</button>
+          <button class="icob" aria-label="Slash commands">/</button>
+          <button class="send">SEND ⏎</button>
+        </div>
+      </footer>
+      <div class="safebar"><i></i></div>
+    </div>
+  </div>
+
+  <!-- phone inset: turn actions bottom sheet -->
+  <div class="phone" aria-label="Phone inset, turn actions sheet">
+    <div class="scr sheet-host" style="height:560px">
+      <header class="phead">
+        <span class="cart" style="padding:4px 7px;font-size:10px"><b></b>freshclaude</span>
+        <span class="ttl">Trace dropped messa…</span>
+      </header>
+      <div class="sheet-bg">
+        <article class="pentry">
+          <div class="eh"><span class="lamp off"></span><span class="who">You</span><time>14:07</time></div>
+          <p class="pt">the reconnect loop is still dropping messages when the tab&rsquo;s in the background…</p>
+        </article>
+      </div>
+      <div class="sheetdim"></div>
+      <div class="sheet" role="dialog" aria-label="Turn actions">
+        <p class="plate-txt" style="margin:2px 4px 6px">TURN №01 · 14:07</p>
+        <button class="sh-row">⌘C&ensp;Copy turn text</button>
+        <button class="sh-row">⑂&ensp;Fork conversation from here</button>
+        <button class="sh-row dest">⟲&ensp;Rewind code to here</button>
+        <button class="sh-cancel">Cancel</button>
+        <div class="safebar"><i></i></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- phone inset: settings full-screen sheet -->
+  <div class="phone" aria-label="Phone inset, settings sheet">
+    <div class="scr sheet-host" style="height:560px">
+      <div class="sheet-bg" style="padding-top:4px">
+        <div class="pstrip"><button class="ptab on"><span class="lamp"></span><span class="t">⚡ Trace dropped…</span></button></div>
+      </div>
+      <div class="fullsheet" role="dialog" aria-label="Settings">
+        <div class="fs-head">
+          <span class="serial">SVC-02 · PANE CONFIG</span>
+          <button class="icob" style="margin-left:auto" aria-label="Done">✓</button>
+        </div>
+        <div class="dr-sec" style="padding-left:16px">
+          <span class="el" style="display:block;margin-bottom:8px">Style</span>
+          <div class="seg"><button class="on">Sans</button><button>Serif</button><button>Mono</button></div>
+        </div>
+        <div class="dr-sec" style="padding-left:16px">
+          <span class="el" style="display:block;margin-bottom:4px">Model</span>
+          <div class="mrow on"><span class="rad"></span><span>Claude Opus 4.6</span></div>
+          <div class="mrow" style="color:var(--muted)"><span class="rad"></span><span>Sonnet 4.6 <span class="soon" style="margin-left:6px"></span></span></div>
+        </div>
+        <div class="dr-sec" style="padding-left:16px">
+          <span class="el" style="display:block;margin-bottom:8px">Effort</span>
+          <div class="seg"><button>Low</button><button>Medium</button><button class="on">High</button></div>
+        </div>
+        <div class="dr-sec" style="padding-left:16px">
+          <span class="el" style="display:block;margin-bottom:8px">Permission mode</span>
+          <div class="seg"><button class="on">Ask</button><button>Accept</button><button>Bypass</button><button>Plan</button></div>
+        </div>
+        <div class="dr-sec" style="padding-left:16px">
+          <div class="tgl-row">Show thinking<span class="tk"><span class="tgl on"><span class="kn"></span></span></span></div>
+          <div class="tgl-row">Show tools<span class="tk"><span class="tgl on"><span class="kn"></span></span></span></div>
+          <div class="tgl-row">Timecodes<span class="tk"><span class="tgl"><span class="kn"></span></span></span></div>
+          <div class="tgl-row" style="color:var(--muted)">Sound on done <span class="soon"></span><span class="tk"><span class="tgl"><span class="kn"></span></span></span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- phone inset: slash tray sheet -->
+  <div class="phone" aria-label="Phone inset, slash sheet">
+    <div class="scr sheet-host" style="height:560px">
+      <div class="sheet-bg">
+        <footer class="pcomp"><div class="box">/re</div></footer>
+      </div>
+      <div class="sheet" role="dialog" aria-label="Slash commands" style="max-height:82%">
+        <div class="t-filter"><span class="sl">/</span><span class="val">re</span><span class="cnt">3 / 18</span></div>
+        <div class="t-group">
+          <span class="t-gplate"><span class="plate-txt">SESSION</span></span>
+          <div class="cmd hit"><span class="cname">/rename</span><span class="cdesc">retitle session</span><span class="soon"></span></div>
+          <div class="cmd faded"><span class="cname">/new</span><span class="cdesc">fresh session</span></div>
+          <div class="cmd faded"><span class="cname">/fork</span><span class="cdesc">branch from a turn</span></div>
+        </div>
+        <div class="t-group">
+          <span class="t-gplate"><span class="plate-txt">INSPECT</span></span>
+          <div class="cmd hit"><span class="cname">/review</span><span class="cdesc">request code review</span><span class="soon"></span></div>
+          <div class="cmd faded"><span class="cname">/status</span><span class="cdesc">health &amp; config</span></div>
+        </div>
+        <div class="t-group">
+          <span class="t-gplate"><span class="plate-txt">CONFIGURE</span></span>
+          <div class="cmd hit"><span class="cname">/permissions</span><span class="cdesc">permission mode</span></div>
+          <div class="cmd faded"><span class="cname">/model</span><span class="cdesc">switch model</span></div>
+        </div>
+        <div class="safebar"><i></i></div>
+      </div>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ============ D. ALT LIGHT SWATCH ============ -->
+<section aria-label="Alternate light mode">
+<h2>Alternate mode</h2>
+<p class="cap">Alt mode · “open bench” — warm aluminum #e8e6e1, ink #23262b · ~400px tiles</p>
+<div class="lite-row">
+  <div class="lite">
+    <span class="l-el" style="display:block;margin-bottom:8px">Bench tile · agent turn</span>
+    <div class="lcard">
+      <div class="lhead"><span class="lamp ok"></span><span class="lwho">Claude · Opus 4.6</span><span class="ltime num">14:07</span></div>
+      <div class="lbody">
+        <p>The heartbeat is too slow for a throttled tab. Beat at 5s and add a server-side pong watchdog instead of trusting the close timeout.</p>
+        <code class="lcode">+ const HEARTBEAT_INTERVAL = 5_000;
++ let lastPongAt = 0;</code>
+      </div>
+    </div>
+  </div>
+  <div class="lite">
+    <span class="l-el" style="display:block;margin-bottom:8px">Bench tile · breaker</span>
+    <div class="lbrk">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span class="serial">BRK-01 · BASH</span>
+        <span style="margin-left:auto;display:flex;align-items:center;gap:6px;font:600 10px/1 var(--mono);letter-spacing:0.12em" class="warn"><span class="lamp err"></span>TRIP</span>
+      </div>
+      <div class="lcmd">rm -rf .worktrees/refresh-*</div>
+      <p class="wrow warn" style="display:flex;gap:6px;align-items:center"><span class="lamp err"></span>This command permanently deletes files.</p>
+      <div style="display:flex;flex-direction:column;gap:11px;margin-top:13px">
+        <button class="rocker" style="min-height:48px">Allow once</button>
+        <span class="latch" style="display:inline-flex;align-items:center;gap:10px">
+          <span class="ltrack"><span class="knob"></span></span>
+          <span style="font:500 12.5px/1.4 var(--sans);color:#4d4841">Always allow <b style="color:#23262b">Bash</b> this session</span>
+        </span>
+        <button class="rocker deny" style="min-height:46px">DENY</button>
+      </div>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ============ FOOTER: DIRECTION CONTRACT ============ -->
+<footer>
+  <div class="footplate">
+    <span class="hex hx-tl"><i></i></span><span class="hex hx-tr"><i></i></span>
+    <span class="hex hx-bl"><i></i></span><span class="hex hx-br"><i></i></span>
+    <span class="plate-txt">SPEC PLATE · UNIT 02 · ENGRAVED IN FOOTER</span>
+    <div class="contract">
+      <div class="cl"><span class="k">THESIS</span><span class="v">A coding agent is machinery you supervise from a well-made console: milled panels, engraved labels, honest lamps and gauges. Nothing is lit unless it reports a real state.</span></div>
+      <div class="cl"><span class="k">OWN-WORLD</span><span class="v">Machined metal, studio electronics — a mastering desk, a lab instrument; warm dark, never gamer-black.</span></div>
+      <div class="cl"><span class="k">STORY</span><span class="v">24 minutes into a dropped-heartbeat trace: thought 12s, 4 tools, 2 files changed; the belt reads RUNNING EDIT while a stale-worktree delete waits at the breaker.</span></div>
+      <div class="cl"><span class="k">FIRST VIEWPORT</span><span class="v">Rack-ear tabs, freshclaude cartridge, VU context gauge at 59%, bolted composer with an orange SEND key.</span></div>
+      <div class="cl"><span class="k">FORM+FINISH</span><span class="v">Archivo labels, JetBrains Mono data; engraved micro-plates at 0.14em tracking; motion ≤250ms — belt shimmer and lamp states only; reduced-motion = static lamp.</span></div>
+    </div>
+  </div>
+  <p class="foot-note">Engine Room · design 2 of 6 · fresh-agent UX study for Freshell · <a href="/">← all designs</a></p>
+</footer>
+
+</div>
+</body>
+</html>

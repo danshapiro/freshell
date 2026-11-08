@@ -1,0 +1,261 @@
+
+<!-- ============ C · PHONE FRAMES ============ -->
+<section aria-label="Phone frames, 390 pixels wide">
+<h2 class="vh">Phone frames</h2>
+<p class="cap"><b>Phone · 390×844</b> — plates full-bleed, single column; the permit slip stands upright with two big stamps (≥52px); the index rail folds into the scrollable chips row; sheets lift on a cloth pull-tab.</p>
+<div class="phonewrap">
+
+  <!-- main phone frame -->
+  <div class="phone h844" role="img" aria-label="Phone: the same session, condensed">
+    <div class="notch" aria-hidden="true"></div>
+    <div class="pchapters" role="tablist" aria-label="Open tabs">
+      <span class="chtab on" role="tab" aria-selected="true"><span class="ribbon" style="height:12px"></span>
+        <span class="leafdot"></span>⚡ Trace dropped…</span>
+      <span class="chtab quiet" role="tab" aria-selected="false">⌨ npm run dev</span>
+      <span class="chtab quiet" role="tab" aria-selected="false">◉ Scrollback…<span class="bm"></span></span>
+    </div>
+    <div class="pphead">
+      <div class="r1">
+        <span class="pchip" style="padding:2px 8px 2px 5px;font-size:10.5px">
+          <span class="pc" style="width:10px;height:10px"></span>freshclaude</span>
+        <span class="pt">Trace dropped messages on background tabs</span>
+        <button class="pico" style="width:28px;height:28px" aria-label="More actions">…</button>
+      </div>
+      <div class="r2"><span class="leafdot"></span> Working… · <b class="tn">$1.38</b></div>
+    </div>
+    <div class="pchiprow" aria-label="Status chips">
+      <span class="pstchip mono">~/code/freshell · <b>fix/ws-reconnect</b></span>
+      <span class="pstchip">Opus 4.6</span>
+      <span class="pstchip"><b>59%</b> ctx</span>
+      <span class="pstchip"><b>$1.38</b></span>
+    </div>
+    <div class="pbody">
+      <div style="margin-top:-436px"> <!-- static comp: transcript drawn scrolled to the permit -->
+      <article class="plate" aria-label="Plate I condensed, your message">
+        <div class="plhd"><span class="no">Plate I</span></div>
+        <p class="pb">the reconnect loop is still dropping messages when the tab&rsquo;s in the background&hellip;</p>
+      </article>
+      <div class="plabel"><span>14:07</span><span class="dots"></span><span>by <span class="whoU">You</span></span><span class="dots"></span><span class="acc">01JRV6</span></div>
+
+      <article class="plate agentbox" aria-label="Plate II condensed, Claude" style="margin-top:18px">
+        <div class="plhd"><span class="no">Plate II</span></div>
+        <p class="pb">Found it — heartbeat is 15s, background tabs clamp timers to ≥60s. Pings gap out;
+          the server closes the socket&hellip;</p>
+        <details class="think"><summary>Thought for 12s</summary>
+          <div class="tin">A 5s beat survives the worst clamp; the watchdog covers the rest.</div></details>
+        <div class="notes">
+          <details class="note" open>
+            <summary><span class="nota">iv</span><span class="ntool">Edit</span>
+              <span class="narg">ws-handler.ts&nbsp;<b style="color:var(--moss)">+12</b>&nbsp;<b style="color:var(--rust)">−4</b></span>
+              <span class="nstat"><span class="okck">✓</span></span></summary>
+            <div class="specimen">
+              <div class="dline del"><span class="ln">42</span><span class="sg">−</span><code class="cd">const HEARTBEAT_INTERVAL = 15_000;</code>
+                <button class="annot" aria-label="Comment on deleted line">✎</button></div>
+              <div class="dline add"><span class="ln">42</span><span class="sg">+</span><code class="cd">const HEARTBEAT_INTERVAL = 5_000;</code>
+                <button class="annot" aria-label="Comment on added line">✎</button></div>
+              <div class="dline add"><span class="ln">44</span><span class="sg">+</span><code class="cd">let lastPongAt = 0;</code></div>
+            </div>
+          </details>
+        </div>
+        <div class="rosterline"><span class="rmark">❧</span>
+          <span>4 notes gathered · 2 specimens altered · 12s</span></div>
+      </article>
+      <div class="plabel"><span>14:07</span><span class="dots"></span><span>by <span class="whoA">Claude · Opus 4.6</span></span><span class="dots"></span><span class="acc">01JRV6</span></div>
+
+      <!-- HANDLING PERMIT — upright slip, thumb-first stamps -->
+      <section class="permit" aria-label="Handling permit requested">
+        <div class="phd"><span class="warnmark">!</span>
+          <span class="pnm">Handling Permit</span>
+          <span class="pno">№ 01JRV6-07 · Bash</span></div>
+        <div class="cmdline">rm -rf .worktrees/refresh-*</div>
+        <p class="why">Deletes 3 stale worktrees.</p>
+        <p class="wtxt"><span class="warnmark" style="width:17px;height:17px;font-size:10px">!</span>
+          This command permanently deletes files.</p>
+        <div class="pstampgrid">
+          <button class="stamp">Grant<small>Allow once</small></button>
+          <button class="stamp refuse">Refuse<small>Deny</small></button>
+        </div>
+        <label class="blanket"><span class="box"></span>
+          <span><b style="color:var(--ink)">Always allow Bash this session</b> — blanket permit, this expedition.</span></label>
+      </section>
+      <button class="newpill">3 new ↓</button>
+      </div>
+    </div>
+
+    <div class="pslope">
+      <div class="queuepeek">
+        <span class="qbm">also bump backoff… <button class="qx" aria-label="Remove queued message">✕</button></span>
+        <span class="qbm">then update AGENTS.md <button class="qx" aria-label="Remove queued message">✕</button></span>
+      </div>
+      <div class="slopein">
+        <textarea rows="2" aria-label="Message to the agent">make the interval configurable in settings, default 5s —</textarea>
+      </div>
+      <div class="comprow">
+        <button class="cbtn" aria-label="Attach a pressed leaf"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M11.5 7.2l-4.6 4.6a2.6 2.6 0 0 1-3.7-3.7l5-5a1.8 1.8 0 0 1 2.6 2.5l-5 5a1 1 0 0 1-1.4-1.4l4.3-4.3"/></svg></button>
+        <button class="cbtn" aria-label="Table of plates" style="font-family:var(--mono);font-weight:600">/</button>
+        <button class="seal" aria-label="Send — press the wax seal">➤</button>
+      </div>
+      <div class="safearea"></div>
+    </div>
+  </div>
+
+  <!-- turn actions — bottom sheet -->
+  <div class="phone small sheetactions" role="img" aria-label="Phone: turn actions as bottom sheet">
+    <div class="notch" aria-hidden="true"></div>
+    <div class="pphead"><div class="r1"><span class="pt" style="color:var(--faint)">[volume dimmed beneath]</span></div></div>
+    <div class="pbody sheetzone">
+      <div class="sheetdim" aria-hidden="true"></div>
+      <div class="sheetlift" role="dialog" aria-label="Turn actions sheet">
+        <span class="pulltab" aria-hidden="true"></span>
+        <div class="shd">Plate I · your turn, 14:07 — lifted plate</div>
+        <button class="shrow"><span class="sic">⧉</span>Copy turn text</button>
+        <button class="shrow"><span class="sic">⑂</span>Fork conversation from here</button>
+        <button class="shrow danger"><span class="sic">↺</span>Rewind code to here</button>
+        <button class="shrow cancel">Cancel</button>
+        <div class="safearea"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- settings — full leaf sheet -->
+  <div class="phone small tall" role="img" aria-label="Phone: settings as a full-screen sheet">
+    <div class="notch" aria-hidden="true"></div>
+    <div class="pbody" style="padding:0;display:flex;flex-direction:column;overflow:hidden">
+      <div class="sheetlift toggzone" role="dialog" aria-label="Settings full sheet" style="flex:1">
+        <span class="pulltab" aria-hidden="true"></span>
+        <div class="shd">Settings — the whole leaf</div>
+        <div class="lrow"><span class="llab">Style</span>
+          <span class="lval"><span class="seg"><button>Sans</button><button>Serif</button><button class="on">Mono</button></span></span></div>
+        <div class="lrow"><span class="llab">Model</span>
+          <span class="lval" style="flex-direction:column;align-items:stretch;gap:5px;flex:1">
+            <span class="modelrow on"><span class="mdot"></span><span class="mt">Claude Opus 4.6</span></span>
+            <span class="modelrow"><span class="mdot"></span><span class="mt">Sonnet 4.6</span><span class="soon">soon</span></span>
+          </span></div>
+        <div class="lrow"><span class="llab">Effort</span>
+          <span class="lval"><span class="seg"><button>Low</button><button>Medium</button><button class="on">High</button></span></span></div>
+        <div class="lrow" style="flex-wrap:wrap"><span class="llab">Permission</span>
+          <span class="lval"><span class="seg"><button class="on">Ask</button><button>Accept edits</button><button>Bypass</button><button>Plan</button></span></span></div>
+        <div class="lrow" style="flex-direction:column;align-items:stretch;gap:8px">
+          <span class="wtoggle"><span class="wdot"></span>Show thinking</span>
+          <span class="wtoggle"><span class="wdot"></span>Show tools</span>
+          <span class="wtoggle"><span class="wdot"></span>Timecodes</span>
+          <span class="wtoggle off"><span class="wdot"></span>Sound on done <span class="soon">soon</span></span>
+          <span class="wtoggle off"><span class="wdot"></span>Desktop notifications <span class="soon">soon</span></span>
+        </div>
+        <div class="lrow" style="border-bottom:none;flex-direction:column;align-items:stretch">
+          <span class="llab">Advanced <span class="soon">soon</span></span>
+          <span class="advgrp">
+            <button class="arow"><span class="aa">→</span>Hooks · MCP servers · Agents · Status-line layout</button>
+          </span></div>
+        <button class="shrow cancel" style="border-top:1px solid var(--hair2);margin-top:6px">Close the leaf</button>
+        <div class="safearea"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- table of plates — bottom sheet, single column -->
+  <div class="phone small pslash" role="img" aria-label="Phone: slash menu as bottom sheet">
+    <div class="notch" aria-hidden="true"></div>
+    <div class="pphead"><div class="r1"><span class="pt" style="color:var(--faint)">[volume dimmed beneath]</span></div></div>
+    <div class="pbody sheetzone">
+      <div class="sheetdim" aria-hidden="true"></div>
+      <div class="sheetlift" role="dialog" aria-label="Table of plates sheet, filtered by re">
+        <span class="pulltab" aria-hidden="true"></span>
+        <div class="shd">Table of plates · “re” — three plates answer</div>
+        <div class="pslashdim">eighteen plates in the full index; the filter keeps these three —
+          <b style="color:var(--ink)">/rename</b>, <b style="color:var(--ink)">/review</b>, <b style="color:var(--ink)">/permissions</b></div>
+        <div class="grp">Session</div>
+        <button class="shrow"><span class="cname">/rename</span><span class="soon">soon</span><span class="cdesc">retitle session</span></button>
+        <div class="grp">Inspect</div>
+        <button class="shrow"><span class="cname">/review</span><span class="soon">soon</span><span class="cdesc">request code review</span></button>
+        <div class="grp">Configure</div>
+        <button class="shrow"><span class="cname">/permissions</span><span class="cdesc">permission mode</span></button>
+        <button class="shrow cancel">Cancel</button>
+        <div class="safearea"></div>
+      </div>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ============ D · NIGHT PRESS — alternate mode swatch ============ -->
+<section aria-label="Night press, dark mode swatch">
+<h2 class="vh">Night press swatch</h2>
+<p class="cap"><b>Night press · the cabinet after dark</b> — same plate and permit under lamplight: ground #1d241b, ink turns parchment; moss/berry/ochre lift one step.</p>
+<div class="nightbar night">
+  <div class="ngrid">
+    <div class="ntile">
+      <article class="plate" aria-label="Night plate, Claude, 14:07">
+        <div class="plhd"><span class="no">Plate II</span><span>the trace</span></div>
+        <p class="pb">Found it. The heartbeat is 15s — but background tabs throttle timers to ≥60s,
+          so the pings gap out and the server closes the socket.</p>
+        <details class="note" style="border-bottom:1px solid var(--hair)">
+          <summary style="display:flex;gap:10px;align-items:baseline;padding:8px 4px">
+            <span class="nota">iv</span><span class="ntool">Edit</span>
+            <span class="narg" style="color:var(--muted)">server/ws-handler.ts&nbsp;
+              <b style="color:var(--moss)">+12</b>&nbsp;<b style="color:var(--rust)">−4</b></span></summary>
+        </details>
+        <div class="rosterline"><span class="rmark">❧</span>
+          <span>4 notes gathered · 2 specimens altered · 12s</span>
+          <span style="margin-left:auto" class="okck">✓ filed</span></div>
+      </article>
+      <div class="plabel"><span>Collected 14:07</span><span class="dots"></span>
+        <span>by <span class="whoA">Claude (Opus 4.6)</span></span><span class="dots"></span>
+        <span class="acc">Expedition 01JRV6</span></div>
+    </div>
+    <div class="ntile">
+      <section class="permit" aria-label="Night permit slip">
+        <div class="phd"><span class="warnmark">!</span>
+          <span class="pnm">Handling Permit</span>
+          <span class="pno">№ 01JRV6-07</span></div>
+        <div class="cmdline" style="background:var(--meadow)">rm -rf .worktrees/refresh-*</div>
+        <p class="why">Deletes 3 stale worktrees.</p>
+        <p class="wtxt"><span class="warnmark" style="width:17px;height:17px;font-size:10px">!</span>
+          This command permanently deletes files.</p>
+        <div class="stamps">
+          <button class="stamp">Grant<small>Allow once</small></button>
+          <button class="stamp refuse">Refuse<small>Deny</small></button>
+        </div>
+      </section>
+      <div class="slopein" style="margin-top:14px;max-width:none">
+        <textarea rows="1" aria-label="Night composer" readonly>make the interval configurable —</textarea>
+        <div class="comprow" style="margin-top:8px">
+          <button class="cbtn" aria-label="Slash">/</button>
+          <button class="seal" aria-label="Send">➤</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ============ FOOTER — the contract, rendered readably ============ -->
+<footer class="foot">
+  <div class="ffhd">Direction contract — Field Guide</div>
+  <dl>
+    <dt>Thesis</dt>
+    <dd>Each session is a field expedition; everything the agent finds and changes is collected,
+      labeled, and plated — naturalist-archive calm with accession-number rigor.</dd>
+    <dt>Own-world</dt>
+    <dd>Turns are Plates with a thin double-rule frame and a specimen-label strip beneath
+      (Collected 14:07 · by Claude (Opus 4.6) · Expedition 01JRV6). Tool calls are Field Notes that
+      settle into a roster, diffs are pressed specimens — old growth struck in rust, new growth
+      inked — and approval is a Handling Permit on darker stock, stamped Grant or Refuse.</dd>
+    <dt>Story</dt>
+    <dd>One heartbeat trace, plated live: four notes gathered, two specimens altered,
+      and a permit pin landing mid-stream.</dd>
+    <dt>First viewport</dt>
+    <dd>A bound volume opened to Plate II — roster settling, permit slip pinning the page,
+      index of plates at right.</dd>
+    <dt>Form + finish</dt>
+    <dd>Parchment and meadow grounds, loam ink. Source Serif 4 prose, Karla chrome, Intel One Mono
+      data. Moss is the agent, berry is you and every action, ochre waits, rust errs. Flat hairlines
+      and one elevation; a wax-seal send. Notes unfold 200ms (transform/opacity), the wax and stamps
+      press 100ms scale .97; no ambient motion, and reduced-motion renders every plate static.</dd>
+  </dl>
+  <p class="sig">filed, Expedition 01JRV6 · Vol. VI</p>
+</footer>
+
+</div>
+</body>
+</html>

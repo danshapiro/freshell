@@ -1,0 +1,1497 @@
+<!DOCTYPE html>
+<!--
+DRAFT — direction contract
+THESIS — Session as working drawing: revisions dimensioned, details called out, approvals redlined.
+OWN-WORLD — Blueprint drafting. Pane header = TITLE BLOCK (PROJECT / SHEET / DRAWN BY / REV / DATE). Turns carry dimension lines with ticks, arrowheads, time/token labels; tools are DETAIL CALLOUTS; diffs strike redline with amber "+12 −4" leaders; approval waits inside a scalloped redline REVISION CLOUD (△ REV b4) with APPROVED / REJECTED / TYP. stamps.
+STORY — freshclaude traces a dropped heartbeat, then holds destructive cleanup in the cloud.
+FIRST VIEWPORT — DRAFT masthead over the open sheet: tabs, title block, dimensioned transcript, sheet-index rail.
+FORM+FINISH — deep drafting blue #12294d, ink #e9f1ff, flat cyan #7fd4ff, amber #ffb454, redline #ff7a6e; Overpass + Chivo Mono; motion annotated only. Alt: trace paper #f4f7fb / #173a6b / #0f6aa8.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DRAFT — fresh-agent UX study 3/6</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Overpass:wght@400;600;700&family=Chivo+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+/* ============ DRAFT — design tokens ============ */
+body{
+  --gridtable:#0d1f3d;     /* page ground behind sheets */
+  --sheet:#12294d;         /* blueprint ground */
+  --panel:#162f59;         /* cooler second layer */
+  --plate:#0e2142;         /* inset plates / code wells */
+  --line:rgba(214,230,255,.14);
+  --line2:rgba(214,230,255,.28);
+  --hair:rgba(214,230,255,.07);
+  --grid:rgba(214,230,255,.05);
+  --grid2:rgba(214,230,255,.09);
+  --ink:#e9f1ff;
+  --muted:#93a7c9;
+  --faint:#7286ad;
+  --anno:#7fd4ff;          /* cyan annotations — flat, never glow */
+  --amber:#ffb454;         /* actions + approval */
+  --amberink:#3a2408;      /* text on amber fills */
+  --ok:#8fd6a2;
+  --red:#ff7a6e;
+  --coral:#c15a3c;         /* freshclaude */
+  --shadow:0 18px 44px -24px rgba(3,8,18,.9);
+  --sans:"Overpass","Segoe UI",system-ui,-apple-system,Roboto,sans-serif;
+  --mono:"Chivo Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+.trace{
+  --gridtable:#dfe6f0; --sheet:#f4f7fb; --panel:#e9eef8; --plate:#fbfdff;
+  --line:rgba(23,58,107,.16); --line2:rgba(23,58,107,.3); --hair:rgba(23,58,107,.07);
+  --grid:rgba(23,58,107,.05); --grid2:rgba(23,58,107,.1);
+  --ink:#173a6b; --muted:#4d6488; --faint:#71849f;
+  --anno:#0f6aa8; --amber:#9c5f08; --amberink:#f8f1e2;
+  --ok:#1e7452; --red:#c43d35; --coral:#b0522f;
+  --shadow:0 18px 40px -24px rgba(23,46,80,.35);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--gridtable);color:var(--ink);font:400 15px/1.55 var(--sans);
+  font-variant-numeric:tabular-nums;padding:34px 24px 80px;-webkit-font-smoothing:antialiased}
+code,kbd{font-family:var(--mono)}
+.mono{font-family:var(--mono)}
+a{color:var(--anno);text-underline-offset:3px;text-decoration-thickness:1px}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;text-align:left}
+input,textarea{font:inherit;color:inherit;caret-color:var(--amber)}
+details>summary{cursor:pointer;list-style:none}
+details>summary::-webkit-details-marker{display:none}
+.wrap{max-width:1460px;margin:0 auto}
+.vh{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.sheetsec{margin-top:36px}
+.cap{font:400 11px/1.5 system-ui,sans-serif;color:#9ba9c2;margin:22px 0 8px}
+.cap b{color:#c3cfe4;font-weight:600}
+/* browser surfaces, blueprint-tuned */
+::selection{background:var(--anno);color:var(--sheet)}
+:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+*{scrollbar-width:thin;scrollbar-color:rgba(127,212,255,.35) transparent}
+*::-webkit-scrollbar{width:8px;height:8px}
+*::-webkit-scrollbar-thumb{background:rgba(127,212,255,.3);border-radius:4px}
+*::-webkit-scrollbar-track{background:transparent}
+/* faint true grid — the drawing surface itself */
+.gridbg{background-image:
+  linear-gradient(var(--grid2) 1px,transparent 1px),
+  linear-gradient(90deg,var(--grid2) 1px,transparent 1px),
+  linear-gradient(var(--grid) 1px,transparent 1px),
+  linear-gradient(90deg,var(--grid) 1px,transparent 1px);
+  background-size:120px 120px,120px 120px,24px 24px,24px 24px}
+/* corner registration marks */
+.reg{position:absolute;width:16px;height:16px;pointer-events:none;opacity:.7}
+.reg::before{content:"";position:absolute;left:50%;top:0;width:1px;height:100%;background:var(--line2)}
+.reg::after{content:"";position:absolute;top:50%;left:0;height:1px;width:100%;background:var(--line2)}
+.reg i{position:absolute;inset:3px;border:1px solid var(--line2);border-radius:50%}
+.reg.tl{top:8px;left:8px}.reg.tr{top:8px;right:8px}.reg.bl{bottom:8px;left:8px}.reg.br{bottom:8px;right:8px}
+/* SOON — tiny amber triangle delta stamp */
+.soon{display:inline-flex;align-items:center;gap:4px;font:700 8px/1.7 var(--mono);
+  letter-spacing:.14em;color:var(--amber);text-transform:uppercase;vertical-align:2px;white-space:nowrap}
+.soon::before{content:"";width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent;
+  border-bottom:7px solid var(--amber)}
+/* ============ A · MASTHEAD — drawing sheet header ============ */
+.mast{position:relative;border:1.5px solid var(--line2);background:var(--sheet);
+  padding:52px 52px 40px;overflow:hidden}
+.mast .dwgno{font:600 10px/1.5 var(--mono);letter-spacing:.24em;color:var(--anno);text-transform:uppercase}
+.mast h1{font:700 clamp(84px,11vw,164px)/.9 var(--sans);letter-spacing:.015em;margin:18px 0 0;
+  color:transparent;-webkit-text-stroke:2.5px var(--ink);
+  text-shadow:7px 7px 0 rgba(127,212,255,.55)}
+.mast .subt{font:400 17px/1.5 var(--sans);color:var(--muted);max-width:56ch;margin-top:24px}
+.mast .subt b{color:var(--ink);font-weight:600}
+.mastmeta{display:flex;flex-wrap:wrap;gap:0;margin-top:30px;border:1px solid var(--line);
+  font:600 9.5px/1.4 var(--mono);letter-spacing:.16em;color:var(--muted);text-transform:uppercase}
+.mastmeta span{padding:8px 15px;border-right:1px solid var(--line)}
+.mastmeta span:last-child{border-right:0}
+.mastmeta b{color:var(--ink)}
+</style>
+<style>
+/* ============ B · app frame = the open sheet ============ */
+.frame{position:relative;border:1.5px solid var(--line2);background:var(--sheet);
+  box-shadow:var(--shadow)}
+.fbar{display:flex;align-items:center;gap:7px;padding:8px 16px;border-bottom:1px solid var(--line);
+  background:var(--panel);font:500 11.5px var(--mono);color:var(--faint)}
+.fbar .fd{width:10px;height:10px;border:1px solid var(--line2);border-radius:50%;background:var(--sheet)}
+.fbar .furl{flex:1;text-align:center;color:var(--muted)}
+/* sheet-index tab strip */
+.tabs{display:flex;gap:3px;align-items:flex-end;padding:9px 16px 0;border-bottom:1px solid var(--line2);
+  background:var(--panel);overflow-x:auto;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tab{display:flex;align-items:center;gap:8px;border:1px solid transparent;border-bottom:0;
+  padding:0 14px;height:33px;font:600 12.5px/1 var(--sans);color:var(--muted);white-space:nowrap;
+  position:relative;background:transparent;flex:0 0 196px;min-width:0}
+.tab .tno{font:700 8.5px/1 var(--mono);letter-spacing:.1em;color:var(--faint)}
+.tab .tt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;max-width:150px}
+.tab:hover{color:var(--ink);background:rgba(214,230,255,.04)}
+.tab.on{color:var(--ink);background:var(--sheet);border-color:var(--line2)}
+.tab.on::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:1.5px;background:var(--sheet)}
+.tab.on .tno{color:var(--anno)}
+.busyd{display:inline-block;width:7px;height:7px;background:var(--amber);transform:rotate(45deg);flex:none}
+.attn{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--ok);flex:none}
+.tabadd{display:grid;place-items:center;width:33px;height:33px;color:var(--muted);font-weight:400;font-size:17px}
+.tabadd:hover{color:var(--ink);background:rgba(214,230,255,.04)}
+/* TITLE BLOCK — pane header as architectural info table */
+.tblock{display:grid;grid-template-columns:1.15fr 1.8fr 1.15fr .55fr .62fr auto;
+  border-bottom:1px solid var(--line2);background:var(--sheet)}
+.tcell{padding:10px 16px;border-right:1px solid var(--line);display:flex;flex-direction:column;
+  justify-content:center;min-width:0}
+.tcell:last-child{border-right:0}
+.tl5{font:600 8px/1.3 var(--mono);letter-spacing:.24em;color:var(--faint);text-transform:uppercase;
+  margin-bottom:4px;display:flex;gap:6px;align-items:baseline}
+.tl5 .ttick{color:var(--anno)}
+.tv5{font:600 13px/1.3 var(--sans);color:var(--ink);overflow-wrap:anywhere}
+.tv5.mono5{font:500 11.5px/1.45 var(--mono)}
+.tv5 .sub{display:block;font:500 9.5px/1.5 var(--mono);color:var(--muted);letter-spacing:.06em;margin-top:2px}
+.pvc{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--line2);padding:2px 8px 2px 4px;
+  font:600 10.5px/1.4 var(--sans);color:var(--ink);background:var(--panel)}
+.pvc i{width:9px;height:9px;background:var(--coral);flex:none}
+.rev{display:inline-flex;align-items:center;gap:7px;font:700 13px/1 var(--mono);color:var(--ink)}
+.rev svg{flex:none}
+.tstate{display:flex;align-items:center;gap:8px;font:600 11.5px/1.3 var(--sans);color:var(--ink)}
+.tops{display:flex;align-items:center;gap:6px}
+.costc{font:600 11.5px/1 var(--mono);color:var(--amber);border:1px solid rgba(255,180,84,.5);
+  padding:6px 9px;margin-right:4px;white-space:nowrap;background:rgba(255,180,84,.05)}
+.ib{position:relative;width:28px;height:28px;display:grid;place-items:center;border:1px solid var(--line);
+  background:transparent;color:var(--muted);font-size:13px;flex:none}
+.ib:hover{color:var(--ink);border-color:var(--line2)}
+.ib .bdg{position:absolute;top:-7px;right:-7px;min-width:15px;height:15px;padding:0 4px;border-radius:0;
+  background:var(--amber);color:var(--amberink);font:700 9.5px/15px var(--mono);text-align:center}
+/* status line — dimensioned datum strip */
+.sline{display:flex;flex-wrap:wrap;gap:4px 0;align-items:center;padding:8px 18px;
+  border-bottom:1px solid var(--line);background:var(--panel);
+  font:500 10.5px/1.9 var(--mono);color:var(--muted);letter-spacing:.02em}
+.sline b{color:var(--ink);font-weight:600}
+.sline .sep{color:var(--line2);margin:0 12px}
+.gauge{display:inline-flex;align-items:center;gap:7px;vertical-align:-1px}
+.gbar{position:relative;width:104px;height:9px;background:rgba(214,230,255,.09);border:1px solid var(--line)}
+.gbar i{position:absolute;top:1px;bottom:1px;left:1px;width:59%;
+  background:repeating-linear-gradient(90deg,var(--anno) 0 5px,transparent 5px 10px)}
+.gbar .wt{position:absolute;top:-2px;bottom:-2px;left:80%;width:1.5px;background:var(--amber)}
+.gwarn{color:var(--faint);font-size:9px;letter-spacing:.08em}
+</style>
+<style>
+/* ============ split: dimensioned transcript + sheet-index rail ============ */
+.split{display:grid;grid-template-columns:minmax(0,1fr) 300px}
+.tran{min-width:0;padding:16px 26px 8px}
+.rail{border-left:1px solid var(--line);background:rgba(14,33,66,.35);padding:18px 16px;min-width:0}
+/* jump-back header chip */
+.jh{display:flex;justify-content:center;margin-bottom:6px}
+.jchip{display:inline-flex;align-items:center;gap:8px;font:600 9.5px/1 var(--mono);letter-spacing:.14em;
+  color:var(--muted);border:1px dashed var(--line2);padding:7px 13px;text-transform:uppercase;text-decoration:none}
+.jchip:hover{color:var(--anno);border-color:var(--anno)}
+/* a turn = dimension rail + body grid */
+.turn{display:grid;grid-template-columns:64px minmax(0,1fr);padding:18px 0 20px;position:relative}
+.turn+.turn{border-top:1px dashed var(--hair)}
+.dim{position:relative;margin:6px 20px 4px 16px;--dc:var(--anno)}
+.dim .dln{position:absolute;top:2px;bottom:2px;left:14.5px;width:1px;background:var(--dc)}
+.dim::before,.dim::after{content:"";position:absolute;left:11px;width:0;height:0;
+  border-left:3.5px solid transparent;border-right:3.5px solid transparent}
+.dim::before{top:-1px;border-bottom:7px solid var(--dc)}
+.dim::after{bottom:-1px;border-top:7px solid var(--dc)}
+.dim .xt{position:absolute;left:8px;width:22px;height:1px;background:var(--dc);opacity:.55}
+.dim .xt.t{top:2px}.dim .xt.b{bottom:2px}
+.dim .dlb{position:absolute;top:50%;left:-6px;transform:translateY(-50%) rotate(-90deg);white-space:nowrap;
+  font:600 9px/1 var(--mono);letter-spacing:.16em;color:var(--dc);text-transform:uppercase}
+.turn.red .dim{--dc:var(--red)}
+/* header line of a turn */
+.who{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:9px}
+.who .nm{font:700 10.5px/1.3 var(--mono);letter-spacing:.18em;text-transform:uppercase;color:var(--ink)}
+.who .nm.agent{color:var(--coral)}
+.who .mdl5{font:500 9.5px/1.3 var(--mono);color:var(--muted);letter-spacing:.08em;text-transform:uppercase}
+.who time{font:500 9.5px/1.3 var(--mono);color:var(--faint);letter-spacing:.1em}
+.who .hact{margin-left:auto;display:flex;gap:9px;opacity:.5}
+.who .hact button{font:500 9.5px/1.3 var(--mono);color:var(--muted);letter-spacing:.08em;
+  border-bottom:1px dotted var(--line2);padding:0 2px;text-transform:lowercase}
+.who .hact button:hover{color:var(--anno);border-color:var(--anno)}
+.msg{font-size:15px;line-height:1.6;max-width:68ch}
+.msg p+p{margin-top:9px}
+/* thinking block */
+details.think{margin:10px 0 4px;border:1px dashed var(--line2);background:rgba(127,212,255,.02)}
+details.think>summary{display:flex;gap:9px;align-items:baseline;padding:7px 13px;
+  font:500 12px/1.4 var(--sans);color:var(--muted)}
+details.think>summary::before{content:"▸";color:var(--anno);font-size:10px}
+details.think[open]>summary::before{content:"▾"}
+details.think .thb{padding:2px 13px 10px 26px;font:400 12.5px/1.55 var(--sans);color:var(--muted);max-width:64ch}
+details.think .tk5{margin-left:auto;font:600 9.5px/1.5 var(--mono);letter-spacing:.14em;color:var(--muted);text-transform:uppercase}
+/* DETAIL CALLOUTS — tool group */
+.dcalls{margin:12px 0 4px;border:1px solid var(--line2)}
+.dch{display:flex;gap:10px;align-items:baseline;padding:7px 14px;border-bottom:1px solid var(--line);
+  font:600 8.5px/1.4 var(--mono);letter-spacing:.2em;color:var(--faint);text-transform:uppercase;background:var(--panel)}
+.dch .cnt{margin-left:auto;color:var(--muted)}
+details.dc{border-bottom:1px solid var(--hair)}
+details.dc:last-child{border-bottom:0}
+details.dc>summary{display:flex;gap:11px;align-items:center;padding:8px 14px;min-height:36px}
+details.dc>summary:hover{background:rgba(214,230,255,.035)}
+.sm{width:22px;height:22px;flex:none;border:1px solid var(--anno);border-radius:50%;
+  display:grid;place-items:center;font:700 10px/1 var(--mono);color:var(--anno);position:relative}
+.sm::after{content:"";position:absolute;left:50%;bottom:-4px;width:1px;height:4px;background:var(--anno);opacity:.5}
+.did{font:600 8.5px/1.2 var(--mono);letter-spacing:.16em;color:var(--faint);text-transform:uppercase;flex:none;min-width:52px}
+.dtl{font:700 11px/1.2 var(--mono);letter-spacing:.1em;color:var(--ink);text-transform:uppercase;flex:none}
+.darg{font:400 11px/1.4 var(--mono);color:var(--muted);overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;min-width:0;flex:1}
+.dmeta{flex:none;display:flex;gap:10px;align-items:baseline;font:500 10px/1.3 var(--mono);color:var(--muted)}
+.dok{color:var(--ok)}
+.dpl{color:var(--ok);font-weight:600}
+.dmn{color:var(--red);font-weight:600}
+.dx{padding:3px 14px 14px 47px}
+.dx .out{font:400 11.5px/1.5 var(--mono);color:var(--muted)}
+.dx .out b{color:var(--ok);font-weight:600}
+/* detail window — diff with corner ticks */
+.dwin{position:relative;border:1.5px solid var(--line2);background:var(--plate);margin:4px 0 2px}
+.dwin .ck{position:absolute;width:9px;height:9px;pointer-events:none}
+.dwin .ck.tl{top:-1px;left:-1px;border-top:1.5px solid var(--anno);border-left:1.5px solid var(--anno)}
+.dwin .ck.tr{top:-1px;right:-1px;border-top:1.5px solid var(--anno);border-right:1.5px solid var(--anno)}
+.dwin .ck.bl{bottom:-1px;left:-1px;border-bottom:1.5px solid var(--anno);border-left:1.5px solid var(--anno)}
+.dwin .ck.br{bottom:-1px;right:-1px;border-bottom:1.5px solid var(--anno);border-right:1.5px solid var(--anno)}
+.dwhead{display:flex;gap:10px;align-items:baseline;padding:5px 12px;border-bottom:1px solid var(--line);
+  font:600 8.5px/1.5 var(--mono);letter-spacing:.18em;color:var(--faint);text-transform:uppercase}
+.dwhead .fw{color:var(--muted)}
+.dwr{display:flex;align-items:baseline;gap:10px;padding:2px 12px;font:400 11.5px/1.55 var(--mono);min-width:0}
+.dwr .sgn{flex:none;width:10px;color:var(--faint)}
+.dwr .cd{white-space:pre;overflow-wrap:normal}
+.dwr.del{background:rgba(255,122,110,.055)}
+.dwr.del .cd{color:var(--red);text-decoration:line-through;text-decoration-color:rgba(255,122,110,.8);
+  text-decoration-thickness:1.2px}
+.dwr.add{background:rgba(255,180,84,.045)}
+.dwr.add .cd{color:var(--ink)}
+.dwr .ldr{flex:1;min-width:16px;border-bottom:1.5px dotted rgba(255,180,84,.55);transform:translateY(-3px)}
+.dwr .dnote{flex:none;font:600 9.5px/1.5 var(--mono);color:var(--amber);letter-spacing:.1em}
+.lncmt{flex:none;margin-left:4px;font:600 8px/1.5 var(--mono);letter-spacing:.12em;color:var(--faint);
+  border:1px solid var(--line);padding:1px 5px;background:transparent;text-transform:uppercase}
+.lncmt:hover{color:var(--anno);border-color:var(--anno)}
+.dxnote{font:400 10px/1.5 var(--mono);color:var(--faint);margin-top:7px;letter-spacing:.04em}
+/* settled strip — schedule note */
+.settled{display:flex;gap:11px;align-items:baseline;flex-wrap:wrap;margin-top:14px;
+  border-top:1px solid var(--line2);border-bottom:1px solid var(--line2);padding:7px 14px;
+  font:600 10px/1.6 var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+.settled b{color:var(--ink)}
+.settled .ssec{color:var(--anno)}
+</style>
+
+<style>
+/* attachments */
+.atts{display:flex;gap:9px;flex-wrap:wrap;margin:2px 0 11px}
+.attchip{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line2);
+  background:var(--panel);padding:4px 11px 4px 5px;font:500 10.5px/1.3 var(--mono);color:var(--ink)}
+.attchip .ath{width:38px;height:27px;flex:none;border:1px solid var(--line);background:var(--plate);
+  background-image:linear-gradient(var(--grid2) 1px,transparent 1px),
+    linear-gradient(90deg,var(--grid2) 1px,transparent 1px);background-size:8px 8px;position:relative}
+.attchip .ath::after{content:"";position:absolute;left:4px;right:4px;bottom:4px;height:5px;
+  border-bottom:1.5px solid var(--ok);border-radius:50%}
+.attchip .afi{width:22px;height:27px;flex:none;border:1px solid var(--line);background:var(--plate);
+  padding:3px 2.5px;display:flex;flex-direction:column;gap:2.5px}
+.attchip .afi i{height:1.5px;background:var(--line2)}
+.attchip .afi i:nth-child(2){width:75%}
+.attchip .aext{color:var(--faint)}
+/* streaming turn */
+.caret{display:inline-block;width:9px;height:16px;background:var(--amber);vertical-align:-3px;margin-left:2px}
+.livest{display:flex;gap:11px;align-items:center;flex-wrap:wrap;margin-top:13px;max-width:660px;
+  border:1px dashed var(--line2);padding:8px 13px;font:600 9.5px/1.4 var(--mono);letter-spacing:.16em;
+  text-transform:uppercase;color:var(--ink);background:rgba(127,212,255,.03)}
+.arc{width:14px;height:14px;flex:none}
+.stopb{margin-left:auto;font:700 9.5px/1 var(--mono);letter-spacing:.16em;color:var(--amber);
+  border:1.5px solid var(--amber);padding:8px 15px;text-transform:uppercase;background:transparent}
+.stopb:hover{background:rgba(255,180,84,.1)}
+/* ===== revision cloud — approval ===== */
+.cloudw{position:relative;margin:4px 0 6px;padding:14px 0}
+.cloudw svg.cloud{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.cld{position:relative;padding:20px 26px 16px;margin:0 18px}
+.clhead{display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+.dtri{width:52px;height:46px;flex:none}
+.clT{font:700 11px/1.3 var(--mono);letter-spacing:.2em;color:var(--red);text-transform:uppercase}
+.clS{font:600 8px/1.5 var(--mono);letter-spacing:.16em;color:var(--faint);text-transform:uppercase;margin-top:2px}
+.clhead .tm{margin-left:auto;font:500 10px/1.4 var(--mono);color:var(--faint);letter-spacing:.08em}
+.clean{display:none}
+.ccmd{display:flex;gap:11px;align-items:center;margin-top:13px;border:1px solid var(--line2);
+  background:var(--plate);padding:9px 14px}
+.ccmd .tg{flex:none;font:700 9px/1 var(--mono);letter-spacing:.14em;color:var(--anno);
+  border:1px solid var(--line2);padding:4px 7px;text-transform:uppercase}
+.ccmd code{font:600 12.5px/1.5 var(--mono);color:var(--ink);overflow-wrap:anywhere}
+.cwhy{margin-top:10px;font-size:13px;line-height:1.5;color:var(--muted)}
+.cwhy b{color:var(--ink)}
+.cwarn{display:flex;gap:9px;align-items:center;margin-top:7px;font:600 12px/1.4 var(--sans);color:var(--red)}
+.cwarn svg{flex:none}
+.cbtns{display:flex;gap:18px;align-items:center;flex-wrap:wrap;margin-top:17px}
+.stamp{position:relative;min-height:54px;padding:9px 20px;display:grid;place-items:center;text-align:center;
+  border:2px solid;background:none;font:700 13px/1.2 var(--sans);letter-spacing:.16em;text-transform:uppercase;
+}
+.stamp.ap{border-color:var(--amber);color:var(--amber);box-shadow:inset 0 0 0 1.5px rgba(255,180,84,.35)}
+.stamp.re{border-color:var(--red);color:var(--red);box-shadow:inset 0 0 0 1.5px rgba(255,122,110,.35);
+}
+.stamp small{display:block;font:400 9px/1.3 var(--mono);letter-spacing:.12em;color:var(--muted);
+  text-transform:none;margin-top:3px}
+.typn{display:inline-flex;align-items:baseline;gap:8px;font:500 10px/1.4 var(--mono);
+  letter-spacing:.1em;color:var(--muted);text-transform:uppercase}
+.typn .tr{width:0;height:0;border-left:4.5px solid transparent;border-right:4.5px solid transparent;
+  border-bottom:7px solid var(--amber);flex:none;transform:translateY(1px)}
+.typn code{font-size:9.5px;color:var(--anno)}
+.motionz{font:400 9px/1.5 var(--mono);color:var(--faint);letter-spacing:.06em;margin-top:12px}
+/* ===== question banner ===== */
+.qban{margin:4px 0 8px;border:1px solid var(--line2);background:var(--panel);max-width:660px}
+.qbh{display:flex;gap:9px;align-items:baseline;padding:7px 14px;border-bottom:1px solid var(--line);
+  font:600 8.5px/1.4 var(--mono);letter-spacing:.2em;color:var(--faint);text-transform:uppercase}
+.qbh .rr{margin-left:auto;color:var(--muted)}
+.qbody{padding:12px 16px 13px}
+.qq{font:600 14.5px/1.4 var(--sans);color:var(--ink);max-width:60ch;margin-bottom:9px}
+.opt{display:flex;gap:11px;align-items:center;padding:8px 12px;border:1px solid var(--line);
+  margin-top:7px;font-size:13px;color:var(--ink);background:transparent;position:relative}
+.opt .qk{flex:none;font:700 9px/1 var(--mono);color:var(--anno);letter-spacing:.08em}
+.opt .on2{font-weight:600}
+.opt .od{color:var(--muted);font-size:11.5px;margin-left:4px}
+.opt .rdo{margin-left:auto;flex:none;width:15px;height:15px;border:1.5px solid var(--line2);
+  border-radius:50%;position:relative;align-self:center}
+.opt.sel{border-color:var(--anno);background:rgba(127,212,255,.05)}
+.opt.sel .rdo{border-color:var(--anno)}
+.opt.sel .rdo::after{content:"";position:absolute;inset:3px;border-radius:50%;background:var(--anno)}
+.qoth{display:flex;gap:9px;align-items:baseline;margin-top:8px;font-size:12px;color:var(--muted)}
+.qoth .oline{flex:1;border-bottom:1.5px dotted var(--line2);min-height:18px}
+.qfoot{display:flex;gap:12px;align-items:center;margin-top:12px}
+.qsub{font:700 10px/1 var(--mono);letter-spacing:.16em;color:var(--amber);border:1.5px solid var(--amber);
+  background:transparent;padding:10px 18px;text-transform:uppercase}
+.qhint{margin-left:auto;font:400 10px/1.4 var(--mono);color:var(--muted);letter-spacing:.05em}
+/* compaction card */
+.cmp{display:flex;gap:13px;align-items:center;max-width:660px;margin:4px 0 8px;
+  border:1px dashed var(--line2);padding:10px 15px;font:400 12.5px/1.5 var(--sans);color:var(--muted);
+  background:rgba(214,230,255,.02)}
+.cmp .cico{flex:none;font:700 8.5px/1.4 var(--mono);letter-spacing:.16em;color:var(--anno);text-transform:uppercase}
+.cmp b{color:var(--ink);font-weight:600}
+.cmp .mono{font-size:11.5px}
+/* queued strip */
+.queue{max-width:660px;border:1px solid var(--line2);background:var(--panel);margin:4px 0 8px}
+.qhd{padding:7px 14px;border-bottom:1px solid var(--line);font:600 8.5px/1.4 var(--mono);
+  letter-spacing:.2em;color:var(--faint);text-transform:uppercase;display:flex;gap:9px;align-items:baseline}
+.qhd .rr{margin-left:auto;color:var(--muted)}
+.qrw{display:flex;gap:10px;align-items:center;padding:8px 14px;border-bottom:1px solid var(--hair);
+  font:400 12.5px/1.5 var(--sans);color:var(--ink)}
+.qrw:last-child{border-bottom:0}
+.qn{flex:none;font:700 8.5px/1 var(--mono);letter-spacing:.14em;color:var(--amber)}
+.qx{margin-left:auto;color:var(--faint);font-size:13px;padding:2px 5px}
+.qx:hover{color:var(--red)}
+/* web search card */
+.srch{max-width:660px;border:1px solid var(--line2);background:var(--panel);margin:4px 0 8px;padding:11px 15px 12px}
+.srch .sh{display:flex;gap:9px;align-items:baseline;font:600 8.5px/1.4 var(--mono);letter-spacing:.2em;
+  color:var(--faint);text-transform:uppercase}
+.sq{font:400 12.5px/1.5 var(--mono);color:var(--ink);margin-top:7px}
+.ss{display:flex;gap:9px;flex-wrap:wrap;margin-top:9px}
+.ssl{display:inline-flex;gap:6px;align-items:center;font:600 11px/1.3 var(--sans);color:var(--anno);
+  border:1px solid var(--line2);background:var(--plate);padding:4px 11px;text-decoration:none}
+/* 3-new pill */
+.npwrap{position:relative;height:0}
+.npill{position:sticky;bottom:14px;display:block;width:max-content;margin:12px auto 0;z-index:3;
+  font:700 10.5px/1 var(--mono);letter-spacing:.14em;color:var(--amberink);background:var(--amber);
+  padding:9px 17px;border-radius:2px;box-shadow:var(--shadow);text-transform:uppercase}
+/* ===== composer — spec strip ===== */
+.cmptr{border-top:1.5px solid var(--line2);background:var(--panel);padding:12px 20px 11px}
+.cmpcap{display:flex;align-items:baseline;gap:9px;font:600 8px/1.4 var(--mono);letter-spacing:.24em;
+  color:var(--faint);text-transform:uppercase;margin-bottom:9px}
+.cmpcap::after{content:"";flex:1;border-top:1px solid var(--line)}
+.cmbox{border:1px solid var(--line2);background:var(--plate);padding:11px 15px 9px}
+.cmbox textarea{display:block;width:100%;border:0;background:transparent;resize:none;outline:none;
+  font:400 14px/1.5 var(--sans);color:var(--ink);padding:0 0 9px;border-bottom:1px solid var(--line)}
+.cmbox textarea:focus-visible{outline:none;border-bottom-color:var(--amber)}
+.cchips{margin-top:9px}
+.crow2{display:flex;gap:9px;align-items:center;margin-top:11px}
+.cbtn{width:33px;height:33px;display:grid;place-items:center;border:1px solid var(--line);
+  background:transparent;color:var(--muted);font-size:14px}
+.cbtn:hover{color:var(--ink);border-color:var(--line2)}
+.stopsq{font:700 9.5px/1 var(--mono);letter-spacing:.14em;color:var(--amber);border:1.5px solid var(--amber);
+  padding:9px 12px;text-transform:uppercase;background:transparent}
+.issue{margin-left:auto;display:flex;align-items:stretch;height:34px;cursor:pointer}
+.issue .ibd{display:grid;place-items:center;background:var(--amber);color:var(--amberink);
+  font:700 10.5px/1 var(--mono);letter-spacing:.18em;text-transform:uppercase;padding:0 14px 0 17px}
+.issue .tip{width:0;height:0;border-top:17px solid transparent;border-bottom:17px solid transparent;
+  border-left:13px solid var(--amber)}
+.chint{margin-top:9px;font:400 9.5px/1.5 var(--mono);color:var(--faint);letter-spacing:.05em}
+</style>
+<style>
+/* ============ sheet-index rail ============ */
+.rsec{margin-bottom:20px}
+.rh{display:flex;align-items:baseline;gap:8px;font:600 9px/1.4 var(--mono);letter-spacing:.18em;
+  color:var(--muted);text-transform:uppercase;border-bottom:1px solid var(--line2);
+  padding-bottom:5px;margin-bottom:7px}
+.rh .rn{color:var(--amber)}
+.rh .rr{margin-left:auto;font-weight:500;color:var(--faint);letter-spacing:.05em;text-transform:none}
+.drow{padding:7px 0 6px;border-bottom:1px dotted var(--hair);font-size:12px}
+.drow .fp{font:400 11px/1.5 var(--mono);color:var(--ink);overflow-wrap:anywhere}
+.drow .meta{display:flex;gap:9px;align-items:baseline;margin-top:2px}
+.drow .nums{font:500 10.5px/1.4 var(--mono)}
+.drow .pl{color:var(--ok)} .drow .mn{color:var(--red)}
+.drow .vl2{font:600 10.5px/1.3 var(--sans);color:var(--anno);text-decoration:none}
+.drow .xh{color:var(--faint);font-size:10px}
+.ckrow{display:flex;gap:9px;align-items:baseline;padding:6.5px 0;border-bottom:1px dotted var(--hair);
+  font-size:12px;color:var(--muted)}
+.ckb{font:700 11px/1.3 var(--mono);color:var(--ink)}
+.ckt{font:500 10px/1.3 var(--mono);color:var(--faint)}
+.ckr{margin-left:auto;font:600 10.5px/1.3 var(--sans);color:var(--anno);text-decoration:none}
+.ledger2{width:100%;border-collapse:collapse;font-size:11.5px}
+.ledger2 td{border-bottom:1px dotted var(--hair);padding:4.5px 0;font-variant-numeric:tabular-nums}
+.ledger2 td.L{color:var(--muted);font-weight:400}
+.ledger2 td.R{text-align:right;font:600 11.5px/1.4 var(--mono);color:var(--ink)}
+.ctx2{height:9px;border:1px solid var(--line);background:rgba(214,230,255,.07);position:relative;margin-top:8px}
+.ctx2 i{position:absolute;top:1px;bottom:1px;left:1px;width:59%;
+  background:repeating-linear-gradient(90deg,var(--anno) 0 5px,transparent 5px 10px)}
+.ctx2 .wt{position:absolute;top:-3px;bottom:-3px;left:80%;width:1.5px;background:var(--amber)}
+.ctx2n{font:400 10px/1.5 var(--sans);color:var(--faint);margin-top:5px}
+.ctx2n b{color:var(--amber);font-weight:600}
+.lrow{display:flex;gap:9px;align-items:baseline;padding:5.5px 0;border-bottom:1px dotted var(--hair);font-size:12px}
+.lrow .ltag{font:700 8.5px/1.4 var(--mono);letter-spacing:.1em;color:var(--faint)}
+.lrow .lnm{font-weight:600;color:var(--ink);overflow-wrap:anywhere}
+.lrow.kid{padding-left:16px}
+.lrow.kid .lnm{font-weight:400}
+.lmd{margin-left:auto;color:var(--faint);font-size:10px}
+/* drawer tab (<900px) */
+.drawertab{display:none}
+@media (max-width:900px){
+  .frame .split{grid-template-columns:1fr}
+  .frame .rail{display:none}
+  .frame .drawertab{display:flex;gap:8px;align-items:center;border-top:1px dashed var(--line);
+    padding:9px 26px;font:600 9px/1.4 var(--mono);letter-spacing:.2em;text-transform:uppercase;
+    color:var(--muted);background:var(--panel)}
+}
+</style>
+
+<style>
+/* ============ insets (part 2) ============ */
+.isets{display:grid;grid-template-columns:656px minmax(440px,1fr);gap:30px 38px;align-items:start}
+#d3-slash{grid-column:1;grid-row:1}
+#d3-mention{grid-column:1;grid-row:2}
+#d3-settings{grid-column:2;grid-row:1/3}
+.incol{min-width:0}
+/* slash — SCHEDULE TABLES */
+.sched{width:640px;max-width:100%;border:1.5px solid var(--line2);background:var(--sheet);box-shadow:var(--shadow)}
+.sc2h{display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--line2);
+  background:var(--panel)}
+.sc2h .dh2{font:600 9px/1.4 var(--mono);letter-spacing:.2em;color:var(--ink);text-transform:uppercase}
+.sflt{margin-left:auto;display:inline-flex;gap:6px;align-items:baseline;font:600 11.5px/1.4 var(--mono);
+  color:var(--ink);border:1px solid var(--anno);padding:3px 10px;background:var(--plate)}
+.sflt .cur{display:inline-block;width:7px;height:11px;background:var(--amber);vertical-align:-1px}
+.sflt .fc2{font-size:8.5px;color:var(--anno);letter-spacing:.14em}
+.sgrid{display:grid;grid-template-columns:1fr 1fr;column-gap:26px;padding:8px 18px 10px}
+.sgrp{padding-top:10px}
+.sgrp .gh{display:flex;gap:8px;align-items:baseline;font:600 8.5px/1.4 var(--mono);letter-spacing:.2em;
+  color:var(--faint);text-transform:uppercase;padding-bottom:2px}
+.sgrp .gh::after{content:"";flex:1;border-top:1px solid var(--line)}
+.scrow{display:block;width:100%;padding:6px 2px;border-bottom:1px dotted var(--hair);min-height:31px}
+.scrow .line1{display:flex;align-items:baseline;gap:8px}
+.scrow .cn{font:600 11.5px/1.5 var(--mono);color:var(--ink);flex:none}
+.scrow .cdot{flex:1;min-width:14px;border-bottom:1.5px dotted var(--line2);transform:translateY(-3px)}
+.scrow .cret{font:500 9px/1.5 var(--mono);color:var(--faint);flex:none}
+.scrow .cd2{display:block;font:400 11px/1.45 var(--sans);color:var(--muted);margin-top:1px}
+.scrow.mut{opacity:.34}
+.scrow.hit{background:rgba(255,180,84,.06);outline:1px dashed rgba(255,180,84,.5)}
+.scrow.hit .cn{color:var(--amber)}
+.sfoot{display:flex;gap:12px;align-items:center;border-top:1px solid var(--line2);padding:8px 18px;
+  font:400 10px/1.5 var(--mono);color:var(--muted);flex-wrap:wrap}
+.kk{font:600 9px/1 var(--mono);border:1px solid var(--line2);border-bottom-width:2px;padding:2.5px 6px;
+  background:var(--plate);color:var(--ink)}
+.sfoot .rr{margin-left:auto;color:var(--faint)}
+/* @ parts schedule */
+.parts{width:430px;max-width:100%;border:1.5px solid var(--line2);background:var(--sheet);box-shadow:var(--shadow)}
+.parts .qh{display:flex;gap:9px;align-items:baseline;padding:10px 16px;border-bottom:1px solid var(--line2);
+  background:var(--panel);font:600 11.5px/1.4 var(--mono);color:var(--muted)}
+.parts .qb{font:600 12px/1.4 var(--mono);color:var(--ink);border:1px solid var(--anno);background:var(--plate);
+  padding:2px 9px}
+.prow{display:flex;gap:10px;align-items:baseline;padding:9px 16px;border-bottom:1px solid var(--hair);
+  font:400 11.5px/1.5 var(--mono)}
+.prow .pn{color:var(--ink);overflow-wrap:anywhere}
+.prow .pk{margin-left:auto;flex:none;font:600 8px/1.5 var(--mono);letter-spacing:.14em;color:var(--faint);
+  text-transform:uppercase}
+.prow.sel{background:rgba(255,180,84,.07);outline:1px dashed rgba(255,180,84,.5)}
+.prow.sel .pn{color:var(--amber)}
+.pfoot{padding:8px 16px;font:400 9.5px/1.5 var(--mono);color:var(--faint);letter-spacing:.04em}
+/* revision settings panel */
+.revp{width:472px;max-width:100%;border:1.5px solid var(--line2);background:var(--sheet);box-shadow:var(--shadow)}
+.rv3h{display:flex;gap:10px;align-items:center;padding:10px 17px;border-bottom:1px solid var(--line2);
+  background:var(--panel)}
+.rv3h .dh3{font:600 9px/1.4 var(--mono);letter-spacing:.2em;color:var(--ink);text-transform:uppercase}
+.rv3h .rnote{margin-left:auto;font:500 8.5px/1.4 var(--mono);letter-spacing:.1em;color:var(--faint)}
+.rrow{display:flex;gap:12px;align-items:center;padding:10px 17px;border-bottom:1px dashed var(--hair);
+  font-size:13px;min-height:44px}
+.rrow .rl{flex:none;width:98px;font:600 10px/1.4 var(--mono);letter-spacing:.14em;color:var(--muted);
+  text-transform:uppercase}
+.rrow .rld{flex:1;border-bottom:1.5px dotted var(--line2);transform:translateY(-4px);min-width:14px}
+.rrow .rv{display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end;text-align:right}
+.seg{display:inline-flex;border:1px solid var(--line2);background:var(--plate)}
+.seg button{padding:6px 10px;font:600 11px/1.3 var(--sans);color:var(--muted);border-right:1px solid var(--hair);
+  min-height:30px;background:transparent}
+.seg button:last-child{border-right:0}
+.seg button:hover{color:var(--ink)}
+.seg button.on{background:var(--anno);color:var(--sheet);font-weight:700}
+.mdlrow{display:flex;gap:9px;align-items:center;border:1px solid var(--hair);background:var(--plate);
+  padding:7px 11px;margin-top:6px;width:100%;font-size:12.5px;color:var(--ink)}
+.mdlrow .rdt{width:13px;height:13px;flex:none;border:1.5px solid var(--line2);border-radius:50%;position:relative}
+.mdlrow.on{outline:1.5px solid var(--anno)}
+.mdlrow.on .rdt{border-color:var(--anno)}
+.mdlrow.on .rdt::after{content:"";position:absolute;inset:2.5px;border-radius:50%;background:var(--anno)}
+.mdlrow .mmut{color:var(--muted);font-size:11px;margin-left:auto}
+.switch{width:32px;height:16px;flex:none;border:1px solid var(--line2);position:relative;background:transparent}
+.switch::after{content:"";position:absolute;top:2px;left:2px;width:10px;height:10px;background:var(--muted)}
+.switch.on{border-color:var(--anno);background:rgba(127,212,255,.12)}
+.switch.on::after{left:auto;right:2px;background:var(--anno)}
+.switch:not(.on){background:repeating-linear-gradient(45deg,rgba(214,230,255,.07) 0 3px,transparent 3px 6px)}
+.advgrp{padding:4px 17px 10px}
+.advr{display:flex;gap:10px;align-items:baseline;padding:7px 0;border-bottom:1px dotted var(--hair);
+  font-size:12.5px;color:var(--muted)}
+.advr:last-child{border-bottom:0}
+.advr .anm{color:var(--ink)}
+.advr .ago{margin-left:auto;font:500 9.5px/1.4 var(--mono);color:var(--faint);letter-spacing:.06em}
+.gearline{padding:9px 17px;border-bottom:1px solid var(--line);display:flex;gap:9px;align-items:center;
+  font:500 10px/1.4 var(--mono);color:var(--faint)}
+.gearline .gib{width:26px;height:26px;display:grid;place-items:center;border:1px solid var(--anno);
+  color:var(--anno);font-size:13px}
+</style>
+
+<style>
+/* ============ phone frames (part 3) ============ */
+.phwrap{display:flex;gap:34px;flex-wrap:wrap;align-items:flex-start}
+.phone{width:390px;flex:none;background:var(--sheet);border:1.5px solid var(--line2);
+  box-shadow:var(--shadow);display:flex;flex-direction:column;overflow:hidden;position:relative}
+.phone.h844{height:844px}
+.phone.h560{height:560px}
+.pnotch{height:12px;flex:none;background:var(--gridtable);border-bottom:1px solid var(--hair);
+  display:grid;place-items:center}
+.pnotch i{width:66px;height:4px;border-radius:2px;background:var(--line2)}
+.ptabs{display:flex;gap:4px;padding:7px 10px 0;border-bottom:1px solid var(--line2);background:var(--panel);
+  overflow-x:auto;scrollbar-width:none}
+.ptabs::-webkit-scrollbar{display:none}
+.ptab{display:flex;gap:6px;align-items:center;flex:none;height:28px;padding:0 10px;border:1px solid transparent;
+  border-bottom:0;font:600 11px/1 var(--sans);color:var(--muted)}
+.ptab.on{color:var(--ink);background:var(--sheet);border-color:var(--line2);position:relative}
+.ptab .tno{font-size:8px;color:var(--faint);font-family:var(--mono)}
+.ph{display:flex;gap:9px;align-items:center;padding:9px 13px 8px;border-bottom:1px solid var(--line);flex:none}
+.ph .ttl{font:600 12.5px/1.3 var(--sans);color:var(--ink);min-width:0;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.ph .ib2{margin-left:auto;width:26px;height:26px;display:grid;place-items:center;border:1px solid var(--line);
+  color:var(--muted);flex:none;font-size:13px}
+.phrow2{display:flex;gap:7px;align-items:center;flex-wrap:wrap;padding:0 13px 9px;flex:none}
+.pchip{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--line2);padding:2px 7px;
+  font:600 9.5px/1.4 var(--sans);color:var(--ink);background:var(--panel)}
+.pchip i{width:8px;height:8px;background:var(--coral)}
+.plive{display:inline-flex;align-items:center;gap:6px;font:600 9px/1.4 var(--mono);letter-spacing:.1em;
+  color:var(--muted);text-transform:uppercase}
+.pcost{font:600 9.5px/1 var(--mono);color:var(--amber);border:1px solid rgba(255,180,84,.5);padding:3px 7px;
+  white-space:nowrap;background:rgba(255,180,84,.05)}
+.pchiprow{display:flex;gap:5px;overflow-x:auto;padding:7px 12px;border-bottom:1px solid var(--line);
+  flex:none;scrollbar-width:none}
+.pchiprow::-webkit-scrollbar{display:none}
+.pchip2{flex:none;font:500 9px/1.6 var(--mono);color:var(--muted);border:1px solid var(--hair);
+  padding:2.5px 8px;letter-spacing:.03em}
+.pchip2 b{color:var(--ink)}
+.pbody{flex:1;min-height:0;overflow:hidden;padding:11px 13px 8px;position:relative}
+.pidim{display:flex;gap:9px;align-items:baseline;margin:13px 0 5px;font:700 8px/1.4 var(--mono);
+  letter-spacing:.2em;text-transform:uppercase;color:var(--anno)}
+.pidim::before{content:"";width:14px;height:1px;background:var(--anno);align-self:center}
+.pidim .pdt{color:var(--faint);font-weight:500}
+.ptn{margin-bottom:4px}
+.pnm{font:700 8.5px/1.3 var(--mono);letter-spacing:.18em;text-transform:uppercase;color:var(--muted)}
+.pnm.a{color:var(--coral)}
+.ptxt{font-size:12.5px;line-height:1.5;max-width:none}
+.pthk{margin-top:6px;border:1px dashed var(--line2);padding:5px 9px;font:500 9.5px/1.4 var(--mono);
+  color:var(--muted);letter-spacing:.06em}
+.pdet{margin-top:6px;display:flex;gap:7px;align-items:center;border:1px solid var(--line);padding:6px 9px;
+  font:600 8.5px/1.4 var(--mono);letter-spacing:.1em;color:var(--muted)}
+.pdet b{color:var(--ink)}
+.pdiff{position:relative;border:1px solid var(--line2);background:var(--plate);margin-top:7px;overflow:hidden}
+.pdh{display:flex;gap:7px;align-items:baseline;padding:4px 9px;border-bottom:1px solid var(--line);
+  font:600 7.5px/1.5 var(--mono);letter-spacing:.18em;color:var(--faint);text-transform:uppercase}
+.pdr{display:flex;gap:7px;padding:1.5px 9px;font:400 9px/1.5 var(--mono);white-space:pre;min-width:0}
+.pdwrap{overflow-x:auto;scrollbar-width:none}
+.pdwrap::-webkit-scrollbar{display:none}
+.pdr .sgn{flex:none;width:8px;color:var(--faint)}
+.pdr.del{background:rgba(255,122,110,.07)}
+.pdr.del .cd{color:var(--red);text-decoration:line-through;text-decoration-thickness:1px}
+.pdr.add{background:rgba(255,180,84,.05)}
+.pdr.add .cd{color:var(--ink)}
+.pnew{position:absolute;right:12px;bottom:104px;z-index:3;font:700 9px/1 var(--mono);letter-spacing:.12em;
+  color:var(--amberink);background:var(--amber);padding:7px 12px;border-radius:2px;box-shadow:var(--shadow);
+  text-transform:uppercase}
+/* phone approval cloud — full bleed */
+.pcloud{position:relative;margin:12px -13px 0;padding:0 0 4px}
+.pcloud svg.cloud{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.pcldi{padding:16px 16px 14px;position:relative}
+.pstamps{display:grid;gap:9px;margin-top:12px}
+.pstamp{min-height:52px;display:grid;place-items:center;text-align:center;border:2px solid;background:none;
+  font:700 12.5px/1.25 var(--sans);letter-spacing:.16em;text-transform:uppercase;padding:9px 14px}
+.pstamp small{display:block;font:400 9px/1.3 var(--mono);letter-spacing:.1em;color:var(--muted);
+  text-transform:none;margin-top:2px}
+.pstamp.ap{border-color:var(--amber);color:var(--amber);box-shadow:inset 0 0 0 1.5px rgba(255,180,84,.35)}
+.pstamp.st{border-color:var(--muted);color:var(--ink);box-shadow:inset 0 0 0 1.5px rgba(147,167,201,.3)}
+.pstamp.re{border-color:var(--red);color:var(--red);box-shadow:inset 0 0 0 1.5px rgba(255,122,110,.35)}
+/* phone composer */
+.pcmp{margin-top:auto;flex:none;border-top:1.5px solid var(--line2);background:var(--panel);
+  padding:9px 12px calc(10px + 6px)}
+.pcmpta{display:block;width:100%;border:0;background:transparent;resize:none;outline:none;
+  font:400 12.5px/1.5 var(--sans);color:var(--ink);padding:0 0 8px;border-bottom:1px solid var(--line)}
+.pcmrow{display:flex;gap:7px;align-items:center;margin-top:9px}
+.pcmrow .cbtn{width:44px;height:44px;font-size:16px}
+.pcmstop{font:700 9px/1 var(--mono);letter-spacing:.12em;color:var(--amber);border:1.5px solid var(--amber);
+  padding:0 11px;height:44px;text-transform:uppercase;background:transparent}
+.pissue{margin-left:auto;height:44px;display:flex;align-items:stretch}
+.pissue .ibd{display:grid;place-items:center;background:var(--amber);color:var(--amberink);
+  font:700 10px/1 var(--mono);letter-spacing:.16em;padding:0 10px 0 15px;text-transform:uppercase}
+.pissue .tip{width:0;height:0;border-top:22px solid transparent;border-bottom:22px solid transparent;
+  border-left:13px solid var(--amber)}
+.safeb{height:12px;display:grid;place-items:center}
+.safeb i{width:126px;height:4.5px;border-radius:2.5px;background:var(--line2)}
+/* bottom sheets demo */
+.scrimback{position:absolute;inset:0;background:rgba(10,23,46,.55);display:grid;place-items:center;
+  font:500 10px/1.5 var(--mono);color:var(--faint);letter-spacing:.1em;z-index:1}
+.bsheet{position:absolute;left:0;right:0;bottom:0;z-index:2;background:var(--panel);
+  border-top:1.5px solid var(--line2);padding:8px 0 6px;max-height:92%}
+.bsheet.full{top:26px}
+.grab{width:38px;height:4px;border-radius:2px;background:var(--line2);margin:2px auto 9px}
+.bhd{display:flex;gap:9px;align-items:baseline;padding:0 16px 8px;border-bottom:1px solid var(--line);
+  font:600 8.5px/1.5 var(--mono);letter-spacing:.2em;text-transform:uppercase;color:var(--muted)}
+.bhd .tm{color:var(--faint);margin-left:auto;font-weight:500;letter-spacing:.06em}
+.brow{display:flex;gap:12px;align-items:center;width:100%;padding:13px 16px;min-height:52px;
+  border-bottom:1px solid var(--hair);font:400 14px/1.4 var(--sans);color:var(--ink);background:transparent}
+.brow .gi{flex:none;width:19px;text-align:center;color:var(--anno);font-size:14px}
+.brow .gk{margin-left:auto;font:500 9.5px/1.4 var(--mono);color:var(--faint);letter-spacing:.06em}
+.brow.red{color:var(--red)}
+.brow.red .gi{color:var(--red)}
+.brow.can{justify-content:center;font:600 10px/1 var(--mono);letter-spacing:.2em;color:var(--muted);
+  text-transform:uppercase}
+.slg{display:block;width:100%;padding:12px 16px;border-bottom:1px solid var(--hair);
+  font:400 11.5px/1.4 var(--sans);color:var(--muted);background:transparent;min-height:52px;text-align:left}
+.slg .scN{font:700 13px/1.4 var(--mono);color:var(--ink)}
+.slg .scd{color:inherit;font-size:11.5px}
+.slg .sg2{font:600 7.5px/1.6 var(--mono);letter-spacing:.18em;color:var(--faint);text-transform:uppercase;
+  display:inline-block;margin-right:8px}
+/* settings sheet rows */
+.sr2{display:flex;gap:11px;align-items:center;padding:10px 16px;border-bottom:1px dashed var(--hair);
+  min-height:42px;font-size:12.5px}
+.sr2 .rl{flex:none;width:86px;font:600 9px/1.4 var(--mono);letter-spacing:.12em;color:var(--muted);
+  text-transform:uppercase}
+.sr2 .rld{flex:1;border-bottom:1.5px dotted var(--line2);transform:translateY(-3px);min-width:10px}
+.sr2 .rv{display:flex;gap:6px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+/* ============ trace swatch (part 3) ============ */
+.altz{background:var(--gridtable);border:1.5px solid var(--line2);padding:22px;margin-top:6px}
+.altz .tilerow{display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start}
+.altz .tile{width:400px;max-width:100%}
+.trace .frame2{border:1.5px solid var(--line2);background:var(--sheet);box-shadow:none}
+/* ============ footer ============ */
+.foot{margin-top:44px;border:1.5px solid var(--line2);background:var(--sheet);position:relative;padding:30px 40px}
+.foot .fh{display:flex;gap:11px;align-items:baseline;font:700 11px/1.3 var(--sans);letter-spacing:.22em;
+  color:var(--ink);text-transform:uppercase;margin-bottom:16px}
+.foot .fh::after{content:"";flex:1;border-top:1px solid var(--line)}
+.foot dl{font-size:13.5px;line-height:1.65}
+.foot dt{font:700 9px/1.4 var(--mono);letter-spacing:.2em;text-transform:uppercase;color:var(--aac,var(--anno));
+  margin-top:14px}
+.foot dd{margin:3px 0 0;color:var(--muted);max-width:72ch}
+.foot dd b{color:var(--ink)}
+.foot .sig{margin-top:20px;font:500 9.5px/1.5 var(--mono);letter-spacing:.12em;color:var(--faint);
+  text-transform:uppercase;border-top:1px dashed var(--hair);padding-top:12px}
+
+/* sheet demos ride next to the master phone at 1500px — no wrap void */
+@media (min-width:1350px){
+  .phone.demo{width:320px}
+  .phwrap{gap:26px}
+}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<!-- ============ A · MASTHEAD ============ -->
+<section class="sheetsec" style="margin-top:0" aria-label="Masthead, design 3 of 6">
+<header class="mast gridbg">
+  <span class="reg tl" aria-hidden="true"><i></i></span><span class="reg tr" aria-hidden="true"><i></i></span>
+  <span class="reg bl" aria-hidden="true"><i></i></span><span class="reg br" aria-hidden="true"><i></i></span>
+  <div class="dwgno">DWG NO. D3 · SCALE 1:1 · FRESH-AGENT UX STUDY, FRESHELL · DESIGN 3 OF 6</div>
+  <h1>Draft</h1>
+  <p class="subt">The session as a working drawing. Every turn is <b>dimensioned</b>,
+    every tool call is a <b>detail callout</b>, every approval waits inside a <b>redline revision cloud</b> —
+    the sheet always knows what changed, by how much, and where.</p>
+  <div class="mastmeta">
+    <span>Ground <b>#12294d</b></span><span>Annotation <b>#7fd4ff</b></span>
+    <span>Action <b>#ffb454</b></span><span>Redline <b>#ff7a6e</b></span>
+    <span>Type <b>Overpass · Chivo Mono</b></span><span>Alt <b>trace paper</b></span>
+  </div>
+  <div style="display:flex;justify-content:space-between;align-items:center;gap:16px;margin-top:18px;
+    font:400 11px/1.5 ui-sans-serif,system-ui,sans-serif;color:#778091">
+    <span>Design 3 of 6 · fresh-agent UX study · Freshell</span>
+    <a href="/" style="color:#5f6b80;text-underline-offset:3px">← all designs</a>
+  </div>
+</header>
+<p class="cap">Masthead · display sample — DRAFT in Overpass 700 with a flat double-stroke outline, drawing-sheet border, corner registration marks, live grid.</p>
+</section>
+
+<!-- ============ B · DESKTOP FRAME ============ -->
+<section class="sheetsec" aria-label="Desktop app frame, roughly 1440 pixels">
+<h2 class="vh">Desktop app frame</h2>
+<p class="cap"><b>Desktop · 1440px</b> — the open sheet: index tabs across the top, then the architectural title block (PROJECT / SHEET / DRAWN BY / REV / DATE / OPS), the dimension strip, a dimensioned transcript, the sheet-index rail, and the spec-strip composer.</p>
+
+<div class="frame gridbg" id="d3-desk">
+  <span class="reg tl" aria-hidden="true"><i></i></span><span class="reg tr" aria-hidden="true"><i></i></span>
+
+  <div class="fbar" aria-hidden="true">
+    <span class="fd"></span><span class="fd"></span><span class="fd"></span>
+    <span class="furl">127.0.0.1:3001/?token=••••••••</span>
+    <span>localhost · sheet on table</span>
+  </div>
+
+  <nav class="tabs" aria-label="Open sheets">
+    <button class="tab on" title="Trace dropped messages on background tabs"><span class="tno">S.01</span><span class="busyd" title="busy"></span><span class="tt">⚡ Trace dropped messages on background tabs</span></button>
+    <button class="tab" title="npm run dev"><span class="tno">S.02</span><span class="tt">⌨ npm run dev</span></button>
+    <button class="tab" title="Scrollback parser"><span class="tno">S.03</span><span class="tt">◉ Scrollback parser</span><span class="attn" title="needs attention"></span></button>
+    <button class="tabadd" aria-label="New sheet">+</button>
+  </nav>
+
+  <!-- TITLE BLOCK -->
+  <div class="tblock" role="group" aria-label="Pane title block">
+    <div class="tcell">
+      <span class="tl5"><span class="ttick">┤</span>Project</span>
+      <span class="tv5 mono5">~/code/freshell<span class="sub">fix/ws-reconnect · +2 files</span></span>
+    </div>
+    <div class="tcell">
+      <span class="tl5"><span class="ttick">┤</span>Sheet</span>
+      <span class="tv5">Trace dropped messages on background tabs<span class="sub">id 01JRV6…KQ3M · 24m · live</span></span>
+    </div>
+    <div class="tcell">
+      <span class="tl5"><span class="ttick">┤</span>Drawn by</span>
+      <span class="tv5"><span class="pvc"><i></i>freshclaude</span><span class="sub">Claude Opus 4.6 · effort High</span></span>
+    </div>
+    <div class="tcell">
+      <span class="tl5"><span class="ttick">┤</span>Rev</span>
+      <span class="tv5"><span class="rev"><svg width="17" height="15" viewBox="0 0 17 15" aria-hidden="true"><path d="M8.5 1.5 L16 13.5 H1 Z" fill="none" stroke="var(--anno)" stroke-width="1.2"/><text x="8.5" y="11.4" text-anchor="middle" font-family="Chivo Mono" font-size="6.2" font-weight="700" fill="var(--anno)">b3</text></svg>b3</span><span class="sub">14:31 ckpt</span></span>
+    </div>
+    <div class="tcell">
+      <span class="tl5"><span class="ttick">┤</span>Date</span>
+      <span class="tv5 mono5">14:02<span class="sub">started</span></span>
+    </div>
+    <div class="tcell" style="border-right:0;gap:7px">
+      <span class="tl5"><span class="ttick">┤</span>Ops · state</span>
+      <div class="tops">
+        <span class="tstate"><span class="busyd" title="busy"></span>Working…</span>
+        <span class="costc">$1.38</span>
+        <button class="ib" aria-label="Diffs — 3 files changed">⎘<span class="bdg">3</span></button>
+        <button class="ib" aria-label="Settings">⚙</button>
+        <button class="ib" aria-label="Refresh">⟳</button>
+        <button class="ib" aria-label="Fullscreen">⛶</button>
+        <button class="ib" aria-label="Close pane">✕</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- status line -->
+  <div class="sline" aria-label="Session datum strip">
+    <span><b>~/code/freshell</b></span><span class="sep">·</span>
+    <span><b>fix/ws-reconnect+2</b></span><span class="sep">·</span>
+    <span>Opus 4.6</span><span class="sep">·</span>
+    <span>effort <b>High</b></span><span class="sep">·</span>
+    <span>Ask</span><span class="sep">·</span>
+    <span class="gauge"><span class="gbar" role="img" aria-label="Context 59 percent"><i></i><span class="wt"></span></span><b>59%</b></span><span class="sep">·</span>
+    <span><b>$1.38</b></span><span class="sep">·</span>
+    <span style="color:var(--faint)">ctx 118,200 / 200,000 · 84.2k↑ / 9.6k↓ · $3.45/h</span>
+  </div>
+
+  <div class="split">
+    <!-- ===== dimensioned transcript ===== -->
+    <div class="tran" aria-label="Transcript, dimensioned">
+      <div class="jh"><a class="jchip" href="#d3-desk">↩ jump back to 14:07 · you were here</a></div>
+
+      <!-- TURN 1 — user -->
+      <section class="turn" aria-label="Your turn, 14:07">
+        <div class="dim" aria-hidden="true"><span class="xt t"></span><span class="dln"></span><span class="dlb">0:00</span><span class="xt b"></span></div>
+        <div>
+          <div class="who">
+            <span class="nm">You</span>
+            <time class="mono">14:07</time>
+            <span class="hact"><button>copy</button><button>fork</button><button>rewind</button><button aria-label="More turn actions">⋯</button></span>
+          </div>
+          <p class="msg">the reconnect loop is still dropping messages when the tab&rsquo;s in the background. can you trace where the heartbeat dies?</p>
+        </div>
+      </section>
+
+      <!-- TURN 2 — agent with 4 callouts -->
+      <section class="turn" aria-label="Claude, 14:07, with tool callouts">
+        <div class="dim" aria-hidden="true"><span class="xt t"></span><span class="dln"></span><span class="dlb">0:42</span><span class="xt b"></span></div>
+        <div>
+          <div class="who">
+            <span class="nm agent">Claude</span><span class="mdl5">Opus 4.6</span>
+            <span class="dlb2 mono" style="font-size:9.5px;color:var(--faint);letter-spacing:.08em">9.6k out</span>
+            <time class="mono">14:07</time>
+            <span class="hact"><button>copy</button><button>fork</button><button>rewind</button><button aria-label="More turn actions">⋯</button></span>
+          </div>
+          <div class="msg">
+            <p>Found it. The heartbeat is 15s, but background tabs throttle timers to ≥60s — so the pings gap out, the server sees a dead socket, and closes it during reconnect.</p>
+            <p>Proposed fix: beat at <b>5s</b> and add a pong watchdog on the server — if 12s passes with no pong, mark the socket dead instead of waiting for the client.</p>
+          </div>
+          <details class="think">
+            <summary>Thought for 12s <span class="tk5">reference</span></summary>
+            <div class="thb">Timer clamping matches the symptom: drops only while the tab is unfocused. Server log shows close-frames 60–75s after the last pong. A 5s beat survives the worst clamp; watchdog covers the rest.</div>
+          </details>
+
+          <!-- CALLOUT GROUP -->
+          <div class="dcalls" aria-label="Tool callouts, details A through D">
+            <div class="dch"><span>DETAIL CALLOUTS — SHEET S.01</span><span class="cnt">4 entries · A–D</span></div>
+            <details class="dc">
+              <summary><span class="sm">A</span><span class="did">Detail A</span><span class="dtl">Read</span>
+                <span class="darg">server/ws-handler.ts</span>
+                <span class="dmeta">1,204 lines <b class="dok">✓</b></span></summary>
+              <div class="dx"><span class="out">Read 1,204 lines — heartbeat constants at L41–L58, socket close path at L212.</span></div>
+            </details>
+            <details class="dc">
+              <summary><span class="sm">B</span><span class="did">Detail B</span><span class="dtl">Grep</span>
+                <span class="darg">&ldquo;heartbeat&rdquo; in server/</span>
+                <span class="dmeta">7 matches <b class="dok">✓</b></span></summary>
+              <div class="dx"><span class="out">7 matches across 3 files: ws-handler.ts (4) · terminal-registry.ts (2) · index.ts (1).</span></div>
+            </details>
+            <details class="dc">
+              <summary><span class="sm">C</span><span class="did">Detail C</span><span class="dtl">Bash</span>
+                <span class="darg">npm run test:vitest -- run test/unit/ws-heartbeat.test.ts</span>
+                <span class="dmeta"><b>14 passed (2.1s)</b> <b class="dok">✓</b></span></summary>
+              <div class="dx"><span class="out"><b>✓ ws-heartbeat.test.ts — 14 passed (2.1s)</b></span></div>
+            </details>
+            <details class="dc" open>
+              <summary><span class="sm">D</span><span class="did">Detail D</span><span class="dtl">Edit</span>
+                <span class="darg">server/ws-handler.ts</span>
+                <span class="dmeta"><b class="dpl">+12</b> <b class="dmn">−4</b> <b class="dok">✓</b></span></summary>
+              <div class="dx">
+                <div class="dwin" role="img" aria-label="Diff: heartbeat interval 15000 becomes 5000, comment about background tab throttling, lastPongAt initialized zero">
+                  <span class="ck tl"></span><span class="ck tr"></span><span class="ck bl"></span><span class="ck br"></span>
+                  <div class="dwhead"><span>DETAIL D — EDIT · SHEET SECTION</span><span class="fw">server/ws-handler.ts</span></div>
+                  <div class="dwr del"><span class="sgn">−</span><code class="cd">const HEARTBEAT_INTERVAL = 15_000;</code>
+                    <button class="lncmt">✎ note</button></div>
+                  <div class="dwr add"><span class="sgn">+</span><code class="cd">const HEARTBEAT_INTERVAL = 5_000;</code><span class="ldr"></span><span class="dnote">+12 −4</span>
+                    <button class="lncmt">✎ note</button></div>
+                  <div class="dwr add"><span class="sgn">+</span><code class="cd">// background-tab timers throttle to ~60s; beat fast enough to survive</code><span class="ldr"></span>
+                    <button class="lncmt">✎ note</button></div>
+                  <div class="dwr add"><span class="sgn">+</span><code class="cd">let lastPongAt = 0;</code><span class="ldr"></span>
+                    <button class="lncmt">✎ note</button></div>
+                </div>
+                <div class="dxnote">† struck lines removed · amber leaders on inserts · ✎ note leaves a per-line comment to the agent on the next turn.</div>
+              </div>
+            </details>
+          </div>
+
+          <!-- settled strip -->
+          <div class="settled" role="note" aria-label="Settled activity summary">
+            <span class="ssec">TOTAL</span><span><b>4 TOOLS · 2 FILES · 12s</b></span>
+            <span style="margin-left:auto">thought 12s · 4 tools used · 2 files changed</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- TURN 3 — user with attachments -->
+      <section class="turn" aria-label="Your turn with attachments, 14:12">
+        <div class="dim" aria-hidden="true"><span class="xt t"></span><span class="dln"></span><span class="dlb">5m</span><span class="xt b"></span></div>
+        <div>
+          <div class="who">
+            <span class="nm">You</span>
+            <time class="mono">14:12</time>
+            <span class="hact"><button>copy</button><button>fork</button><button>rewind</button><button aria-label="More turn actions">⋯</button></span>
+          </div>
+          <div class="atts" aria-label="Attachments">
+            <span class="attchip"><span class="ath" role="img" aria-label="image thumbnail"></span>screenshot.png<span class="aext">212 KB</span></span>
+            <span class="attchip"><span class="afi" aria-hidden="true"><i></i><i></i><i></i><i></i></span>logs.txt<span class="aext">18 KB</span></span>
+          </div>
+          <p class="msg">here&rsquo;s what the console shows when it dies</p>
+        </div>
+      </section>
+
+      <!-- TURN 4 — streaming -->
+      <section class="turn" aria-label="Claude, streaming, 14:13">
+        <div class="dim" aria-hidden="true"><span class="xt t"></span><span class="dln"></span><span class="dlb">live</span><span class="xt b"></span></div>
+        <div>
+          <div class="who">
+            <span class="nm agent">Claude</span><span class="mdl5">Opus 4.6</span>
+            <time class="mono">14:13</time>
+            <span class="hact"><button>copy</button><button aria-label="More turn actions">⋯</button></span>
+          </div>
+          <p class="msg">So the watchdog needs to live in the server, and the client should—<span class="caret" aria-hidden="true"></span></p>
+          <div class="livest" aria-label="Live activity">
+            <svg class="arc" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.5" fill="none" stroke="var(--line2)" stroke-width="1.6"/><path d="M8 1.5 A6.5 6.5 0 0 1 14.5 8" fill="none" stroke="var(--anno)" stroke-width="1.6"/></svg>
+            <span>Running Edit — server/ws-handler.ts</span>
+            <span style="color:var(--faint);letter-spacing:.06em;text-transform:none">DETAIL E in progress</span>
+            <button class="stopb">Stop</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- REVISION CLOUD — approval -->
+      <section class="turn red" aria-label="Approval requested, revision b4 pending">
+        <div class="dim" aria-hidden="true"><span class="xt t"></span><span class="dln"></span><span class="dlb">hold</span><span class="xt b"></span></div>
+        <div>
+          <div class="who">
+            <span class="nm" style="color:var(--red)">REV b4</span><span class="mdl5">pending — hold the presses</span>
+            <time class="mono">14:13</time>
+          </div>
+          <div class="cloudw">
+            <svg class="cloud" viewBox="0 0 480 240" preserveAspectRatio="none" aria-hidden="true">
+              <path d="M12 12 a12 12 0 0 1 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 a12 12 0 0 1 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 a12 12 0 0 1 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 a12 12 0 0 1 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 z" transform="translate(3 2.5)" fill="none" stroke="#a04a40" stroke-width="1.6"/><path d="M12 12 a12 12 0 0 1 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 a12 12 0 0 1 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 a12 12 0 0 1 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 a12 12 0 0 1 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 z" fill="none" stroke="var(--red)" stroke-width="1.5"/>
+            </svg>
+            <div class="cld">
+              <div class="clhead">
+                <svg class="dtri" viewBox="0 0 52 46" aria-hidden="true"><path d="M26 5 L47 40 H5 Z" fill="none" stroke="var(--red)" stroke-width="1.8"/><text x="26" y="32" text-anchor="middle" font-family="Chivo Mono" font-size="13" font-weight="700" fill="var(--red)">b4</text></svg>
+                <div>
+                  <div class="clT">△ REV b4 — pending</div>
+                  <div class="clS">redline cloud · proposed change · tool Bash</div>
+                </div>
+                <time class="tm">proposed 14:13</time>
+              </div>
+              <div class="ccmd"><span class="tg">Bash</span><code>rm -rf .worktrees/refresh-*</code></div>
+              <p class="cwhy">Reason for the request: <b>Deletes 3 stale worktrees.</b></p>
+              <p class="cwarn"><svg width="16" height="14" viewBox="0 0 16 14" aria-hidden="true"><path d="M8 1.5 L15 12.5 H1 Z" fill="none" stroke="var(--red)" stroke-width="1.4"/><line x1="8" y1="5.2" x2="8" y2="8.6" stroke="var(--red)" stroke-width="1.5"/><circle cx="8" cy="10.6" r=".85" fill="var(--red)"/></svg>This command permanently deletes files.</p>
+              <div class="cbtns">
+                <button class="stamp ap">Approved<small>Allow once — this command only</small></button>
+                <button class="stamp re">Rejected<small>Deny — nothing runs</small></button>
+                <span class="typn"><span class="tr" aria-hidden="true"></span>TYP. note — <span style="color:var(--ink)">Always allow <code>Bash</code> this session</span></span>
+              </div>
+              <div class="motionz">motion note — cloud draws on via clip-path, 300ms, once · stamps press 100ms · reduced-motion renders all static</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- QUESTION banner -->
+      <section class="turn" aria-label="Question from the agent, 14:13">
+        <div class="dim" aria-hidden="true"><span class="xt t"></span><span class="dln"></span><span class="dlb">wait</span><span class="xt b"></span></div>
+        <div>
+          <div class="qban" role="group" aria-label="AskUserQuestion survey">
+            <div class="qbh"><span>AskUserQuestion — survey flag</span><span class="rr">1 of 1 on this sheet</span></div>
+            <div class="qbody">
+              <p class="qq">How should the client catch up after reconnect?</p>
+              <div role="radiogroup" aria-label="Catch-up strategy">
+                <button class="opt"><span class="qk">q1</span><span><span class="on2">Replay buffer only</span><span class="od">— cheapest; gaps stay gaps</span></span><span class="rdo" aria-hidden="true"></span></button>
+                <button class="opt sel"><span class="qk">q2</span><span><span class="on2">Full snapshot if gap &gt; 5s</span><span class="od">— the survey leads here</span></span><span class="rdo" aria-hidden="true"></span></button>
+                <button class="opt"><span class="qk">q3</span><span><span class="on2">Always resync</span><span class="od">— safest, heaviest payload</span></span><span class="rdo" aria-hidden="true"></span></button>
+              </div>
+              <label class="qoth">Other&hellip; <span class="oline" aria-hidden="true"></span></label>
+              <div class="qfoot">
+                <button class="qsub">Submit the survey</button>
+                <span class="qhint">single-select · the answer posts to this turn</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- COMPACTION -->
+      <section class="turn" aria-label="Context compaction note, 14:26">
+        <div class="dim" aria-hidden="true"><span class="xt t"></span><span class="dln"></span><span class="dlb">zoom</span><span class="xt b"></span></div>
+        <div>
+          <div class="cmp" role="note" aria-label="Context compacted">
+            <span class="cico">Rescale note</span>
+            <span><b>Context compacted</b> · <span class="mono">41,203 → 12,850</span> tokens · full transcript preserved</span>
+          </div>
+
+          <!-- queued strip -->
+          <div class="queue" aria-label="Queued while busy, two messages">
+            <div class="qhd"><span>Queued while busy — held at the rail</span><span class="rr">2 waiting</span></div>
+            <div class="qrw"><span class="qn">q1</span>also bump the client backoff cap
+              <button class="qx" aria-label="Remove queued message: also bump the client backoff cap">✕</button></div>
+            <div class="qrw"><span class="qn">q2</span>then update AGENTS.md
+              <button class="qx" aria-label="Remove queued message: then update AGENTS.md">✕</button></div>
+          </div>
+
+          <!-- web search card -->
+          <div class="srch" aria-label="Web search reference">
+            <div class="sh"><span>Reference — web search, pinned to the sheet</span>
+              <span class="rr" style="margin-left:auto;color:var(--muted);font-weight:500;text-transform:none;letter-spacing:0">2 sources</span></div>
+            <p class="sq">&ldquo;browser background tab timer throttling&rdquo;</p>
+            <div class="ss">
+              <a class="ssl" href="#d3-desk">MDN — setTimeout clamping</a>
+              <a class="ssl" href="#d3-desk">Chrome for Developers — timer throttling</a>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <div class="npwrap" aria-hidden="false">
+        <button class="npill">3 new ↓</button>
+      </div>
+    </div>
+
+    <!-- ===== SHEET-INDEX RAIL ===== -->
+    <aside class="rail" aria-label="Sheet index">
+      <div class="rsec">
+        <h4 class="rh"><span class="rn">§A</span> Diffs schedule <span class="rr">3 changed</span></h4>
+        <div class="drow">
+          <div class="fp">server/ws-handler.ts</div>
+          <div class="meta"><span class="nums"><span class="pl">+12</span> <span class="mn">−4</span></span>
+            <a class="vl2" href="#d3-desk">view ↗</a><span class="xh">✎ per-line note</span></div>
+        </div>
+        <div class="drow">
+          <div class="fp">test/unit/ws-heartbeat.test.ts</div>
+          <div class="meta"><span class="nums"><span class="pl">+9</span> <span class="mn">−0</span></span>
+            <a class="vl2" href="#d3-desk">view ↗</a><span class="xh">✎ per-line note</span></div>
+        </div>
+        <div class="drow">
+          <div class="fp">docs/AGENTS.md</div>
+          <div class="meta"><span class="nums"><span class="pl">+2</span> <span class="mn">−2</span></span>
+            <a class="vl2" href="#d3-desk">view ↗</a><span class="xh">✎ per-line note</span></div>
+        </div>
+      </div>
+
+      <div class="rsec">
+        <h4 class="rh"><span class="rn">§B</span> Revisions <span class="rr">b1–b3 · rewind ↺</span></h4>
+        <div class="ckrow"><span class="ckb">b1</span><span class="ckt">14:07</span> trace begins
+          <a class="ckr" href="#d3-desk">↺ rewind</a></div>
+        <div class="ckrow"><span class="ckb">b2</span><span class="ckt">14:19</span> detail D drawn
+          <a class="ckr" href="#d3-desk">↺ rewind</a></div>
+        <div class="ckrow"><span class="ckb">b3</span><span class="ckt">14:31</span> survey flagged
+          <a class="ckr" href="#d3-desk">↺ rewind</a></div>
+        <div style="font:400 10px/1.5 var(--sans);color:var(--faint);margin-top:5px">rewind restores code + turns to that rev</div>
+      </div>
+
+      <div class="rsec">
+        <h4 class="rh"><span class="rn">§C</span> Load <span class="rr">usage ledger</span></h4>
+        <table class="ledger2">
+          <tr><td class="L">session cost</td><td class="R">$1.38</td></tr>
+          <tr><td class="L">tokens</td><td class="R">84.2k↑ / 9.6k↓</td></tr>
+          <tr><td class="L">burn</td><td class="R">$3.45/h</td></tr>
+          <tr><td class="L">context</td><td class="R">118,200 / 200,000 · 59%</td></tr>
+        </table>
+        <div class="ctx2" role="img" aria-label="Context 59 percent, warning line at 80 percent"><i></i><span class="wt"></span></div>
+        <div class="ctx2n">segmented bar rises right → arms the <b>warn</b> tick at 80%</div>
+      </div>
+
+      <div class="rsec">
+        <h4 class="rh"><span class="rn">§D</span> Linked sheets <span class="rr">threads</span></h4>
+        <div class="lrow"><span class="ltag">WT</span><span class="lnm mono" style="font-size:11px">ws-reconnect·b</span>
+          <span class="lmd">worktree · this sheet</span></div>
+        <div class="lrow kid"><span class="ltag">CH</span><span class="lnm">heartbeat probe</span>
+          <span class="lmd">child · idle</span></div>
+        <div class="lrow kid"><span class="ltag">CH</span><span class="lnm">docs pass</span>
+          <span class="lmd">child · done ✓</span></div>
+      </div>
+    </aside>
+  </div>
+
+  <div class="drawertab" aria-hidden="true">≡ Sheet index — drawer (rail collapses below 900px)</div>
+
+  <!-- ===== SPEC-STRIP COMPOSER ===== -->
+  <div class="cmptr" aria-label="Composer, spec strip">
+    <div class="cmpcap"><span>Spec strip — issue channel S.01</span><span>sheet bottom · anchored</span></div>
+    <div class="cmbox">
+      <textarea rows="2" aria-label="Message to the agent">make the interval configurable in settings, default 5s —</textarea>
+      <div class="cchips">
+        <span class="attchip"><span class="afi" aria-hidden="true"><i></i><i></i><i></i><i></i></span>heartbeat.md
+          <button style="color:var(--faint);padding:0 2px" aria-label="Remove attachment heartbeat.md">✕</button></span>
+      </div>
+    </div>
+    <div class="crow2">
+      <button class="cbtn" aria-label="Attach a file" title="Attach">📎</button>
+      <button class="cbtn" aria-label="Slash commands" style="font-family:var(--mono);font-weight:600">/</button>
+      <button class="cbtn" aria-label="Mention a file">@</button>
+      <button class="stopsq" aria-label="Stop the run">■ Stop</button>
+      <button class="issue" aria-label="Issue — send the spec"><span class="ibd">Issue ⏎</span><span class="tip"></span></button>
+    </div>
+    <div class="chint">⏎ send · ⇧⏎ newline · esc interrupt · ↑ history · @ files · ! shell</div>
+  </div>
+</div>
+</section>
+
+<!-- ============ B-INSETS · DESKTOP OVERLAYS ============ -->
+<section class="sheetsec" aria-label="Desktop overlays and popovers">
+<h2 class="vh">Desktop overlays</h2>
+<p class="cap"><b>Overlays · pinned beside the sheet</b> — the slash SCHEDULE TABLES (filter <span class="mono">re</span> latched), the @ parts schedule, and the revision panel hanging outboard so the drawing stays visible.</p>
+<div class="isets">
+
+  <!-- SLASH — schedule tables -->
+  <div class="incol" id="d3-slash">
+    <div class="sched" role="dialog" aria-label="Slash command schedule, filter re">
+      <div class="sc2h">
+        <span class="dh2">Schedule — slash commands · sheet S.01</span>
+        <span class="sflt">/re<span class="cur" aria-hidden="true"></span></span>
+      </div>
+      <div class="sgrid">
+        <div class="sgrp">
+          <div class="gh">Session</div>
+          <button class="scrow mut"><span class="line1"><span class="cn">/new</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">fresh session — aliases /reset, /restart</span></button>
+          <button class="scrow mut"><span class="line1"><span class="cn">/fork</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">branch this conversation from a turn</span></button>
+          <button class="scrow mut"><span class="line1"><span class="cn">/compact</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">summarize context now</span></button>
+          <button class="scrow hit"><span class="line1"><span class="cn">/rename</span><span class="soon">soon</span><span class="cdot"></span><span class="cret">↵ run</span></span>
+            <span class="cd2">retitle session</span></button>
+          <button class="scrow mut"><span class="line1"><span class="cn">/export</span><span class="soon">soon</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">save transcript</span></button>
+        </div>
+        <div class="sgrp">
+          <div class="gh">Inspect</div>
+          <button class="scrow mut"><span class="line1"><span class="cn">/status</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">session health &amp; config</span></button>
+          <button class="scrow mut"><span class="line1"><span class="cn">/cost</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">usage breakdown</span></button>
+          <button class="scrow mut"><span class="line1"><span class="cn">/diff</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">open changed files</span></button>
+          <button class="scrow mut"><span class="line1"><span class="cn">/context</span><span class="soon">soon</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">token map</span></button>
+          <button class="scrow hit"><span class="line1"><span class="cn">/review</span><span class="soon">soon</span><span class="cdot"></span><span class="cret">↵ run</span></span>
+            <span class="cd2">request code review</span></button>
+        </div>
+        <div class="sgrp" style="grid-column:1/-1">
+          <div class="gh">Configure</div>
+          <button class="scrow mut"><span class="line1"><span class="cn">/model</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">switch model</span></button>
+          <button class="scrow mut"><span class="line1"><span class="cn">/effort</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">thinking effort</span></button>
+          <button class="scrow hit"><span class="line1"><span class="cn">/permissions</span><span class="cdot"></span><span class="cret">↵ run</span></span>
+            <span class="cd2">permission mode</span></button>
+          <button class="scrow mut"><span class="line1"><span class="cn">/hooks</span><span class="soon">soon</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">event hooks</span></button>
+          <button class="scrow mut"><span class="line1"><span class="cn">/mcp</span><span class="soon">soon</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">MCP servers</span></button>
+          <button class="scrow mut"><span class="line1"><span class="cn">/agents</span><span class="soon">soon</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">subagents</span></button>
+          <button class="scrow mut"><span class="line1"><span class="cn">/notify</span><span class="soon">soon</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">completion alerts</span></button>
+          <button class="scrow mut"><span class="line1"><span class="cn">/theme</span><span class="soon">soon</span><span class="cdot"></span><span class="cret">↵</span></span>
+            <span class="cd2">pane theme</span></button>
+        </div>
+      </div>
+      <div class="sfoot">
+        <span><b class="mono">3</b> of 18 commands match &ldquo;re&rdquo;</span>
+        <span style="display:flex;gap:7px;align-items:center"><span class="kk">↑↓</span> choose <span class="kk">↵</span> run</span>
+        <span class="rr">esc close</span>
+      </div>
+    </div>
+    <div style="font:400 10.5px/1.5 var(--mono);color:var(--faint);margin-top:8px;letter-spacing:.04em">
+      motion note — schedule slides up over the composer 200ms; rows do not stagger</div>
+  </div>
+
+  <!-- @ parts schedule -->
+  <div class="incol" id="d3-mention">
+    <div class="parts" role="dialog" aria-label="Mention menu, parts schedule, query ws-">
+      <div class="qh"><span style="color:var(--anno);font-weight:700">@</span>
+        <span>files schedule —</span>
+        <span class="qb">ws-<span class="cur" style="display:inline-block;width:7px;height:11px;background:var(--amber);vertical-align:-1px" aria-hidden="true"></span></span>
+        <span style="margin-left:auto;font-size:8.5px;letter-spacing:.14em;text-transform:uppercase">3 parts</span></div>
+      <button class="prow sel"><span class="pn">server/ws-handler.ts</span><span class="pk">detail D · in-sheet</span></button>
+      <button class="prow"><span class="pn">src/lib/fresh-agent-ws.ts</span><span class="pk">source</span></button>
+      <button class="prow"><span class="pn">test/unit/ws-heartbeat.test.ts</span><span class="pk">test · 14 passed</span></button>
+      <div class="pfoot">↵ insert into spec strip · esc withdraws</div>
+    </div>
+  </div>
+
+  <!-- REVISION PANEL — settings -->
+  <div class="incol" id="d3-settings">
+    <div class="revp" role="dialog" aria-label="Settings, revision panel">
+      <div class="gearline"><span class="gib" aria-hidden="true">⚙</span><span>opens from settings ⚙ in the ops cell — popover, not modal</span></div>
+      <div class="rv3h"><span class="dh3">Revision panel — pane config · S.01</span>
+        <span class="rnote">draft b4 · not yet issued</span>
+        <button style="margin-left:8px;color:var(--muted);font-size:13px" aria-label="Close settings">✕</button></div>
+
+      <div class="rrow"><span class="rl">Style</span><span class="rld"></span>
+        <span class="rv"><span class="seg" role="radiogroup" aria-label="Pane style">
+          <button class="on">Sans</button><button>Serif</button><button>Mono</button></span></span></div>
+
+      <div class="rrow" title="Preview only — flips this sheet to the §D trace-paper ground">
+        <span class="rl">Finish</span><span class="rld"></span>
+        <span class="rv"><span class="seg" role="radiogroup" aria-label="Sheet finish">
+          <button class="on">Blueprint</button><button>Trace paper</button></span>
+          <span style="font:500 9px/1.4 var(--mono);color:var(--muted);letter-spacing:.04em">mock flips to §D — preview tiles below</span></span></div>
+
+      <div class="rrow" style="flex-wrap:wrap;border-bottom-style:solid">
+        <span class="rl">Model</span><span class="rld"></span>
+        <span class="rv" style="flex-direction:column;align-items:stretch;gap:6px;flex:1;text-align:left">
+          <span class="mdlrow on"><span class="rdt"></span>Claude Opus 4.6 <span class="mmut">current drafting hand</span></span>
+          <span class="mdlrow"><span class="rdt"></span>Sonnet 4.6 <span class="soon">soon</span><span class="mmut">lighter revs</span></span>
+        </span></div>
+
+      <div class="rrow"><span class="rl">Effort</span><span class="rld"></span>
+        <span class="rv"><span class="seg" role="radiogroup" aria-label="Thinking effort">
+          <button>Low</button><button>Medium</button><button class="on">High</button></span></span></div>
+
+      <div class="rrow"><span class="rl">Permission</span><span class="rld"></span>
+        <span class="rv"><span class="seg" role="radiogroup" aria-label="Permission mode">
+          <button class="on">Ask</button><button>Accept edits</button><button>Bypass</button><button>Plan</button></span></span></div>
+
+      <div class="rrow"><span class="rl">Thinking</span><span class="rld"></span>
+        <span class="rv">Show thinking <span class="switch on" role="switch" aria-checked="true" aria-label="Show thinking"></span></span></div>
+      <div class="rrow"><span class="rl">Tools</span><span class="rld"></span>
+        <span class="rv">Show tools <span class="switch on" role="switch" aria-checked="true" aria-label="Show tools"></span></span></div>
+      <div class="rrow"><span class="rl">Timecodes</span><span class="rld"></span>
+        <span class="rv">Timecodes <span class="switch on" role="switch" aria-checked="true" aria-label="Timecodes"></span></span></div>
+      <div class="rrow" style="color:var(--muted)"><span class="rl">Sound</span><span class="rld"></span>
+        <span class="rv">Sound on done <span class="soon">soon</span>
+          <span class="switch" role="switch" aria-checked="false" aria-label="Sound on done"></span></span></div>
+      <div class="rrow" style="color:var(--muted)"><span class="rl">Notify</span><span class="rld"></span>
+        <span class="rv">Desktop notifications <span class="soon">soon</span>
+          <span class="switch" role="switch" aria-checked="false" aria-label="Desktop notifications"></span></span></div>
+
+      <div class="advgrp">
+        <div style="font:600 8.5px/1.4 var(--mono);letter-spacing:.2em;text-transform:uppercase;color:var(--faint);padding:8px 0 5px">
+          Advanced — annex sheets <span class="soon">soon</span></div>
+        <div class="advr"><span class="anm">Hooks</span><span class="ago">event hooks · annex H</span></div>
+        <div class="advr"><span class="anm">MCP servers</span><span class="ago">tool sched · annex M</span></div>
+        <div class="advr"><span class="anm">Agents</span><span class="ago">subagent roster · annex A</span></div>
+        <div class="advr"><span class="anm">Status-line layout</span><span class="ago">datum strip fields · annex D</span></div>
+      </div>
+      <div class="sfoot" style="border-top:1px solid var(--line2)">
+        <span>values are the drawn state — leader dots read left → right</span>
+        <span class="rr">esc withdraw</span>
+      </div>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ============ C · PHONE FRAMES ============ -->
+<section class="sheetsec" aria-label="Phone frames, 390 pixels wide">
+<h2 class="vh">Phone frames</h2>
+<p class="cap"><b>Phone · 390×844</b> — the sheet folds: dimension rails collapse to inline dims above turns, the cloud goes full-bleed with stacked stamps (≥52px), the composer stacks into two rows, sheets lift from the bottom. Safe-area respected.</p>
+<div class="phwrap">
+
+  <!-- main phone frame -->
+  <div class="phone h844" role="img" aria-label="Phone sheet: same session condensed">
+    <div class="pnotch" aria-hidden="true"><i></i></div>
+    <div class="ptabs" aria-label="Open sheets">
+      <button class="ptab on"><span class="busyd"></span>⚡ Trace dropped…</button>
+      <button class="ptab">⌨ npm run dev</button>
+      <button class="ptab">◉ Scrollback…<span class="attn"></span></button>
+    </div>
+    <div class="ph">
+      <span class="pchip"><i></i>freshclaude</span>
+      <span class="ttl">Trace dropped messages on backgr…</span>
+      <button class="ib2" aria-label="More actions">⋯</button>
+    </div>
+    <div class="phrow2">
+      <span class="plive"><span class="busyd"></span>Working…</span>
+      <span class="pcost">$1.38</span>
+    </div>
+    <div class="pchiprow" aria-label="Status chips">
+      <span class="pchip2">~/code/freshell · <b>fix/ws-reconnect</b></span>
+      <span class="pchip2">Opus 4.6 · High</span>
+      <span class="pchip2">ctx <b>59%</b></span>
+      <span class="pchip2"><b>$1.38</b></span>
+    </div>
+
+    <div class="pbody">
+      <button class="pnew">3 new ↓</button>
+      <div class="ptn">
+        <div class="pidim">0:00 <span class="pdt">· you · 14:07</span></div>
+        <p class="ptxt">the reconnect loop is still dropping messages when the tab&rsquo;s in the background&hellip;</p>
+      </div>
+      <div class="ptn">
+        <div class="pidim">0:42 <span class="pdt">· claude · 14:07 · 9.6k out</span></div>
+        <p class="ptxt">Heartbeat is 15s; background tabs clamp timers to ≥60s, pings gap out, server closes the socket. Beat at 5s + add a pong watchdog:</p>
+        <div class="pthk">▸ Thought for 12s — folded</div>
+        <div class="pdet">A–D · 4 details <b>Read · Grep · Bash · Edit</b> <span style="margin-left:auto">✓</span></div>
+        <div class="pdiff" role="img" aria-label="Diff, two lines changed, server/ws-handler.ts">
+          <div class="pdh"><span>Detail D — Edit</span><span>ws-handler.ts</span></div>
+          <div class="pdwrap">
+            <div class="pdr del"><span class="sgn">−</span><span class="cd">const HEARTBEAT_INTERVAL = 15_000;</span></div>
+            <div class="pdr add"><span class="sgn">+</span><span class="cd">const HEARTBEAT_INTERVAL = 5_000;</span></div>
+            <div class="pdr add"><span class="sgn">+</span><span class="cd">// bg timers clamp to ~60s; beat to survive</span></div>
+            <div class="pdr add"><span class="sgn">+</span><span class="cd">let lastPongAt = 0;</span></div>
+          </div>
+        </div>
+        <div class="pdet" style="border-style:dashed">SETTLED — <b>4 tools · 2 files · 12s</b></div>
+      </div>
+
+      <!-- phone cloud — full bleed -->
+      <div class="pcloud">
+        <svg class="cloud" viewBox="0 0 480 336" preserveAspectRatio="none" aria-hidden="true">
+          <path d="M12 12 a12 12 0 0 1 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 a12 12 0 0 1 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 a12 12 0 0 1 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 a12 12 0 0 1 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 z" transform="translate(3 2.5)" fill="none" stroke="#a04a40" stroke-width="1.6"/><path d="M12 12 a12 12 0 0 1 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 a12 12 0 0 1 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 a12 12 0 0 1 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 a12 12 0 0 1 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 z" fill="none" stroke="var(--red)" stroke-width="1.5"/>
+        </svg>
+        <div class="pcldi">
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            <svg width="46" height="41" viewBox="0 0 52 46" aria-hidden="true"><path d="M26 5 L47 40 H5 Z" fill="none" stroke="var(--red)" stroke-width="1.8"/><text x="26" y="32" text-anchor="middle" font-family="Chivo Mono" font-size="13" font-weight="700" fill="var(--red)">b4</text></svg>
+            <div>
+              <div class="clT" style="font-size:12.5px">△ REV b4 — pending</div>
+              <div class="clS">redline cloud · bash proposed</div>
+            </div>
+            <time class="mono" style="margin-left:auto;font-size:9.5px;color:var(--faint)">14:31</time>
+          </div>
+          <div class="ccmd" style="margin-top:10px"><span class="tg">Bash</span><code style="font-size:11px">rm -rf .worktrees/refresh-*</code></div>
+          <p class="cwhy" style="font-size:12px;margin-top:9px">Deletes 3 stale worktrees.</p>
+          <p class="cwarn" style="font-size:11px;margin-top:6px">⚠ This command permanently deletes files.</p>
+          <div class="pstamps">
+            <button class="pstamp ap">Approved<small>Allow once</small></button>
+            <button class="pstamp st">Always allow Bash this session<small>TYP. note — stamp every repeat</small></button>
+            <button class="pstamp re">Rejected<small>Deny — nothing runs</small></button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="pcmp" aria-label="Composer">
+      <textarea class="pcmpta" rows="2" aria-label="Message to the agent">make the interval configurable in settings, default 5s —</textarea>
+      <div class="pcmrow">
+        <button class="cbtn" aria-label="Attach">📎</button>
+        <button class="cbtn" aria-label="Slash commands" style="font-family:var(--mono);font-weight:600">/</button>
+        <button class="pcmstop">■ Stop</button>
+        <button class="pissue" aria-label="Issue — send"><span class="ibd">Issue ⏎</span><span class="tip"></span></button>
+      </div>
+      <div class="safeb" aria-hidden="true"><i></i></div>
+    </div>
+  </div>
+
+  <!-- SHEET 2 — turn actions bottom sheet -->
+  <div class="phone h560 demo" role="img" aria-label="Phone: turn actions bottom sheet">
+    <div class="pnotch" aria-hidden="true"><i></i></div>
+    <div class="scrimback">— transcript dimmed beneath the lift —</div>
+    <div class="bsheet" role="dialog" aria-label="Turn actions sheet">
+      <div class="grab" aria-hidden="true"></div>
+      <div class="bhd"><span>Turn actions — lift sheet</span><span class="tm">T.1 · you · 14:07</span></div>
+      <button class="brow"><span class="gi">⧉</span>Copy turn text</button>
+      <button class="brow"><span class="gi">⑂</span>Fork conversation from here</button>
+      <button class="brow red"><span class="gi">↺</span>Rewind code to here<span class="gk">redline</span></button>
+      <button class="brow can">Cancel</button>
+      <div class="safeb" aria-hidden="true"><i></i></div>
+    </div>
+  </div>
+
+  <!-- SHEET 3 — settings full-screen sheet -->
+  <div class="phone h560 demo" role="img" aria-label="Phone: settings full-screen sheet">
+    <div class="pnotch" aria-hidden="true"><i></i></div>
+    <div class="bsheet full" role="dialog" aria-label="Settings, full-screen sheet">
+      <div class="grab" aria-hidden="true"></div>
+      <div class="bhd"><span>Settings — revision panel, lifted whole</span><span class="tm">S.01</span>
+        <button style="margin-left:6px;color:var(--muted);font-size:13px" aria-label="Close settings">✕</button></div>
+      <div class="sr2"><span class="rl">Style</span><span class="rld"></span>
+        <span class="rv"><span class="seg"><button class="on">Sans</button><button>Serif</button><button>Mono</button></span></span></div>
+      <div class="sr2"><span class="rl">Finish</span><span class="rld"></span>
+        <span class="rv"><span class="seg"><button class="on">Blueprint</button><button>Trace paper</button></span>
+        <span style="font:500 8.5px/1.4 var(--mono);color:var(--muted);letter-spacing:.04em">mock — §D preview</span></span></div>
+      <div class="sr2"><span class="rl">Model</span><span class="rld"></span>
+        <span class="rv" style="flex-direction:column;align-items:flex-end;gap:3px">
+          <span class="mono" style="font-size:11px">Claude Opus 4.6 ✓</span>
+          <span style="font-size:10.5px;color:var(--muted)">Sonnet 4.6 <span class="soon">soon</span></span></span></div>
+      <div class="sr2"><span class="rl">Effort</span><span class="rld"></span>
+        <span class="rv"><span class="seg"><button>Low</button><button>Medium</button><button class="on">High</button></span></span></div>
+      <div class="sr2" style="flex-wrap:wrap;gap:7px"><span class="rl">Permission</span>
+        <span class="rv" style="flex:1"><span class="seg"><button class="on">Ask</button><button>Accept edits</button><button>Bypass</button><button>Plan</button></span></span></div>
+      <div class="sr2"><span class="rl">Thinking</span><span class="rld"></span>
+        <span class="rv">Show <span class="switch on" role="switch" aria-checked="true" aria-label="Show thinking"></span></span></div>
+      <div class="sr2"><span class="rl">Tools</span><span class="rld"></span>
+        <span class="rv">Show <span class="switch on" role="switch" aria-checked="true" aria-label="Show tools"></span></span></div>
+      <div class="sr2"><span class="rl">Timecodes</span><span class="rld"></span>
+        <span class="rv">Show <span class="switch on" role="switch" aria-checked="true" aria-label="Timecodes"></span></span></div>
+      <div class="sr2" style="color:var(--muted)"><span class="rl">Sound</span><span class="rld"></span>
+        <span class="rv">On done <span class="soon">soon</span> <span class="switch" role="switch" aria-checked="false" aria-label="Sound on done"></span></span></div>
+      <div class="sr2" style="color:var(--muted);border-bottom-style:solid">
+        <span class="rl">Advanced</span><span class="rld"></span>
+        <span class="rv">annex — hooks · MCP · agents <span class="soon">soon</span></span></div>
+      <div class="safeb" aria-hidden="true"><i></i></div>
+    </div>
+  </div>
+
+  <!-- SHEET 4 — slash menu bottom sheet -->
+  <div class="phone h560 demo" role="img" aria-label="Phone: slash menu bottom sheet">
+    <div class="pnotch" aria-hidden="true"><i></i></div>
+    <div class="scrimback">— composer dimmed; schedule lifted —</div>
+    <div class="bsheet" role="dialog" aria-label="Slash schedule sheet, filter re">
+      <div class="grab" aria-hidden="true"></div>
+      <div class="bhd"><span>Schedule — slash commands</span>
+        <span class="qb" style="margin-left:auto;font:600 11px/1.4 var(--mono);color:var(--ink);border:1px solid var(--anno);padding:2px 9px;background:var(--plate)">/re</span></div>
+      <button class="slg"><span class="sg2">Session</span><span class="scN">/rename</span>
+        <span class="soon">soon</span><span class="gk" style="margin-left:auto">↵</span><br>
+        <span class="scd">retitle session</span></button>
+      <button class="slg"><span class="sg2">Inspect</span><span class="scN">/review</span>
+        <span class="soon">soon</span><span class="gk" style="margin-left:auto;float:right">↵</span><br>
+        <span class="scd">request code review</span></button>
+      <button class="slg"><span class="sg2">Configure</span><span class="scN">/permissions</span>
+        <span class="gk" style="margin-left:auto;float:right">↵</span><br>
+        <span class="scd">permission mode</span></button>
+      <div style="padding:9px 16px;font:400 10px/1.5 var(--mono);color:var(--muted)">
+        3 of 18 match &ldquo;re&rdquo; · the rest of the schedule stays rolled below</div>
+      <button class="brow can">Dismiss</button>
+      <div class="safeb" aria-hidden="true"><i></i></div>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ============ D · TRACE PAPER — alternate mode ============ -->
+<section class="sheetsec" aria-label="Alternate mode, trace paper">
+<h2 class="vh">Trace-paper alternate mode</h2>
+<p class="cap"><b>Alt mode · trace paper</b> — same sheet, lifted off the table onto vellum: ground <span class="mono">#f4f7fb</span>, ink <span class="mono">#173a6b</span>, annotation <span class="mono">#0f6aa8</span>. An agent turn and the revision cloud, side by side at ~400px.</p>
+<div class="trace altz" style="background:var(--gridtable)">
+  <div class="tilerow">
+
+    <div class="tile">
+      <div class="frame2" role="img" aria-label="Trace-paper excerpt: agent turn with settled strip">
+        <div style="padding:6px 13px;border-bottom:1px solid var(--line2);font:600 8px/1.5 var(--mono);letter-spacing:.2em;color:var(--muted);text-transform:uppercase">
+          SHEET S.01 · T.2 · DRAWN 14:07</div>
+        <section class="turn" style="padding:12px 14px">
+          <div class="dim" aria-hidden="true" style="margin-left:2px;margin-right:14px"><span class="xt t"></span><span class="dln"></span><span class="dlb">0:42</span><span class="xt b"></span></div>
+          <div>
+            <div class="who" style="margin-bottom:6px">
+              <span class="nm agent">Claude</span>
+              <time class="mono" style="font-size:9px">14:07</time>
+            </div>
+            <p class="msg" style="font-size:13.5px">Found it. The heartbeat is 15s — background tabs throttle timers to ≥60s,
+              so pings gap out and the server closes the socket.</p>
+            <details class="think" style="margin-top:8px">
+              <summary style="font-size:11.5px">Thought for 12s</summary>
+              <div class="thb" style="font-size:11.5px">A 5s beat survives the worst clamp; the watchdog covers the rest.</div>
+            </details>
+            <div class="settled" style="margin-top:9px;padding:6px 10px;font-size:9.5px">
+              <span class="ssec">TOTAL</span><span><b>4 TOOLS · 2 FILES · 12s</b></span>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <div class="tile">
+      <div class="frame2" role="img" aria-label="Trace-paper excerpt: revision cloud holding REV b4">
+        <div style="padding:6px 13px;border-bottom:1px solid var(--line2);font:600 8px/1.5 var(--mono);letter-spacing:.2em;color:var(--muted);text-transform:uppercase">
+          SHEET S.01 · REV b4 · PENDING</div>
+        <div style="position:relative;margin:0;padding:10px 4px 12px">
+          <svg class="cloud" viewBox="0 0 420 240" preserveAspectRatio="none" aria-hidden="true"
+               style="position:absolute;inset:0;width:100%;height:100%">
+            <path d="M12 12 a12 12 0 0 1 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 a12 12 0 0 1 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 a12 12 0 0 1 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 a12 12 0 0 1 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 z" transform="translate(3 2.5)" fill="none" stroke="#a8453c" stroke-width="1.6"/><path d="M12 12 a12 12 0 0 1 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 a12 12 0 0 1 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 0 24 a12 12 0 0 1 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 a12 12 0 0 1 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 0 -24 z" fill="none" stroke="var(--red)" stroke-width="1.5"/>
+          </svg>
+          <div style="position:relative;padding:12px 22px 4px">
+            <div style="display:flex;gap:10px;align-items:center">
+              <svg width="42" height="38" viewBox="0 0 52 46" aria-hidden="true"><path d="M26 5 L47 40 H5 Z" fill="none" stroke="var(--red)" stroke-width="1.8"/><text x="26" y="32" text-anchor="middle" font-family="Chivo Mono" font-size="13" font-weight="700" fill="var(--red)">b4</text></svg>
+              <div>
+                <div class="clT">△ REV b4 — pending</div>
+                <div class="clS">bash · trace on vellum</div>
+              </div>
+            </div>
+            <div class="ccmd" style="margin-top:9px;background:#eef2f8">
+              <span class="tg">Bash</span><code style="font-size:11px">rm -rf .worktrees/refresh-*</code></div>
+            <p class="cwhy" style="font-size:11.5px;margin-top:7px">Deletes 3 stale worktrees.</p>
+            <p class="cwarn" style="font-size:11px;margin-top:5px">⚠ This command permanently deletes files.</p>
+            <div class="cbtns" style="margin-top:11px;gap:10px">
+              <button class="stamp ap" style="min-height:46px;padding:7px 14px;font-size:11.5px">Approved<small>Allow once</small></button>
+              <button class="stamp re" style="min-height:46px;padding:7px 14px;font-size:11.5px">Rejected<small>Deny</small></button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ============ FOOTER — the direction contract ============ -->
+<footer class="foot" aria-label="Direction contract">
+  <h2 class="fh">Direction contract — Draft</h2>
+  <dl>
+    <dt>Thesis</dt>
+    <dd>A coding session is a working drawing — revisions dimensioned, details called out, approvals redlined.
+      The sheet knows what changed, by how much, and where.</dd>
+    <dt>Own-world</dt>
+    <dd>Architectural blueprint: a real drawing surface (faint true grid, hairlines, registration marks).
+      <b>The pane header is a title block</b> (PROJECT / SHEET / DRAWN BY / REV / DATE).
+      <b>Turns carry dimension lines</b> with extension ticks, arrowheads, and elapsed/token labels;
+      tool calls are DETAIL CALLOUTS; diffs redline-strike in corner-ticked windows with amber &ldquo;+12 −4&rdquo; leaders;
+      the settled strip is a schedule note.
+      <b>Approval waits inside a redline revision cloud</b> with a △ REV triangle and
+      APPROVED / REJECTED / TYP. stamps.</dd>
+    <dt>Story</dt>
+    <dd>freshclaude (Opus 4.6) traces a dropped heartbeat, files four callouts, edits ws-handler.ts,
+      then holds a destructive cleanup inside the cloud.</dd>
+    <dt>First viewport</dt>
+    <dd>DRAFT display type over the open sheet — index tabs, title block, dimensioned transcript mid-flow,
+      the sheet-index rail at right.</dd>
+    <dt>Form + finish</dt>
+    <dd>Deep drafting blue #12294d, faint grid, hairlines, ink #e9f1ff; annotations flat cyan #7fd4ff (never glow);
+      amber #ffb454 actions, redline #ff7a6e holds, ok #8fd6a2. Overpass prose at 15px, Chivo Mono for all
+      dimensions and data with 0.08em tracking. Motion is annotated only — cloud draws 300ms once, ticks snap
+      150ms, reduced-motion renders everything static. Alt mode is trace paper #f4f7fb / #173a6b / #0f6aa8.</dd>
+  </dl>
+  <div class="sig">DWG D3 · design 3 of 6 · fresh-agent UX study, Freshell · drawn with Overpass &amp; Chivo Mono · static comp, no scripts</div>
+</footer>
+
+</div>
+</body>
+</html>

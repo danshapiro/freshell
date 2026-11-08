@@ -1,0 +1,173 @@
+<style>
+  .fx { --panel:#161a22; --panel2:#1d222c; --border:#2a303d; --text:#dbe1ec; --muted:#8b93a5; --accent:#6ea8fe; --selbg:#22304a; --ok:#3fb950; --warn:#f0a35e;
+        font-family: ui-sans-serif, system-ui, sans-serif; color: var(--text); }
+  .fx .mockwin { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:12px; display:inline-block; box-shadow:0 8px 24px rgba(0,0,0,.35); }
+  .fx .row { padding:5px 10px; border-radius:6px; display:flex; gap:8px; align-items:center; font-size:13px; }
+  .fx .grouplabel { font-size:10.5px; text-transform:uppercase; letter-spacing:.07em; color:var(--muted); padding:8px 10px 3px; }
+  .fx .sel { background:var(--selbg); }
+  .fx .current::after { content:"●"; color:var(--ok); font-size:9px; margin-left:auto; }
+  .fx input.mock { background:var(--panel2); border:1px solid var(--accent); color:var(--text); border-radius:7px; padding:7px 10px; font-size:13px; width:100%; box-sizing:border-box; }
+  .fx .inputwrap { position:relative; margin-bottom:6px; }
+  .fx .cursor { position:absolute; left:14px; top:9px; width:8px; height:17px; border-left:2px solid var(--accent); animation:none; }
+  .fx .chip { display:inline-block; background:#2a2417; color:var(--warn); border:1px solid #4a3c1d; border-radius:99px; padding:2px 10px; font-size:12px; }
+  .fx .btn { background:var(--panel2); border:1px solid var(--border); border-radius:7px; padding:6px 14px; font-size:13px; color:var(--text); }
+  .fx .btn.primary { background:var(--accent); border-color:var(--accent); color:#0b1220; font-weight:600; }
+  .fx .cols { display:grid; grid-template-columns: 300px 220px; gap:2px; border-top:1px solid var(--border); margin-top:8px; padding-top:8px;}
+  .fx .colR { border-left:1px solid var(--border); padding-left:8px; }
+  .fx .muted { color:var(--muted); }
+  .fx .strike { text-decoration: line-through; }
+  .fx .annot { font-size:12.5px; color:var(--muted); margin-top:6px; }
+  .fx table.real td, .fx table.real th { padding:4px 12px 4px 0; font-size:13px; }
+  .fx .badge { font-size:11px; color:var(--muted); border:1px solid var(--border); border-radius:5px; padding:0 6px; margin-left:auto; }
+  .fx .check { color:var(--ok); margin-left:auto; }
+  .fx .lvl { padding:5px 10px; border-radius:6px; font-size:13px; display:flex; align-items:center; }
+  .fx .lvl em { font-style:normal; color:var(--muted); font-size:11.5px; margin-left:auto; }
+  .fx .footerbar { display:flex; gap:8px; justify-content:flex-end; border-top:1px solid var(--border); margin-top:10px; padding-top:10px; align-items:center; }
+  .fx .enterhint { font-size:11px; color:var(--muted); margin-right:auto; }
+</style>
+
+<div class="fx">
+<h2>Model + thinking selector: where things stand &amp; the proposed design</h2>
+<p class="subtitle">Real data from your live opencode catalog (probed today, opencode 1.18.18) — not mock names.</p>
+
+<!-- ============ SECTION 1: TODAY ============ -->
+<div class="section">
+<h3>1 · What the gear opens today (in the newest client build)</h3>
+<div class="split">
+  <div class="mockup">
+    <div class="mockup-header">Gear popover — freshopencode, today</div>
+    <div class="mockup-body">
+      <div class="mockwin" style="width:300px">
+        <div class="grouplabel">Style</div>
+        <div class="row">Completion style <span class="badge">Subtle bar ▾</span></div>
+        <div class="grouplabel">Thinking</div>
+        <div class="row">max ▾ <span class="badge">same 5 levels for every model</span></div>
+        <div class="grouplabel">Model</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:2px 0">
+          <div class="row sel">GLM 5.2 <span class="check">✓</span></div>
+          <div class="row">DeepSeek V4 Flash</div>
+          <div class="row">umans Kimi k2.7</div>
+          <div class="row">Kimi K3</div>
+        </div>
+        <div class="inputwrap" style="margin-top:8px"><input class="mock" value="" placeholder="Search enabled models…" readonly></div>
+      </div>
+      <div class="annot">4 recent-model tiles = 1-click instant switch. Search box opens the one-column browser (right).</div>
+    </div>
+  </div>
+  <div class="mockup">
+    <div class="mockup-header">One-column model browser (opens from that search box)</div>
+    <div class="mockup-body">
+      <div class="mockwin" style="width:330px">
+        <div class="inputwrap"><input class="mock" placeholder="Filter enabled models…" readonly></div>
+        <div class="grouplabel">deepseek</div>
+        <div class="row">DeepSeek V4 Flash</div>
+        <div class="row">DeepSeek V4 Pro</div>
+        <div class="grouplabel">OpenCode Go</div>
+        <div class="row current">GLM 5.2</div>
+        <div class="row">Kimi K2.7 Code</div>
+        <div class="row">Qwen3.7 Max</div>
+        <div class="grouplabel">Kimi For Coding</div>
+        <div class="row">Kimi K3</div>
+        <div class="annot">Click a model → instantly applied. No thinking choice here; that's back in the separate dropdown.</div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="annot">⚠ Three gaps today: <b>(a)</b> this applies on click (no OK) and the Thinking list is the same hardcoded five levels for every model — <b>(b)</b> typing <code>/model</code> in the composer just sends the literal text "/model" to the agent — and <b>(c)</b> see section 2.</div>
+</div>
+
+<!-- ============ SECTION 2: WHY IT LOOKS BROKEN FOR YOU ============ -->
+<div class="section">
+<h3>2 · Why it looks like "nothing works" on your live server right now</h3>
+<div class="mockup">
+  <div class="mockup-body">
+    <ul style="margin:4px 0 0 0; padding-left: 18px; font-size:14px; line-height:1.65">
+      <li>The catalog endpoint (<code>/api/fresh-agent/model-capabilities/freshopencode</code>) exists <b>only in the old Node server</b>. Your live Rust server (port 3001) answers <span class="chip">404 {"error":"Not found"}</span> — verified just now.</li>
+      <li>So in the gear popover the Model section shows <i>"Model catalog unavailable. Try again later."</i>, the search box hides, and the recent-model tiles sit disabled.</li>
+      <li>The popover itself should still open. If your gear click does literally nothing, your browser tab is probably holding an older bundle — the client deploys from disk on hard-refresh (<b>Ctrl+Shift+R</b>), no server restart needed. Please try that and tell me if the gear is still dead; I couldn't get a clean headless repro (my scratch tabs wouldn't attach) and saw no JS errors either way.</li>
+    </ul>
+  </div>
+</div>
+</div>
+
+<!-- ============ SECTION 3: NEW DESIGN ============ -->
+<div class="section">
+<h3>3 · Proposed: one two-column selector, two entry points</h3>
+<p class="subtitle">Typing <code>/model</code> in the composer OR clicking the gear popover's Model button opens this same dialog. freshopencode and freshcodex share it; common logic lives in shared fresh-agent code, per-CLI bits in each provider's adapter.</p>
+
+<div style="display:flex; gap:24px; align-items:flex-start; flex-wrap:wrap">
+  <!-- entry point -->
+  <div>
+    <div class="grouplabel" style="padding-left:0">Gear popover becomes just this</div>
+    <div class="mockwin" style="width:300px">
+      <div class="grouplabel">Style</div>
+      <div class="row">Completion style <span class="badge">Subtle bar ▾</span></div>
+      <div class="grouplabel">Model</div>
+      <button class="btn" style="width:100%; text-align:left; display:flex; justify-content:space-between">GLM 5.2 · max <span class="muted">Change…</span></button>
+      <div class="annot">Tiles, one-column modal, separate Thinking dropdown — all retired. (freshclaude/kilroy keep today's simple list.)</div>
+    </div>
+  </div>
+
+  <!-- the dialog -->
+  <div>
+    <div class="grouplabel" style="padding-left:0">The selector (opens from gear or /model)</div>
+    <div class="mockwin" style="width:560px">
+      <div class="inputwrap"><span class="cursor"></span><input class="mock" style="padding-left:20px" value="glm" readonly></div>
+      <div class="cols">
+        <div>
+          <div class="grouplabel">Recent</div>
+          <div class="row sel"><span><b>GLM 5.2</b> <span class="muted">· OpenCode Go</span></span><span class="check">✓ current</span></div>
+          <div class="row">Kimi K3 <span class="muted">· Kimi For Coding</span></div>
+          <div class="row">DeepSeek V4 Flash <span class="muted">· OpenCode Go</span></div>
+          <div class="grouplabel">OpenCode Go</div>
+          <div class="row">GLM 5.3</div>
+          <div class="row">GLM 5.2 Vision</div>
+          <div class="grouplabel">glm-runpod</div>
+          <div class="row">GLM-5.2-FP8</div>
+        </div>
+        <div class="colR">
+          <div class="grouplabel">Thinking — GLM 5.2</div>
+          <div class="lvl">low</div>
+          <div class="lvl">high <em>last used</em></div>
+          <div class="lvl sel"><b>max</b> <em>highest</em></div>
+          <div class="annot" style="padding:6px 10px 0">Real levels this model declares. Highlight another model → this column changes. Models with none show a single <i>Default</i> row.</div>
+        </div>
+      </div>
+      <div class="footerbar">
+        <span class="enterhint">↑↓ move · ←→ switch column · Enter = OK · Esc = cancel · applies from your next message · becomes your default</span>
+        <button class="btn">Cancel</button>
+        <button class="btn primary">Use GLM 5.2 · max</button>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="annot">Cursor starts in the search box; the list filters as you type. Preselection = your last-used level for that model, else its highest level. OK updates <b>this pane from your next message</b> (safe mid-conversation; model+thinking are per-message) <b>and</b> saves as the default for new panes.</div>
+</div>
+
+<!-- ============ SECTION 4: WHY REAL LEVELS ============ -->
+<div class="section">
+<h3>4 · Why the thinking list must come from the real catalog</h3>
+<div class="mockup"><div class="mockup-body">
+<table class="real">
+  <tr><th class="muted" style="text-align:left">Model (from your catalog, today)</th><th class="muted" style="text-align:left">Thinking levels it actually declares</th></tr>
+  <tr><td>GLM 5.2 <span class="muted">(default)</span></td><td>low · high · max</td></tr>
+  <tr><td>Kimi K3</td><td><b>max only</b> — today we'd offer you 5 fake levels</td></tr>
+  <tr><td>MiniMax M3</td><td>none · thinking <span class="muted">(not a single "normal" name)</span></td></tr>
+  <tr><td>GLM 5.2 Vision</td><td>minimal · low · medium · high · xhigh · max · off</td></tr>
+  <tr><td>Kimi K2.7 Code, Qwen3.7 Max, DeepSeek Chat…</td><td>none declared → right column shows just <i>Default</i></td></tr>
+</table>
+<div class="annot">Today's code hardcodes <code>minimal/low/medium/high/max</code> for every model. In the new dialog the right column is ordered low→highest canonically (none &lt; minimal &lt; low &lt; medium &lt; high &lt; xhigh &lt; max); custom names like "thinking" rank after the known ones.</div>
+</div></div>
+</div>
+
+<!-- ============ NEXT ============ -->
+<div class="section">
+<h3>5 · Also affected</h3>
+<div class="mockup"><div class="mockup-body" >
+  <b>freshcodex</b> gets the same dialog from its static list: GPT-5.5 (none·minimal·low·medium·high·<b>max</b>), GPT-5.4 Flash (…up to high), GPT-5.3 Codex Spark (…·max). Its gear popover's radio list folds into the same compact button.
+  <div class="annot">Server side: the Rust server gains the catalog endpoint (cwd-scoped probe, 5-min cache) so this works on port 3001 — I will verify behavior against the real opencode API directly rather than trusting the Node code's assumptions.</div>
+</div></div>
+</div>
+
+<p class="subtitle" style="margin-top:26px">Tell me what to change — anything from overall layout down to button labels. Saying "looks right" green-lights the written design doc + implementation plan.</p>
+</div>

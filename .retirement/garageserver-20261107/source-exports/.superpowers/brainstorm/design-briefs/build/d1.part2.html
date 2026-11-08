@@ -1,0 +1,109 @@
+<!-- ============ DESKTOP INSETS ============ -->
+<p class="cap"><b>Desktop insets</b> — slash index (open + filtered) · @-mention · settings popover</p>
+<div class="rows">
+
+  <!-- slash menu — open, full index -->
+  <section class="inset" style="width:460px" aria-label="Slash command index, open">
+    <div class="idxhead"><span class="mono" style="color:var(--accent);font-weight:600">/</span><span class="mono" style="color:var(--muted)">type to filter the index…</span><span class="keyh">↵ run · esc close</span></div>
+    <div class="igroup">
+      <h4>Session</h4>
+      <div class="irow"><span class="ic">/new</span><span class="il"></span><span class="idesc">fresh session <span class="mono" style="font-size:10px;color:var(--muted)">/reset · /restart</span></span></div>
+      <div class="irow"><span class="ic">/fork</span><span class="il"></span><span class="idesc">branch this conversation from a turn</span></div>
+      <div class="irow"><span class="ic">/compact</span><span class="il"></span><span class="idesc">summarize context now</span></div>
+      <div class="irow"><span class="ic">/rename</span><span class="il"></span><span class="idesc">retitle session<span class="soon">soon</span></span></div>
+      <div class="irow"><span class="ic">/export</span><span class="il"></span><span class="idesc">save transcript<span class="soon">soon</span></span></div>
+    </div>
+    <div class="igroup">
+      <h4>Inspect</h4>
+      <div class="irow"><span class="ic">/status</span><span class="il"></span><span class="idesc">session health &amp; config</span></div>
+      <div class="irow"><span class="ic">/cost</span><span class="il"></span><span class="idesc">usage breakdown</span></div>
+      <div class="irow"><span class="ic">/diff</span><span class="il"></span><span class="idesc">open changed files</span></div>
+      <div class="irow"><span class="ic">/context</span><span class="il"></span><span class="idesc">token map<span class="soon">soon</span></span></div>
+      <div class="irow"><span class="ic">/review</span><span class="il"></span><span class="idesc">request code review<span class="soon">soon</span></span></div>
+    </div>
+    <div class="igroup" style="border-bottom:none">
+      <h4>Configure</h4>
+      <div class="irow"><span class="ic">/model</span><span class="il"></span><span class="idesc">switch model</span></div>
+      <div class="irow"><span class="ic">/effort</span><span class="il"></span><span class="idesc">thinking effort</span></div>
+      <div class="irow"><span class="ic">/permissions</span><span class="il"></span><span class="idesc">permission mode</span></div>
+      <div class="irow"><span class="ic">/hooks</span><span class="il"></span><span class="idesc">event hooks<span class="soon">soon</span></span></div>
+      <div class="irow"><span class="ic">/mcp</span><span class="il"></span><span class="idesc">MCP servers<span class="soon">soon</span></span></div>
+      <div class="irow"><span class="ic">/agents</span><span class="il"></span><span class="idesc">subagents<span class="soon">soon</span></span></div>
+      <div class="irow"><span class="ic">/notify</span><span class="il"></span><span class="idesc">completion alerts<span class="soon">soon</span></span></div>
+      <div class="irow"><span class="ic">/theme</span><span class="il"></span><span class="idesc">pane theme<span class="soon">soon</span></span></div>
+    </div>
+  </section>
+
+  <div style="display:flex;flex-direction:column;gap:34px">
+    <!-- slash menu — filtered "re" -->
+    <section class="inset" style="width:340px" aria-label="Slash menu filtered by re">
+      <div class="idxhead"><span class="mono" style="color:var(--accent);font-weight:600">/re</span><span class="caret" aria-hidden="true"></span><span class="keyh">↵ run · esc close</span></div>
+      <div class="igroup" style="border-bottom:none">
+        <h4>3 matches</h4>
+        <div class="irow isel"><span class="ic">/<b>re</b>name</span><span class="il"></span><span class="idesc">retitle session<span class="soon">soon</span></span><span class="keyh">↵</span></div>
+        <div class="irow"><span class="ic">/<b>re</b>view</span><span class="il"></span><span class="idesc">request code review<span class="soon">soon</span></span></div>
+        <div class="irow"><span class="ic">/pe<b>r</b>missions</span><span class="il"></span><span class="idesc">permission mode</span></div>
+      </div>
+    </section>
+
+    <!-- @-mention dropdown -->
+    <section class="inset" style="width:340px" aria-label="File mention dropdown for query ws-">
+      <div class="idxhead"><span class="mono" style="color:var(--accent);font-weight:600">@</span><span class="mono">ws-</span><span class="caret" aria-hidden="true"></span><span class="keyh">↑↓ · ↵ insert</span></div>
+      <div class="igroup" style="border-bottom:none">
+        <h4>Files</h4>
+        <div class="irow isel"><span class="mono" style="font-size:11px;color:var(--muted)">ƒ</span><span class="ic">server/<b>ws</b>-handler.ts</span><span class="il"></span><span class="mono" style="font-size:10px;color:var(--muted)">edited № 2·iv</span></div>
+        <div class="irow"><span class="mono" style="font-size:11px;color:var(--muted)">ƒ</span><span class="ic">src/lib/fresh-agent-<b>ws</b>.ts</span><span class="il"></span></div>
+        <div class="irow"><span class="mono" style="font-size:11px;color:var(--muted)">ƒ</span><span class="ic">test/unit/<b>ws</b>-heartbeat.test.ts</span><span class="il"></span></div>
+      </div>
+    </section>
+  </div>
+
+  <!-- settings — tipped-in paper slip -->
+  <div style="display:flex;flex-direction:column;align-items:flex-end;gap:0">
+    <span class="inset" style="width:auto;border-bottom:none;border-radius:3px 3px 0 0;padding:2px 8px;position:relative;top:1px;z-index:2">
+      <span class="ib" aria-hidden="true" style="color:var(--accent);border-color:var(--accent)">⚙</span>
+    </span>
+  <section class="inset spop" style="width:360px" aria-label="Settings popover">
+    <span class="snotch" aria-hidden="true"></span>
+    <div class="ssec">
+      <span class="slabel">Style</span>
+      <div class="seg" role="group" aria-label="Type style">
+        <button class="sg">Sans</button><button class="sg on">Serif</button><button class="sg">Mono</button>
+      </div>
+    </div>
+    <div class="ssec">
+      <span class="slabel">Model</span>
+      <div class="mrow on"><span class="mk2">✓</span>Claude Opus 4.6<span class="mono" style="margin-left:auto;font-size:10.5px;color:var(--muted)">current</span></div>
+      <div class="mrow"><span class="mk2"></span>Sonnet 4.6<span class="soon">soon</span></div>
+    </div>
+    <div class="ssec">
+      <span class="slabel">Effort</span>
+      <div class="seg" role="group" aria-label="Thinking effort">
+        <button class="sg">Low</button><button class="sg">Medium</button><button class="sg on">High</button>
+      </div>
+    </div>
+    <div class="ssec">
+      <span class="slabel">Permission mode</span>
+      <div class="seg wrap" role="group" aria-label="Permission mode">
+        <button class="sg on">Ask</button><button class="sg">Accept edits</button><button class="sg">Bypass</button><button class="sg">Plan</button>
+      </div>
+    </div>
+    <div class="ssec">
+      <span class="slabel">Ledger display</span>
+      <div class="trow2"><span>Show thinking</span><span class="tog on"><i></i></span></div>
+      <div class="trow2"><span>Show tools</span><span class="tog on"><i></i></span></div>
+      <div class="trow2"><span>Timecodes</span><span class="tog on"><i></i></span></div>
+      <div class="trow2"><span>Sound on done<span class="soon">soon</span></span><span class="tog"><i></i></span></div>
+      <div class="trow2"><span>Desktop notifications<span class="soon">soon</span></span><span class="tog"><i></i></span></div>
+    </div>
+    <div class="ssec" style="border-bottom:none">
+      <span class="slabel">Advanced<span class="soon">soon</span></span>
+      <div class="arow2"><span>Hooks</span><span class="mono" style="color:var(--muted)">→</span></div>
+      <div class="arow2"><span>MCP servers</span><span class="mono" style="color:var(--muted)">→</span></div>
+      <div class="arow2"><span>Agents</span><span class="mono" style="color:var(--muted)">→</span></div>
+      <div class="arow2"><span>Status-line layout</span><span class="mono" style="color:var(--muted)">→</span></div>
+    </div>
+  </section>
+  </div>
+</div>
+<!--P3-->
