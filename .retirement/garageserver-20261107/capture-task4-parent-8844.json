@@ -1,0 +1,21 @@
+{
+  "purpose": "Source preservation for permanent garageserver retirement; unfinished source is not a tested release.",
+  "original_worktree": "/home/dan/code/freshell/.worktrees/task4-parent-8844",
+  "original_branch": null,
+  "original_head": "8844e431cb8eebdcf0a85c92efcbc0718fc48107",
+  "entries": [
+    {
+      "status": "??",
+      "path": ".task4-parent-rust-baseline.config.ts"
+    }
+  ],
+  "sources": [
+    {
+      "source": "/home/dan/code/freshell/.worktrees/task4-parent-8844/.task4-parent-rust-baseline.config.ts",
+      "destination": ".task4-parent-rust-baseline.config.ts",
+      "mode": "100644",
+      "oid": "a63aae8a01ebc7459118c33f820e47e43e25d468",
+      "bytes": 632
+    }
+  ]
+}
