@@ -306,7 +306,12 @@ export class ManagedRuntimeBrowserRig {
   }
 
   ownedProviderExec(containerId: string, args: string[]): string {
-    return this.runtime.execOwnedContainerAsExact(containerId, '65534:0', args)
+    // docker exec starts a fresh process and does not inherit the managed PTY's HOME.
+    return this.runtime.execOwnedContainerAsExact(containerId, '65534:0', [
+      'env',
+      'HOME=/home/freshell/provider',
+      ...args,
+    ])
   }
 
   ownedContainerHasPid(containerId: string, pid: number): boolean {

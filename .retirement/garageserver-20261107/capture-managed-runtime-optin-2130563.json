@@ -1,0 +1,21 @@
+{
+  "purpose": "Source preservation for permanent garageserver retirement; unfinished source is not a tested release.",
+  "original_worktree": "/home/dan/code/freshell/.worktrees/managed-runtime-optin-2130563",
+  "original_branch": "refs/heads/fix/managed-provider-qualification-home",
+  "original_head": "2130563d76c23397ad4a37fed42c77927cc51e8b",
+  "entries": [
+    {
+      "status": " M",
+      "path": "test/e2e-browser/helpers/managed-runtime.ts"
+    }
+  ],
+  "sources": [
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-runtime-optin-2130563/test/e2e-browser/helpers/managed-runtime.ts",
+      "destination": "test/e2e-browser/helpers/managed-runtime.ts",
+      "mode": "100644",
+      "oid": "ed934312f9dd0345e3ee49f3a93bda92715b2447",
+      "bytes": 20476
+    }
+  ]
+}
