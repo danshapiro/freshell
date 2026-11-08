@@ -1403,5 +1403,962 @@
       "missing_after_blobs": []
     }
   ],
-  "note": "No application histories, credentials, diagnostic logs, archives or patches are stored in this manifest."
+  "note": "No application histories, credentials, diagnostic logs, archives or patches are stored in this manifest.",
+  "worktree_pseudorefs": [
+    {
+      "worktree": "/home/dan/code/freshell",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "d535f2467fd58359438c5b65175481b507fd97d5"
+      ]
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/0q8k",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "e3b1a057a77590f5e82a1d9dbcf116fd56937e34"
+      ]
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/15gk",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "398a866f527909e37e68c46424a5d3a77951cf60"
+      ]
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/3gvd",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "1acab8b7d0ccfe52e5b0c2d8c11e6cabf1598145"
+      ]
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/3pjv",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "db7a0058ea387845058198390e6ce7e975ba1073"
+      ]
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/4g2a",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "ac20a6b8eb0dd2bdf211beabe63b6b87576ea668"
+      ]
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/6rbc",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "1f9f4c1f64da98d6035955ebed0eeef25a66bce5"
+      ]
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/a57r",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "990afc5c16c2e65da56d75c239204b49fdf2e33c"
+      ]
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/b5fb",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "78b8d9d7ae6c02f81646fe22f11bd7e286f0054c"
+      ]
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/des0",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "398a866f527909e37e68c46424a5d3a77951cf60"
+      ]
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/eaw7",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "76304a545e798316273aa61104f1a8ed9af557ad"
+      ]
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/ekc6",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "7b86de3c1c7752e7b80139b37dfefcb50dc38a60"
+      ]
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/ex4c",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "4e50bf67df61c3496152014a7d13d3b2d9ab6edc"
+      ]
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/f0ef",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "5d3fce4dc33d12e1fd1d05a120ac8aa085bc71c3"
+      ]
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/fd1m",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "6b4fd5486d07cd687246662de54c73e6eaab3ac5"
+      ]
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/kqn1",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "894fb56f4abed5847634dffea94339f841c287a4"
+      ]
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/qzka",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "cca8a75ad5789d1143226d5b1a72d49c3a5c5400"
+      ]
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/r47n",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "25a027d74c0066bced9e056fa8d1b2afbc6f33a3"
+      ]
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/r49m",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "5cf92ae4cc01c78c8bb34421d344dda24d6eb06e"
+      ]
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/rw3z",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "bed76da3aa88072c63c99bbb25c782a920cbd9d7"
+      ]
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/s52d",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "5228e282f87c527e9e8dada22b447cd96c635aa9"
+      ]
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/te1m",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "495863f8184fa42182d8d985f5e028fd7f3f2138"
+      ]
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/wfah",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "bf2a27e76e4d4441432d328b9e42e19eeb56887c"
+      ]
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/xkwq",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "4e50bf67df61c3496152014a7d13d3b2d9ab6edc"
+      ]
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/y83s",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "66cf6f8987f286768dc27057e8625cccf86ebdfc"
+      ]
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/ywwf",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "6bd783b8b03ad0ad5236102e162253bdddf1e890"
+      ]
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "55a6ac74936f89a25b8409f602f651b342c4e33b"
+      ]
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z7j7",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "571bccb910639917a4d97495c32441f88b36703e"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/.base-gate-242209",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "20dbddf53d831c2fbcebdac294d67cc262c57838"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/.base-gate-985321",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "51ca8c6a33daa41f5461f93540138a5677698ed6"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/b8ke-handoff",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "d0541c17169af8b53ed55c1d2ae35a90cea4cfe2"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/cloud-image-identity",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "f9aac274642b2aec7566d1a50927b9ac826c5d86"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/cloud-vitest-wedge-rca",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "786d18bbb1be7a045e67b1479a9165ddc4e32127"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/codex-pane-lifecycle",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "7d64365e54cf24435f4f23b47b3f8cf3cce84e82"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/deploy-main-281c67",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "281c67b914c526cd30fbb650d8963870ba0bfd6e"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/deploy-main-d0cc7cb5",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "d0cc7cb5e038811be0fb3ff5f4fc5812d2723228"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-browser-check-fixes",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "7d7a91baaf1f7cf1b99b5ee89c4ce8799b5ffce1"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-cold-sandbox",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "151f2cf4f52d0493fc35eaa61203b08d83f167e9"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-doc-alignment",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "151f2cf4f52d0493fc35eaa61203b08d83f167e9"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-final-validation",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "8a0502d14b62d4b5c054e190f89708c5d3c5a41a"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate28-build-stamp",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "8dc5b010860f0e6e8e885f0ec3f4990a128c0408"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate28-cloud-output",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "8dc5b010860f0e6e8e885f0ec3f4990a128c0408"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate28-codex-fixture",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "8dc5b010860f0e6e8e885f0ec3f4990a128c0408"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate28-opencode-recovery",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "8f54c79008f498bc1ad446b0da885749884c5ba1"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate28-parity-fixtures",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "8f54c79008f498bc1ad446b0da885749884c5ba1"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate28-runtime-ownership",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "87552b2e0ef0cb12ed950bf4cbe9eda7f108f808"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate28-tab-projection",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "8dc5b010860f0e6e8e885f0ec3f4990a128c0408"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate29-fixture",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "589cb3a43ac568d3d2e6ce266259fdd8ab84183f"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate30-cloud",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "ed2014b9f731cdbce1c38cdab833783120d33a79"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate30-provider",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "ed2014b9f731cdbce1c38cdab833783120d33a79"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate30-provider-review",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "d39b34a084a4a07c8321517468864a95618a6eb4"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate31-host-stop",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "33c1d91a821e4bfdcc8f6ce9dad581258faf8340"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate31-provider-review",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "a3cdbf25926efb3567a3e341d8e396a02db95e2c"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate31-publisher-fixes",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "33c1d91a821e4bfdcc8f6ce9dad581258faf8340"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate33-observer-evidence",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "e9c51e3fb7f80d323ce4af1a9843702f1ac5f483"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate33-shell-end",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "e9c51e3fb7f80d323ce4af1a9843702f1ac5f483"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate34-broker-schema",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "2b30f03ff7e5d3fff84060390827afe609d65b22"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate34-provider",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "2b30f03ff7e5d3fff84060390827afe609d65b22"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-history-diagnosis",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "17e17fbee792b439fe4f9ed4770abfa7bf609bc3"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-host-reply-stack",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "b24bd64c6dfb12db58f778a3ad63757110257462"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-host-startup-fixes",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "5ee63dd340e910ecb7bbf9b5d3e5147a59fcb1c7"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-host-transfer-tests",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "da2dd4f06a52f6c593d6601cd2d279280e6f9d2b"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-kilroy-fixture-repair",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "7d92eaaf06adf0d5c76aeeda3c9ecad319708efe"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-live-rereview",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "b7cdcc8144cc4e6d50f87c770009590711ebfafe"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-live-review",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "ded2bf86ffb9cd8c9a124f5be06193288a3cf225"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-native-probe-fixes",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "7d7a91baaf1f7cf1b99b5ee89c4ce8799b5ffce1"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-native-tool-fixes",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "e22d9ace24b1c4f697a81bc9a1dc8975c63a556e"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-opencode-history-notification",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "7f55e89952fd500362cbda9d02c7dbf11a59d440"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-opencode-inputs",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "f2b1862bae0e3ba1bc651025299a37fc84877e27"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-outage-reader",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "bfe46da37488cad9334e232cb170f652c08a3d0d"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-parity-repair",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "49d3ba08ffc1f6ad295fec2f50b3ecf788820cff"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-provider-review-fixes",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "151f2cf4f52d0493fc35eaa61203b08d83f167e9"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-registry-fixes",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "3dcd7884236e4184859a2e40c7115383f5de6831"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-reliability-task008",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "8110de6e648556801784132c6ceba6e677adf6ea"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-reliability-task009",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "0bf559bdb2de2c86b1a780c9979be274f7ce73f8"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-reliability-task009-claude",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "8fb3759a3b92f5d7db77b40d97f0dbee7e83b92f"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-reliability-task009-ui",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "17aa5fd099d5d643f23ea43142933ec0f701f17e"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-reliability-task010",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "132d546411ff8c9492b7d91ec7761dbe76b44f77"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-review",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "151f2cf4f52d0493fc35eaa61203b08d83f167e9"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-review-fixes",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "151f2cf4f52d0493fc35eaa61203b08d83f167e9"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-review3-probes",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "b24bd64c6dfb12db58f778a3ad63757110257462"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-review4-protocol",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "335d85219df6595583906280532793463c483407"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-round5-activity",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "aaeb0a51dd85edf3fd7ab15bfa9c404af9df0217"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-round5-recovery",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "aaeb0a51dd85edf3fd7ab15bfa9c404af9df0217"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-round5-windows",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "aaeb0a51dd85edf3fd7ab15bfa9c404af9df0217"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-runner-cleanup",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "47f97140fc37252f1c94f1794803731608c636ed"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-saved-history-repair",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "335d85219df6595583906280532793463c483407"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-server-startup-fixes",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "0036b1d040a837e74013fa22a0163d8e4323355b"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-sidecar-fixes",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "02b92b6dc07dad3133c2c14446d33325c12f5e0a"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-snapshot-fixes",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "b7cdcc8144cc4e6d50f87c770009590711ebfafe"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-stale-loss-repair",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "335d85219df6595583906280532793463c483407"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-test-oracle-fixes",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "e22d9ace24b1c4f697a81bc9a1dc8975c63a556e"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-transfer-runtime-fixes",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "7d7a91baaf1f7cf1b99b5ee89c4ce8799b5ffce1"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-validation",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "3dcd7884236e4184859a2e40c7115383f5de6831"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/fix-dead-session-warn-flake",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "f9aac274642b2aec7566d1a50927b9ac826c5d86"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/fix-freshagent-approval-flake",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "f9aac274642b2aec7566d1a50927b9ac826c5d86"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/fix-session-init-provenance-flake",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "d3c22bf203dbf903fa24fb64e8534e9ac6ec2b07"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/fix-settings-throttle-flake",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "f9aac274642b2aec7566d1a50927b9ac826c5d86"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/flaky-supervisor-permission",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "31cb9ad69f5b55f3a5414b97be691a7f53ca1c50"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes",
+      "name": "MERGE_HEAD",
+      "oids": [
+        "cbcb0726431d906355c407ed2c2859227618e1ae"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "ee54ee43472b989e3de809f4b4bee65e30d6ffb6"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/freshagent-multiple-devices",
+      "name": "REBASE_HEAD",
+      "oids": [
+        "95c10e6e059d38ef3f118f3ab10717f3e926ee80"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/freshagent-multiple-devices",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "95c10e6e059d38ef3f118f3ab10717f3e926ee80"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/freshclaude-client-e2e",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "0bcefa19d028328f524c0ad6e294907840a26751"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/freshclaude-client-e2e2",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "58959d1480235bf8f5bc606b0f3e822cf37260fe"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/freshclaude-core-c",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "8e05e67a362e8df1041bb0bc8cc122d0da99ff85"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/freshclaude-core-d",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "a2cef8120a84fd67f37764739ec4250b3e6cc06f"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/freshclaude-mcp",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "eb3b2cf1f72699b9088f86d33e2d69a771733c3a"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/freshcodex-complete",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "1d3eda197c8e58f8eb7b9b1736f957c084a44507"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/freshcodex-task004-tdd-recovery-20261026",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "ffe42dabfeac5faee91bd9a693609aeea90fc883"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/freshell-crash-resilience",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "283e4c4b87e58f31a048732800cefb345b799082"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/gate-local-phases-only",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "f9aac274642b2aec7566d1a50927b9ac826c5d86"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/investigate-sidebar-opencode-rail",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "34f425faeb565a993655a429d5f291681315d0a0"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/kata-rrx7-rollout-continuation",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "67b0f74dce6b23c024c7e331d9b876cbe67d11a3"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/lb-v3-scratch",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "1c7e4dff71fb533ae1c6dc096e6f0fe7ccd0236b"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "aa1a43cb2b60192d5ae0c9115e60a76c44b39f26"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/managed-runtime-optin-2130563",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "2130563d76c23397ad4a37fed42c77927cc51e8b"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/mdmw-sandbox-budget",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "cbae31df487bc150c1d57ba93b63f18910ce5098"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/name-reliability-client",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "c517c1b910ae3671fac9753ec461e6587c4a9320"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/name-reliability-terminal",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "566438b38541b62991c3d4696cb657d477bd7a45"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/name-repro-presouls",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "0f044b4a0830846c4ebcbf26365c9758114bf84f"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/name-repro-scratch",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "302cee989de81e4d881bafbd3a33abfa7a07e57a"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/oomd-session-proof",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "520626c46b7e5bfcbdddd85480fd375cdc9cb783"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/oomd-session-proof-current",
+      "name": "REBASE_HEAD",
+      "oids": [
+        "002174a51e707f7b0c125bc9e5d0debbf87641ba"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/oomd-session-proof-current",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "002174a51e707f7b0c125bc9e5d0debbf87641ba"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/opencode-bg-green-gate",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "398a866f527909e37e68c46424a5d3a77951cf60"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/opencode-managed-model-live",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "0eb7ef9a32dc54e4030eb2a3706f387b1b65fead"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/pane-title-recovery",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "763244b4dff0b57ddbc897369432c29d69413ea6"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/rca-attach-wedge",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "855dae72a83404c930a56d8c6810dab5746720fa"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/rust-cache-experiment-77444e9",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "77444e9f22e1dbcf34c01202e4fb5acfad144281"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/task4-parent-8844",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "8844e431cb8eebdcf0a85c92efcbc0718fc48107"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/task4-parent-rust",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "8844e431cb8eebdcf0a85c92efcbc0718fc48107"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/terminal-replay-credit",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "58b65677ff2c70a42525413bd76daa67de13644f"
+      ]
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/z06a-probe",
+      "name": "ORIG_HEAD",
+      "oids": [
+        "7b86de3c1c7752e7b80139b37dfefcb50dc38a60"
+      ]
+    }
+  ],
+  "pseudoref_supplement": {
+    "additional_commits": 43,
+    "independent_tips": [
+      "6bd783b8b03ad0ad5236102e162253bdddf1e890",
+      "5d3fce4dc33d12e1fd1d05a120ac8aa085bc71c3",
+      "55a6ac74936f89a25b8409f602f651b342c4e33b",
+      "1f9f4c1f64da98d6035955ebed0eeef25a66bce5",
+      "ac20a6b8eb0dd2bdf211beabe63b6b87576ea668",
+      "571bccb910639917a4d97495c32441f88b36703e",
+      "495863f8184fa42182d8d985f5e028fd7f3f2138",
+      "bed76da3aa88072c63c99bbb25c782a920cbd9d7",
+      "e3b1a057a77590f5e82a1d9dbcf116fd56937e34",
+      "5cf92ae4cc01c78c8bb34421d344dda24d6eb06e",
+      "6b4fd5486d07cd687246662de54c73e6eaab3ac5"
+    ],
+    "secret_scan": "41nonmergecommits,1.77MB,noleaks"
+  }
 }
