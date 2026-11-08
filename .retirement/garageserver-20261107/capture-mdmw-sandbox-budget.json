@@ -1,0 +1,98 @@
+{
+  "purpose": "Source preservation for permanent garageserver retirement; unfinished source is not a tested release.",
+  "original_worktree": "/home/dan/code/freshell/.worktrees/mdmw-sandbox-budget",
+  "original_branch": "refs/heads/the-usual/mdmw-sandbox-main-fast",
+  "original_head": "342e6e73081fa3b8d70935dd5c97cda030be8427",
+  "entries": [
+    {
+      "status": " M",
+      "path": "docs/development/test-sandbox.md"
+    },
+    {
+      "status": " M",
+      "path": "scripts/sandbox-selftest.sh"
+    },
+    {
+      "status": " M",
+      "path": "scripts/sandbox-test.sh"
+    },
+    {
+      "status": " M",
+      "path": "scripts/testing/sandbox-diagnostics.mjs"
+    },
+    {
+      "status": " M",
+      "path": "test/unit/tooling/sandbox-test.config.ts"
+    },
+    {
+      "status": " M",
+      "path": "test/unit/tooling/sandbox-test.sandbox.ts"
+    },
+    {
+      "status": "??",
+      "path": "scripts/test/sandbox-observer-init.py"
+    },
+    {
+      "status": "??",
+      "path": "test/unit/tooling/sandbox-cargo-observer.sandbox.ts"
+    }
+  ],
+  "sources": [
+    {
+      "source": "/home/dan/code/freshell/.worktrees/mdmw-sandbox-budget/docs/development/test-sandbox.md",
+      "destination": "docs/development/test-sandbox.md",
+      "mode": "100644",
+      "oid": "e563d03be3ae9160bc6a70fa46735a966d2fd03e",
+      "bytes": 21134
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/mdmw-sandbox-budget/scripts/sandbox-selftest.sh",
+      "destination": "scripts/sandbox-selftest.sh",
+      "mode": "100755",
+      "oid": "c40f973f33984c6a0dae0f64c519f26ae55cc137",
+      "bytes": 28786
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/mdmw-sandbox-budget/scripts/sandbox-test.sh",
+      "destination": "scripts/sandbox-test.sh",
+      "mode": "100755",
+      "oid": "052e1602e3df44d5f5fefd98e8acff0e3845a1ff",
+      "bytes": 46248
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/mdmw-sandbox-budget/scripts/testing/sandbox-diagnostics.mjs",
+      "destination": "scripts/testing/sandbox-diagnostics.mjs",
+      "mode": "100644",
+      "oid": "0400ef269fbc36ce81614dfd71fb70e38bf3feed",
+      "bytes": 9445
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/mdmw-sandbox-budget/test/unit/tooling/sandbox-test.config.ts",
+      "destination": "test/unit/tooling/sandbox-test.config.ts",
+      "mode": "100644",
+      "oid": "062806e686008a775a5dffd77839cc4a24efea68",
+      "bytes": 956
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/mdmw-sandbox-budget/test/unit/tooling/sandbox-test.sandbox.ts",
+      "destination": "test/unit/tooling/sandbox-test.sandbox.ts",
+      "mode": "100644",
+      "oid": "767f1fca99c463123bfa322badcf344445a792f5",
+      "bytes": 59124
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/mdmw-sandbox-budget/scripts/test/sandbox-observer-init.py",
+      "destination": "scripts/test/sandbox-observer-init.py",
+      "mode": "100644",
+      "oid": "9ecdd088b0ff9ff1517544ac569a8339bc64a217",
+      "bytes": 2560
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/mdmw-sandbox-budget/test/unit/tooling/sandbox-cargo-observer.sandbox.ts",
+      "destination": "test/unit/tooling/sandbox-cargo-observer.sandbox.ts",
+      "mode": "100644",
+      "oid": "763e299ed0adbd37d18a2e0bf8071fd29c77c28c",
+      "bytes": 4203
+    }
+  ]
+}

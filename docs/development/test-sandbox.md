@@ -40,11 +40,26 @@ cleanup outcome. They omit command text and arbitrary environment values.
 Jobs inputs appear as numeric strings, null, or a fixed non-numeric marker.
 Workload stdout and stderr keep their original contents.
 
+Each phase also starts with an `unobserved` Cargo jobs receipt. A small
+unprivileged observer can then record the `NUM_JOBS` reported to a verified
+Cargo build script, associated with that phase and command digest. A
+phase-local process number distinguishes witnessed Cargo processes; multiple
+reports can have different values. These are samples, not a complete list:
+cached, short-lived, inaccessible, or otherwise missed scripts remain unknown.
+The reported value is neither the number of processes running simultaneously
+nor the capacity of an inherited shared jobserver.
+
+The observer scans at most 512 processes every 200 ms, reads at most 64 KiB of
+a qualifying script's environment, and emits at most 64 samples. It never logs
+paths, command lines, or environment contents. It shares the existing CPU,
+memory, and process limits and does not own or wait for the caller. Observer
+failure leaves the unknown receipt and the caller's result unchanged.
+
 Containers retain `--rm`, so their post-exit state is reported as
 `not_retained`. Unavailable OOM state remains null; this launcher never
-classifies exit 137 as OOM. Diagnostic helper failures emit a fixed unavailable
-event and preserve execution and cleanup statuses. Such a run lacks required
-diagnostic evidence even if its workload succeeds.
+classifies exit 137 as OOM. Synchronous diagnostic helper failures emit a fixed
+unavailable event and preserve execution and cleanup statuses. Such a run lacks
+required diagnostic evidence even if its workload succeeds.
 
 The self-test includes six-member offline Cargo smokes for the native default,
 project, exported, inline, and CLI job settings. Each checks actual build-script

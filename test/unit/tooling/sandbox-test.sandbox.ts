@@ -159,10 +159,10 @@ with (root / 'receipt.jsonl').open('a') as log:
             // Do not accidentally inherit the outer sandbox's own mount.
             mapped[3] = path.join(path.dirname(state), 'unmounted', path.basename(helper));
           }
-          const child = spawnSync('bash', mapped, {encoding:'utf8', timeout:5000});
+          const child = spawnSync('bash', mapped, {encoding:'utf8', timeout:15000});
           process.stdout.write(child.stdout ?? '');
           process.stderr.write(child.stderr ?? '');
-          status = child.status ?? 124;
+          status = child.status ?? (child.signal === 'SIGTERM' ? 143 : 124);
         }
         if (args.includes('--rm')) fs.unlinkSync(state);
         process.exit(status);
@@ -296,6 +296,30 @@ function metadata(stderr: string) {
   })
 }
 
+function cargoFixture(root: string) {
+  mkdirSync(path.join(root, 'src'))
+  writeFileSync(path.join(root, 'Cargo.toml'), '[package]\nname = "jobs-fixture"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\n')
+  writeFileSync(path.join(root, 'src/lib.rs'), 'pub fn fixture() {}\n')
+  writeFileSync(path.join(root, 'build.rs'), `
+    use std::io::Write;
+    fn main() {
+      println!("cargo:rerun-if-changed=build.rs");
+      println!("cargo:rerun-if-changed=src/lib.rs");
+      let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+      let mut file = std::fs::OpenOptions::new().create(true).append(true)
+        .open(format!("{root}/recorded-jobs")).unwrap();
+      writeln!(file, "{}", std::env::var("NUM_JOBS").unwrap()).unwrap();
+      let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+      let parent = stat.rsplit_once(") ").unwrap().1.split_whitespace().nth(1).unwrap();
+      std::fs::write(format!("{root}/recorded-exe"),
+        std::fs::read_link("/proc/self/exe").unwrap().to_string_lossy().as_bytes()).unwrap();
+      std::fs::write(format!("{root}/recorded-parent-exe"),
+        std::fs::read_link(format!("/proc/{parent}/exe")).unwrap().to_string_lossy().as_bytes()).unwrap();
+      std::thread::sleep(std::time::Duration::from_millis(1500));
+    }
+  `)
+}
+
 describe('sandbox build budget and compact failure receipts', () => {
   const cid = 'a'.repeat(64)
   const launches = (events: Array<{ kind: string; args?: string[] }>) => events
@@ -359,6 +383,144 @@ describe('sandbox build budget and compact failure receipts', () => {
         cargo_build_jobs_env: '3', availability: 'complete', ...limits,
       }))
       expect(metadata(result.stderr).some(row => row.event === 'sandbox_diagnostics_unavailable')).toBe(false)
+    } finally { f.cleanup() }
+  })
+
+  it.each([
+    { name: 'native default', expected: undefined },
+    { name: 'project configuration', project: 3, expected: 3 },
+    { name: 'exported environment', environment: '4', expected: 4 },
+    { name: 'inline environment overriding the exported value', environment: '4', inline: '2', expected: 2 },
+    { name: 'CLI overriding competing environment values', environment: '4', inline: '3', cli: 1, expected: 1 },
+    { name: 'Cargo replacing the caller process', cli: 2, expected: 2, exec: true },
+  ])('reports a real Cargo build script\'s independently recorded jobs: $name', options => {
+    const f = fixture('budget-success')
+    try {
+      cargoFixture(f.root)
+      if (options.project) {
+        mkdirSync(path.join(f.root, '.cargo'))
+        writeFileSync(path.join(f.root, '.cargo/config.toml'), `[build]\njobs = ${options.project}\n`)
+      }
+      const inline = options.inline ? `CARGO_BUILD_JOBS=${options.inline} ` : ''
+      const cli = options.cli ? ` --jobs ${options.cli}` : ''
+      const command = `cd '${f.root}' && ${inline}CARGO_OBSERVER_CANARY=DO_NOT_LOG_JOB_SECRET ${options.exec ? 'exec ' : ''}cargo build --offline --quiet${cli}${options.exec ? '' : " && printf 'real-cargo-finished'"}`
+      const result = f.run(false, false, false, { command, cargoJobs: options.environment, executePrelude: true })
+      expect(result.status, result.stderr).toBe(0)
+      expect(result.stdout).toBe(options.exec ? '' : 'real-cargo-finished')
+      const recorded = Number(readFileSync(path.join(f.root, 'recorded-jobs'), 'utf8'))
+      expect(recorded).toBeGreaterThan(0)
+      if (options.expected !== undefined) expect(recorded).toBe(options.expected)
+      expect(readFileSync(path.join(f.root, 'recorded-exe'), 'utf8')).toMatch(/\/build\/[^/]+-[a-f0-9]{16}\/build-script-[A-Za-z0-9_-]+$/)
+      expect(path.basename(readFileSync(path.join(f.root, 'recorded-parent-exe'), 'utf8'))).toBe('cargo')
+      const rows = metadata(result.stderr)
+      const context = { container: result.name, phase: 'ordinary', command_sha256: createHash('sha256').update(command).digest('hex') }
+      expect(rows).toContainEqual(expect.objectContaining({ event: 'sandbox_effective_limits', ...context, memory_max: expect.any(String) }))
+      expect(rows).toContainEqual(expect.objectContaining({ event: 'sandbox_cargo_jobs', ...context, state: 'unobserved', jobs: null }))
+      expect(rows).toContainEqual(expect.objectContaining({ event: 'sandbox_cargo_jobs', ...context,
+        state: 'observed', source: 'cargo_build_script', cargo_process: expect.any(Number), jobs: recorded }))
+      expect(result.stderr).not.toContain('DO_NOT_LOG_JOB_SECRET')
+    } finally { f.cleanup() }
+  }, 15_000)
+
+  it('keeps distinct actual Cargo invocations and their different job reports separate', () => {
+    const f = fixture('budget-success')
+    try {
+      cargoFixture(f.root)
+      const command = `cd '${f.root}' && cargo build --offline --quiet --jobs 1 && cargo clean --quiet && cargo build --offline --quiet --jobs 3`
+      const result = f.run(false, false, false, { command, executePrelude: true })
+      expect(result.status, result.stderr).toBe(0)
+      expect(readFileSync(path.join(f.root, 'recorded-jobs'), 'utf8').trim().split('\n').map(Number)).toEqual([1, 3])
+      const samples = metadata(result.stderr).filter(row => row.event === 'sandbox_cargo_jobs' && row.state === 'observed')
+      expect(samples.map(row => row.jobs)).toEqual([1, 3])
+      expect(new Set(samples.map(row => row.cargo_process)).size).toBe(2)
+    } finally { f.cleanup() }
+  }, 20_000)
+
+  it('reports a build script under an inherited make jobserver without claiming its capacity', () => {
+    const f = fixture('budget-success')
+    try {
+      cargoFixture(f.root)
+      writeFileSync(path.join(f.root, 'Makefile'), 'all:\n\t+cargo build --offline --quiet\n')
+      const command = `cd '${f.root}' && make --no-print-directory --silent -j3`
+      const result = f.run(false, false, false, { command, executePrelude: true })
+      expect(result.status, result.stderr).toBe(0)
+      const recorded = Number(readFileSync(path.join(f.root, 'recorded-jobs'), 'utf8'))
+      expect(recorded).toBeGreaterThan(0)
+      const samples = metadata(result.stderr).filter(row => row.event === 'sandbox_cargo_jobs' && row.state === 'observed')
+      expect(samples).toContainEqual(expect.objectContaining({ source: 'cargo_build_script', jobs: recorded }))
+      expect(samples.every(row => !('jobserver_capacity' in row))).toBe(true)
+    } finally { f.cleanup() }
+  }, 15_000)
+
+  it('leaves unrelated NUM_JOBS values unknown without exposing environment or command contents', () => {
+    const f = fixture('budget-success')
+    try {
+      const command = "NUM_JOBS=37 CARGO_OBSERVER_CANARY=DO_NOT_LOG_JOB_SECRET sleep 1 && printf 'caller bytes'"
+      const result = f.run(false, false, false, { command, executePrelude: true })
+      expect(result.status, result.stderr).toBe(0)
+      expect(result.stdout).toBe('caller bytes')
+      const samples = metadata(result.stderr).filter(row => row.event === 'sandbox_cargo_jobs')
+      expect(samples).toHaveLength(1)
+      expect(samples[0]).toEqual(expect.objectContaining({ state: 'unobserved', jobs: null }))
+      expect(result.stderr).not.toContain('DO_NOT_LOG_JOB_SECRET')
+      expect(result.stderr).not.toContain('NUM_JOBS=37')
+    } finally { f.cleanup() }
+  })
+
+  it('keeps a cached Cargo build unknown when no build script runs', () => {
+    const f = fixture('budget-success')
+    try {
+      cargoFixture(f.root)
+      const warm = spawnSync('cargo', ['build', '--offline', '--quiet'], { cwd: f.root, encoding: 'utf8', timeout: 10_000 })
+      expect(warm.status, warm.stderr).toBe(0)
+      const command = `cd '${f.root}' && cargo build --offline --quiet`
+      const result = f.run(false, false, false, { command, executePrelude: true })
+      expect(result.status, result.stderr).toBe(0)
+      expect(readFileSync(path.join(f.root, 'recorded-jobs'), 'utf8').trim().split('\n')).toHaveLength(1)
+      const samples = metadata(result.stderr).filter(row => row.event === 'sandbox_cargo_jobs')
+      expect(samples).toHaveLength(1)
+      expect(samples[0]).toEqual(expect.objectContaining({ state: 'unobserved', jobs: null }))
+    } finally { f.cleanup() }
+  }, 15_000)
+
+  it.each(['observe-launch', 'observe-watch'])('preserves caller bytes and status when %s fails', mode => {
+    const f = fixture('budget-success')
+    try {
+      const helper = path.join(f.root, 'scripts/testing/sandbox-diagnostics.mjs')
+      copyFileSync(helper, path.join(f.root, 'scripts/testing/original-diagnostics.mjs'))
+      writeFileSync(helper, `if (process.argv[2] === ${JSON.stringify(mode)}) { console.error('OBSERVER_FAILURE_SECRET'); process.exit(79) }\nawait (await import('./original-diagnostics.mjs')).main()\n`)
+      const command = "printf 'caller stdout'; printf 'caller stderr' >&2; sleep 0.5; exit 37"
+      const result = f.run(false, false, false, { command, executePrelude: true })
+      expect(result.status, result.stderr).toBe(37)
+      expect(result.stdout).toBe('caller stdout')
+      expect(result.stderr).toContain('caller stderr')
+      expect(result.stderr).not.toContain('OBSERVER_FAILURE_SECRET')
+      expect(metadata(result.stderr)).toContainEqual(expect.objectContaining({ event: 'sandbox_cargo_jobs', state: 'unobserved', jobs: null }))
+      expect(metadata(result.stderr)).toContainEqual(expect.objectContaining({ event: 'sandbox_result', docker_status: 37, final_status: 37, settled: true }))
+      expect(existsSync(result.control)).toBe(false)
+    } finally { f.cleanup() }
+  })
+
+  it('does not leave the observer as a caller child or interfere with waiting for a real child', () => {
+    const f = fixture('budget-success')
+    try {
+      const probe = path.join(f.root, 'child-probe.py')
+      writeFileSync(probe, `import os, time\ntime.sleep(0.4)\ntry:\n os.waitpid(-1, os.WNOHANG)\n raise SystemExit(51)\nexcept ChildProcessError:\n pass\npid = os.fork()\nif pid == 0: os._exit(0)\nchild, status = os.waitpid(-1, 0)\nassert child == pid and status == 0\nprint('child-wait-ok', end='')\n`)
+      const result = f.run(false, false, false, { command: `exec python3 '${probe}'`, executePrelude: true })
+      expect(result.status, result.stderr).toBe(0)
+      expect(result.stdout).toBe('child-wait-ok')
+      expect(metadata(result.stderr)).toContainEqual(expect.objectContaining({ event: 'sandbox_result', final_status: 0, settled: true }))
+    } finally { f.cleanup() }
+  })
+
+  it('preserves an actual caller termination signal and exact cleanup with the observer enabled', () => {
+    const f = fixture('budget-success')
+    try {
+      const result = f.run(false, false, false, { command: 'kill -TERM $$', executePrelude: true })
+      expect(result.status, result.stderr).toBe(143)
+      expect(metadata(result.stderr)).toContainEqual(expect.objectContaining({ event: 'sandbox_result', docker_status: 143, final_status: 143, settled: true }))
+      expect(existsSync(f.state)).toBe(false)
+      expect(existsSync(result.control)).toBe(false)
     } finally { f.cleanup() }
   })
 
@@ -489,7 +651,7 @@ describe('sandbox build budget and compact failure receipts', () => {
           else if (existsSync(helper)) {
             const original = path.join(f.root, 'scripts/testing/original-diagnostics.mjs')
             copyFileSync(helper, original)
-            writeFileSync(helper, `if (process.argv[2] === ${JSON.stringify(failure)}) { console.error('BUDGET_SECRET_SENTINEL'); process.exit(79) }\nawait import('./original-diagnostics.mjs')\n`)
+            writeFileSync(helper, `if (process.argv[2] === ${JSON.stringify(failure)}) { console.error('BUDGET_SECRET_SENTINEL'); process.exit(79) }\nawait (await import('./original-diagnostics.mjs')).main()\n`)
           }
           const result = f.run(false, false)
           expect(result.status, result.stderr).toBe(status)

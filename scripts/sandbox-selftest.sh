@@ -576,6 +576,18 @@ else
 fi
 echo
 
+# ---- Proof 10: actual init adoption and sandbox-local /proc permissions ----
+echo "--- Proof 10: sandbox Cargo observer process relationship ---"
+P10_STATUS=0
+P10_OUT="$("${REPO_ROOT}/scripts/sandbox-test.sh" --runtime-suite 'exec python3 scripts/test/sandbox-observer-init.py' 2>&1)" || P10_STATUS=$?
+echo "${P10_OUT}"
+if [ "${P10_STATUS}" -eq 0 ] && grep -q '"event": "sandbox_observer_init_probe"' <<<"${P10_OUT}"; then
+  pass "init adopts the observer, the caller retains its own children, and sandbox /proc is accessible"
+else
+  fail "sandbox Cargo observer process relationship: exit=${P10_STATUS}"
+fi
+echo
+
 # ---- final host isolation check ----
 FINAL_3001="$(host_3001)"
 FINAL_3002="$(host_3002)"

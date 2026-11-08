@@ -970,6 +970,14 @@ docker "${DOCKER_ARGS[@]}" "${IMAGE_TAG}" bash -c '
   else
     printf '\''{"severity":"warn","event":"sandbox_diagnostics_unavailable","mode":"effective"}\n'\'' >&2 || true
   fi
+  # The context values are generated or validated by the outer wrapper. Emit
+  # unknown even if the helper cannot start; samples never imply completeness.
+  if [ -n "$4" ]; then digest_json="\"$4\""; else digest_json=null; fi
+  printf '\''{"severity":"info","event":"sandbox_cargo_jobs","container":"%s","phase":"%s","command_sha256":%s,"state":"unobserved","jobs":null}\n'\'' \
+    "$2" "$3" "$digest_json" >&2 || true
+  # Join only the short launcher, so init adopts the watcher before the exec.
+  # fd 3 carries fixed observations; watcher failures cannot print raw errors.
+  node "$1" observe-launch "$2" "$3" "$4" "$$" 3>&2 >/dev/null 2>&1 || true
   exec bash -c "$6"
 ' sandbox-observe "${DIAGNOSTIC_CONTAINER_HELPER}" \
   "${OWNED_CONTAINER_NAME}" "${DIAGNOSTIC_PHASE}" "${COMMAND_SHA256}" "${CARGO_BUILD_JOBS:-}" "${CMD}" &

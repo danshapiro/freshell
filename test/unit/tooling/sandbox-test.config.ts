@@ -9,6 +9,7 @@ export default defineConfig({
     ...baseConfig.test,
     include: [
       'test/unit/tooling/sandbox-test.sandbox.ts',
+      'test/unit/tooling/sandbox-cargo-observer.sandbox.ts',
       'test/unit/tooling/sandbox-budget-smoke.test.ts',
       'test/unit/tooling/sandbox-selftests.sandbox.ts',
       'test/unit/tooling/run-rust-tests.test.ts',
