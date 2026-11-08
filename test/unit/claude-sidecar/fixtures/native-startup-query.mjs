@@ -139,6 +139,7 @@ export function query({ prompt, options }) {
         const input = { command: 'fixture owned harmless counter' }
         const toolUseID = 'toolu_original1'
         const assistant = { type: 'assistant', sessionId: nativeRoot, session_id: nativeRoot,
+          cwd: options.cwd,
           uuid: 'assistant-original', version: '2.1.237',
           message: { id: 'msg_fixture_original', content: [{ type: 'tool_use', id: toolUseID, name: 'Bash', input }] } }
         const callback = message.eager && process.env.FRESHELL_SIDECAR_TEST_CHECKPOINT_EAGER_CALLBACK_ONLY === '1'

@@ -1,0 +1,21 @@
+{
+  "purpose": "Source preservation for permanent garageserver retirement; unfinished source is not a tested release.",
+  "original_worktree": "/home/dan/code/freshell",
+  "original_branch": "refs/heads/main",
+  "original_head": "cbcb0726431d906355c407ed2c2859227618e1ae",
+  "entries": [
+    {
+      "status": " M",
+      "path": "test/unit/claude-sidecar/fixtures/native-startup-query.mjs"
+    }
+  ],
+  "sources": [
+    {
+      "source": "/home/dan/code/freshell/test/unit/claude-sidecar/fixtures/native-startup-query.mjs",
+      "destination": "test/unit/claude-sidecar/fixtures/native-startup-query.mjs",
+      "mode": "100644",
+      "oid": "08483a2769591d67622a6df89f5ea8b55bb9e8cc",
+      "bytes": 18705
+    }
+  ]
+}
