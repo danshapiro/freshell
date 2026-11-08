@@ -1,0 +1,32 @@
+{
+  "purpose": "Source preservation for permanent garageserver retirement; unfinished source is not a tested release.",
+  "original_worktree": "/home/dan/code/freshell/.worktrees/task4-parent-rust",
+  "original_branch": null,
+  "original_head": "8844e431cb8eebdcf0a85c92efcbc0718fc48107",
+  "entries": [
+    {
+      "status": " M",
+      "path": "test/e2e-browser/specs/freshopencode-db-history.spec.ts"
+    },
+    {
+      "status": " M",
+      "path": "test/e2e-browser/specs/freshopencode-first-send-reload-repro.spec.ts"
+    }
+  ],
+  "sources": [
+    {
+      "source": "/home/dan/code/freshell/.worktrees/task4-parent-rust/test/e2e-browser/specs/freshopencode-db-history.spec.ts",
+      "destination": "test/e2e-browser/specs/freshopencode-db-history.spec.ts",
+      "mode": "100644",
+      "oid": "118f0d026e4cd6f1721b577cf4260cb28c0a1468",
+      "bytes": 18266
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/task4-parent-rust/test/e2e-browser/specs/freshopencode-first-send-reload-repro.spec.ts",
+      "destination": "test/e2e-browser/specs/freshopencode-first-send-reload-repro.spec.ts",
+      "mode": "100644",
+      "oid": "1383ef569513339093ddedaddafa8a65982162ee",
+      "bytes": 7419
+    }
+  ]
+}
