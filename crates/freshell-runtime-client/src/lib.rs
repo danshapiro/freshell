@@ -6,20 +6,20 @@
 
 use freshell_runtime_protocol::{
     write_frame, AcknowledgeViewProjectionRequest, AdminCommand, AdminReply, AdminResult,
-    ControlRole, Envelope, FreshAgentCapture, FreshAgentCaptureRequest, FreshAgentCompactRequest,
-    FreshAgentForkRequest, FreshAgentInterruptRequest, FreshAgentReadEventsRequest,
-    FreshAgentResolveRequest, FreshAgentRollbackDirection, FreshAgentRollbackMode,
-    FreshAgentRollbackRequest, FreshAgentSendRequest, IncidentId, IncidentSummaryRequest,
-    LaunchRequest, LossIncidentSummary, LostSoulRepairTarget, ManagedRolloutMode, MigrationPlan,
-    MigrationPlanRequest, NoticeDeliveryState, NoticeId, NoticeReceiptRequest,
-    OpenCodeTransferAction, OpenCodeTransferDescriptor, OpenCodeTransferResult,
-    PendingNoticesRequest, PendingViewProjectionsRequest, RecoverRequest, RecoveryProbeRequest,
-    RecoveryTrigger, RepairAudit, RepairRequest, RequestId, RestoreLostSoulsRequest,
-    RestoreLostSoulsResult, RuntimeError, RuntimeErrorCode, RuntimeInventorySnapshot,
-    RuntimeMetricsRequest, RuntimeMetricsSnapshot, RuntimeNotice, RuntimeView, SoulId, StopOutcome,
-    StopRequest, TerminalInputRequest, TerminalReadOutputRequest, TerminalResizeRequest,
-    UpdateLimitsRequest, UpdateLimitsResult, UpdateViewVisibilityRequest, UpsertViewIntentRequest,
-    ViewIntent, ViewProjectionEvent, CONTROL_PROTOCOL_VERSION,
+    CanonicalOwnerChoice, ControlRole, Envelope, FreshAgentCapture, FreshAgentCaptureRequest,
+    FreshAgentCompactRequest, FreshAgentForkRequest, FreshAgentInterruptRequest,
+    FreshAgentReadEventsRequest, FreshAgentResolveRequest, FreshAgentRollbackDirection,
+    FreshAgentRollbackMode, FreshAgentRollbackRequest, FreshAgentSendRequest, IncidentId,
+    IncidentSummaryRequest, LaunchRequest, LossIncidentSummary, LostSoulRepairTarget,
+    ManagedRolloutMode, MigrationPlan, MigrationPlanRequest, NoticeDeliveryState, NoticeId,
+    NoticeReceiptRequest, OpenCodeTransferAction, OpenCodeTransferDescriptor,
+    OpenCodeTransferResult, PendingNoticesRequest, PendingViewProjectionsRequest, RecoverRequest,
+    RecoveryProbeRequest, RecoveryTrigger, RepairAudit, RepairRequest, RequestId,
+    RestoreLostSoulsRequest, RestoreLostSoulsResult, RuntimeError, RuntimeErrorCode,
+    RuntimeInventorySnapshot, RuntimeMetricsRequest, RuntimeMetricsSnapshot, RuntimeNotice,
+    RuntimeView, SoulId, StopOutcome, StopRequest, TerminalInputRequest, TerminalReadOutputRequest,
+    TerminalResizeRequest, UpdateLimitsRequest, UpdateLimitsResult, UpdateViewVisibilityRequest,
+    UpsertViewIntentRequest, ViewIntent, ViewProjectionEvent, CONTROL_PROTOCOL_VERSION,
 };
 use std::{path::PathBuf, sync::Arc};
 use tokio::{net::UnixStream, sync::RwLock};
@@ -536,9 +536,11 @@ impl RuntimeClient {
         &self,
         request_id: RequestId,
         targets: Vec<LostSoulRepairTarget>,
+        canonical_owners: Vec<CanonicalOwnerChoice>,
     ) -> Result<RestoreLostSoulsResult, ClientError> {
         let mut request = RestoreLostSoulsRequest {
             targets,
+            canonical_owners,
             expected_control_epoch: Some(self.current_epoch().await?),
         };
         request.validate_exact_batch().map_err(|error| {

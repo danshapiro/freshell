@@ -2522,6 +2522,7 @@ impl Supervisor {
                 fixture_evidence,
                 exited,
                 native_session_id,
+                opencode_adoption,
                 opencode_transfer_receipt,
                 ..
             } => Ok(HostStatus {
@@ -2531,6 +2532,7 @@ impl Supervisor {
                 fixture_evidence,
                 exited,
                 native_session_id,
+                opencode_adoption,
                 opencode_transfer_receipt,
             }),
             _ => Err(RuntimeError::new(
@@ -2762,6 +2764,7 @@ pub(crate) struct HostStatus {
     pub(crate) fixture_evidence: serde_json::Value,
     pub(crate) exited: bool,
     pub(crate) native_session_id: Option<String>,
+    pub(crate) opencode_adoption: freshell_runtime_protocol::OpenCodeAdoptionStatus,
     pub(crate) opencode_transfer_receipt: Option<OpenCodeTransferReadinessReceipt>,
 }
 

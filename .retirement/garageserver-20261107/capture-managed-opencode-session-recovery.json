@@ -1,0 +1,329 @@
+{
+  "purpose": "Source preservation for permanent garageserver retirement; unfinished source is not a tested release.",
+  "original_worktree": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery",
+  "original_branch": "refs/heads/the-usual/managed-opencode-session-recovery",
+  "original_head": "8362581b8c90de7e192a353b2256a7a5e71b5494",
+  "entries": [
+    {
+      "status": " M",
+      "path": "crates/freshell-agent-runtime/src/lib.rs"
+    },
+    {
+      "status": " M",
+      "path": "crates/freshell-runtime-client/src/lib.rs"
+    },
+    {
+      "status": " M",
+      "path": "crates/freshell-runtime-protocol/src/lib.rs"
+    },
+    {
+      "status": " M",
+      "path": "crates/freshell-server/src/managed_runtime_api.rs"
+    },
+    {
+      "status": " M",
+      "path": "crates/freshell-session-host/src/main.rs"
+    },
+    {
+      "status": " M",
+      "path": "crates/freshell-session-host/src/providers/deterministic_fresh_agent.rs"
+    },
+    {
+      "status": " M",
+      "path": "crates/freshell-session-host/src/pty.rs"
+    },
+    {
+      "status": " M",
+      "path": "crates/freshell-supervisor/src/backend/native_history.rs"
+    },
+    {
+      "status": " M",
+      "path": "crates/freshell-supervisor/src/loss_report_tests.rs"
+    },
+    {
+      "status": " M",
+      "path": "crates/freshell-supervisor/src/notice_outbox.rs"
+    },
+    {
+      "status": " M",
+      "path": "crates/freshell-supervisor/src/recovery.rs"
+    },
+    {
+      "status": " M",
+      "path": "crates/freshell-supervisor/src/registry.rs"
+    },
+    {
+      "status": " M",
+      "path": "crates/freshell-supervisor/src/resume_catalog.rs"
+    },
+    {
+      "status": " M",
+      "path": "crates/freshell-supervisor/src/service.rs"
+    },
+    {
+      "status": " M",
+      "path": "crates/freshell-supervisor/src/stopped_repair_cas.rs"
+    },
+    {
+      "status": " M",
+      "path": "docs/plans/2026-10-03-managed-opencode-session-recovery.md"
+    },
+    {
+      "status": " M",
+      "path": "extensions/opencode/freshell-rebind-plugin.ts"
+    },
+    {
+      "status": " M",
+      "path": "port/contract/managed-runtime.schema.json"
+    },
+    {
+      "status": " M",
+      "path": "scripts/testing/runtime-sandbox.ts"
+    },
+    {
+      "status": " M",
+      "path": "scripts/testing/runtime-test-broker.ts"
+    },
+    {
+      "status": " M",
+      "path": "shared/managed-runtime.ts"
+    },
+    {
+      "status": " M",
+      "path": "test/e2e-browser/helpers/managed-runtime.ts"
+    },
+    {
+      "status": " M",
+      "path": "test/e2e-browser/specs/runtime-provider-resurrection-rust.spec.ts"
+    },
+    {
+      "status": " M",
+      "path": "test/unit/extensions/opencode-rebind-plugin.test.ts"
+    },
+    {
+      "status": " M",
+      "path": "test/unit/lib/managed-runtime-recovery.test.ts"
+    },
+    {
+      "status": " M",
+      "path": "test/unit/tooling/testing/runtime-test-broker.test.ts"
+    },
+    {
+      "status": "??",
+      "path": "test/e2e-browser/fixtures/managed-opencode-host-status.cjs"
+    },
+    {
+      "status": "??",
+      "path": "test/e2e-browser/fixtures/managed-opencode-host-status.node-test.cjs"
+    },
+    {
+      "status": "??",
+      "path": "test/e2e-browser/fixtures/managed-opencode-source.ts"
+    }
+  ],
+  "sources": [
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/crates/freshell-agent-runtime/src/lib.rs",
+      "destination": "crates/freshell-agent-runtime/src/lib.rs",
+      "mode": "100644",
+      "oid": "244428459ac9c83da1c720f172fb266882847081",
+      "bytes": 65067
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/crates/freshell-runtime-client/src/lib.rs",
+      "destination": "crates/freshell-runtime-client/src/lib.rs",
+      "mode": "100644",
+      "oid": "83ecb150ee0d137c19976e6d2517b88ea2e4c4f3",
+      "bytes": 56885
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/crates/freshell-runtime-protocol/src/lib.rs",
+      "destination": "crates/freshell-runtime-protocol/src/lib.rs",
+      "mode": "100644",
+      "oid": "4df6225ce95192ba156bdc03a5e35b5945a1f953",
+      "bytes": 167604
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/crates/freshell-server/src/managed_runtime_api.rs",
+      "destination": "crates/freshell-server/src/managed_runtime_api.rs",
+      "mode": "100644",
+      "oid": "70724f77b6932e87332427907a59eac6e324c3b4",
+      "bytes": 43325
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/crates/freshell-session-host/src/main.rs",
+      "destination": "crates/freshell-session-host/src/main.rs",
+      "mode": "100644",
+      "oid": "87d48c668fba03797aa25373cb412a32947f03ad",
+      "bytes": 282698
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/crates/freshell-session-host/src/providers/deterministic_fresh_agent.rs",
+      "destination": "crates/freshell-session-host/src/providers/deterministic_fresh_agent.rs",
+      "mode": "100644",
+      "oid": "665c9ecf08060e34183e0bafe459241d04f461cb",
+      "bytes": 30168
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/crates/freshell-session-host/src/pty.rs",
+      "destination": "crates/freshell-session-host/src/pty.rs",
+      "mode": "100644",
+      "oid": "16a05284ea1c1591dcc6490106e9f1d0245ad85e",
+      "bytes": 65569
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/crates/freshell-supervisor/src/backend/native_history.rs",
+      "destination": "crates/freshell-supervisor/src/backend/native_history.rs",
+      "mode": "100644",
+      "oid": "60394bcc4c981a646a9e10a3e54537287d1498c1",
+      "bytes": 38814
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/crates/freshell-supervisor/src/loss_report_tests.rs",
+      "destination": "crates/freshell-supervisor/src/loss_report_tests.rs",
+      "mode": "100644",
+      "oid": "3cfcfdbb7deaf84c18e747d1b43cc906060e6982",
+      "bytes": 62630
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/crates/freshell-supervisor/src/notice_outbox.rs",
+      "destination": "crates/freshell-supervisor/src/notice_outbox.rs",
+      "mode": "100644",
+      "oid": "94b4966ccf1f4ae2a09c5c0dd8e3e850be463152",
+      "bytes": 48147
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/crates/freshell-supervisor/src/recovery.rs",
+      "destination": "crates/freshell-supervisor/src/recovery.rs",
+      "mode": "100644",
+      "oid": "0919a28e09e5a1e0b7be171e200812b282a409bc",
+      "bytes": 185462
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/crates/freshell-supervisor/src/registry.rs",
+      "destination": "crates/freshell-supervisor/src/registry.rs",
+      "mode": "100644",
+      "oid": "acbe18ec2b0c9214c8124b8f8cf9790c972cfcfd",
+      "bytes": 351907
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/crates/freshell-supervisor/src/resume_catalog.rs",
+      "destination": "crates/freshell-supervisor/src/resume_catalog.rs",
+      "mode": "100644",
+      "oid": "ea649f9146cd3d1bf031e0ef2efaaa43c092178d",
+      "bytes": 31774
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/crates/freshell-supervisor/src/service.rs",
+      "destination": "crates/freshell-supervisor/src/service.rs",
+      "mode": "100644",
+      "oid": "caaaffac7edff52a6247710c40a422d86b44fd3a",
+      "bytes": 178846
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/crates/freshell-supervisor/src/stopped_repair_cas.rs",
+      "destination": "crates/freshell-supervisor/src/stopped_repair_cas.rs",
+      "mode": "100644",
+      "oid": "69804c4b51ebdc8d4bd3dcaad410f68b76b463e5",
+      "bytes": 68749
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/docs/plans/2026-10-03-managed-opencode-session-recovery.md",
+      "destination": "docs/plans/2026-10-03-managed-opencode-session-recovery.md",
+      "mode": "100644",
+      "oid": "481025e91d8ce5d8a79ec720ab5029b1fa9d4650",
+      "bytes": 72236
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/extensions/opencode/freshell-rebind-plugin.ts",
+      "destination": "extensions/opencode/freshell-rebind-plugin.ts",
+      "mode": "100644",
+      "oid": "98b2e1f5f93febdede97ff75a807075f6986b96f",
+      "bytes": 19557
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/port/contract/managed-runtime.schema.json",
+      "destination": "port/contract/managed-runtime.schema.json",
+      "mode": "100644",
+      "oid": "2be238efcae98c6ca5f8b5a87dbc1160ea728bc4",
+      "bytes": 82699
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/scripts/testing/runtime-sandbox.ts",
+      "destination": "scripts/testing/runtime-sandbox.ts",
+      "mode": "100644",
+      "oid": "d79445ed7b44a50aba2e319bccaa53028677c891",
+      "bytes": 54644
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/scripts/testing/runtime-test-broker.ts",
+      "destination": "scripts/testing/runtime-test-broker.ts",
+      "mode": "100644",
+      "oid": "7a9cbee9c3fd1a7f60bb1b90edb79fb46fd18d48",
+      "bytes": 27922
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/shared/managed-runtime.ts",
+      "destination": "shared/managed-runtime.ts",
+      "mode": "100644",
+      "oid": "88faae175c46e7da17662e861a07e3e8ce763932",
+      "bytes": 13236
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/test/e2e-browser/helpers/managed-runtime.ts",
+      "destination": "test/e2e-browser/helpers/managed-runtime.ts",
+      "mode": "100644",
+      "oid": "3ca05e4586c8ab22b511fc32c099d24406243336",
+      "bytes": 23197
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/test/e2e-browser/specs/runtime-provider-resurrection-rust.spec.ts",
+      "destination": "test/e2e-browser/specs/runtime-provider-resurrection-rust.spec.ts",
+      "mode": "100644",
+      "oid": "7c46e11a3e97f366fde715deb8f796e9c4b3bac3",
+      "bytes": 26106
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/test/unit/extensions/opencode-rebind-plugin.test.ts",
+      "destination": "test/unit/extensions/opencode-rebind-plugin.test.ts",
+      "mode": "100644",
+      "oid": "1c72b28e6a92f8378206d705331c0174fd21b3af",
+      "bytes": 26408
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/test/unit/lib/managed-runtime-recovery.test.ts",
+      "destination": "test/unit/lib/managed-runtime-recovery.test.ts",
+      "mode": "100644",
+      "oid": "1e86bd4065a168e14284e6497b8ff34742c9e334",
+      "bytes": 34914
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/test/unit/tooling/testing/runtime-test-broker.test.ts",
+      "destination": "test/unit/tooling/testing/runtime-test-broker.test.ts",
+      "mode": "100644",
+      "oid": "a8680b83a2e1e2ba44e89aa12b26b9fd8e71b752",
+      "bytes": 17888
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/test/e2e-browser/fixtures/managed-opencode-host-status.cjs",
+      "destination": "test/e2e-browser/fixtures/managed-opencode-host-status.cjs",
+      "mode": "100644",
+      "oid": "90e8b6696b189905cdb97a2c6122d2a06865d489",
+      "bytes": 4084
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/test/e2e-browser/fixtures/managed-opencode-host-status.node-test.cjs",
+      "destination": "test/e2e-browser/fixtures/managed-opencode-host-status.node-test.cjs",
+      "mode": "100644",
+      "oid": "e183a0a5da2120d21eb68ad7b3f0469defd11ef9",
+      "bytes": 3929
+    },
+    {
+      "source": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/test/e2e-browser/fixtures/managed-opencode-source.ts",
+      "destination": "test/e2e-browser/fixtures/managed-opencode-source.ts",
+      "mode": "100644",
+      "oid": "c7930b4e09d3b35bea6afb330afc845615b47bee",
+      "bytes": 11054
+    }
+  ]
+}

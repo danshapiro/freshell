@@ -84,6 +84,32 @@ describe('managed runtime broker actor storage', () => {
   })
 })
 
+describe('managed OpenCode transfer stage mount', () => {
+  it('allows only the read-only ready bundle owned by the active runtime root', () => {
+    const validate = (body: Buffer): { ok: boolean } => (
+      broker() as unknown as { validateCreate(body: Buffer): { ok: boolean } }
+    ).validateCreate(body)
+    const stageRoot = path.join(path.dirname(runtimeDir), 'opencode-transfers')
+    const target = '/run/freshell-opencode-transfer'
+
+    expect(validate(createBody([
+      ...ordinaryBinds,
+      actorBind,
+      `${path.join(stageRoot, 'opencode-transfer-123.ready')}:${target}:ro`,
+    ])).ok).toBe(true)
+    expect(validate(createBody([
+      ...ordinaryBinds,
+      actorBind,
+      `/tmp/owned/r/scenario/other/x/opencode-transfers/opencode-transfer-123.ready:${target}:ro`,
+    ])).ok).toBe(false)
+    expect(validate(createBody([
+      ...ordinaryBinds,
+      actorBind,
+      `${path.join(stageRoot, 'opencode-transfer-123.ready')}:${target}:rw`,
+    ])).ok).toBe(false)
+  })
+})
+
 describe('managed MCP mount', () => {
   it('accepts the exact private grant and approved provider root mounts', () => {
     const validate = (body: Buffer): { ok: boolean } => (

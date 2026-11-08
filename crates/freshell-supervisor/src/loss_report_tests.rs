@@ -554,6 +554,7 @@ async fn stopped_repair_checks_every_exact_loss_revision_before_source_access() 
             RequestId::new(),
             RestoreLostSoulsRequest {
                 targets,
+                canonical_owners: Vec::new(),
                 expected_control_epoch: Some(registry.control_epoch()),
             },
         )
@@ -593,6 +594,7 @@ async fn stopped_repair_retry_after_withdrawal_cas_resumes_without_lost_row_vali
     let operation_id = RequestId::new();
     let request = RestoreLostSoulsRequest {
         targets: targets.clone(),
+        canonical_owners: Vec::new(),
         expected_control_epoch: Some(registry.control_epoch()),
     };
     let prepared = registry
@@ -628,8 +630,11 @@ async fn stopped_repair_retry_after_withdrawal_cas_resumes_without_lost_row_vali
 #[tokio::test]
 async fn stopped_repair_first_cas_completes_seven_roots_and_withdraws_only_false_loss_records() {
     use freshell_runtime_protocol::{
-        IncidentId, LostSoulRepairTarget, NoticeKind, RequestId, RestoreLostSoulsRequest,
-        SoulRepairStatus, UpsertViewIntentRequest, ViewIntentId, ViewIntentKind, ViewIntentRequest,
+        opencode_target_build_receipt, opencode_transfer_bundle_digest, IncidentId,
+        LostSoulRepairTarget, NoticeKind, OpenCodeAdoptionBaseline, OpenCodeTransferDescriptor,
+        OpenCodeTransferFile, RequestId, RestoreLostSoulsRequest, SoulRepairStatus,
+        UpsertViewIntentRequest, ViewIntentId, ViewIntentKind, ViewIntentRequest,
+        OPENCODE_TRANSFER_DESTINATION_DB,
     };
 
     let dir = tempfile::tempdir().unwrap();
@@ -656,13 +661,16 @@ async fn stopped_repair_first_cas_completes_seven_roots_and_withdraws_only_false
 
         let root_index = index.min(6);
         let root_session_id = format!("ses_repair_root_{root_index}");
-        let source_store_id = format!("host-store-{root_index}");
-        let source_generation = format!("generation-{root_index}");
         let terminal_spec = serde_json::json!({
             "terminalId": format!("term-repair-{index}"),
             "streamId": format!("stream-repair-{index}"),
             "mode": "opencode",
             "program": "opencode",
+            "env": {
+                "HOME": "/home/freshell/provider",
+                "XDG_DATA_HOME": "/home/freshell/provider/.local/share",
+                "XDG_CONFIG_HOME": "/home/freshell/provider/.config"
+            },
             "cwd": "/workspace",
             "runAsUid": 65534,
             "runAsGid": 65534,
@@ -675,19 +683,12 @@ async fn stopped_repair_first_cas_completes_seven_roots_and_withdraws_only_false
         let mut conn = Connection::open(registry.database_path()).unwrap();
         let tx = conn.transaction().unwrap();
         tx.execute(
-            "UPDATE souls SET native_session_id=?1,native_import_state='pending', \
-             native_import_source_store_id=?2,native_import_root_session_id=?1, \
-             native_import_source_generation=?3,native_import_schema_fingerprint=?4, \
-             native_import_migration_fingerprint=?5,native_import_complete_inventory=0, \
-             native_import_authority='exact_source_snapshot' WHERE soul_id=?6",
-            params![
-                root_session_id,
-                source_store_id,
-                source_generation,
-                schema_fingerprint,
-                migration_fingerprint,
-                prepared.certificate.soul_id.as_str(),
-            ],
+            "UPDATE souls SET native_session_id=?1,native_import_state='legacy_unknown', \
+             native_import_source_store_id=NULL,native_import_root_session_id=NULL, \
+             native_import_source_generation=NULL,native_import_schema_fingerprint=NULL, \
+             native_import_migration_fingerprint=NULL,native_import_complete_inventory=0, \
+             native_import_authority='legacy_unknown' WHERE soul_id=?2",
+            params![root_session_id, prepared.certificate.soul_id.as_str()],
         )
         .unwrap();
         tx.execute(
@@ -699,17 +700,12 @@ async fn stopped_repair_first_cas_completes_seven_roots_and_withdraws_only_false
         )
         .unwrap();
         tx.execute(
-            "UPDATE loss_incidents SET captured_native_import_state='pending', \
-             captured_native_import_complete=0,captured_native_import_authority='exact_source_snapshot', \
-             captured_source_store_id=?1,captured_root_session_id=?2,captured_source_generation=?3, \
-             captured_source_schema_fingerprint=?4,captured_migration_fingerprint=?5 \
-             WHERE incident_id=?6 AND soul_id=?7",
+            "UPDATE loss_incidents SET captured_native_import_state='legacy_unknown', \
+             captured_native_import_complete=0,captured_native_import_authority='legacy_unknown', \
+             captured_source_store_id=NULL,captured_root_session_id=NULL,captured_source_generation=NULL, \
+             captured_source_schema_fingerprint=NULL,captured_migration_fingerprint=NULL \
+             WHERE incident_id=?1 AND soul_id=?2",
             params![
-                source_store_id,
-                root_session_id,
-                source_generation,
-                schema_fingerprint,
-                migration_fingerprint,
                 prepared.certificate.incident_id.as_str(),
                 prepared.certificate.soul_id.as_str(),
             ],
@@ -773,6 +769,7 @@ async fn stopped_repair_first_cas_completes_seven_roots_and_withdraws_only_false
     let operation_id = RequestId::new();
     let request = RestoreLostSoulsRequest {
         targets: targets.clone(),
+        canonical_owners: Vec::new(),
         expected_control_epoch: Some(registry.control_epoch()),
     };
     let operation = registry
@@ -786,8 +783,67 @@ async fn stopped_repair_first_cas_completes_seven_roots_and_withdraws_only_false
         let context = &contexts[root_index];
         let target = &targets[root_index];
         let root_session_id = format!("ses_repair_root_{root_index}");
-        let source_store_id = format!("host-store-{root_index}");
-        let source_generation = format!("generation-{root_index}");
+        let source_store_id = format!(
+            "{:x}",
+            Sha256::digest(format!("host-store-{root_index}").as_bytes())
+        );
+        let source_generation = format!(
+            "{:x}",
+            Sha256::digest(format!("generation-{root_index}").as_bytes())
+        );
+        let transfer_id = format!("transfer-root-{root_index}");
+        let target_image_ref = context.prior_handle.image_ref().to_owned();
+        let target_build_receipt =
+            opencode_target_build_receipt(&target_image_ref, "opencode-1.18.21");
+        let payload_sha256 = format!("{:x}", Sha256::digest(b"x"));
+        let manifest_json = serde_json::json!({
+            "version": 1,
+            "provider_schema": "opencode-1.18.21",
+            "root_session_id": root_session_id,
+            "source_store_id": source_store_id,
+            "source_schema_fingerprint": schema_fingerprint,
+            "migration_journal_fingerprint": migration_fingerprint,
+            "sqlite_version": "test",
+            "row_count": 0,
+            "rows": [],
+            "assets": [],
+            "payload_bytes": 1,
+            "payload_sha256": payload_sha256,
+            "generation": source_generation,
+        })
+        .to_string();
+        let files = vec![OpenCodeTransferFile {
+            index: 0,
+            relative_path: "payload.json".into(),
+            size_bytes: 1,
+            sha256: payload_sha256,
+        }];
+        let mut descriptor = OpenCodeTransferDescriptor {
+            transfer_id: transfer_id.clone(),
+            provider: "opencode".into(),
+            source_store_id: source_store_id.clone(),
+            root_session_id: root_session_id.clone(),
+            source_generation: source_generation.clone(),
+            provider_schema: "opencode-1.18.21".into(),
+            source_schema_fingerprint: schema_fingerprint.clone(),
+            migration_journal_fingerprint: migration_fingerprint.clone(),
+            destination_store_id: context.provider_store_id.clone(),
+            destination_database_path: OPENCODE_TRANSFER_DESTINATION_DB.into(),
+            target_image_ref: target_image_ref.clone(),
+            target_build_receipt: target_build_receipt.clone(),
+            incarnation_id: context.prior_handle.incarnation_id().as_str().into(),
+            manifest_json,
+            files,
+            total_bytes: 1,
+            bundle_sha256: String::new(),
+        };
+        descriptor.bundle_sha256 =
+            opencode_transfer_bundle_digest(&descriptor.manifest_json, &descriptor.files);
+        let adoption_baseline = OpenCodeAdoptionBaseline {
+            manifest_sha256: format!("{:x}", Sha256::digest(descriptor.manifest_json.as_bytes())),
+            descriptor: descriptor.clone(),
+        };
+        adoption_baseline.validate().unwrap();
         let execution_generation: u64 = Connection::open(registry.database_path())
             .unwrap()
             .query_row(
@@ -799,17 +855,18 @@ async fn stopped_repair_first_cas_completes_seven_roots_and_withdraws_only_false
         let receipt = crate::registry::StoppedRepairRootReceipt {
             root_session_id,
             canonical_soul_id: target.soul_id.clone(),
-            transfer_id: format!("transfer-root-{root_index}"),
+            transfer_id,
+            adoption_baseline,
             destination_store_id: context.provider_store_id.clone(),
             source_store_id,
             source_generation,
-            bundle_sha256: "e".repeat(64),
+            bundle_sha256: descriptor.bundle_sha256,
             source_schema_fingerprint: schema_fingerprint.clone(),
             migration_journal_fingerprint: migration_fingerprint.clone(),
-            target_image_ref: context.prior_handle.image_ref().into(),
-            target_build_receipt: format!("build-root-{root_index}"),
-            row_count: 12,
-            asset_count: 2,
+            target_image_ref,
+            target_build_receipt,
+            row_count: 0,
+            asset_count: 0,
             structural_sha256: "c".repeat(64),
             provider_uid: context.terminal.as_ref().unwrap().run_as_uid,
             provider_gid: context.terminal.as_ref().unwrap().run_as_gid,
@@ -849,8 +906,13 @@ async fn stopped_repair_first_cas_completes_seven_roots_and_withdraws_only_false
         .unwrap()
         .execute(
             "INSERT INTO native_origin_owners(provider,source_store_id,native_root_session_id,owner_soul_id,source_generation,ownership_state,updated_at) \
-             VALUES ('opencode','host-store-6','ses_repair_root_6',?1,'generation-6','owned',1)",
-            params![targets[7].soul_id.as_str()],
+             VALUES ('opencode',?1,?2,?3,?4,'owned',1)",
+            params![
+                roots[6].source_store_id,
+                roots[6].root_session_id,
+                targets[7].soul_id.as_str(),
+                roots[6].source_generation,
+            ],
         )
         .unwrap();
 
@@ -936,8 +998,8 @@ async fn stopped_repair_first_cas_completes_seven_roots_and_withdraws_only_false
     for root_index in 0..7 {
         let canonical = &targets[root_index];
         let root_session_id = format!("ses_repair_root_{root_index}");
-        let source_store_id = format!("host-store-{root_index}");
-        let (desired, recovery, import_state, authority, import_revision, stored_source, stored_root, loss_id): (
+        let source_store_id = roots[root_index].source_store_id.clone();
+        type RepairedSoulImportStateRow = (
             String,
             String,
             String,
@@ -946,7 +1008,8 @@ async fn stopped_repair_first_cas_completes_seven_roots_and_withdraws_only_false
             Option<String>,
             Option<String>,
             Option<String>,
-        ) = conn
+        );
+        let (desired, recovery, import_state, authority, import_revision, stored_source, stored_root, loss_id): RepairedSoulImportStateRow = conn
             .query_row(
                 "SELECT desired_state,recovery_state,native_import_state,native_import_authority, \
                  native_import_revision,native_import_source_store_id,native_import_root_session_id,loss_incident_id \
@@ -978,9 +1041,186 @@ async fn stopped_repair_first_cas_completes_seven_roots_and_withdraws_only_false
             )
             .unwrap();
         assert_eq!(origin.0.as_deref(), Some(canonical.soul_id.as_str()));
-        assert_eq!(origin.1, format!("generation-{root_index}"));
+        assert_eq!(origin.1, roots[root_index].source_generation);
         assert_eq!(origin.2, "owned");
+
+        let terminal_json: String = conn
+            .query_row(
+                "SELECT terminal_spec FROM incarnations WHERE incarnation_id=?1",
+                params![contexts[root_index].prior_handle.incarnation_id().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let terminal: serde_json::Value = serde_json::from_str(&terminal_json).unwrap();
+        assert!(
+            terminal.pointer("/opencodeTransfer").is_none(),
+            "resume evidence must stay separate from the staged-transfer descriptor"
+        );
     }
+
+    let repaired_context = registry
+        .recovery_context(targets[0].soul_id.clone())
+        .await
+        .unwrap();
+    let persisted_baseline = repaired_context
+        .opencode_adoption_baseline
+        .clone()
+        .expect("completed repair receipt supplies an exact resume baseline");
+    assert!(repaired_context
+        .terminal
+        .as_ref()
+        .is_some_and(|terminal| terminal.opencode_transfer.is_none()));
+    let next_intent_revision = registry
+        .start_stopped_data_repair(
+            targets[0].soul_id.clone(),
+            targets[0].expected_intent_revision,
+        )
+        .await
+        .unwrap();
+    let running_repaired_context = registry
+        .recovery_context(targets[0].soul_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        running_repaired_context.intent_revision,
+        next_intent_revision
+    );
+    let exact_candidate =
+        crate::resume_catalog::exact_resume_candidate(&running_repaired_context, None);
+    assert!(
+        exact_candidate.is_ok(),
+        "exact repaired resume candidate failed: {exact_candidate:?}"
+    );
+    // The authenticated-host path uses this candidate when the provider has
+    // exited but the session host is still running; it must retain the
+    // completed repair baseline before the host performs its current-store
+    // check.
+    let host_resume_spec = exact_candidate
+        .unwrap()
+        .expect("exact host resume candidate");
+    assert_eq!(
+        host_resume_spec.opencode_adoption_baseline,
+        Some(persisted_baseline.clone())
+    );
+    assert_eq!(
+        host_resume_spec
+            .environment
+            .get("OPENCODE_DB")
+            .map(String::as_str),
+        Some("/home/freshell/provider/.local/share/opencode/opencode.db")
+    );
+    // A legacy stored specification takes an early return in the base
+    // candidate builder. The authenticated host must receive the repaired
+    // evidence on this path too, even after the soul has left repair state.
+    let mut stored_context = running_repaired_context.clone();
+    stored_context.recovery_state = freshell_runtime_protocol::RecoveryState::Blocked;
+    let mut legacy_spec = host_resume_spec.clone();
+    legacy_spec.opencode_adoption_baseline = None;
+    legacy_spec.environment.remove("OPENCODE_DB");
+    stored_context.resume_spec = Some(legacy_spec);
+    let stored_host_candidate = crate::resume_catalog::exact_resume_candidate(
+        &stored_context,
+        stored_context.native_session_id.as_deref(),
+    )
+    .unwrap()
+    .expect("stored legacy host resume candidate");
+    assert_eq!(
+        stored_host_candidate.opencode_adoption_baseline,
+        Some(persisted_baseline.clone())
+    );
+    assert_eq!(
+        stored_host_candidate.environment.get("OPENCODE_DB"),
+        host_resume_spec.environment.get("OPENCODE_DB")
+    );
+
+    let mut stale_spec = stored_host_candidate;
+    let stale_baseline = &roots[1].adoption_baseline;
+    assert_ne!(stale_baseline, &persisted_baseline);
+    stale_baseline.validate().unwrap();
+    stale_spec.opencode_adoption_baseline = Some(stale_baseline.clone());
+    stored_context.resume_spec = Some(stale_spec);
+    assert!(matches!(
+        crate::resume_catalog::exact_resume_candidate(
+            &stored_context,
+            stored_context.native_session_id.as_deref(),
+        ),
+        Err(freshell_runtime_protocol::RecoveryProbe::Blocked {
+            reason: RecoveryBlockReason::WrongNativeIdentity,
+            ..
+        })
+    ));
+    let resume_probe = crate::recovery::offline_probe(&running_repaired_context).unwrap();
+    let freshell_runtime_protocol::RecoveryProbe::ResumeReady { resume_spec, .. } = resume_probe
+    else {
+        panic!("repaired legacy soul should have an exact resume candidate: {resume_probe:?}");
+    };
+    assert_eq!(
+        resume_spec.opencode_adoption_baseline,
+        Some(persisted_baseline.clone())
+    );
+    assert_eq!(
+        resume_spec
+            .environment
+            .get("OPENCODE_DB")
+            .map(String::as_str),
+        Some("/home/freshell/provider/.local/share/opencode/opencode.db")
+    );
+    assert_eq!(
+        resume_spec
+            .environment
+            .get("XDG_DATA_HOME")
+            .map(String::as_str),
+        Some("/home/freshell/provider/.local/share")
+    );
+
+    let recovery_start = registry
+        .begin_recovery_fenced(
+            targets[0].soul_id.clone(),
+            freshell_runtime_protocol::RecoveryTrigger::ManualRetry,
+            freshell_runtime_protocol::RecoveryPath::NativeResume,
+            running_repaired_context.write_fence(),
+        )
+        .await
+        .unwrap();
+    registry
+        .mark_recovery_blocked(
+            targets[0].soul_id.clone(),
+            Some(recovery_start.attempt_id.clone()),
+            RecoveryBlockReason::ProviderUnavailable,
+            vec!["synthetic first resume reader failure".into()],
+            recovery_start
+                .context
+                .write_fence_for_attempt(recovery_start.attempt_id.clone()),
+        )
+        .await
+        .unwrap();
+    let retrying_repaired_context = registry
+        .recovery_context(targets[0].soul_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        retrying_repaired_context.recovery_state,
+        freshell_runtime_protocol::RecoveryState::Blocked
+    );
+    let retry_probe = crate::recovery::offline_probe(&retrying_repaired_context).unwrap();
+    let freshell_runtime_protocol::RecoveryProbe::ResumeReady {
+        resume_spec: retry_spec,
+        ..
+    } = retry_probe
+    else {
+        panic!("repaired retry should preserve its adoption baseline: {retry_probe:?}");
+    };
+    assert_eq!(
+        retry_spec.opencode_adoption_baseline,
+        Some(persisted_baseline.clone())
+    );
+    assert_eq!(
+        retry_spec
+            .environment
+            .get("OPENCODE_DB")
+            .map(String::as_str),
+        Some("/home/freshell/provider/.local/share/opencode/opencode.db")
+    );
 
     let duplicate = &targets[7];
     let canonical_duplicate_root = &targets[6];

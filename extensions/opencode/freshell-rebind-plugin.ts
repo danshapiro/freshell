@@ -50,6 +50,10 @@ interface AdoptionExpectation {
   dir: string
 }
 
+type TuiSlotContribution = {
+  slots: Record<string, (context: unknown, props: unknown) => unknown>
+}
+
 interface AdoptionTuiApi {
   route?: { current?: unknown }
   state?: {
@@ -496,7 +500,7 @@ export default {
         ? createObservationEmitter({ env })
         : undefined
       const a = api as {
-        slots?: { register?: (name: string, fn: (ctx: unknown) => unknown) => unknown }
+        slots?: { register?: (plugin: TuiSlotContribution) => unknown }
         route?: { current?: unknown }
         lifecycle?: {
           signal?: AbortSignal
@@ -506,13 +510,17 @@ export default {
       // Unmanaged panes keep their route/slot rebind signal. For managed
       // launches, these edges only trigger a fresh TUI-state check; their
       // route and slot arguments never qualify as adoption evidence. The
-      // renderer returns undefined so host content is never replaced.
+      // renderer returns null so this plugin contributes no host content.
       for (const slot of ['session_prompt', 'sidebar_title']) {
         try {
-          a?.slots?.register?.(slot, (ctx: unknown) => {
-            if (emitLegacy) emitLegacy(ctx)
-            if (emitObservation) void emitObservation(a)
-            return undefined
+          a?.slots?.register?.({
+            slots: {
+              [slot]: (_context: unknown, props: unknown) => {
+                if (emitLegacy) emitLegacy(props)
+                if (emitObservation) void emitObservation(a)
+                return null
+              },
+            },
           })
         } catch {
           /* slot API absent/changed -> polling still covers us */

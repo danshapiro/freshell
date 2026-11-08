@@ -370,6 +370,11 @@ pub(crate) fn sanitize_false_incident_notices_in_tx(
                 }
             }
         }
+        // A collapsed source can resolve its supersession edge back to the
+        // rebuilt notice itself. That edge is internal to the collapsed
+        // group and must not suppress the surviving notice or conflict with
+        // a separate valid successor.
+        superseded_destinations.remove(new_id);
         if superseded_destinations.len() > 1 {
             return Err(RegistryError::Integrity(
                 "collapsed runtime notices have conflicting supersession targets".into(),
@@ -978,7 +983,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(notice.0, target.notice_id.as_str());
-        assert_eq!(notice.1, serde_json::to_string(&[keep.clone()]).unwrap());
+        assert_eq!(
+            notice.1,
+            serde_json::to_string(std::slice::from_ref(&keep)).unwrap()
+        );
         assert_eq!(notice.2, None);
         let receipt: (String, Option<i64>) = conn
             .query_row(
@@ -1022,6 +1030,162 @@ mod tests {
             "notice delivery remains terminal after deterministic identity rebuild"
         );
     }
+
+    #[tokio::test]
+    async fn withdrawing_false_member_from_coalesced_startup_notice_preserves_real_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let real_incident = IncidentId::parse("incident-real").unwrap();
+        let false_incident = IncidentId::parse("incident-false").unwrap();
+        let real_notice = stable_notice_id(
+            NoticeKind::CleanupSucceeded,
+            std::slice::from_ref(&real_incident),
+        );
+
+        let mut conn = crate::registry::open_connection(registry.database_path()).unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        enqueue_notice_in_tx(
+            &tx,
+            NoticeKind::CleanupSucceeded,
+            std::slice::from_ref(&real_incident),
+            0,
+            100,
+        )
+        .unwrap();
+        enqueue_notice_in_tx(
+            &tx,
+            NoticeKind::CleanupSucceeded,
+            std::slice::from_ref(&false_incident),
+            0,
+            101,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        drop(conn);
+
+        registry.coalesce_startup_notices(100, 101).await.unwrap();
+
+        let mut conn = crate::registry::open_connection(registry.database_path()).unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        sanitize_false_incident_notices_in_tx(
+            &tx,
+            &std::collections::BTreeSet::from([false_incident.to_string()]),
+            200,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let superseded_by: Option<String> = conn
+            .query_row(
+                "SELECT superseded_by FROM runtime_notices WHERE notice_id=?1",
+                params![real_notice.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            superseded_by, None,
+            "the real notice must not supersede itself"
+        );
+
+        let pending = registry
+            .pending_notices("fresh-profile".into(), 10)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].notice_id, real_notice);
+        assert_eq!(pending[0].incident_ids, vec![real_incident]);
+    }
+
+    #[tokio::test]
+    async fn collapsed_notice_ignores_self_edge_and_preserves_external_successor() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let real_incident = IncidentId::parse("incident-real-with-successor").unwrap();
+        let false_incident = IncidentId::parse("incident-false-with-successor").unwrap();
+        let successor_incident = IncidentId::parse("incident-successor").unwrap();
+        let real_notice = stable_notice_id(
+            NoticeKind::CleanupSucceeded,
+            std::slice::from_ref(&real_incident),
+        );
+        let batch_notice = stable_notice_id(
+            NoticeKind::CleanupSucceeded,
+            &[real_incident.clone(), false_incident.clone()],
+        );
+
+        let mut conn = crate::registry::open_connection(registry.database_path()).unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        enqueue_notice_in_tx(
+            &tx,
+            NoticeKind::CleanupSucceeded,
+            std::slice::from_ref(&real_incident),
+            0,
+            100,
+        )
+        .unwrap();
+        enqueue_notice_in_tx(
+            &tx,
+            NoticeKind::CleanupSucceeded,
+            std::slice::from_ref(&false_incident),
+            0,
+            101,
+        )
+        .unwrap();
+        let external_successor = enqueue_notice_in_tx(
+            &tx,
+            NoticeKind::CleanupFailed,
+            std::slice::from_ref(&successor_incident),
+            0,
+            102,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        drop(conn);
+
+        registry.coalesce_startup_notices(100, 101).await.unwrap();
+
+        let mut conn = crate::registry::open_connection(registry.database_path()).unwrap();
+        conn.execute(
+            "UPDATE runtime_notices SET superseded_by=?1 WHERE notice_id=?2",
+            params![external_successor.notice_id.as_str(), batch_notice.as_str()],
+        )
+        .unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        sanitize_false_incident_notices_in_tx(
+            &tx,
+            &std::collections::BTreeSet::from([false_incident.to_string()]),
+            200,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let superseded_by: Option<String> = conn
+            .query_row(
+                "SELECT superseded_by FROM runtime_notices WHERE notice_id=?1",
+                params![real_notice.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            superseded_by.as_deref(),
+            Some(external_successor.notice_id.as_str())
+        );
+
+        let pending = registry
+            .pending_notices("fresh-profile".into(), 10)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].notice_id, external_successor.notice_id);
+    }
+
     #[tokio::test]
     async fn duplicate_notice_receipt_is_a_noop_across_restart_including_metrics() {
         let dir = tempfile::tempdir().unwrap();

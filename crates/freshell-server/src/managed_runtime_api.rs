@@ -571,6 +571,8 @@ async fn stop_soul(
 struct RestoreLostSoulsBody {
     idempotency_key: String,
     targets: Vec<LostSoulRepairTarget>,
+    #[serde(default)]
+    canonical_owners: Vec<freshell_runtime_protocol::CanonicalOwnerChoice>,
 }
 
 async fn restore_lost_souls(
@@ -587,6 +589,7 @@ async fn restore_lost_souls(
     };
     let request = freshell_runtime_protocol::RestoreLostSoulsRequest {
         targets: body.targets.clone(),
+        canonical_owners: body.canonical_owners.clone(),
         expected_control_epoch: None,
     };
     if let Err(error) = request.validate_exact_batch() {
@@ -596,7 +599,10 @@ async fn restore_lost_souls(
         Ok(client) => client,
         Err(rejection) => return rejection.into_response(),
     };
-    match client.restore_lost_souls(request_id, body.targets).await {
+    match client
+        .restore_lost_souls(request_id, body.targets, body.canonical_owners)
+        .await
+    {
         Ok(result) => Json(result).into_response(),
         Err(error) => client_error(error),
     }

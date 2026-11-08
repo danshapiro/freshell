@@ -19,19 +19,19 @@ use crate::{
     resume_catalog,
     service::{LaunchWorkload, Supervisor},
 };
-use freshell_agent_runtime::{classify_provider_failure, recovery_paths, verify_native_identity};
+use freshell_agent_runtime::{classify_provider_failure, recovery_paths};
 use freshell_runtime_protocol::{
     opencode_target_build_receipt, opencode_transfer_bundle_digest, CleanupState, CommandState,
     DesiredState, EvidenceStoreState, HostCommand, HostResult, IncidentAnalysis,
     IncidentTimelineEvent, LaunchState, LossBuildEvidence, LossCleanupReport, ManagedRolloutMode,
-    OpenCodeTransferChunk, OpenCodeTransferDescriptor, OpenCodeTransferFile, ReattachHandle,
-    RecoverRequest, RecoveryAttemptId, RecoveryBlockReason, RecoveryEvidenceVerdict,
-    RecoveryOutcome, RecoveryPath, RecoveryPathEvidence, RecoveryProbe, RecoveryResult,
-    RecoveryTrigger, RestoreLostSoulRootResult, RestoreLostSoulsRequest, RestoreLostSoulsResult,
-    RetryHint, RootRepairImportStatus, RuntimeError, RuntimeErrorCode, RuntimeView, SoulId,
-    SoulRepairStatus, StopOutcome, TerminalLaunchSpec, CONTROL_PROTOCOL_VERSION,
-    MAX_OPENCODE_TRANSFER_BUNDLE_BYTES, MAX_OPENCODE_TRANSFER_CHUNK_BYTES,
-    OPENCODE_TRANSFER_DESTINATION_DB,
+    OpenCodeAdoptionBaseline, OpenCodeTransferChunk, OpenCodeTransferDescriptor,
+    OpenCodeTransferFile, ReattachHandle, RecoverRequest, RecoveryAttemptId, RecoveryBlockReason,
+    RecoveryEvidenceVerdict, RecoveryOutcome, RecoveryPath, RecoveryPathEvidence, RecoveryProbe,
+    RecoveryResult, RecoveryTrigger, RestoreLostSoulRootResult, RestoreLostSoulsRequest,
+    RestoreLostSoulsResult, RetryHint, RootRepairImportStatus, RuntimeError, RuntimeErrorCode,
+    RuntimeView, SoulId, SoulRepairStatus, StopOutcome, TerminalLaunchSpec,
+    CONTROL_PROTOCOL_VERSION, MAX_OPENCODE_TRANSFER_BUNDLE_BYTES,
+    MAX_OPENCODE_TRANSFER_CHUNK_BYTES, OPENCODE_TRANSFER_DESTINATION_DB,
 };
 use freshell_sessions::opencode_transfer::{
     export_exact_session, ExportOptions, HostOpenCodeInventory, OpenCodeNativeSnapshot,
@@ -45,12 +45,143 @@ use std::{
 };
 use tokio::time::{sleep, Duration, Instant};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NativeIdentityWait {
+    Observed {
+        native_session_id: String,
+        elapsed_ms: u64,
+    },
+    ProviderExited {
+        elapsed_ms: u64,
+    },
+    HostUnavailable {
+        message: String,
+        elapsed_ms: u64,
+    },
+    TimedOut {
+        adoption_pending: bool,
+        elapsed_ms: u64,
+    },
+    StopIntent {
+        elapsed_ms: u64,
+    },
+    IntentChanged {
+        elapsed_ms: u64,
+    },
+}
+
+const NATIVE_IDENTITY_STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
+const OPENCODE_ADOPTION_READINESS_TIMEOUT: Duration = Duration::from_secs(180);
+
+fn native_identity_wait_timeout(opencode_adoption_required: bool) -> Duration {
+    if opencode_adoption_required {
+        OPENCODE_ADOPTION_READINESS_TIMEOUT
+    } else {
+        NATIVE_IDENTITY_STARTUP_TIMEOUT
+    }
+}
+
+fn native_identity_wait_cancellation(
+    desired_state: DesiredState,
+    current_intent_revision: u64,
+    expected_intent_revision: u64,
+    elapsed_ms: u64,
+) -> Option<NativeIdentityWait> {
+    if desired_state == DesiredState::Stopped {
+        Some(NativeIdentityWait::StopIntent { elapsed_ms })
+    } else if current_intent_revision != expected_intent_revision {
+        Some(NativeIdentityWait::IntentChanged { elapsed_ms })
+    } else {
+        None
+    }
+}
+
+fn native_identity_wait_from_status(
+    exited: bool,
+    native_session_id: Option<String>,
+    elapsed_ms: u64,
+) -> Option<NativeIdentityWait> {
+    if exited {
+        Some(NativeIdentityWait::ProviderExited { elapsed_ms })
+    } else {
+        native_session_id.map(|native_session_id| NativeIdentityWait::Observed {
+            native_session_id,
+            elapsed_ms,
+        })
+    }
+}
+
+fn validate_native_identity_wait(
+    expected: &str,
+    result: NativeIdentityWait,
+) -> Result<String, (RecoveryBlockReason, String)> {
+    match result {
+        NativeIdentityWait::Observed {
+            native_session_id, ..
+        } if native_session_id == expected => Ok(native_session_id),
+        NativeIdentityWait::Observed {
+            native_session_id, ..
+        } => Err((
+            RecoveryBlockReason::WrongNativeIdentity,
+            format!("expected native session {expected}, provider returned {native_session_id}"),
+        )),
+        NativeIdentityWait::ProviderExited { .. } => Err((
+            RecoveryBlockReason::ProviderUnavailable,
+            "provider exited before reporting its resumed native session identity".into(),
+        )),
+        NativeIdentityWait::TimedOut {
+            adoption_pending, ..
+        } => {
+            let reason = if adoption_pending {
+                RecoveryBlockReason::CapabilityPending
+            } else {
+                RecoveryBlockReason::ProviderUnavailable
+            };
+            Err((
+                reason,
+                "provider did not report its resumed native session identity before the readiness deadline"
+                .into(),
+            ))
+        }
+        NativeIdentityWait::HostUnavailable { message, .. } => {
+            Err((RecoveryBlockReason::ProviderUnavailable, message))
+        }
+        NativeIdentityWait::StopIntent { .. } => Err((
+            RecoveryBlockReason::StopIntent,
+            "durable stop intent superseded provider readiness".into(),
+        )),
+        NativeIdentityWait::IntentChanged { .. } => Err((
+            RecoveryBlockReason::ProviderUnavailable,
+            "soul intent changed while waiting for provider readiness".into(),
+        )),
+    }
+}
+
+#[derive(Debug)]
+enum CanonicalRootOwnerSelection<'a> {
+    Chosen(&'a StoppedRepairOwnerCandidate),
+    ChoiceRequired(Vec<SoulId>),
+}
+
+struct PreparedStoppedRepairRoot {
+    root_session_id: String,
+    target: freshell_runtime_protocol::LostSoulRepairTarget,
+    captured: RecoveryContext,
+    snapshot: OpenCodeNativeSnapshot,
+}
+
+enum StoppedRepairRootPreflight {
+    Ready(Box<PreparedStoppedRepairRoot>),
+    OwnerChoiceRequired(Vec<SoulId>),
+}
+
 fn choose_canonical_root_owner<'a>(
     candidates: &'a [StoppedRepairOwnerCandidate],
     source_store_id: &str,
     root_session_id: &str,
     source_generation: &str,
-) -> Result<&'a StoppedRepairOwnerCandidate, String> {
+    choice: Option<&SoulId>,
+) -> Result<CanonicalRootOwnerSelection<'a>, String> {
     let candidates = candidates
         .iter()
         .filter(|candidate| candidate.native_import_authority != "retired_duplicate")
@@ -79,48 +210,68 @@ fn choose_canonical_root_owner<'a>(
         })
         .collect::<Vec<_>>();
     if let [owner] = receipts.as_slice() {
-        return Ok(*owner);
+        if choice.is_some_and(|choice| owner.soul_id != *choice) {
+            return Err("canonical owner choice conflicts with the verified import receipt".into());
+        }
+        return Ok(CanonicalRootOwnerSelection::Chosen(owner));
     }
     if receipts.len() > 1 {
-        return Err("multiple souls have the exact native import receipt".into());
+        if let Some(choice) = choice {
+            if let Some(owner) = receipts
+                .iter()
+                .find(|candidate| candidate.soul_id == *choice)
+            {
+                return Ok(CanonicalRootOwnerSelection::Chosen(owner));
+            }
+            return Err("canonical owner choice is not a valid receipt candidate".into());
+        }
+        return Ok(CanonicalRootOwnerSelection::ChoiceRequired(
+            receipts
+                .iter()
+                .map(|candidate| candidate.soul_id.clone())
+                .collect(),
+        ));
     }
 
     let explicit = candidates
         .iter()
         .filter(|candidate| candidate.explicit_view_count > 0)
+        .copied()
         .collect::<Vec<_>>();
     if let [owner] = explicit.as_slice() {
-        return Ok(*owner);
+        if choice.is_some_and(|choice| owner.soul_id != *choice) {
+            return Err("canonical owner choice conflicts with the unique explicit view".into());
+        }
+        return Ok(CanonicalRootOwnerSelection::Chosen(owner));
     }
-    if explicit.len() > 1 {
-        return Err("native root has explicit views under multiple souls".into());
+    let choice_candidates = if explicit.len() > 1 {
+        explicit
+    } else {
+        candidates
+    };
+    if let [owner] = choice_candidates.as_slice() {
+        if choice.is_some_and(|choice| owner.soul_id != *choice) {
+            return Err(
+                "canonical owner choice conflicts with the unique remaining candidate".into(),
+            );
+        }
+        return Ok(CanonicalRootOwnerSelection::Chosen(owner));
     }
-
-    let max_revision = candidates
-        .iter()
-        .map(|candidate| {
-            (
-                candidate.identity_revision,
-                candidate.native_import_revision,
-                candidate.intent_revision,
-            )
-        })
-        .max()
-        .expect("non-empty candidates");
-    let owners = candidates
-        .iter()
-        .filter(|candidate| {
-            (
-                candidate.identity_revision,
-                candidate.native_import_revision,
-                candidate.intent_revision,
-            ) == max_revision
-        })
-        .collect::<Vec<_>>();
-    if let [owner] = owners.as_slice() {
-        return Ok(*owner);
+    if let Some(choice) = choice {
+        if let Some(owner) = choice_candidates
+            .iter()
+            .find(|candidate| candidate.soul_id == *choice)
+        {
+            return Ok(CanonicalRootOwnerSelection::Chosen(owner));
+        }
+        return Err("canonical owner choice is not a valid candidate".into());
     }
-    Err("native root owner is ambiguous from exact durable metadata".into())
+    Ok(CanonicalRootOwnerSelection::ChoiceRequired(
+        choice_candidates
+            .iter()
+            .map(|candidate| candidate.soul_id.clone())
+            .collect(),
+    ))
 }
 
 fn is_lower_hex_sha256(value: &str) -> bool {
@@ -149,6 +300,28 @@ fn pending_stopped_repair_result(
         total_target_count: target_count as u32,
         roots: progress.into_values().collect(),
     }
+}
+
+fn owner_decision_stopped_repair_result(
+    operation_id: freshell_runtime_protocol::RequestId,
+    target_count: usize,
+    progress: BTreeMap<String, RestoreLostSoulRootResult>,
+) -> RestoreLostSoulsResult {
+    RestoreLostSoulsResult {
+        operation_id,
+        status: SoulRepairStatus::OwnerDecisionRequired,
+        repaired_target_count: 0,
+        total_target_count: target_count as u32,
+        roots: progress.into_values().collect(),
+    }
+}
+
+fn stopped_repair_error_reason_code(error: &RuntimeError) -> Option<String> {
+    error
+        .message
+        .strip_prefix("stopped OpenCode repair is pending (")
+        .and_then(|message| message.strip_suffix(')'))
+        .map(str::to_owned)
 }
 
 fn stopped_repair_transfer_id(
@@ -329,10 +502,16 @@ fn verified_stopped_repair_receipt(
     }))
     .map_err(|_| ())?;
     let reader_environment_sha256 = format!("{:x}", Sha256::digest(environment_receipt));
+    let adoption_baseline = OpenCodeAdoptionBaseline {
+        descriptor: descriptor.clone(),
+        manifest_sha256: format!("{:x}", Sha256::digest(descriptor.manifest_json.as_bytes())),
+    };
+    adoption_baseline.validate().map_err(|_| ())?;
     Ok(StoppedRepairRootReceipt {
         root_session_id: descriptor.root_session_id.clone(),
         canonical_soul_id: context.soul_id.clone(),
         transfer_id: descriptor.transfer_id.clone(),
+        adoption_baseline,
         destination_store_id: descriptor.destination_store_id.clone(),
         source_store_id: descriptor.source_store_id.clone(),
         source_generation: descriptor.source_generation.clone(),
@@ -366,6 +545,11 @@ impl Supervisor {
     ) -> Result<RestoreLostSoulsResult, RuntimeError> {
         request.validate_exact_batch()?;
         let targets = request.targets.clone();
+        let owner_choices = request
+            .canonical_owners
+            .iter()
+            .map(|choice| (choice.root_session_id.clone(), choice.soul_id.clone()))
+            .collect::<BTreeMap<_, _>>();
         let operation = self
             .registry
             .prepare_stopped_repair_operation(operation_id.clone(), request)
@@ -462,8 +646,8 @@ impl Supervisor {
         }
 
         let mut progress = groups
-            .iter()
-            .map(|(root, _)| {
+            .keys()
+            .map(|root| {
                 (
                     root.clone(),
                     RestoreLostSoulRootResult {
@@ -472,6 +656,8 @@ impl Supervisor {
                         import_status: RootRepairImportStatus::Pending,
                         intent_revision: None,
                         native_import_revision: None,
+                        owner_candidates: Vec::new(),
+                        reason_code: None,
                     },
                 )
             })
@@ -481,6 +667,13 @@ impl Supervisor {
                 operation_id,
                 targets.len(),
                 progress,
+            ));
+        }
+
+        if owner_choices.keys().any(|root| !groups.contains_key(root)) {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "canonical owner choice names a root outside this exact repair batch",
             ));
         }
 
@@ -499,27 +692,83 @@ impl Supervisor {
             }
         };
 
-        let mut verified_roots = Vec::with_capacity(groups.len());
+        let mut prepared_roots = Vec::with_capacity(groups.len());
+        let mut owner_decision_required = false;
+        let mut preflight_blocked = false;
         for (root, target_contexts) in &groups {
             match self
-                .repair_stopped_opencode_root(
-                    &operation_id,
+                .preflight_stopped_opencode_root(
                     root,
                     target_contexts,
                     &inventory,
                     &targets,
+                    owner_choices.get(root),
                 )
+                .await
+            {
+                Ok(StoppedRepairRootPreflight::Ready(prepared)) => {
+                    progress
+                        .get_mut(root)
+                        .expect("root progress initialized")
+                        .canonical_soul_id = Some(prepared.target.soul_id.clone());
+                    progress
+                        .get_mut(root)
+                        .expect("root progress initialized")
+                        .intent_revision = Some(prepared.target.expected_intent_revision);
+                    prepared_roots.push(*prepared);
+                }
+                Ok(StoppedRepairRootPreflight::OwnerChoiceRequired(candidates)) => {
+                    owner_decision_required = true;
+                    let root_progress = progress.get_mut(root).expect("root progress initialized");
+                    root_progress.import_status = RootRepairImportStatus::OwnerDecisionRequired;
+                    root_progress.owner_candidates = candidates;
+                }
+                Err(error) if error.code == RuntimeErrorCode::StaleIntentRevision => {
+                    return Err(error);
+                }
+                Err(error) => {
+                    preflight_blocked = true;
+                    progress
+                        .get_mut(root)
+                        .expect("root progress initialized")
+                        .reason_code = stopped_repair_error_reason_code(&error);
+                }
+            }
+        }
+
+        if owner_decision_required {
+            return Ok(owner_decision_stopped_repair_result(
+                operation_id,
+                targets.len(),
+                progress,
+            ));
+        }
+        if preflight_blocked || prepared_roots.len() != groups.len() {
+            return Ok(pending_stopped_repair_result(
+                operation_id,
+                targets.len(),
+                progress,
+            ));
+        }
+
+        let mut verified_roots = Vec::with_capacity(groups.len());
+        for prepared in prepared_roots {
+            let root = prepared.root_session_id.clone();
+            match self
+                .repair_stopped_opencode_root(&operation_id, prepared)
                 .await
             {
                 Ok((target, receipt)) => {
                     progress.insert(
                         root.clone(),
                         RestoreLostSoulRootResult {
-                            root_session_id: root.clone(),
+                            root_session_id: root,
                             canonical_soul_id: Some(target.soul_id.clone()),
                             import_status: RootRepairImportStatus::ProviderReadable,
                             intent_revision: Some(target.expected_intent_revision),
                             native_import_revision: Some(receipt.captured_native_import_revision),
+                            owner_candidates: Vec::new(),
+                            reason_code: None,
                         },
                     );
                     verified_roots.push(receipt);
@@ -527,7 +776,11 @@ impl Supervisor {
                 Err(error) if error.code == RuntimeErrorCode::StaleIntentRevision => {
                     return Err(error);
                 }
-                Err(_) => {
+                Err(error) => {
+                    progress
+                        .get_mut(&root)
+                        .expect("root progress initialized")
+                        .reason_code = stopped_repair_error_reason_code(&error);
                     return Ok(pending_stopped_repair_result(
                         operation_id,
                         targets.len(),
@@ -563,9 +816,8 @@ impl Supervisor {
         .map_err(map_registry)
     }
 
-    async fn repair_stopped_opencode_root(
+    async fn preflight_stopped_opencode_root(
         &self,
-        operation_id: &freshell_runtime_protocol::RequestId,
         root_session_id: &str,
         target_contexts: &[(
             freshell_runtime_protocol::LostSoulRepairTarget,
@@ -573,13 +825,8 @@ impl Supervisor {
         )],
         inventory: &HostOpenCodeInventory,
         all_targets: &[freshell_runtime_protocol::LostSoulRepairTarget],
-    ) -> Result<
-        (
-            freshell_runtime_protocol::LostSoulRepairTarget,
-            StoppedRepairRootReceipt,
-        ),
-        RuntimeError,
-    > {
+        owner_choice: Option<&SoulId>,
+    ) -> Result<StoppedRepairRootPreflight, RuntimeError> {
         let mut trusted_workspaces = Vec::<PathBuf>::new();
         for (_, context) in target_contexts {
             let workspace = context
@@ -632,8 +879,24 @@ impl Supervisor {
             &manifest.source_store_id,
             root_session_id,
             &manifest.generation,
+            owner_choice,
         )
-        .map_err(|_| stopped_repair_blocked("canonical_owner_ambiguous"))?;
+        .map_err(|reason| {
+            let reason_code = if reason.contains("choice") {
+                "canonical_owner_choice_invalid"
+            } else if reason.contains("receipt") {
+                "canonical_owner_receipt_conflict"
+            } else {
+                "canonical_owner_ambiguous"
+            };
+            stopped_repair_blocked(reason_code)
+        })?;
+        let canonical = match canonical {
+            CanonicalRootOwnerSelection::Chosen(canonical) => canonical,
+            CanonicalRootOwnerSelection::ChoiceRequired(candidates) => {
+                return Ok(StoppedRepairRootPreflight::OwnerChoiceRequired(candidates));
+            }
+        };
         if !all_targets
             .iter()
             .any(|target| target.soul_id == canonical.soul_id)
@@ -659,11 +922,37 @@ impl Supervisor {
         if captured.terminal.is_none() {
             return Err(stopped_repair_blocked("terminal_workspace_missing"));
         }
+        Ok(StoppedRepairRootPreflight::Ready(Box::new(
+            PreparedStoppedRepairRoot {
+                root_session_id: root_session_id.to_owned(),
+                target: target.clone(),
+                captured: captured.clone(),
+                snapshot,
+            },
+        )))
+    }
+
+    async fn repair_stopped_opencode_root(
+        &self,
+        operation_id: &freshell_runtime_protocol::RequestId,
+        prepared: PreparedStoppedRepairRoot,
+    ) -> Result<
+        (
+            freshell_runtime_protocol::LostSoulRepairTarget,
+            StoppedRepairRootReceipt,
+        ),
+        RuntimeError,
+    > {
+        let root_session_id = prepared.root_session_id.as_str();
+        let target = &prepared.target;
+        let captured = &prepared.captured;
+        let snapshot = prepared.snapshot;
+        let manifest = snapshot.manifest().clone();
         let transfer_id = stopped_repair_transfer_id(
             operation_id,
             root_session_id,
             &manifest.generation,
-            &canonical.soul_id,
+            &target.soul_id,
         );
         let files = vec![OpenCodeTransferFile {
             index: 0,
@@ -731,7 +1020,7 @@ impl Supervisor {
                 }
             }
         }
-        if let Err(_) = stage_snapshot_payload(&snapshot, &descriptor, &attempt_id, staging) {
+        if stage_snapshot_payload(&snapshot, &descriptor, &attempt_id, staging).is_err() {
             if let Some(_guard) = lifecycle_guard.take() {
                 let _ = staging.abort(&transfer_id, &attempt_id);
             }
@@ -751,7 +1040,7 @@ impl Supervisor {
         };
         let fresh_before_helper = self
             .registry
-            .recovery_context(canonical.soul_id.clone())
+            .recovery_context(target.soul_id.clone())
             .await
             .map_err(map_registry)?;
         if !same_stopped_repair_context(captured, &fresh_before_helper) {
@@ -851,6 +1140,29 @@ impl Supervisor {
             .await
             .map_err(map_registry)?;
         let probe = self.probe_recovery_context(&mut context).await?;
+        let probe = match probe {
+            RecoveryProbe::ResumeReady { resume_spec, .. }
+                if context.resume_spec.as_ref() != Some(&*resume_spec) =>
+            {
+                let stored = self
+                    .registry
+                    .store_verified_resume_spec_fenced(
+                        context.soul_id.clone(),
+                        *resume_spec,
+                        context.write_fence(),
+                    )
+                    .await
+                    .map_err(map_registry)?;
+                context.evidence_revision = stored.evidence_revision;
+                context.allocation_state = stored.allocation_state;
+                context.resume_spec = Some(stored.clone());
+                RecoveryProbe::ResumeReady {
+                    evidence_revision: stored.evidence_revision,
+                    resume_spec: Box::new(stored),
+                }
+            }
+            probe => probe,
+        };
         if !matches!(
             probe,
             RecoveryProbe::ReattachReady { .. } | RecoveryProbe::ResumeReady { .. }
@@ -1105,6 +1417,33 @@ impl Supervisor {
             .assert_soul_intent_revision(request.soul_id.clone(), request.expected_intent_revision)
             .await
             .map_err(map_registry)?;
+        let before_retry = self
+            .registry
+            .recovery_context(request.soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        if request.trigger == RecoveryTrigger::ManualRetry
+            && before_retry.desired_state == DesiredState::Stopped
+            && before_retry.recovery_state
+                == freshell_runtime_protocol::RecoveryState::DataRepairComplete
+        {
+            let expected_revision = request.expected_intent_revision.ok_or_else(|| {
+                RuntimeError::new(
+                    RuntimeErrorCode::InvalidRequest,
+                    "resuming repaired data requires the current soul intent revision",
+                )
+            })?;
+            let next_revision = self
+                .registry
+                .start_stopped_data_repair(request.soul_id.clone(), expected_revision)
+                .await
+                .map_err(map_registry)?;
+            crate::service::append_event(
+                &self.config.lifecycle_log,
+                "supervisor.stopped_data_repair_resume_requested",
+                serde_json::json!({"soulId":request.soul_id,"intentRevision":next_revision}),
+            );
+        }
         if let Some(view) = self
             .registry
             .inventory()
@@ -1694,18 +2033,98 @@ impl Supervisor {
         let observed_native_session_id = if let Some(expected) =
             expected_native_session_id.as_deref()
         {
-            let observed = self
-                .wait_for_native_identity(&prepared.prepared.incarnation_id)
-                .await?;
-            if let Err(error) = verify_native_identity(expected, observed.as_deref()) {
+            let adoption_required = resume_spec
+                .as_ref()
+                .is_some_and(|spec| spec.opencode_adoption_baseline.is_some());
+            let wait = self
+                .wait_for_native_identity(
+                    &soul_id,
+                    &prepared.prepared.incarnation_id,
+                    start.context.intent_revision,
+                    native_identity_wait_timeout(adoption_required),
+                )
+                .await;
+            if matches!(wait, NativeIdentityWait::StopIntent { .. }) {
+                let current = self
+                    .registry
+                    .recovery_context(soul_id.clone())
+                    .await
+                    .map_err(map_registry)?;
+                return Ok(RecoveryResult {
+                    outcome: RecoveryOutcome::Stopped,
+                    view: self.view_for(current.prior_handle.incarnation_id()).await?,
+                    probe: Some(blocked(
+                        path,
+                        RecoveryBlockReason::StopIntent,
+                        "the durable desired state is STOPPED",
+                        None,
+                    )),
+                    prior_incarnation_id: Some(prior_incarnation_id),
+                    attempt_id: Some(attempt_id),
+                    expected_native_session_id,
+                    observed_native_session_id: None,
+                    incident_id: None,
+                });
+            }
+            if matches!(wait, NativeIdentityWait::IntentChanged { .. }) {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::StaleIntentRevision,
+                    "soul intent changed while waiting for provider readiness",
+                ));
+            }
+            let observed = match &wait {
+                NativeIdentityWait::Observed {
+                    native_session_id, ..
+                } => Some(native_session_id.clone()),
+                NativeIdentityWait::ProviderExited { .. }
+                | NativeIdentityWait::HostUnavailable { .. }
+                | NativeIdentityWait::TimedOut { .. }
+                | NativeIdentityWait::StopIntent { .. }
+                | NativeIdentityWait::IntentChanged { .. } => None,
+            };
+            if let Err((reason, message)) = validate_native_identity_wait(expected, wait.clone()) {
+                let (wait_outcome, adoption_pending, elapsed_ms) = match wait {
+                    NativeIdentityWait::Observed { elapsed_ms, .. } => {
+                        ("identity_mismatch", false, elapsed_ms)
+                    }
+                    NativeIdentityWait::ProviderExited { elapsed_ms } => {
+                        ("provider_exited", false, elapsed_ms)
+                    }
+                    NativeIdentityWait::HostUnavailable { elapsed_ms, .. } => {
+                        ("host_unavailable", false, elapsed_ms)
+                    }
+                    NativeIdentityWait::TimedOut {
+                        adoption_pending,
+                        elapsed_ms,
+                    } => ("timed_out", adoption_pending, elapsed_ms),
+                    NativeIdentityWait::StopIntent { elapsed_ms } => {
+                        ("stop_intent", false, elapsed_ms)
+                    }
+                    NativeIdentityWait::IntentChanged { elapsed_ms } => {
+                        ("intent_changed", false, elapsed_ms)
+                    }
+                };
+                crate::service::append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.recovery.native_identity_wait_failed",
+                    serde_json::json!({
+                        "soulId": soul_id,
+                        "incarnationId": prepared.prepared.incarnation_id,
+                        "provider": start.context.provider,
+                        "outcome": wait_outcome,
+                        "adoptionPending": adoption_pending,
+                        "elapsedMs": elapsed_ms,
+                        "reason": format!("{reason:?}"),
+                    }),
+                );
                 self.cleanup_failed_replacement(&prepared.prepared.incarnation_id)
                     .await;
                 self.registry
                     .mark_recovery_blocked(
                         soul_id.clone(),
                         Some(attempt_id.clone()),
-                        RecoveryBlockReason::WrongNativeIdentity,
-                        vec![error.to_string()],
+                        reason,
+                        vec![message.clone()],
                         verdict_fence.clone(),
                     )
                     .await
@@ -1717,9 +2136,9 @@ impl Supervisor {
                         .await?,
                     probe: Some(blocked(
                         path,
-                        RecoveryBlockReason::WrongNativeIdentity,
-                        &error.to_string(),
-                        None,
+                        reason,
+                        &message,
+                        (reason != RecoveryBlockReason::WrongNativeIdentity).then_some(2_000),
                     )),
                     prior_incarnation_id: Some(prior_incarnation_id),
                     attempt_id: Some(attempt_id),
@@ -2548,7 +2967,18 @@ impl Supervisor {
     }
 
     pub(crate) async fn export_pending_incidents(&self) -> Result<(), RuntimeError> {
-        self.resume_pending_stopped_repair_withdrawals().await?;
+        let withdrawal_still_pending = match self.resume_pending_stopped_repair_withdrawals().await
+        {
+            Ok(()) => false,
+            Err(error) => {
+                crate::service::append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.stopped_repair_withdrawal_deferred",
+                    serde_json::json!({"error": error.message}),
+                );
+                true
+            }
+        };
         let exports = match self.registry.pending_incident_exports(100).await {
             Ok(exports) => exports,
             Err(error) => {
@@ -2616,6 +3046,12 @@ impl Supervisor {
                     ));
                 }
             }
+        }
+        if withdrawal_still_pending {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::IncidentPersistenceFailed,
+                "a stopped-repair incident withdrawal remains pending",
+            ));
         }
         Ok(())
     }
@@ -2802,28 +3238,75 @@ impl Supervisor {
 
     async fn wait_for_native_identity(
         &self,
+        soul_id: &SoulId,
         incarnation_id: &freshell_runtime_protocol::IncarnationId,
-    ) -> Result<Option<String>, RuntimeError> {
-        let handle = self
-            .registry
-            .owned_handle(incarnation_id.clone())
-            .await
-            .map_err(map_registry)?;
-        let deadline = Instant::now() + Duration::from_secs(8);
+        expected_intent_revision: u64,
+        timeout: Duration,
+    ) -> NativeIdentityWait {
+        let started = Instant::now();
+        let handle = match self.registry.owned_handle(incarnation_id.clone()).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                return NativeIdentityWait::HostUnavailable {
+                    message: map_registry(error).message,
+                    elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                }
+            }
+        };
+        let deadline = started + timeout;
         loop {
+            let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
             let host = self
                 .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
-                .await?;
-            let status = self
-                .host_status(handle.incarnation_id().clone(), handle.runtime_dir(), &host)
-                .await?;
-            if let Some(observed) = status.native_session_id {
-                return Ok(Some(observed));
+                .await;
+            let status = match host {
+                Ok(host) => self
+                    .host_status(handle.incarnation_id().clone(), handle.runtime_dir(), &host)
+                    .await
+                    .map_err(|error| error.message),
+                Err(error) => Err(error.message),
+            };
+            let current = match self.registry.recovery_context(soul_id.clone()).await {
+                Ok(current) => current,
+                Err(error) => {
+                    return NativeIdentityWait::HostUnavailable {
+                        message: map_registry(error).message,
+                        elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    }
+                }
+            };
+            if let Some(cancellation) = native_identity_wait_cancellation(
+                current.desired_state,
+                current.intent_revision,
+                expected_intent_revision,
+                started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            ) {
+                return cancellation;
             }
-            if status.exited || Instant::now() >= deadline {
-                return Ok(None);
+            let status = match status {
+                Ok(status) => status,
+                Err(message) => {
+                    return NativeIdentityWait::HostUnavailable {
+                        message,
+                        elapsed_ms,
+                    }
+                }
+            };
+            if let Some(result) = native_identity_wait_from_status(
+                status.exited,
+                status.native_session_id,
+                started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            ) {
+                return result;
             }
-            sleep(Duration::from_millis(100)).await;
+            if Instant::now() >= deadline {
+                return NativeIdentityWait::TimedOut {
+                    adoption_pending: status.opencode_adoption
+                        == freshell_runtime_protocol::OpenCodeAdoptionStatus::AwaitingObservation,
+                    elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                };
+            }
+            sleep(Duration::from_millis(250)).await;
         }
     }
 
@@ -2953,7 +3436,35 @@ pub(crate) fn after_native_probe(context: &RecoveryContext, probe: RecoveryProbe
     }
 }
 
-fn offline_probe(context: &RecoveryContext) -> Result<RecoveryProbe, RuntimeError> {
+pub(crate) fn offline_probe(context: &RecoveryContext) -> Result<RecoveryProbe, RuntimeError> {
+    let completed_opencode_import = context.provider == "opencode"
+        && context.native_import_state == NativeImportState::Completed
+        && context.native_import_authority == "verified_import_receipt";
+    if (context.recovery_state == freshell_runtime_protocol::RecoveryState::DataRepairComplete
+        || context.opencode_adoption_baseline.is_some()
+        || completed_opencode_import)
+        && context.desired_state == DesiredState::Running
+        && context.provider == "opencode"
+        && context.native_import_state == NativeImportState::Completed
+        && context.native_import_authority == "verified_import_receipt"
+        && context.native_import_source_store_id.is_some()
+        && context.native_import_root_session_id.as_deref() == context.native_session_id.as_deref()
+        && context.native_import_source_generation.is_some()
+    {
+        return match resume_catalog::exact_resume_candidate(context, None) {
+            Ok(Some(spec)) => Ok(RecoveryProbe::ResumeReady {
+                evidence_revision: spec.evidence_revision,
+                resume_spec: Box::new(spec),
+            }),
+            Ok(None) => Ok(blocked(
+                RecoveryPath::NativeResume,
+                RecoveryBlockReason::StoreUnreadable,
+                "the repaired provider store has no exact resumable launch specification",
+                None,
+            )),
+            Err(probe) => Ok(probe),
+        };
+    }
     if let Some(spec) = context.resume_spec.clone() {
         return Ok(RecoveryProbe::ResumeReady {
             evidence_revision: spec.evidence_revision,
@@ -3098,9 +3609,15 @@ fn terminal_without_first_boot_state(
     terminal.map(|mut terminal| {
         // Exact recovery consumes the credential/config copies already named
         // by ResumeSpec::credential_references in the verified provider
-        // volume. Source bind mounts are first-boot inputs, not recovery
-        // dependencies, and may no longer exist by the time a host fails.
+        // volume. Source bind mounts and the OpenCode transfer descriptor are
+        // first-launch inputs, not recovery dependencies: transfer staging is
+        // released after import and may no longer exist when a host fails.
+        // The saved OpenCode adoption baseline remains in ResumeSpec and is
+        // revalidated against the installed store for each replacement.
         terminal.provider_bootstrap_files.clear();
+        terminal.opencode_transfer = None;
+        terminal.opencode_transfer_attempt_id = None;
+        terminal.opencode_adoption = None;
         terminal
     })
 }
@@ -3296,6 +3813,112 @@ pub(crate) mod tests {
     use super::*;
     use freshell_runtime_protocol::{FreshAgentLaunchSpec, FreshProvider, IncarnationId};
 
+    #[test]
+    fn missing_adoption_observation_is_not_reported_as_wrong_native_identity() {
+        assert_eq!(
+            validate_native_identity_wait(
+                "ses_expected",
+                NativeIdentityWait::TimedOut {
+                    adoption_pending: true,
+                    elapsed_ms: 180_000,
+                },
+            )
+            .unwrap_err()
+            .0,
+            RecoveryBlockReason::CapabilityPending
+        );
+        assert_eq!(
+            validate_native_identity_wait(
+                "ses_expected",
+                NativeIdentityWait::ProviderExited { elapsed_ms: 8_000 },
+            )
+            .unwrap_err()
+            .0,
+            RecoveryBlockReason::ProviderUnavailable
+        );
+        assert_eq!(
+            validate_native_identity_wait(
+                "ses_expected",
+                NativeIdentityWait::HostUnavailable {
+                    message: "host status socket unavailable".into(),
+                    elapsed_ms: 1_000,
+                },
+            )
+            .unwrap_err()
+            .0,
+            RecoveryBlockReason::ProviderUnavailable
+        );
+        assert_eq!(
+            validate_native_identity_wait(
+                "ses_expected",
+                NativeIdentityWait::TimedOut {
+                    adoption_pending: false,
+                    elapsed_ms: 8_000,
+                },
+            )
+            .unwrap_err()
+            .0,
+            RecoveryBlockReason::ProviderUnavailable
+        );
+        assert_eq!(
+            validate_native_identity_wait(
+                "ses_expected",
+                NativeIdentityWait::Observed {
+                    native_session_id: "ses_other".into(),
+                    elapsed_ms: 5_000,
+                },
+            )
+            .unwrap_err()
+            .0,
+            RecoveryBlockReason::WrongNativeIdentity
+        );
+        assert_eq!(
+            validate_native_identity_wait(
+                "ses_expected",
+                NativeIdentityWait::Observed {
+                    native_session_id: "ses_expected".into(),
+                    elapsed_ms: 5_000,
+                },
+            )
+            .unwrap(),
+            "ses_expected"
+        );
+    }
+
+    #[test]
+    fn opencode_adoption_wait_uses_the_browser_readiness_budget() {
+        assert_eq!(native_identity_wait_timeout(true), Duration::from_secs(180));
+        assert_eq!(native_identity_wait_timeout(false), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn stopped_intent_cancels_readiness_wait_without_rewriting_newer_intent() {
+        assert_eq!(
+            native_identity_wait_cancellation(DesiredState::Stopped, 7, 7, 1),
+            Some(NativeIdentityWait::StopIntent { elapsed_ms: 1 })
+        );
+        assert_eq!(
+            native_identity_wait_cancellation(DesiredState::Running, 8, 7, 2),
+            Some(NativeIdentityWait::IntentChanged { elapsed_ms: 2 })
+        );
+        assert_eq!(
+            native_identity_wait_cancellation(DesiredState::Running, 7, 7, 3),
+            None
+        );
+    }
+
+    #[test]
+    fn exited_provider_is_not_accepted_even_if_it_retained_its_native_identity() {
+        let result =
+            native_identity_wait_from_status(true, Some("ses_expected".into()), 9_000).unwrap();
+        assert_eq!(
+            validate_native_identity_wait("ses_expected", result)
+                .unwrap_err()
+                .0,
+            RecoveryBlockReason::ProviderUnavailable
+        );
+    }
+
     fn owner_candidate(id: &str) -> StoppedRepairOwnerCandidate {
         StoppedRepairOwnerCandidate {
             soul_id: SoulId::parse(id).unwrap(),
@@ -3304,67 +3927,82 @@ pub(crate) mod tests {
             source_generation: Some("generation-exact".into()),
             native_import_state: NativeImportState::Pending,
             native_import_authority: "exact_source_snapshot".into(),
-            intent_revision: 2,
-            identity_revision: 1,
-            native_import_revision: 3,
             explicit_view_count: 0,
         }
     }
 
     #[test]
-    fn duplicate_root_owner_selection_uses_receipts_views_then_revision_and_blocks_ties() {
+    fn duplicate_root_owner_selection_uses_receipts_views_then_explicit_choice() {
         let mut candidates = vec![owner_candidate("soul-one"), owner_candidate("soul-two")];
         candidates[0].native_import_state = NativeImportState::Completed;
         candidates[0].native_import_authority = "verified_import_receipt".into();
-        assert_eq!(
-            choose_canonical_root_owner(
-                &candidates,
-                "source-store",
-                "ses_exact",
-                "generation-exact"
-            )
-            .unwrap()
-            .soul_id,
-            candidates[0].soul_id
-        );
+        let selection = choose_canonical_root_owner(
+            &candidates,
+            "source-store",
+            "ses_exact",
+            "generation-exact",
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            selection,
+            CanonicalRootOwnerSelection::Chosen(owner) if owner.soul_id == candidates[0].soul_id
+        ));
 
         candidates[0].native_import_state = NativeImportState::Pending;
         candidates[0].native_import_authority = "exact_source_snapshot".into();
         candidates[1].explicit_view_count = 1;
-        assert_eq!(
-            choose_canonical_root_owner(
-                &candidates,
-                "source-store",
-                "ses_exact",
-                "generation-exact"
-            )
-            .unwrap()
-            .soul_id,
-            candidates[1].soul_id
-        );
-
-        candidates[1].explicit_view_count = 0;
-        candidates[1].native_import_revision = 2;
-        assert_eq!(
-            choose_canonical_root_owner(
-                &candidates,
-                "source-store",
-                "ses_exact",
-                "generation-exact"
-            )
-            .unwrap()
-            .soul_id,
-            candidates[0].soul_id
-        );
-
-        candidates[1].native_import_revision = 3;
-        assert!(choose_canonical_root_owner(
+        let selection = choose_canonical_root_owner(
             &candidates,
             "source-store",
             "ses_exact",
-            "generation-exact"
+            "generation-exact",
+            None,
         )
-        .is_err());
+        .unwrap();
+        assert!(
+            matches!(selection, CanonicalRootOwnerSelection::Chosen(owner)
+            if owner.soul_id == candidates[1].soul_id)
+        );
+
+        candidates[1].explicit_view_count = 0;
+        let selection = choose_canonical_root_owner(
+            &candidates,
+            "source-store",
+            "ses_exact",
+            "generation-exact",
+            None,
+        )
+        .unwrap();
+        assert!(
+            matches!(selection, CanonicalRootOwnerSelection::ChoiceRequired(owners)
+            if owners == vec![candidates[0].soul_id.clone(), candidates[1].soul_id.clone()])
+        );
+
+        let selected = choose_canonical_root_owner(
+            &candidates,
+            "source-store",
+            "ses_exact",
+            "generation-exact",
+            Some(&candidates[1].soul_id),
+        )
+        .unwrap();
+        assert!(
+            matches!(selected, CanonicalRootOwnerSelection::Chosen(owner)
+            if owner.soul_id == candidates[1].soul_id)
+        );
+
+        assert!(matches!(
+            choose_canonical_root_owner(
+                &candidates,
+                "source-store",
+                "ses_exact",
+                "generation-exact",
+                None,
+            )
+            .unwrap(),
+            CanonicalRootOwnerSelection::ChoiceRequired(_)
+        ));
     }
 
     #[test]
@@ -3378,7 +4016,8 @@ pub(crate) mod tests {
             &candidates,
             "source-store",
             "ses_exact",
-            "generation-exact"
+            "generation-exact",
+            None,
         )
         .unwrap_err()
         .contains("conflicting import receipt"));
@@ -3387,24 +4026,17 @@ pub(crate) mod tests {
     #[test]
     fn duplicate_root_owner_selection_ignores_retired_duplicate_authority() {
         let mut candidates = vec![owner_candidate("canonical"), owner_candidate("retired")];
-        candidates[0].native_import_revision = 3;
         candidates[1].native_import_state = NativeImportState::Completed;
         candidates[1].native_import_authority = "retired_duplicate".into();
         candidates[1].explicit_view_count = 9;
-        candidates[1].identity_revision = 99;
-        candidates[1].native_import_revision = 99;
-        candidates[1].intent_revision = 99;
-        assert_eq!(
-            choose_canonical_root_owner(
-                &candidates,
-                "source-store",
-                "ses_exact",
-                "generation-exact"
-            )
-            .unwrap()
-            .soul_id,
-            candidates[0].soul_id
-        );
+        assert!(matches!(choose_canonical_root_owner(
+            &candidates,
+            "source-store",
+            "ses_exact",
+            "generation-exact",
+            None,
+        ).unwrap(), CanonicalRootOwnerSelection::Chosen(owner)
+            if owner.soul_id == candidates[0].soul_id));
     }
 
     struct ObservedRuntime(BackendRuntimeState);
@@ -3528,6 +4160,51 @@ pub(crate) mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn pending_stopped_repair_withdrawal_does_not_suppress_unrelated_exports() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = crate::registry::Registry::open(dir.path(), None).unwrap();
+        let operation_id = freshell_runtime_protocol::RequestId::new();
+        let incident_id = freshell_runtime_protocol::IncidentId::new();
+        let conn = crate::registry::open_connection(registry.database_path()).unwrap();
+        conn.execute(
+            "INSERT INTO stopped_repair_operations(operation_id,idempotency_key,target_fingerprint,targets_json,status,created_at,updated_at) VALUES (?1,?1,'test-fingerprint','[]','withdraw_pending',1,1)",
+            rusqlite::params![operation_id.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO outbox(event_id,event_kind,payload,created_at) VALUES ('unrelated-final-export','loss_incident.final',?1,1)",
+            rusqlite::params![serde_json::json!({
+                "incidentId": incident_id,
+                "cleanupState": "closed",
+                "event": "unrelated"
+            }).to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let supervisor = missing_supervisor(&dir, registry.clone());
+        let result = supervisor.export_pending_incidents().await;
+        assert!(result.is_err(), "failed withdrawal remains retryable");
+        assert!(
+            registry
+                .registry_root()
+                .join("incidents")
+                .join(format!("{incident_id}.closed.json"))
+                .exists(),
+            "unrelated incident export completes despite the separate pending withdrawal"
+        );
+        let delivered: Option<i64> = crate::registry::open_connection(registry.database_path())
+            .unwrap()
+            .query_row(
+                "SELECT delivered_at FROM outbox WHERE event_id='unrelated-final-export'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(delivered.is_some());
     }
 
     #[test]
@@ -3681,7 +4358,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn exact_replacement_drops_first_boot_sources_but_keeps_launch_identity() {
+    fn exact_replacement_drops_first_boot_sources_and_transfer_but_keeps_launch_identity() {
         let terminal = TerminalLaunchSpec {
             terminal_id: "terminal-exact".into(),
             stream_id: "stream-exact".into(),
@@ -3709,14 +4386,34 @@ pub(crate) mod tests {
             }],
             provider_secret_references: Vec::new(),
             provider_launch_context: None,
-            opencode_transfer: None,
-            opencode_transfer_attempt_id: None,
+            opencode_transfer: Some(OpenCodeTransferDescriptor {
+                transfer_id: "first-boot-transfer".into(),
+                provider: "opencode".into(),
+                source_store_id: "source-store".into(),
+                root_session_id: "ses_exact".into(),
+                source_generation: "generation".into(),
+                provider_schema: "opencode-1.18.21".into(),
+                source_schema_fingerprint: "schema-fingerprint".into(),
+                migration_journal_fingerprint: "migration-fingerprint".into(),
+                destination_store_id: "soul-exact".into(),
+                destination_database_path: ".local/share/opencode/opencode.db".into(),
+                target_image_ref: "sha256:image".into(),
+                target_build_receipt: "build-receipt".into(),
+                incarnation_id: "first-incarnation".into(),
+                manifest_json: "{}".into(),
+                files: Vec::new(),
+                total_bytes: 0,
+                bundle_sha256: "bundle-digest".into(),
+            }),
+            opencode_transfer_attempt_id: Some("a".repeat(32)),
             opencode_adoption: None,
         };
 
         let replacement = terminal_without_first_boot_state(Some(terminal.clone())).unwrap();
 
         assert!(replacement.provider_bootstrap_files.is_empty());
+        assert!(replacement.opencode_transfer.is_none());
+        assert!(replacement.opencode_transfer_attempt_id.is_none());
         assert_eq!(replacement.terminal_id, terminal.terminal_id);
         assert_eq!(replacement.program, terminal.program);
         assert_eq!(replacement.args, terminal.args);
