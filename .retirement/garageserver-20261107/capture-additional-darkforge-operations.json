@@ -1,0 +1,32 @@
+{
+  "purpose": "Preserve Freshell-only Darkforge operations source before permanent garageserver removal.",
+  "source_records": [
+    {
+      "source": "/home/dan/.local/share/darkforge/sources/freshell-qa.sh",
+      "mode": "100755",
+      "bytes": 1215,
+      "oid": "03437608dd4ad0fc2274c4787416b4c9c40923b5",
+      "sha256": "7dc029782715d9c1bc65d3c15369218f840c90e0477d3866d3ca664ca7b9c3c9",
+      "remote_reachable": false,
+      "remote_object_path": null,
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.local/share/darkforge/sources/freshell-qa.sh"
+    },
+    {
+      "source": "/home/dan/.local/share/darkforge/sources/kata-freshell.py",
+      "mode": "100755",
+      "bytes": 7713,
+      "oid": "26d2d6d43b4ad546b14e0c026e3b66e44b545231",
+      "sha256": "6543dff53869251641f5fdf3bf173bdb069fdf1d09bff6581e74aa8c0f77f7cc",
+      "remote_reachable": false,
+      "remote_object_path": null,
+      "destination": ".retirement/garageserver-20261107/operations/home/dan/.local/share/darkforge/sources/kata-freshell.py"
+    }
+  ],
+  "secret_review": "Both scripts reviewed in full; no secrets, settings, histories or user data; gitleaks stdin passed.",
+  "duplicate_disposition": {
+    "archive": "/home/sentinelx/archive/freshell-inspect-20261014.tgz",
+    "archive_payloads": 3392,
+    "sentinelx_plan_files": 2,
+    "verified": "Exact payload blobs reachable from freshly advertised remote commits."
+  }
+}
