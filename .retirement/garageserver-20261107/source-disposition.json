@@ -1,0 +1,1407 @@
+{
+  "purpose": "Remote source disposition for permanent Freshell retirement on garageserver",
+  "original_local_refs": [
+    "refs/heads/b5fb-squash-local 04ce2c7302afeec42a6741696b241b7646b06b78",
+    "refs/heads/backup/dev-remote-before-origin-main-2c5432c6 2c5432c62fc5db679a82709f04ea984afd3a14f4",
+    "refs/heads/backup/durable-souls-before-approved-landing-20261031 48112ef8fa7b454abd96c603ecefeebcd057f9bb",
+    "refs/heads/backup/durable-souls-before-main-20261029 e7b8eac821431fb52eda7b9626fe0fe7dbfc43b2",
+    "refs/heads/backup/durable-souls-before-no-modal-rebase-20261031 dfb0e954d7ff0d760daf760c6860734060e75e60",
+    "refs/heads/backup/durable-souls-before-rewind-rebase-20261101-735d51c5a 735d51c5adffdfb640fcb479123e4947819ebfa9",
+    "refs/heads/backup/durable-souls-before-sandbox-cache-rebase-20261030 e95310dffb256afc7f656e09586e91992dedb413",
+    "refs/heads/backup/durable-souls-before-supervisor-test-rebase-20261101-f8687190a f8687190a00069f4a9504857da1fda4ad3d0bd78",
+    "refs/heads/backup/durable-souls-pre-rebase-2026-09-28 0fad69aeee475ee639b9f629a180417c9958fd43",
+    "refs/heads/backup/durable-souls-pre-rebase-912a5a16 912a5a16b9c12437558a1485ff44672aa0981bcd",
+    "refs/heads/backup/durable-souls-reliability-partial-replay-20261016-de81e1eca de81e1eca654e5e6d6c79bd216efa849028809df",
+    "refs/heads/backup/durable-souls-reliability-pre-rebase-20261016-52365037a 52365037a47a373b15a2a67301ce2f691fc64098",
+    "refs/heads/backup/durable-souls-verified-e3-before-main-20261030 e3d50b5d3a3c6cb698d56f6293f2ec4fc8dec1eb",
+    "refs/heads/backup/freshclaude-client-e2e-027a1758 027a1758788db74a6dd6c4f7b8abd23d22905fd4",
+    "refs/heads/backup/freshclaude-client-e2e2-20261023 e6cd66a7a5a91221b6fb617a8fce29086841a560",
+    "refs/heads/backup/main-before-pr381-sync-96a6c3a2 96a6c3a2c5f1af0a8dbd7db1d77ac7ccfa571f0e",
+    "refs/heads/backup/managed-recovery-contextual-ui-pre-96e57-rebase-20261004 470a3342c7968a51fc3a2866ab663416fbf37564",
+    "refs/heads/backup/opencode-reveal-refresh-pre-5713b29-20261031 0f43805c9622ec3bed3c22801ee9bc69bdc261fd",
+    "refs/heads/backup/opencode-reveal-refresh-pre-rebase-20261031-6fdabd9 6fdabd91715ee394cad6270f15c965bc8f39d02b",
+    "refs/heads/backup/resume-validation-pre-589-rebase d7026ca3ebdef26f22f248ec51fa85aeff04911f",
+    "refs/heads/backup/resume-validation-pre-rebase-2026-07-30 0739d357dd48d06aa3b83a8fb55f1294f9daef99",
+    "refs/heads/backup/retire-node-server-v2-before-rebase 107e8b5c3f185637621b5c37180e0c734f2b9e5e",
+    "refs/heads/backup/retire-node-server-v2-pre-message-rewrite 4704d658a380df436e12af8f9a5c65804d45e7ac",
+    "refs/heads/backup/rust-resolve-parity-pre-rebase bc214bf9667c0d8191602166c663b63343fb90ee",
+    "refs/heads/checkpoint/name-reliability-before-rebase-20261024-0755 586ba31980abdfdaa3b0ac0d2b000d1c84eb97d8",
+    "refs/heads/cloud-image-identity c8822329489e4366a28f8aefa370c5d2f2e10570",
+    "refs/heads/darkforge/0q8k 9cca1d3d89ff50d8b6430d60fa55bc43d3762db6",
+    "refs/heads/darkforge/15gk 218d2cca4bae18c2cb00f8a23f4294ea376934a5",
+    "refs/heads/darkforge/15gk-landing-v1 7a8f29082f52a5cf65ef96d05b3d3d111e6e38bf",
+    "refs/heads/darkforge/3gvd-20260826-072729 c3a59d350b143df0e7aea84ac313f74d13448cf7",
+    "refs/heads/darkforge/3pjv dfa2cc88acc770a370d74336970f2dd67843236e",
+    "refs/heads/darkforge/4g2a b6d7027401e2736f6594fb271135d3482183f3da",
+    "refs/heads/darkforge/6rbc d1854f0dbfcbde5eec6bc27659eee4021d193aec",
+    "refs/heads/darkforge/a57r 990afc5c16c2e65da56d75c239204b49fdf2e33c",
+    "refs/heads/darkforge/b5fb 389151b6e748686143bb7afacb15b905cd9fd9ff",
+    "refs/heads/darkforge/b5fb-landing 04ce2c7302afeec42a6741696b241b7646b06b78",
+    "refs/heads/darkforge/des0 feaed36461c206076126f131984168344b164513",
+    "refs/heads/darkforge/eaw7 71d7aea97450dd2bf8a537a55a53e2e0b2612a32",
+    "refs/heads/darkforge/ekc6 662d6b8c46031d1f0ea1ea1c80e093257405b1b6",
+    "refs/heads/darkforge/ex4c 3ee75fc422586752f6092511e739628aa2b69b34",
+    "refs/heads/darkforge/ex4c-pre-rebase-backup deb67e3850000a16ebe586f2d7332d22269434a5",
+    "refs/heads/darkforge/f0ef c14e1abcebc6e9d80d4309e4001d7f850f36b546",
+    "refs/heads/darkforge/fd1m 30849bb9de4cd42e6391aeb90a244403dcb4486d",
+    "refs/heads/darkforge/kqn1 1389a272b05e503a62d787e5e4297bacc7f687b8",
+    "refs/heads/darkforge/qzka f6570fe0009efd4ac13b4cd0b9dac0dc41781eef",
+    "refs/heads/darkforge/r47n e775d6ae84f08ae1177481512f644a87797131cb",
+    "refs/heads/darkforge/r49m d059d232207d35d4b074ce0ddf4f1c69895fcd44",
+    "refs/heads/darkforge/r49m-landing 2c78116747202396f0e3f0c925a4e48268091ef1",
+    "refs/heads/darkforge/rw3z e5794400ff907b6d35abf38559ad5924dafb7344",
+    "refs/heads/darkforge/rw3z-landing 6b8048af0b65c260e9b9920e98871dce7e20a007",
+    "refs/heads/darkforge/s52d ab2c2caf89de4e1dffe53b26f864c0f05a824a26",
+    "refs/heads/darkforge/s52d-landing 5cddd9937e440fe89e661001fe180d1137509246",
+    "refs/heads/darkforge/te1m bb2bd388b8d2b1dcdddcb26b86e166d9662011b9",
+    "refs/heads/darkforge/wfah 84eaea68a162b74bbd3ef983fbffff9e6da05747",
+    "refs/heads/darkforge/xkwq 45d254372c477fd93bfe810cc4c8ebc74e498f69",
+    "refs/heads/darkforge/xkwq-landing 0108a89a2f9d55f2133a7c282e75024976927c7b",
+    "refs/heads/darkforge/y83s 66cf6f8987f286768dc27057e8625cccf86ebdfc",
+    "refs/heads/darkforge/ywwf 1d136cdafcb8d0132a8f8c9a61256e099aced32d",
+    "refs/heads/darkforge/z06a-20260826-072716 4625868f162b9c4c99e5b0a04204e6f10da9e2d8",
+    "refs/heads/darkforge/z7j7 2e979740d8bac7e08f3b2a7381c8dbe20f6fe2bb",
+    "refs/heads/df1/control-plane cc406d032973ada0cf141513c6a4d21c5aade0df",
+    "refs/heads/df1/integration-prerebase caf11cad0ff28477d3275e6217120393570adaba",
+    "refs/heads/df1/session-09-live-watching d823c9870592b5c061fdcc2079dc6345704ec8e6",
+    "refs/heads/df1/wave1 36b7e09b4461262bfd141bbb8a62f3c2edbdd41e",
+    "refs/heads/docs/0gdd-handoff 20acc485d2dbe723faef32eb43799c91e1748a49",
+    "refs/heads/docs/df1-retrospective 3dd36640cd46d255e36a5f91005f459c372eec40",
+    "refs/heads/docs/rca-attach-wedge a26886da4fab3fb071ac8f0c7773901d44c443ee",
+    "refs/heads/f0ef-landing 441e0abe9af6acee88fbb52afd9754ba71bff54e",
+    "refs/heads/feat/deploy-compatibility-rollback 9a91c2f4b7d46ba1c19754841f2f1e4bc4e11306",
+    "refs/heads/feat/durable-souls-rebased 91a3af6cc23e9c01aeae30d173cf8ce9088357eb",
+    "refs/heads/feat/durable-souls-replay 13c6feff9374d6f60e57263521b1f83de065229d",
+    "refs/heads/feat/fresh-agent-thinking-label e9930f7c18ec81d257f6518046fd822ebf344940",
+    "refs/heads/feat/freshclaude-attention-replay 8c23e2bc8bd08559ae8f505d47acd2e74a98187f",
+    "refs/heads/feat/freshclaude-c30-browser-fakes b81c52ed8117e0f6f037f4b356e0f47ca7e314d7",
+    "refs/heads/feat/freshclaude-core-history 0ecfb656f7ed611f207368b3e438474ee2d5af40",
+    "refs/heads/feat/freshclaude-core-turns 3da2f0b40ebf05dd2208b8d494e50480bff7c578",
+    "refs/heads/feat/freshclaude-freshell-mcp ab3cd3ba44de582fd4bab4194a8dd9fd3f348349",
+    "refs/heads/feat/freshclaude-recovery c733ccef61617753885fd48fa9a6af86e29934dc",
+    "refs/heads/feat/freshclaude-rest-lane 9749ceef513080a353d8bac5433359561da67813",
+    "refs/heads/feat/freshclaude-restart-notice d214c80b6d399e38188475781580397904b9c6f5",
+    "refs/heads/feat/freshclaude-session-identity b6fb292c08a1e2ea0cf71724d5f641684eeaece1",
+    "refs/heads/feat/playwright-azure-cloud a0155ec31f1e42f86d39198c7538d1299780b8ad",
+    "refs/heads/feat/restart-recovery-hardening f3233d24a49808883c9d7e96080a7284e1be6ecc",
+    "refs/heads/feat/restart-resumable-pane 1d591b723af2b79d41cf98904c35fccbbb0bdd9c",
+    "refs/heads/feat/session09-ws-acceptance-test ded572266cae48bce24f64da8e3aec30a8668b21",
+    "refs/heads/feat/tab-bar-visual-overhaul f4adeb1162cb2776cab36719a7b676f3cdd2dbd0",
+    "refs/heads/fix-dead-session-warn-flake a6848c65b0fbd8a05ab84a804593ba8bf5548927",
+    "refs/heads/fix-freshagent-approval-flake affc86a4e00b495e977c4f49fb7fc5b08c86f2c4",
+    "refs/heads/fix-session-init-provenance-flake 8186d9f3e7af55dfd7cde05e70ca51600e61920b",
+    "refs/heads/fix-settings-throttle-flake 3a4e18af485d645e3f42f863b4326d7b1c72fbf1",
+    "refs/heads/fix/claude-perm-fixture-cleanup-race ac5a4ddf552aeeb214953eeed7ac2433008a078a",
+    "refs/heads/fix/cloud-exec-id-parse 151e990e4c377f2af284d55035c90973b87a286b",
+    "refs/heads/fix/durable-souls-host-transfer-tests 526713d7b98822c33c02a8e38037ec511c3de7fe",
+    "refs/heads/fix/durable-souls-outage-reader ee9281d6f96ce0ff65dbcb4aeb3f42819ad36f36",
+    "refs/heads/fix/flaky-supervisor-permission 11508754c84f019254d1fb2f2561c6812ad77817",
+    "refs/heads/fix/freshclaude-baseline-runtime 4edd7df59a210c9101cd6803e4098dc5279c00c5",
+    "refs/heads/fix/logger-separation-timeout 92841ef9197fd917665cf96db4d692633712c465",
+    "refs/heads/fix/managed-provider-qualification-home 2130563d76c23397ad4a37fed42c77927cc51e8b",
+    "refs/heads/fix/name-reliability-client 48e2cfce447c857029c5b9f4438f4de451338ce6",
+    "refs/heads/fix/name-reliability-terminal af691bd97f8c383a99d3fab76e4bdb854f7cc0cc",
+    "refs/heads/fix/opencode-live-turn-status 293bbd32990d4af2a09d90be4ed8083f2ad1e3e5",
+    "refs/heads/fix/remove-minimap-viewport 625e3119d61104ec9c742c5d05127ff702cfdaf5",
+    "refs/heads/fix/rest-terminal-identity-publication b131c557696c1dbdd034e09becc2edddc9dc99c1",
+    "refs/heads/fix/rest-terminal-session-identity ef3014bab6f3bbc467e6a672045bbf8a680227d6",
+    "refs/heads/fix/vitest-cloud-status-retry c26c4b9daddf2c39f27a54aba6d7cfe5a476fc2b",
+    "refs/heads/fix/windows-codex-cold-recovery d37930bb4d7d51c4cab696e195776c28e93da7c2",
+    "refs/heads/freshagent-proof-archive/b82894e3d57c b82894e3d57ca34577298def6995b4003a214373",
+    "refs/heads/freshagent-proof-archive/ci-proof-557 0f320913a4c07f36ddcf8ea19a946cdfd4ada99d",
+    "refs/heads/freshagent-proof-archive/client-10f932cc8-41634646952 19655b677d67cb3a22155ba1d08a53f31c0828d3",
+    "refs/heads/freshagent-proof-archive/client-f7eab7a2c-41633750339 11b287a78e5ca343c677adb5d1f280564b45667b",
+    "refs/heads/freshagent-proof-archive/parity-gc1p-8ab-attempt1 ebe6c70fac3d3fcf2de848a743b6829f17958511",
+    "refs/heads/freshagent-proof-archive/parity-gc1p-8ab-attempt2 c61b00e9aee250581d8c67961fb7e4071058d970",
+    "refs/heads/freshagent-proof-archive/parity-gc1p-base-51ca 48fbbcac852b763ac7a7a646a7178ee118114964",
+    "refs/heads/freshagent-proof-archive/prepush-c8abd6442 5b248cb02d4f9015f1eef52192eb683d3b6bc756",
+    "refs/heads/freshagent-proof-archive/remaining/acceptance-identity-red-9a4a981b5 9b9f405b7f3ea9cf5673675bd1f9912b4befde76",
+    "refs/heads/freshagent-proof-archive/remaining/accepted-turn-red-bb377092e e00ea1270dfbe45f218851b06d3de1fa1bcffe8b",
+    "refs/heads/freshagent-proof-archive/remaining/accepted-turn-red-f7f407b25 91ba7004bdd25dfc5fbf61687937b36a75deb49c",
+    "refs/heads/freshagent-proof-archive/remaining/batched-switch-red-29c64da16 2a56671e6867abf867db4863b34645412fe22379",
+    "refs/heads/freshagent-proof-archive/remaining/checkpoint-scope-red-1eb99a489 9c59337c03f7894b9e18cd24d5a6ac3242dcd2ef",
+    "refs/heads/freshagent-proof-archive/remaining/claude-hold-green-4aeb5c5e 7e256229c3b7c73f3939ce628953cf0dd2328afd",
+    "refs/heads/freshagent-proof-archive/remaining/claude-hold-red-4aeb5c5e 98e867caa7722024924213aa97f6d6371914d576",
+    "refs/heads/freshagent-proof-archive/remaining/claude-stop-proof-4aeb5c5e d627c338ab0a34d676ea6c714566a0bc87fbf4ca",
+    "refs/heads/freshagent-proof-archive/remaining/client-proof-04bc72260 68f5cf05e88582a59540c92da512ea5d48ec689b",
+    "refs/heads/freshagent-proof-archive/remaining/client-proof-240a74ba1 b95c65f1a9e918503d884dc474a8d834835655ef",
+    "refs/heads/freshagent-proof-archive/remaining/client-proof-4aeb5c5e0 cd2c19bd2df9d8aaada876909efed43beb4eae31",
+    "refs/heads/freshagent-proof-archive/remaining/client-proof-552b6fb8e 7d9da7c6a0e428ae12fe95bd448a37f5ca7b12d6",
+    "refs/heads/freshagent-proof-archive/remaining/client-proof-6d10d5acf eec90db53e64153ec8732ddeefdc0cbe5547df38",
+    "refs/heads/freshagent-proof-archive/remaining/client-proof-89a7721de f1bf342b7a8be83d1641fbfd0083974d6cc2abde",
+    "refs/heads/freshagent-proof-archive/remaining/client-proof-8ab102268 c18a9a781f08f65471c562f6bffa3a4c47d3a2d7",
+    "refs/heads/freshagent-proof-archive/remaining/client-proof-96ef7adc8 225c60286d01f6c119f0239898a0e16b15f26432",
+    "refs/heads/freshagent-proof-archive/remaining/client-proof-98627d4b5 5f42c50dd65be15c8aae5562375d33ede42d0416",
+    "refs/heads/freshagent-proof-archive/remaining/client-proof-9c7016c19 8f921ceba45579bf4c8bfe6ff49474285aeb1ac4",
+    "refs/heads/freshagent-proof-archive/remaining/client-proof-bed8ed764 4a57ce28a64e02c877c3ce3091f25e4caeb14ae2",
+    "refs/heads/freshagent-proof-archive/remaining/client-proof-df3821435 39e9cc4b12d21ae37cf7618b4a3040b6a14c273f",
+    "refs/heads/freshagent-proof-archive/remaining/client-proof-f017efda9 b8d0cd72dbbe85d66bda10a008edf8d9b29d506f",
+    "refs/heads/freshagent-proof-archive/remaining/client-proof-f807eeb38 c32eef632db0133c8291c99e018e8961fa13c6fe",
+    "refs/heads/freshagent-proof-archive/remaining/client-proof-fb28ec562 96546d1bbc839708c5fd11f15d03bd28862cda4e",
+    "refs/heads/freshagent-proof-archive/remaining/codex-control-green-6f33b90c9 49ed564ce936f16decd46d6880282c32ec2e3d38",
+    "refs/heads/freshagent-proof-archive/remaining/codex-control-red-6f33b90c9 0b2eaa98acc434689b954eeb88110ec04e347ca8",
+    "refs/heads/freshagent-proof-archive/remaining/concurrent-notices-green-bfd06f092 7f364090b159eaede40222c9b653a0b791e0ae77",
+    "refs/heads/freshagent-proof-archive/remaining/concurrent-notices-red-54ad0d40c 88d9ef8e6a401b3c6a8b0f822c2d1461948808c3",
+    "refs/heads/freshagent-proof-archive/remaining/cross-session-green-cde591666 89040af13aae302003081a0ad6b97438ca93d577",
+    "refs/heads/freshagent-proof-archive/remaining/cross-session-red-3b2a1beb2 e9f42187cce29db2df0ab2c98eafc3e09fe00037",
+    "refs/heads/freshagent-proof-archive/remaining/cross-session-red-684989491 4fa65c3500a364bdf1e7e7246cf9a12b583500f2",
+    "refs/heads/freshagent-proof-archive/remaining/drainer-diagnostic-151b12b8e f7535d619c96b0f83da15bf912667184f8c7b881",
+    "refs/heads/freshagent-proof-archive/remaining/drainer-stress-151b12b8e b1aafc3eb25bb0e6e99af470475fa85033861190",
+    "refs/heads/freshagent-proof-archive/remaining/drainer-wait-proof-bed8ed764 bbb3fae152874e16b5a87c253a63367ca6564331",
+    "refs/heads/freshagent-proof-archive/remaining/duplicate-unit-red-2d6a2ca2a f469e67c7bbc824bd32faeb71ceac5f46255c5a2",
+    "refs/heads/freshagent-proof-archive/remaining/errors-proof-505955e9d 24bb9eb51911f886c5ca508e84929374f2d3910c",
+    "refs/heads/freshagent-proof-archive/remaining/errors-proof-67ef41df2 446343082ca400d83672c4bc3c39012edcb18039",
+    "refs/heads/freshagent-proof-archive/remaining/held-meter-proof-151b12b8e 28445bc7f63e1a0359d479a1567439909987596e",
+    "refs/heads/freshagent-proof-archive/remaining/materialization-red-4dc2fa8ce 027cae2922aa6bfda2d4e24f20ec99490b5a7482",
+    "refs/heads/freshagent-proof-archive/remaining/notice-gap-red-92aaf7153 ffe9687f3f13e53ecb2ff79444b68ccb1859bb36",
+    "refs/heads/freshagent-proof-archive/remaining/notice-memo-proof-bed8 9645620d13e8ed9cb046210fea24237215c55707",
+    "refs/heads/freshagent-proof-archive/remaining/notice-switch-red-d661df580 309f503297fc5c7de655e9d1d3be06e13f48bd56",
+    "refs/heads/freshagent-proof-archive/remaining/notice-toggle-instrument-bed8 e046b51b3182b5243b4884212e563474d3781dba",
+    "refs/heads/freshagent-proof-archive/remaining/notice-toggle-proof-bed8ed764 4f59b101a15b8ab904cf26e586c4714ce7799616",
+    "refs/heads/freshagent-proof-archive/remaining/notice-unit-red-043c6a784 d7a5be915bb8b615aee51ba5a329f53b3fbe6d0c",
+    "refs/heads/freshagent-proof-archive/remaining/opencode-diagnostic-cd38797d0 ae4478a9d51ffe4a6fd4f3aa1c9cffe6008acbbd",
+    "refs/heads/freshagent-proof-archive/remaining/opencode-exec-proof-3757b1e80 65963bf541f68b1baf002314b63d2f7c2c7fad3f",
+    "refs/heads/freshagent-proof-archive/remaining/rebind-duplicate-red-62b1a166c 8d05090ed38d3d9925defb5896486dd0200edb50",
+    "refs/heads/freshagent-proof-archive/remaining/rust-failures-proof-cd38797d0 a3430e378ef483a9198e43fff4c40cad136f7ec1",
+    "refs/heads/freshagent-proof-archive/remaining/rust-failures-proof-cd38797d0-r2 e797c7d3cb332d79846de09a4ee94b289f6a5f0f",
+    "refs/heads/freshagent-proof-archive/remaining/send-scope-green-96ef7adc8 ecadc49a86936d333241ac8d3f049a6dcf91971c",
+    "refs/heads/freshagent-proof-archive/remaining/steer-grouped-red-cbff82970 757c922529c15d3e6968614fd10a79491f306c97",
+    "refs/heads/freshagent-proof-archive/remaining/steer-identity-red-c2170a2dc 93ab3dcaab8ca2b7d821fe33db168bd9bf83081f",
+    "refs/heads/freshagent-proof-archive/remaining/steer-immediate-red-1aec7e048 dd8fd8e4081c97a62cf1b1fa3ab782401f11eda0",
+    "refs/heads/freshagent-proof-archive/remaining/steer-projection-red-0d4f0e5ef af8608f0cd5fdb741acee7db2cd2df81fbab3fd1",
+    "refs/heads/freshagent-proof-archive/remaining/steer-projection-red-1f55fd50f bb8772a429811a4d8d50bfbc58fc91c11c1d361e",
+    "refs/heads/freshagent-proof-archive/remaining/steer-races-red-4fd356dc3 351a32410c508c9840f53327fa471af9f6e566b8",
+    "refs/heads/freshagent-proof-archive/remaining/supplement-proof-8ab102268 711bca0ffea077b89758b76e354befde25d9e822",
+    "refs/heads/freshagent-proof-archive/remaining/uncertainty-notice-green-d075669c8 603da18f3b0cd1cc73a902b3a54d48ee895ea209",
+    "refs/heads/freshagent-proof-archive/remaining/uncertainty-notice-red-946c9f5d2 6576a9ad570c1ac6bbb5db97ab2c7bf0096f01a3",
+    "refs/heads/freshagent-proof-archive/rust-sandbox-10f932cc8-08397410ea 5a7713b321fd1c8cb2c67a23f9ec615bdab54879",
+    "refs/heads/freshagent-proof-archive/rust-sandbox-ad7ca113f-669deae573 d60003648253bee1d3cd9ea47975a419a25e1ffc",
+    "refs/heads/freshagent-proof-archive/supplement-2b2ef61c8 f5dc497f15dd981792f238c42ebd3f6ab15bb4d2",
+    "refs/heads/freshagent-proof-archive/supplement-d13d2e08b bd37125541c245e864acdf4b9c2f74b0b0acc8d0",
+    "refs/heads/freshagent-proof-archive/supplement-f7eab7a2c-41633750449 4b2c9d10ffd66196b7fa4002486962abd97e8e21",
+    "refs/heads/freshagent-proof-archive/two-slot/batched-notice-green-d5b9619e0 50e5870f1ebab120fdf389ca68b0accdd3a0daa7",
+    "refs/heads/freshagent-proof-archive/two-slot/batched-notice-red-0bcd1e535 d82931057eb5879c81845738de04b545df59ca73",
+    "refs/heads/freshagent-proof-archive/two-slot/blocked-send-green-d13d2e08b 67fc5309a722726fac598b32d3d06dbb001123ce",
+    "refs/heads/freshagent-proof-archive/two-slot/blocked-send-red-a40449695 95d0789d12c17a0e9d5c4ee0b87a1681f3c5cbe6",
+    "refs/heads/freshagent-proof-archive/two-slot/blocked-send-replay-red-7039a752e 7ef2f2b9263809d4ff55f832549ea2241cde303a",
+    "refs/heads/freshagent-proof-archive/two-slot/durable-blocked-send-final-c8abd6442 c4a4d8f7e2891e964236b7bfb095cacd883f017d",
+    "refs/heads/freshagent-proof-archive/two-slot/durable-blocked-send-green-2b2ef61c8 5eeea29c9a76fb48ff58969a95eb2d82faaa1ab5",
+    "refs/heads/freshagent-proof-archive/two-slot/landed-echo-mutant-df382 085586e25229c12a6058eb68c7f8b5417ce0c92e",
+    "refs/heads/freshagent-proof-archive/two-slot/late-acceptance-diagnostic-c736 bb004bc6816452c98b53e726d8e82be71eae366c",
+    "refs/heads/freshagent-proof-archive/two-slot/late-acceptance-green-6b1040bcf 48fcb4600a1e2011cc7f9c26b2dca1423694aef7",
+    "refs/heads/freshagent-proof-archive/two-slot/late-acceptance-green-df3821435 ebad5bffc8ff7c3f8baaa46f734a728744b0b0c5",
+    "refs/heads/freshagent-proof-archive/two-slot/late-acceptance-red-963ad2f90 70baded4dbd091ea8844d01e7ba90122471effb2",
+    "refs/heads/freshagent-proof-archive/two-slot/materialization-assertion-red-963 851e769aba81e2b59cde3a1d9f40c9aad9e2f60d",
+    "refs/heads/freshagent-proof-archive/two-slot/merge-runtime-f7eab7a2c 49b8be53903f1c24a500328d20693edffdc8d941",
+    "refs/heads/freshagent-proof-archive/two-slot/merge-runtime-fixed-fe04b70b8 acb72b057a7769f6f99b1cbae2279012ab50defd",
+    "refs/heads/freshagent-proof-archive/two-slot/receipt-final-proof-04bc 7d05d9196485f5b08edcab0104157971a2119635",
+    "refs/heads/freshagent-proof-archive/two-slot/receipt-identity-proof-f017 0d64c6cd4daeca771d449af07c4fa409482d4271",
+    "refs/heads/freshagent-proof-archive/two-slot/refusal-consumers-red-3ab82d04a 68e498f3cc896d7bd3c9142d1428e56f096ddd6a",
+    "refs/heads/freshagent-proof-archive/two-slot/settled-echo-diagnostic-6fc 659256fb55de4b6494077ce899a079f5b3e5645a",
+    "refs/heads/freshagent-proof-archive/two-slot/settled-echo-fixed-6fc 53c969cdcda6e45c16063147823edcdd174aa629",
+    "refs/heads/freshagent-proof-archive/two-slot/settled-echo-fixed-e436 7f1de13eb48824652007c0ac7887f4733355ce78",
+    "refs/heads/freshagent-proof-archive/two-slot/settled-echo-mutant-6fc a0f5a9078f125fdda554c7e0caab3f9aedfc3a65",
+    "refs/heads/freshagent-proof-archive/two-slot/settled-echo-mutant-e436 5a59a0fadefb529a8f9edf4faa4220bbf5c7c3a0",
+    "refs/heads/freshagent-proof-archive/two-slot/steer-correlation-proof-89a 829d1f0915d2374522ea77c3bac1c9d226c33035",
+    "refs/heads/freshagent-proof-archive/two-slot/steer-grouped-proof-8ab cd427bf637fd5edfef1fbf43f1e1749581062fba",
+    "refs/heads/freshagent-proof-archive/two-slot/steer-proof-240a c5ae55b7cbd83d31a1abb3511ee76959a8cccb49",
+    "refs/heads/freshagent-proof-archive/two-slot/steer-races-proof-371c a82c28bd0f634c82ca4d15bd98253715fece24d5",
+    "refs/heads/freshagent-proof-archive/two-slot/supplement-proof-10f932cc8 8d1ecd0bf25a79428d514da008a9c8b7176416f2",
+    "refs/heads/gate-local-phases-only 6b45120736fe4282ff3c572b4c7a94c3c28d16ef",
+    "refs/heads/integration/main-to-tested-dev-stack-20260520 4813bbbf2fb2aca112c91103634a6d2b54f46041",
+    "refs/heads/investigation/0gdd-measurement 225a91db3e4d48d4b6a7e8bc0987afad8ff31917",
+    "refs/heads/investigation/0gdd-observer 225a91db3e4d48d4b6a7e8bc0987afad8ff31917",
+    "refs/heads/landing/eaw7 84f1c944c2496d81c26fe05446b537556502f69c",
+    "refs/heads/main cbcb0726431d906355c407ed2c2859227618e1ae",
+    "refs/heads/parity-campaign-20260805 3fe59654fcaa57c715eb443e36321d88f98c1eb1",
+    "refs/heads/proof/freshagent-parity-gc1p-8ab-20261103-retry1 c61b00e9aee250581d8c67961fb7e4071058d970",
+    "refs/heads/proof/freshagent-parity-gc1p-8ab-20261103T1017Z ebe6c70fac3d3fcf2de848a743b6829f17958511",
+    "refs/heads/proof/freshagent-parity-gc1p-base-51ca-20261103 48fbbcac852b763ac7a7a646a7178ee118114964",
+    "refs/heads/publish/main-sync-s5 d873e0dfa8fd026c9a70e6ec544d954d22d35273",
+    "refs/heads/qa-campaign-20260806 45dada4c47e7b30106a4a43e1d746cf18eff9eba",
+    "refs/heads/r47n-landing cba7866bca5ad920dc80c576f42fa97969a3bddf",
+    "refs/heads/release/v0.7.6-rc.1 1db15fba6c1cc6f92a4387713b84a1c3b5c8df50",
+    "refs/heads/remove-opencode-static-menu ea3aa291b0da56eaae6202bb51ab0e59c17b31a7",
+    "refs/heads/repair/durable-souls-browser-check-fixes 74c638d0c4e1c8731d33719f5818f562ec706349",
+    "refs/heads/repair/durable-souls-cold-sandbox 165ed25b5a38226849eadd8ec33b2a020241872c",
+    "refs/heads/repair/durable-souls-doc-alignment 11e703a8269a34a391d99084c3bf352a1cfe38b6",
+    "refs/heads/repair/durable-souls-gate33-observer-evidence a92461769555065290f661618009530dc9d13ac0",
+    "refs/heads/repair/durable-souls-gate33-shell-end f0f2f3ddfcf3f4f3ab9cec59380a59e9bed534fd",
+    "refs/heads/repair/durable-souls-host-startup-fixes 8b23eec8f11fc0257401e4e8627ce3a9ce66b5bd",
+    "refs/heads/repair/durable-souls-native-probe-fixes 903e4c0a6400b768924c008be6f709046fd2ee80",
+    "refs/heads/repair/durable-souls-native-tool-fixes 760760d06ffb10cea23ee140196aa62523e02d43",
+    "refs/heads/repair/durable-souls-provider-review-fixes 65fb8b8882588ebd28d8e9ae1963849568bb8ffc",
+    "refs/heads/repair/durable-souls-registry-fixes fa6bc66e4b5ce3c75c1b62ee9dfe3804c765e7f3",
+    "refs/heads/repair/durable-souls-review-findings 59d1bbe3ca5933dc7f1a64b8bb79a7db428571c2",
+    "refs/heads/repair/durable-souls-runner-cleanup ed924fec23ac5be0b0c73b58caf5f1b612fe009b",
+    "refs/heads/repair/durable-souls-server-startup-fixes f7885dfa1b78855c0a95e9e0254d8cc9f4c8c22a",
+    "refs/heads/repair/durable-souls-sidecar-fixes 5b538cbc6da4526e85b15d6311859dbee3ce6d08",
+    "refs/heads/repair/durable-souls-snapshot-fixes a35b112efad97a6bd348fb9ca138e45bc377a36b",
+    "refs/heads/repair/durable-souls-test-oracle-fixes 9703c9b7a4a0d30405b7a8beb92ad2e55fb8fea2",
+    "refs/heads/repair/durable-souls-transfer-runtime-fixes 2a1305f3dff31cbdbf83dac5c742fd5a74ca79f3",
+    "refs/heads/revert-2300258d6-tmp d9712f84be3b7e5cb2f91db0064af9b8c821bb47",
+    "refs/heads/safety/pr699-pre-main-763 9c5f04c6508d433fa3393b1236f63672f7dcaa6d",
+    "refs/heads/safety/pr699-pre-main-764 bc56db213a665a470f6b77e57a62f4bb4ee99abc",
+    "refs/heads/skill/triage-old-worktrees-fixes b135a85e0962a842037d0784ff4d7eaa05551d5c",
+    "refs/heads/test/deflake-kata-continue 0be1731df7ff3b2dfdf79e52252c9a2ca8c03562",
+    "refs/heads/test/freshclaude-c30-runtime-fakes 439eaeac6e5a6ab9eb41fcb3d58cc79619277ca7",
+    "refs/heads/the-usual/b8ke-handoff 7824b5aab40b761fb500ce87c937b82d12858b69",
+    "refs/heads/the-usual/b8ke-handoff-stabilization d71385eb40b86fc53ac88c64cbfb68ecad19f463",
+    "refs/heads/the-usual/claude-cli-pane-status 0908a46247d4a6404cd0d1d753cd4432ea9d8766",
+    "refs/heads/the-usual/codex-pane-lifecycle 712c08bf614b15285a6522e42663e5ca50d29112",
+    "refs/heads/the-usual/coding-agent-resource-containment e68ca6f15b869ac475e6ed02ab11c9e087f5a896",
+    "refs/heads/the-usual/docs-deploy-workflow ff076229ec02aa48ca63627544e969a9f9b83895",
+    "refs/heads/the-usual/durable-souls-broker-publication 75723b9cda741acecbf57f1a1c0a0ca36163e27b",
+    "refs/heads/the-usual/durable-souls-browser-fixture 63c74bb760ad269bf58bcb22bb40d07398960dbc",
+    "refs/heads/the-usual/durable-souls-final-validation 23bb99407d96c603612fe3794c72c152c818bba1",
+    "refs/heads/the-usual/durable-souls-gate28-build-stamp 541f467b2b7abfa83a285d43e44d1a888d080a03",
+    "refs/heads/the-usual/durable-souls-gate28-cloud-output a0b92b4ea13a9a1428ec1285cc7c4f90aa743891",
+    "refs/heads/the-usual/durable-souls-gate28-codex-fixture 2bb388abf4662d492db87a505ff368663f78e4b1",
+    "refs/heads/the-usual/durable-souls-gate28-hygiene-reader 290e11f49dac9af3bfcfe225a456e93ee5f518d5",
+    "refs/heads/the-usual/durable-souls-gate28-opencode-recovery 4d6a635bf93ca32e5113f3afea372491b85664db",
+    "refs/heads/the-usual/durable-souls-gate28-parity-fixtures c09167e53bb6a4ee0b3f09a41852b24a0cf7c775",
+    "refs/heads/the-usual/durable-souls-gate28-runtime-ownership 5e395f4f268308cc2009fc85daed009e020e050e",
+    "refs/heads/the-usual/durable-souls-gate28-store-recovery 4d6a635bf93ca32e5113f3afea372491b85664db",
+    "refs/heads/the-usual/durable-souls-gate28-tab-projection f4e042df0bd2b2675e01252f8db5a9f640fa4300",
+    "refs/heads/the-usual/durable-souls-gate29-fixture ed2014b9f731cdbce1c38cdab833783120d33a79",
+    "refs/heads/the-usual/durable-souls-gate30-cloud 3185e629f612fbc45e4c29553e23e9a9614287b0",
+    "refs/heads/the-usual/durable-souls-gate30-provider 227a93e92fecda21f28a46a3ec7784b8bdf345a6",
+    "refs/heads/the-usual/durable-souls-gate31-host-stop 8fc78614a99fc083e65b56051e77fd1167018caf",
+    "refs/heads/the-usual/durable-souls-gate31-publisher-fixes eb3fd429d7f976642193b3f344112d6832f81309",
+    "refs/heads/the-usual/durable-souls-gate34-broker-schema 74faffdce760b53bfe4f7688dd96b593e14e765e",
+    "refs/heads/the-usual/durable-souls-gate34-provider a7608f643a1709e9b0823c5cc8b91bc067517287",
+    "refs/heads/the-usual/durable-souls-history-diagnosis 255f91850aee58ad4d34e56edbf99bc617580911",
+    "refs/heads/the-usual/durable-souls-host-reply-stack 1795ddecac089e8a398ba295ee0847d2d585525d",
+    "refs/heads/the-usual/durable-souls-host-test-wrapper 539fc12b43ce9142a22350bc1cad1c8dead68ef7",
+    "refs/heads/the-usual/durable-souls-kilroy-fixture-repair aaeb0a51dd85edf3fd7ab15bfa9c404af9df0217",
+    "refs/heads/the-usual/durable-souls-opencode-history-notification 335d85219df6595583906280532793463c483407",
+    "refs/heads/the-usual/durable-souls-opencode-inputs 0776445cf36144face0685ccb49aedc2ef0b277a",
+    "refs/heads/the-usual/durable-souls-parent-lookup-repair 32d7b0193e5413eac99a82fc3f8860540f41176b",
+    "refs/heads/the-usual/durable-souls-parity-repair ab53188a4626a9698bc2e0b6a7bb6759d42924f8",
+    "refs/heads/the-usual/durable-souls-projection-repair 9de2e41c21ff1645e78f248abd9a9cd1a65c4250",
+    "refs/heads/the-usual/durable-souls-reliability 0d098bd80d793031ecf062b7a961a07b8e3db74d",
+    "refs/heads/the-usual/durable-souls-reliability-task008 0779df04e9e03d87c0b607d65653c219c8958c82",
+    "refs/heads/the-usual/durable-souls-reliability-task009 d597941f512a0056a2c89db2821cd5212f712c82",
+    "refs/heads/the-usual/durable-souls-reliability-task009-claude fb2f8fd208840c505c386ee1734b30b8a102ab90",
+    "refs/heads/the-usual/durable-souls-reliability-task009-ui 236502d7210c5a23a63ba0838ddcd80813a5284d",
+    "refs/heads/the-usual/durable-souls-reliability-task010 cefdc7e3ca8100598779cf82b97b6114152fb5d2",
+    "refs/heads/the-usual/durable-souls-reserved-native-retry f1c513ad683eedd103685990a625d3ae5e4ede2c",
+    "refs/heads/the-usual/durable-souls-review3-harness e6bf00ad281e72429fe3122ad6ee299f41382961",
+    "refs/heads/the-usual/durable-souls-review3-probes 1da744135ada2871f89757bc9d6529daf2760572",
+    "refs/heads/the-usual/durable-souls-review3-recovery aef9553c38b77d22142ec24e5a24b7e3202632a9",
+    "refs/heads/the-usual/durable-souls-review4-protocol 9200a044574ca9ba2831c272e7f60111593ad458",
+    "refs/heads/the-usual/durable-souls-round5-activity 6de69e313fdbfbce9e414d003b8a7c882a7e5042",
+    "refs/heads/the-usual/durable-souls-round5-recovery a088bad1abe74267b5c3444fac3fa7afb2cb3140",
+    "refs/heads/the-usual/durable-souls-round5-windows b53e6ba455508b74e530b8883c288985b3df0ddd",
+    "refs/heads/the-usual/durable-souls-saved-history-repair 4535a29f6b2379fd6df8952ca035a80db2774a07",
+    "refs/heads/the-usual/durable-souls-stale-loss-repair dc54f355654e828a218dd0685d304afb6da4eeab",
+    "refs/heads/the-usual/fresh-agent-compact-panels 68a058c3f46ee0dbde0b1d706350cb2565d66362",
+    "refs/heads/the-usual/fresh-agent-recovery-fixes ee54ee43472b989e3de809f4b4bee65e30d6ffb6",
+    "refs/heads/the-usual/fresh-agent-review-polish 693600635ac0901a7da19f8ef25bb0f3effbba28",
+    "refs/heads/the-usual/fresh-agent-status-strip 71213506fe1b5e0d1a3bd7fba03ea167a513fe65",
+    "refs/heads/the-usual/freshagent-activity-line 939a1d1f7703f3b828c167dda72cdf1c94199a59",
+    "refs/heads/the-usual/freshagent-multiple-devices 6b169df358018111b36eeff7048df51664966def",
+    "refs/heads/the-usual/freshagent-sessionref-regression 0910d8b05801636fe7480cfb0b8a8513cc0c7cdc",
+    "refs/heads/the-usual/freshcodex-complete 10b19fa6e0fe3c67f1521a56bc2d808307def3c1",
+    "refs/heads/the-usual/freshcodex-task004-tdd-recovery-20261026 477092c3c2f6efb4ac5b9b8d577dae1eab272f9a",
+    "refs/heads/the-usual/freshell-crash-resilience 82f38ed14a6b1086aef65904d04f13f1cfb1bd83",
+    "refs/heads/the-usual/gc1p-cold-recovery 24f305ee06198a41793d5a17026f7ac3871950c7",
+    "refs/heads/the-usual/gc1p-recovery edfcba080cba49239b478181b2ea6ff055de34a7",
+    "refs/heads/the-usual/green-tab-sidebar-polish c400d39c657e4703463114355b71a794ecc0e2fb",
+    "refs/heads/the-usual/kata-rrx7-rollout-continuation 53ed56696d33db3ab639dc8bf8ddcc3458433360",
+    "refs/heads/the-usual/kata-sbnj 2fa6d5c78d2bfba4c2879fa4a7b31072d3729d02",
+    "refs/heads/the-usual/managed-opencode-session-recovery 8362581b8c90de7e192a353b2256a7a5e71b5494",
+    "refs/heads/the-usual/managed-recovery-contextual-ui-pre-a531-rebase-20261003 671d13b38ab690c18884dd75d8906348ae2324a3",
+    "refs/heads/the-usual/managed-recovery-contextual-ui-pre-rebase-20261003 8acacb3d8df3ccf3774ed287e6a3dc96dbb45627",
+    "refs/heads/the-usual/mdmw-sandbox-budget ff63d2746a98b993ca15d87616c2907acb0dd67b",
+    "refs/heads/the-usual/mdmw-sandbox-main-fast 342e6e73081fa3b8d70935dd5c97cda030be8427",
+    "refs/heads/the-usual/minimal-supervisor-cleanup ee8e0ad8218e26541fe17877f566c2e1b57c7c83",
+    "refs/heads/the-usual/oomd-session-proof b899c166033a5e8002539b01f9a2ac64bee6f461",
+    "refs/heads/the-usual/oomd-session-proof-current 84ca1c6b2ab5c6b80b93600c63b2705f1bcca5a4",
+    "refs/heads/the-usual/opencode-bg-green-gate 398a866f527909e37e68c46424a5d3a77951cf60",
+    "refs/heads/the-usual/opencode-reveal-refresh 781d83080ce2099100c79418ec923d93a16ec7a7",
+    "refs/heads/the-usual/pane-title-recovery 0bc28c07aea080bf487e25ce1c39b735776e329d",
+    "refs/heads/the-usual/session-directory-lazy-page-prep e57091c7f427f207d39c653adbd87199cc685ad8",
+    "refs/heads/the-usual/session-directory-page-bound d1ef097ec552a781c7728fb12c6d7dc9b33c2bee",
+    "refs/heads/the-usual/session-directory-page-prep 745ea64e825d8bc3ccb23d4b85a5d4341b41eb13",
+    "refs/heads/the-usual/sidebar-needs-attention-green eb3637b2b2d3dc17ed4ee67b7b9acee6a0e62958",
+    "refs/heads/the-usual/sidebar-remove-blue-fill 9b96cf7847fb8d4ab18746d3ef7770fd36d67991",
+    "refs/heads/the-usual/slash-command-catalogs 2ca852dd277cfea46e3de875e6edbc980fdc7590",
+    "refs/heads/the-usual/terminal-replay-credit 675db5ebf3b6264e7c3852bcfb45453af1202b2b",
+    "refs/heads/the-usual/viewport-screenshots 218a37fa04b624b0848023c203528d449908a223",
+    "refs/heads/the-usual/ws-bootstrap-recovery-flake 3969ea802d7050b9fbcb98e20515ddcd6dde0bd4",
+    "refs/heads/triage/worktrees-20260823 7fd81a131e1571fef96637ee5b8fd815cc0839ae",
+    "refs/heads/validation/fresh-agent-thinking-label 14d8ed9bb997e9ab786a623749db8ee5b93244fd",
+    "refs/heads/wfah-landing 412810f02aee5f9b12b0a16cee37a4503f9fe2cc",
+    "refs/heads/ywwf-rebase e9709a49832ad8455e96ae99a11087e9e90da20f",
+    "refs/heads/z06a-landing 55417f7385a0d638703f00b4d7e40e572c4088a4",
+    "refs/heads/z7j7-landing b28bda34a03ebd11c165e1a0a2492c27b3497317",
+    "refs/tags/pre-reword-backup b829a96730680a78e1633a5b40b3d85b76f263e1",
+    "refs/tags/pre-reword-backup-iter5 338f659ca8c0d4b8e5a49bc3c83f3359c7d9df1e",
+    "refs/tags/v0.1.0 dbb585c63fc99ff82849683cccb75a81fd4824d5",
+    "refs/tags/v0.2.0 6ec831a0cba273e6568c41bd5f8abc1699b12efd",
+    "refs/tags/v0.2.1 661167420a3af2e42342a05ef48d9e012b12aeb8",
+    "refs/tags/v0.2.2 1f63d91303fab2831616a7f063b1501529f42f5d",
+    "refs/tags/v0.2.3 02d53abbb3daf70c9f2267e8df810c987754c3d5",
+    "refs/tags/v0.2.4 49c2d4fa437762e21891069553d3fd995a6ab64c",
+    "refs/tags/v0.2.5 aee2973e85c65576fc6d71eae6e2aad2e8bfd26d",
+    "refs/tags/v0.3.0 b10e510e8f40105078c683d2b21bcdb6deb0451c",
+    "refs/tags/v0.3.1 013158637b478ab8d7d76ca5757aa05482f44a07",
+    "refs/tags/v0.3.2 8fe21eac1de06abf8057d380726c54aced97358d",
+    "refs/tags/v0.4.0 ffea1aeadb50a90d58ab26102524005d4b0a0d5d",
+    "refs/tags/v0.4.1 58eeb6868f33becdf6c508ede325d64db43d4cd7",
+    "refs/tags/v0.4.5 76c6236c6c224bd519ff7c89d808f1df0f97588a",
+    "refs/tags/v0.5.0 a704edd993dd030d28ff1c475c3d4ce3a1756a9f",
+    "refs/tags/v0.6.0 bcc1bc783a1635168da3e9c6818529031640f24d",
+    "refs/tags/v0.7.0 c297558fc48e2c99c563cca0b0d33666aebb33d1",
+    "refs/tags/v0.7.5 8264f70e5b325399354b30313f48403230be2902"
+  ],
+  "original_worktrees": [
+    {
+      "worktree": "/home/dan/code/freshell",
+      "HEAD": "cbcb0726431d906355c407ed2c2859227618e1ae",
+      "branch": "refs/heads/main"
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/0q8k",
+      "HEAD": "9cca1d3d89ff50d8b6430d60fa55bc43d3762db6",
+      "branch": "refs/heads/darkforge/0q8k"
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/15gk",
+      "HEAD": "8dde49c37ea976721b5576bdc997664d23a86f3b",
+      "detached": ""
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/3gvd",
+      "HEAD": "c3a59d350b143df0e7aea84ac313f74d13448cf7",
+      "branch": "refs/heads/darkforge/3gvd-20260826-072729"
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/3pjv",
+      "HEAD": "dfa2cc88acc770a370d74336970f2dd67843236e",
+      "branch": "refs/heads/darkforge/3pjv"
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/4g2a",
+      "HEAD": "b6d7027401e2736f6594fb271135d3482183f3da",
+      "branch": "refs/heads/darkforge/4g2a"
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/6rbc",
+      "HEAD": "d1854f0dbfcbde5eec6bc27659eee4021d193aec",
+      "branch": "refs/heads/darkforge/6rbc"
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/a57r",
+      "HEAD": "990afc5c16c2e65da56d75c239204b49fdf2e33c",
+      "branch": "refs/heads/darkforge/a57r"
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/b5fb",
+      "HEAD": "04ce2c7302afeec42a6741696b241b7646b06b78",
+      "branch": "refs/heads/b5fb-squash-local"
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/des0",
+      "HEAD": "feaed36461c206076126f131984168344b164513",
+      "branch": "refs/heads/darkforge/des0"
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/eaw7",
+      "HEAD": "84f1c944c2496d81c26fe05446b537556502f69c",
+      "branch": "refs/heads/landing/eaw7"
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/ekc6",
+      "HEAD": "990afc5c16c2e65da56d75c239204b49fdf2e33c",
+      "detached": ""
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/ex4c",
+      "HEAD": "85309720453dfd9cfc8d1f790731b96ec1359af9",
+      "detached": ""
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/f0ef",
+      "HEAD": "c14e1abcebc6e9d80d4309e4001d7f850f36b546",
+      "branch": "refs/heads/darkforge/f0ef"
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/fd1m",
+      "HEAD": "30849bb9de4cd42e6391aeb90a244403dcb4486d",
+      "branch": "refs/heads/darkforge/fd1m"
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/kqn1",
+      "HEAD": "48d9ab2879f36e559417ecf0baa680ea0e7b36ae",
+      "detached": ""
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/qzka",
+      "HEAD": "f6570fe0009efd4ac13b4cd0b9dac0dc41781eef",
+      "branch": "refs/heads/darkforge/qzka"
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/r47n",
+      "HEAD": "e775d6ae84f08ae1177481512f644a87797131cb",
+      "branch": "refs/heads/darkforge/r47n"
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/r49m",
+      "HEAD": "2c78116747202396f0e3f0c925a4e48268091ef1",
+      "branch": "refs/heads/darkforge/r49m-landing"
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/rw3z",
+      "HEAD": "6b8048af0b65c260e9b9920e98871dce7e20a007",
+      "detached": ""
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/s52d",
+      "HEAD": "ab2c2caf89de4e1dffe53b26f864c0f05a824a26",
+      "branch": "refs/heads/darkforge/s52d"
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/te1m",
+      "HEAD": "bb2bd388b8d2b1dcdddcb26b86e166d9662011b9",
+      "branch": "refs/heads/darkforge/te1m"
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/wfah",
+      "HEAD": "84eaea68a162b74bbd3ef983fbffff9e6da05747",
+      "branch": "refs/heads/darkforge/wfah"
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/xkwq",
+      "HEAD": "45d254372c477fd93bfe810cc4c8ebc74e498f69",
+      "branch": "refs/heads/darkforge/xkwq"
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/y83s",
+      "HEAD": "66cf6f8987f286768dc27057e8625cccf86ebdfc",
+      "branch": "refs/heads/darkforge/y83s"
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/ywwf",
+      "HEAD": "e9709a49832ad8455e96ae99a11087e9e90da20f",
+      "branch": "refs/heads/ywwf-rebase"
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a",
+      "HEAD": "55417f7385a0d638703f00b4d7e40e572c4088a4",
+      "branch": "refs/heads/z06a-landing"
+    },
+    {
+      "worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z7j7",
+      "HEAD": "2e979740d8bac7e08f3b2a7381c8dbe20f6fe2bb",
+      "branch": "refs/heads/darkforge/z7j7"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/.base-gate-242209",
+      "HEAD": "20dbddf53d831c2fbcebdac294d67cc262c57838",
+      "detached": "",
+      "locked": "Owned garageserver update artifact build in progress"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/.base-gate-985321",
+      "HEAD": "51ca8c6a33daa41f5461f93540138a5677698ed6",
+      "detached": "",
+      "locked": "Owned garageserver candidate build reads source"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/b8ke-handoff",
+      "HEAD": "7824b5aab40b761fb500ce87c937b82d12858b69",
+      "branch": "refs/heads/the-usual/b8ke-handoff"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/cloud-image-identity",
+      "HEAD": "c8822329489e4366a28f8aefa370c5d2f2e10570",
+      "branch": "refs/heads/cloud-image-identity"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/cloud-vitest-wedge-rca",
+      "HEAD": "786d18bbb1be7a045e67b1479a9165ddc4e32127",
+      "detached": ""
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/codex-pane-lifecycle",
+      "HEAD": "712c08bf614b15285a6522e42663e5ca50d29112",
+      "branch": "refs/heads/the-usual/codex-pane-lifecycle"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/deploy-main-281c67",
+      "HEAD": "281c67b914c526cd30fbb650d8963870ba0bfd6e",
+      "detached": ""
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/deploy-main-d0cc7cb5",
+      "HEAD": "d0cc7cb5e038811be0fb3ff5f4fc5812d2723228",
+      "detached": ""
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-browser-check-fixes",
+      "HEAD": "74c638d0c4e1c8731d33719f5818f562ec706349",
+      "branch": "refs/heads/repair/durable-souls-browser-check-fixes"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-cold-sandbox",
+      "HEAD": "165ed25b5a38226849eadd8ec33b2a020241872c",
+      "branch": "refs/heads/repair/durable-souls-cold-sandbox"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-doc-alignment",
+      "HEAD": "11e703a8269a34a391d99084c3bf352a1cfe38b6",
+      "branch": "refs/heads/repair/durable-souls-doc-alignment"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-final-validation",
+      "HEAD": "e7b8eac821431fb52eda7b9626fe0fe7dbfc43b2",
+      "detached": ""
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate28-build-stamp",
+      "HEAD": "541f467b2b7abfa83a285d43e44d1a888d080a03",
+      "branch": "refs/heads/the-usual/durable-souls-gate28-build-stamp"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate28-cloud-output",
+      "HEAD": "a0b92b4ea13a9a1428ec1285cc7c4f90aa743891",
+      "branch": "refs/heads/the-usual/durable-souls-gate28-cloud-output"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate28-codex-fixture",
+      "HEAD": "2bb388abf4662d492db87a505ff368663f78e4b1",
+      "branch": "refs/heads/the-usual/durable-souls-gate28-codex-fixture"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate28-opencode-recovery",
+      "HEAD": "4d6a635bf93ca32e5113f3afea372491b85664db",
+      "branch": "refs/heads/the-usual/durable-souls-gate28-opencode-recovery"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate28-parity-fixtures",
+      "HEAD": "c09167e53bb6a4ee0b3f09a41852b24a0cf7c775",
+      "branch": "refs/heads/the-usual/durable-souls-gate28-parity-fixtures"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate28-runtime-ownership",
+      "HEAD": "290e11f49dac9af3bfcfe225a456e93ee5f518d5",
+      "branch": "refs/heads/the-usual/durable-souls-gate28-hygiene-reader"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate28-tab-projection",
+      "HEAD": "f4e042df0bd2b2675e01252f8db5a9f640fa4300",
+      "branch": "refs/heads/the-usual/durable-souls-gate28-tab-projection"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate29-fixture",
+      "HEAD": "ed2014b9f731cdbce1c38cdab833783120d33a79",
+      "branch": "refs/heads/the-usual/durable-souls-gate29-fixture"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate30-cloud",
+      "HEAD": "3185e629f612fbc45e4c29553e23e9a9614287b0",
+      "branch": "refs/heads/the-usual/durable-souls-gate30-cloud"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate30-provider",
+      "HEAD": "227a93e92fecda21f28a46a3ec7784b8bdf345a6",
+      "branch": "refs/heads/the-usual/durable-souls-gate30-provider"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate30-provider-review",
+      "HEAD": "2735885449aa084f5cf87c975628fe3b54eb67a1",
+      "detached": ""
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate31-host-stop",
+      "HEAD": "8fc78614a99fc083e65b56051e77fd1167018caf",
+      "branch": "refs/heads/the-usual/durable-souls-gate31-host-stop"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate31-provider-review",
+      "HEAD": "a7608f643a1709e9b0823c5cc8b91bc067517287",
+      "detached": ""
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate31-publisher-fixes",
+      "HEAD": "eb3fd429d7f976642193b3f344112d6832f81309",
+      "branch": "refs/heads/the-usual/durable-souls-gate31-publisher-fixes"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate33-observer-evidence",
+      "HEAD": "a92461769555065290f661618009530dc9d13ac0",
+      "branch": "refs/heads/repair/durable-souls-gate33-observer-evidence"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate33-shell-end",
+      "HEAD": "f0f2f3ddfcf3f4f3ab9cec59380a59e9bed534fd",
+      "branch": "refs/heads/repair/durable-souls-gate33-shell-end"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate34-broker-schema",
+      "HEAD": "74faffdce760b53bfe4f7688dd96b593e14e765e",
+      "branch": "refs/heads/the-usual/durable-souls-gate34-broker-schema"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-gate34-provider",
+      "HEAD": "a7608f643a1709e9b0823c5cc8b91bc067517287",
+      "branch": "refs/heads/the-usual/durable-souls-gate34-provider"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-history-diagnosis",
+      "HEAD": "255f91850aee58ad4d34e56edbf99bc617580911",
+      "branch": "refs/heads/the-usual/durable-souls-history-diagnosis"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-host-reply-stack",
+      "HEAD": "1795ddecac089e8a398ba295ee0847d2d585525d",
+      "branch": "refs/heads/the-usual/durable-souls-host-reply-stack"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-host-startup-fixes",
+      "HEAD": "8b23eec8f11fc0257401e4e8627ce3a9ce66b5bd",
+      "branch": "refs/heads/repair/durable-souls-host-startup-fixes"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-host-transfer-tests",
+      "HEAD": "526713d7b98822c33c02a8e38037ec511c3de7fe",
+      "branch": "refs/heads/fix/durable-souls-host-transfer-tests"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-kilroy-fixture-repair",
+      "HEAD": "aaeb0a51dd85edf3fd7ab15bfa9c404af9df0217",
+      "branch": "refs/heads/the-usual/durable-souls-kilroy-fixture-repair"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-live-rereview",
+      "HEAD": "b7cdcc8144cc4e6d50f87c770009590711ebfafe",
+      "detached": ""
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-live-review",
+      "HEAD": "ded2bf86ffb9cd8c9a124f5be06193288a3cf225",
+      "detached": ""
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-native-probe-fixes",
+      "HEAD": "903e4c0a6400b768924c008be6f709046fd2ee80",
+      "branch": "refs/heads/repair/durable-souls-native-probe-fixes"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-native-tool-fixes",
+      "HEAD": "760760d06ffb10cea23ee140196aa62523e02d43",
+      "branch": "refs/heads/repair/durable-souls-native-tool-fixes"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-opencode-history-notification",
+      "HEAD": "335d85219df6595583906280532793463c483407",
+      "branch": "refs/heads/the-usual/durable-souls-opencode-history-notification"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-opencode-inputs",
+      "HEAD": "e6bf00ad281e72429fe3122ad6ee299f41382961",
+      "branch": "refs/heads/the-usual/durable-souls-review3-harness"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-outage-reader",
+      "HEAD": "ee9281d6f96ce0ff65dbcb4aeb3f42819ad36f36",
+      "branch": "refs/heads/fix/durable-souls-outage-reader"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-parity-repair",
+      "HEAD": "aef9553c38b77d22142ec24e5a24b7e3202632a9",
+      "branch": "refs/heads/the-usual/durable-souls-review3-recovery"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-provider-review-fixes",
+      "HEAD": "65fb8b8882588ebd28d8e9ae1963849568bb8ffc",
+      "branch": "refs/heads/repair/durable-souls-provider-review-fixes"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-registry-fixes",
+      "HEAD": "fa6bc66e4b5ce3c75c1b62ee9dfe3804c765e7f3",
+      "branch": "refs/heads/repair/durable-souls-registry-fixes"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-reliability-task008",
+      "HEAD": "0779df04e9e03d87c0b607d65653c219c8958c82",
+      "branch": "refs/heads/the-usual/durable-souls-reliability-task008"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-reliability-task009",
+      "HEAD": "d597941f512a0056a2c89db2821cd5212f712c82",
+      "branch": "refs/heads/the-usual/durable-souls-reliability-task009"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-reliability-task009-claude",
+      "HEAD": "fb2f8fd208840c505c386ee1734b30b8a102ab90",
+      "branch": "refs/heads/the-usual/durable-souls-reliability-task009-claude"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-reliability-task009-ui",
+      "HEAD": "236502d7210c5a23a63ba0838ddcd80813a5284d",
+      "branch": "refs/heads/the-usual/durable-souls-reliability-task009-ui"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-reliability-task010",
+      "HEAD": "cefdc7e3ca8100598779cf82b97b6114152fb5d2",
+      "branch": "refs/heads/the-usual/durable-souls-reliability-task010"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-review",
+      "HEAD": "151f2cf4f52d0493fc35eaa61203b08d83f167e9",
+      "detached": ""
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-review-fixes",
+      "HEAD": "59d1bbe3ca5933dc7f1a64b8bb79a7db428571c2",
+      "branch": "refs/heads/repair/durable-souls-review-findings"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-review3-probes",
+      "HEAD": "f1c513ad683eedd103685990a625d3ae5e4ede2c",
+      "branch": "refs/heads/the-usual/durable-souls-reserved-native-retry"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-review4-protocol",
+      "HEAD": "9200a044574ca9ba2831c272e7f60111593ad458",
+      "branch": "refs/heads/the-usual/durable-souls-review4-protocol"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-round5-activity",
+      "HEAD": "6de69e313fdbfbce9e414d003b8a7c882a7e5042",
+      "branch": "refs/heads/the-usual/durable-souls-round5-activity"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-round5-recovery",
+      "HEAD": "a088bad1abe74267b5c3444fac3fa7afb2cb3140",
+      "branch": "refs/heads/the-usual/durable-souls-round5-recovery"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-round5-windows",
+      "HEAD": "b53e6ba455508b74e530b8883c288985b3df0ddd",
+      "branch": "refs/heads/the-usual/durable-souls-round5-windows"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-runner-cleanup",
+      "HEAD": "ed924fec23ac5be0b0c73b58caf5f1b612fe009b",
+      "branch": "refs/heads/repair/durable-souls-runner-cleanup"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-saved-history-repair",
+      "HEAD": "4535a29f6b2379fd6df8952ca035a80db2774a07",
+      "branch": "refs/heads/the-usual/durable-souls-saved-history-repair"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-server-startup-fixes",
+      "HEAD": "f7885dfa1b78855c0a95e9e0254d8cc9f4c8c22a",
+      "branch": "refs/heads/repair/durable-souls-server-startup-fixes"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-sidecar-fixes",
+      "HEAD": "5b538cbc6da4526e85b15d6311859dbee3ce6d08",
+      "branch": "refs/heads/repair/durable-souls-sidecar-fixes"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-snapshot-fixes",
+      "HEAD": "a35b112efad97a6bd348fb9ca138e45bc377a36b",
+      "branch": "refs/heads/repair/durable-souls-snapshot-fixes"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-stale-loss-repair",
+      "HEAD": "dc54f355654e828a218dd0685d304afb6da4eeab",
+      "branch": "refs/heads/the-usual/durable-souls-stale-loss-repair"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-test-oracle-fixes",
+      "HEAD": "9703c9b7a4a0d30405b7a8beb92ad2e55fb8fea2",
+      "branch": "refs/heads/repair/durable-souls-test-oracle-fixes"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-transfer-runtime-fixes",
+      "HEAD": "2a1305f3dff31cbdbf83dac5c742fd5a74ca79f3",
+      "branch": "refs/heads/repair/durable-souls-transfer-runtime-fixes"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/durable-souls-validation",
+      "HEAD": "3dcd7884236e4184859a2e40c7115383f5de6831",
+      "detached": ""
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/fix-dead-session-warn-flake",
+      "HEAD": "a6848c65b0fbd8a05ab84a804593ba8bf5548927",
+      "branch": "refs/heads/fix-dead-session-warn-flake"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/fix-freshagent-approval-flake",
+      "HEAD": "affc86a4e00b495e977c4f49fb7fc5b08c86f2c4",
+      "branch": "refs/heads/fix-freshagent-approval-flake"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/fix-session-init-provenance-flake",
+      "HEAD": "8186d9f3e7af55dfd7cde05e70ca51600e61920b",
+      "branch": "refs/heads/fix-session-init-provenance-flake"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/fix-settings-throttle-flake",
+      "HEAD": "3a4e18af485d645e3f42f863b4326d7b1c72fbf1",
+      "branch": "refs/heads/fix-settings-throttle-flake"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/flaky-supervisor-permission",
+      "HEAD": "11508754c84f019254d1fb2f2561c6812ad77817",
+      "branch": "refs/heads/fix/flaky-supervisor-permission"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes",
+      "HEAD": "ee54ee43472b989e3de809f4b4bee65e30d6ffb6",
+      "branch": "refs/heads/the-usual/fresh-agent-recovery-fixes"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/freshagent-multiple-devices",
+      "HEAD": "6b169df358018111b36eeff7048df51664966def",
+      "branch": "refs/heads/the-usual/freshagent-multiple-devices"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/freshclaude-client-e2e",
+      "HEAD": "b81c52ed8117e0f6f037f4b356e0f47ca7e314d7",
+      "branch": "refs/heads/feat/freshclaude-c30-browser-fakes"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/freshclaude-client-e2e2",
+      "HEAD": "c733ccef61617753885fd48fa9a6af86e29934dc",
+      "branch": "refs/heads/feat/freshclaude-recovery"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/freshclaude-core-c",
+      "HEAD": "9749ceef513080a353d8bac5433359561da67813",
+      "branch": "refs/heads/feat/freshclaude-rest-lane"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/freshclaude-core-d",
+      "HEAD": "b6fb292c08a1e2ea0cf71724d5f641684eeaece1",
+      "branch": "refs/heads/feat/freshclaude-session-identity"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/freshclaude-mcp",
+      "HEAD": "439eaeac6e5a6ab9eb41fcb3d58cc79619277ca7",
+      "branch": "refs/heads/test/freshclaude-c30-runtime-fakes"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/freshcodex-complete",
+      "HEAD": "10b19fa6e0fe3c67f1521a56bc2d808307def3c1",
+      "branch": "refs/heads/the-usual/freshcodex-complete"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/freshcodex-task004-tdd-recovery-20261026",
+      "HEAD": "477092c3c2f6efb4ac5b9b8d577dae1eab272f9a",
+      "branch": "refs/heads/the-usual/freshcodex-task004-tdd-recovery-20261026"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/freshell-crash-resilience",
+      "HEAD": "82f38ed14a6b1086aef65904d04f13f1cfb1bd83",
+      "branch": "refs/heads/the-usual/freshell-crash-resilience"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/gate-local-phases-only",
+      "HEAD": "6b45120736fe4282ff3c572b4c7a94c3c28d16ef",
+      "branch": "refs/heads/gate-local-phases-only"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/investigate-sidebar-opencode-rail",
+      "HEAD": "34f425faeb565a993655a429d5f291681315d0a0",
+      "detached": ""
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/kata-rrx7-rollout-continuation",
+      "HEAD": "53ed56696d33db3ab639dc8bf8ddcc3458433360",
+      "branch": "refs/heads/the-usual/kata-rrx7-rollout-continuation"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/lb-v3-scratch",
+      "HEAD": "1c7e4dff71fb533ae1c6dc096e6f0fe7ccd0236b",
+      "detached": ""
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery",
+      "HEAD": "8362581b8c90de7e192a353b2256a7a5e71b5494",
+      "branch": "refs/heads/the-usual/managed-opencode-session-recovery"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/managed-runtime-optin-2130563",
+      "HEAD": "2130563d76c23397ad4a37fed42c77927cc51e8b",
+      "branch": "refs/heads/fix/managed-provider-qualification-home"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/mdmw-sandbox-budget",
+      "HEAD": "342e6e73081fa3b8d70935dd5c97cda030be8427",
+      "branch": "refs/heads/the-usual/mdmw-sandbox-main-fast"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/name-reliability-client",
+      "HEAD": "48e2cfce447c857029c5b9f4438f4de451338ce6",
+      "branch": "refs/heads/fix/name-reliability-client"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/name-reliability-terminal",
+      "HEAD": "af691bd97f8c383a99d3fab76e4bdb854f7cc0cc",
+      "branch": "refs/heads/fix/name-reliability-terminal"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/name-repro-presouls",
+      "HEAD": "0f044b4a0830846c4ebcbf26365c9758114bf84f",
+      "detached": ""
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/name-repro-scratch",
+      "HEAD": "302cee989de81e4d881bafbd3a33abfa7a07e57a",
+      "detached": ""
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/oomd-session-proof",
+      "HEAD": "b899c166033a5e8002539b01f9a2ac64bee6f461",
+      "branch": "refs/heads/the-usual/oomd-session-proof"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/oomd-session-proof-current",
+      "HEAD": "24f305ee06198a41793d5a17026f7ac3871950c7",
+      "branch": "refs/heads/the-usual/gc1p-cold-recovery"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/opencode-bg-green-gate",
+      "HEAD": "398a866f527909e37e68c46424a5d3a77951cf60",
+      "branch": "refs/heads/the-usual/opencode-bg-green-gate"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/opencode-managed-model-live",
+      "HEAD": "596877170025fc811139d7019400539ffde02134",
+      "detached": ""
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/pane-title-recovery",
+      "HEAD": "0bc28c07aea080bf487e25ce1c39b735776e329d",
+      "branch": "refs/heads/the-usual/pane-title-recovery"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/rca-attach-wedge",
+      "HEAD": "a26886da4fab3fb071ac8f0c7773901d44c443ee",
+      "branch": "refs/heads/docs/rca-attach-wedge"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/rust-cache-experiment-77444e9",
+      "HEAD": "77444e9f22e1dbcf34c01202e4fb5acfad144281",
+      "detached": ""
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/task4-parent-8844",
+      "HEAD": "8844e431cb8eebdcf0a85c92efcbc0718fc48107",
+      "detached": ""
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/task4-parent-rust",
+      "HEAD": "8844e431cb8eebdcf0a85c92efcbc0718fc48107",
+      "detached": ""
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/terminal-replay-credit",
+      "HEAD": "675db5ebf3b6264e7c3852bcfb45453af1202b2b",
+      "branch": "refs/heads/the-usual/terminal-replay-credit"
+    },
+    {
+      "worktree": "/home/dan/code/freshell/.worktrees/z06a-probe",
+      "HEAD": "7b86de3c1c7752e7b80139b37dfefcb50dc38a60",
+      "detached": ""
+    }
+  ],
+  "source_captures": [
+    {
+      "slug": "main",
+      "commit": "63edb33eb6bc7995b283786e45d1b6d03aa2646d",
+      "ref": "refs/heads/retired/garageserver-20261107/working/main",
+      "parent": "cbcb0726431d906355c407ed2c2859227618e1ae",
+      "source_records": 1,
+      "original_worktree": "/home/dan/code/freshell"
+    },
+    {
+      "slug": "ekc6",
+      "commit": "ffd380ab0721dd97ef440a93349c3ca3da46b4bc",
+      "ref": "refs/heads/retired/garageserver-20261107/working/ekc6",
+      "parent": "990afc5c16c2e65da56d75c239204b49fdf2e33c",
+      "source_records": 1,
+      "original_worktree": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/ekc6"
+    },
+    {
+      "slug": "fresh-agent-recovery-fixes",
+      "commit": "5e87fe33ffd4db245ffdc1c3910375f0b157f7fa",
+      "ref": "refs/heads/retired/garageserver-20261107/working/fresh-agent-recovery-fixes",
+      "parent": "ee54ee43472b989e3de809f4b4bee65e30d6ffb6",
+      "source_records": 76,
+      "original_worktree": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes"
+    },
+    {
+      "slug": "managed-opencode-session-recovery",
+      "commit": "a34b000df8c828979abbc3b83594068746c3dafa",
+      "ref": "refs/heads/retired/garageserver-20261107/working/managed-opencode-session-recovery",
+      "parent": "8362581b8c90de7e192a353b2256a7a5e71b5494",
+      "source_records": 29,
+      "original_worktree": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery"
+    },
+    {
+      "slug": "managed-runtime-optin-2130563",
+      "commit": "567e92209798aae821bb37fa04ea280504bca741",
+      "ref": "refs/heads/retired/garageserver-20261107/working/managed-runtime-optin-2130563",
+      "parent": "2130563d76c23397ad4a37fed42c77927cc51e8b",
+      "source_records": 1,
+      "original_worktree": "/home/dan/code/freshell/.worktrees/managed-runtime-optin-2130563"
+    },
+    {
+      "slug": "mdmw-sandbox-budget",
+      "commit": "b383b3078cfbc750cde23c0da5f1d964613b594c",
+      "ref": "refs/heads/retired/garageserver-20261107/working/mdmw-sandbox-budget",
+      "parent": "342e6e73081fa3b8d70935dd5c97cda030be8427",
+      "source_records": 8,
+      "original_worktree": "/home/dan/code/freshell/.worktrees/mdmw-sandbox-budget"
+    },
+    {
+      "slug": "task4-parent-8844",
+      "commit": "1135c1cbd9f280e45d5b022534aa75c7af654019",
+      "ref": "refs/heads/retired/garageserver-20261107/working/task4-parent-8844",
+      "parent": "8844e431cb8eebdcf0a85c92efcbc0718fc48107",
+      "source_records": 1,
+      "original_worktree": "/home/dan/code/freshell/.worktrees/task4-parent-8844"
+    },
+    {
+      "slug": "task4-parent-rust",
+      "commit": "7a6341cbc5659d0486199868d6a96f2381f698dd",
+      "ref": "refs/heads/retired/garageserver-20261107/working/task4-parent-rust",
+      "parent": "8844e431cb8eebdcf0a85c92efcbc0718fc48107",
+      "source_records": 2,
+      "original_worktree": "/home/dan/code/freshell/.worktrees/task4-parent-rust"
+    },
+    {
+      "slug": "ignored-source",
+      "commit": "9e727312ad8174a9e52dd9f1b150a4a4a0518f06",
+      "ref": "refs/heads/retired/garageserver-20261107/working/ignored-source",
+      "parent": "cbcb0726431d906355c407ed2c2859227618e1ae",
+      "source_records": 50,
+      "original_worktree": null
+    },
+    {
+      "slug": "operations",
+      "commit": "7f71f2b893b65533961e00c80b4ee3166a2ba58e",
+      "ref": "refs/heads/retired/garageserver-20261107/working/operations",
+      "parent": "cbcb0726431d906355c407ed2c2859227618e1ae",
+      "source_records": 104,
+      "original_worktree": null
+    }
+  ],
+  "waived_diagnostics": [
+    {
+      "path": "/home/dan/code/freshell/.worktrees/cloud-vitest-wedge-rca/RCA-REPORT.md",
+      "reason": "diagnostic/progress document waived by retirement scope"
+    },
+    {
+      "path": "/home/dan/code/freshell/.worktrees/freshagent-multiple-devices/usual-sdd/progress.md",
+      "reason": "diagnostic/progress document waived by retirement scope"
+    }
+  ],
+  "duplicate_sources": [
+    {
+      "path": "/home/dan/code/freshell/.ai/attractor-followup/evidence/pipeline-final.dot",
+      "oid": "e1f82a88675c9f147cd6d92f19ebc44e7c1bbb85",
+      "reason": "empty or exact blob already reachable in Git"
+    },
+    {
+      "path": "/home/dan/code/freshell/.ai/attractor-followup/logs/attempt5/pipeline.dot",
+      "oid": "e1f82a88675c9f147cd6d92f19ebc44e7c1bbb85",
+      "reason": "empty or exact blob already reachable in Git"
+    },
+    {
+      "path": "/home/dan/code/freshell/.ai/attractor-followup/logs/attempt5/graph.dot",
+      "oid": "e1f82a88675c9f147cd6d92f19ebc44e7c1bbb85",
+      "reason": "empty or exact blob already reachable in Git"
+    },
+    {
+      "path": "/home/dan/code/freshell/.ai/attractor-runs/remote-access/pipeline.dot",
+      "oid": "3b4acb44dfd92a62891504554dadfc4a3a8de18e",
+      "reason": "empty or exact blob already reachable in Git"
+    },
+    {
+      "path": "/home/dan/code/freshell/.ai/attractor-runs/remote-access/graph.dot",
+      "oid": "3b4acb44dfd92a62891504554dadfc4a3a8de18e",
+      "reason": "empty or exact blob already reachable in Git"
+    },
+    {
+      "path": "/home/dan/code/freshell/.ai/attractor-runs/remote-access-v2-attempt5/pipeline.dot",
+      "oid": "e1f82a88675c9f147cd6d92f19ebc44e7c1bbb85",
+      "reason": "empty or exact blob already reachable in Git"
+    },
+    {
+      "path": "/home/dan/code/freshell/.ai/attractor-runs/remote-access-v2-attempt5/graph.dot",
+      "oid": "e1f82a88675c9f147cd6d92f19ebc44e7c1bbb85",
+      "reason": "empty or exact blob already reachable in Git"
+    },
+    {
+      "path": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/ka-merged.ts",
+      "oid": "79a0e5c09f8c6e7b20ea4568d546b25e80231fd9",
+      "reason": "empty or exact blob already reachable in Git"
+    },
+    {
+      "path": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/cmp-main.tsx",
+      "oid": "658b9249f2094022ac7b88a8ff9d871abe527701",
+      "reason": "empty or exact blob already reachable in Git"
+    },
+    {
+      "path": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/merge-compare-appserver-main.rs",
+      "oid": "4d7ce03d0ab413fe166aab0a92ae2d610ef67940",
+      "reason": "empty or exact blob already reachable in Git"
+    },
+    {
+      "path": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/ka-kata.ts",
+      "oid": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "reason": "empty or exact blob already reachable in Git"
+    },
+    {
+      "path": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/merge-compare-claude-main.rs",
+      "oid": "1219ca7c59090a57ef1081b96b91e48ec95327ee",
+      "reason": "empty or exact blob already reachable in Git"
+    },
+    {
+      "path": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/merge-compare-claude-kata.rs",
+      "oid": "c111785c23aedf187962ff271150e0a755c75a94",
+      "reason": "empty or exact blob already reachable in Git"
+    },
+    {
+      "path": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/merge-compare-codex-kata.rs",
+      "oid": "40e0eb40369e6fa6141c11d9106f9fc4832cfd5b",
+      "reason": "empty or exact blob already reachable in Git"
+    },
+    {
+      "path": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/cmp-kata.tsx",
+      "oid": "a46dc6fd3aba36abcb59cad04301ba8b761c5c63",
+      "reason": "empty or exact blob already reachable in Git"
+    },
+    {
+      "path": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/merge-compare-codex-main.rs",
+      "oid": "a40f22a00b988a5ec6ffd1ce2994e5f8dfebd2b6",
+      "reason": "empty or exact blob already reachable in Git"
+    },
+    {
+      "path": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/merge-compare-appserver-kata.rs",
+      "oid": "1d553a6d8f95fcf87caad157855e0eb451d73f2d",
+      "reason": "empty or exact blob already reachable in Git"
+    },
+    {
+      "path": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/ka-main.ts",
+      "oid": "63c92b74c15a7b621983c2e835b9b073154b4e25",
+      "reason": "empty or exact blob already reachable in Git"
+    },
+    {
+      "path": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/fav-kata.tsx",
+      "oid": "a533af2fd38cee444c733088b1d2ea45ac080b4a",
+      "reason": "empty or exact blob already reachable in Git"
+    },
+    {
+      "path": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/fav-main.tsx",
+      "oid": "569ed4cd5634194165b6f063ccdef4643598db92",
+      "reason": "empty or exact blob already reachable in Git"
+    },
+    {
+      "path": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/fav-test-main.ts",
+      "oid": "e1abf0e6094303597071d95943c4c7f4acfcd455",
+      "reason": "empty or exact blob already reachable in Git"
+    },
+    {
+      "path": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/fav-kata.ts",
+      "oid": "c04131075b1f4b6ab164ac514939337237611015",
+      "reason": "empty or exact blob already reachable in Git"
+    },
+    {
+      "path": "/home/dan/.config/systemd/user/freshell-rust.service.d/managed-runtime.conf",
+      "oid": "8c53940dc90657464de5b2bae07c5aad6b28b146",
+      "reason": "exact blob already reachable in Git"
+    },
+    {
+      "path": "/home/dan/.config/systemd/user/freshell-supervisor.service",
+      "oid": "aa6b018c7a7d9cb264b21df48adbdd82f4fdb2aa",
+      "reason": "exact blob already reachable in Git"
+    }
+  ],
+  "secret_review": {
+    "history_commits_scanned": 3205,
+    "unpublished_commits": 3338,
+    "history_findings": 173,
+    "history_findings_classified": "fixture UUIDs, deterministic hexadecimal test secrets, unsigned synthetic OAuth JWTs, SQL/field names, sentinel test string",
+    "new_source_findings": [
+      {
+        "path": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-server/src/fresh_agent_proxy_tests.rs",
+        "line": 945,
+        "classification": "deterministic fixture secret",
+        "confirmed": true
+      },
+      {
+        "path": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-server/src/fresh_agent_proxy_tests.rs",
+        "line": 963,
+        "classification": "deterministic fixture secret",
+        "confirmed": true
+      },
+      {
+        "path": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-server/src/fresh_agent_proxy_tests.rs",
+        "line": 1376,
+        "classification": "deterministic fixture secret",
+        "confirmed": true
+      },
+      {
+        "path": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-server/src/fresh_agent_proxy_tests.rs",
+        "line": 1480,
+        "classification": "deterministic fixture secret",
+        "confirmed": true
+      },
+      {
+        "path": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-server/src/fresh_agent_proxy_tests.rs",
+        "line": 1563,
+        "classification": "deterministic fixture secret",
+        "confirmed": true
+      },
+      {
+        "path": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-server/src/fresh_agent_proxy_tests.rs",
+        "line": 3365,
+        "classification": "deterministic fixture secret",
+        "confirmed": true
+      },
+      {
+        "path": "/home/dan/code/freshell/.worktrees/fresh-agent-recovery-fixes/crates/freshell-server/src/fresh_agent_proxy_tests.rs",
+        "line": 5940,
+        "classification": "deterministic fixture secret",
+        "confirmed": true
+      },
+      {
+        "path": "/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery/test/e2e-browser/fixtures/managed-opencode-source.ts",
+        "line": 41,
+        "classification": "migration identifier",
+        "confirmed": true
+      }
+    ],
+    "real_secrets_found": 0
+  },
+  "patches": [
+    {
+      "file": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/eaw7/.eaw7-scratch/usual-sdd/task-001-diff.patch",
+      "pairs": 9,
+      "missing_after_blobs": []
+    },
+    {
+      "file": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/eaw7/.eaw7-scratch/usual-sdd/task-003-diff.patch",
+      "pairs": 4,
+      "missing_after_blobs": []
+    },
+    {
+      "file": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/eaw7/.eaw7-scratch/usual-sdd/task-004-diff.patch",
+      "pairs": 15,
+      "missing_after_blobs": []
+    },
+    {
+      "file": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/eaw7/.eaw7-scratch/usual-sdd/whole-branch-diff.patch",
+      "pairs": 39,
+      "missing_after_blobs": []
+    },
+    {
+      "file": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/eaw7/.eaw7-scratch/usual-sdd/task-005-diff.patch",
+      "pairs": 8,
+      "missing_after_blobs": []
+    },
+    {
+      "file": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/eaw7/.eaw7-scratch/usual-sdd/task-006-diff.patch",
+      "pairs": 2,
+      "missing_after_blobs": []
+    },
+    {
+      "file": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/eaw7/.eaw7-scratch/usual-sdd/task-002-diff.patch",
+      "pairs": 2,
+      "missing_after_blobs": []
+    },
+    {
+      "file": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/task-003.diff",
+      "pairs": 18,
+      "missing_after_blobs": []
+    },
+    {
+      "file": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/task-001.diff",
+      "pairs": 1,
+      "missing_after_blobs": []
+    },
+    {
+      "file": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/kata-whole-branch.diff",
+      "pairs": 31,
+      "missing_after_blobs": []
+    },
+    {
+      "file": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/task-002.diff",
+      "pairs": 3,
+      "missing_after_blobs": []
+    },
+    {
+      "file": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/task-004.diff",
+      "pairs": 3,
+      "missing_after_blobs": []
+    },
+    {
+      "file": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/task-002-fix2.diff",
+      "pairs": 2,
+      "missing_after_blobs": []
+    },
+    {
+      "file": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/task-009.diff",
+      "pairs": 7,
+      "missing_after_blobs": []
+    },
+    {
+      "file": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/task-008.diff",
+      "pairs": 3,
+      "missing_after_blobs": []
+    },
+    {
+      "file": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/task-001-full.diff",
+      "pairs": 2,
+      "missing_after_blobs": []
+    },
+    {
+      "file": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/task-006.diff",
+      "pairs": 7,
+      "missing_after_blobs": []
+    },
+    {
+      "file": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/task-010.diff",
+      "pairs": 3,
+      "missing_after_blobs": []
+    },
+    {
+      "file": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/task-001-fix.diff",
+      "pairs": 2,
+      "missing_after_blobs": []
+    },
+    {
+      "file": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/task-007.diff",
+      "pairs": 5,
+      "missing_after_blobs": []
+    },
+    {
+      "file": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/task-002-fix.diff",
+      "pairs": 2,
+      "missing_after_blobs": []
+    },
+    {
+      "file": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/task-005.diff",
+      "pairs": 3,
+      "missing_after_blobs": []
+    },
+    {
+      "file": "/home/dan/.local/state/darkforge/freshell-fb808e79f4/worktrees/z06a/.dfx/task-002-full.diff",
+      "pairs": 3,
+      "missing_after_blobs": []
+    }
+  ],
+  "note": "No application histories, credentials, diagnostic logs, archives or patches are stored in this manifest."
+}
